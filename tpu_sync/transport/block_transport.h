@@ -90,6 +90,13 @@ class BlockTransport final {
   // It is the first IP in `local_ips` if provided, otherwise "127.0.0.1".
   const std::string& bound_ip() const { return raw_transport_.bound_ip(); }
 
+  // Port of the Peregrine control endpoint, 0 when the Peregrine transport is
+  // not running. It is a separate kernel-assigned port from `local_port()`;
+  // a peer addressing a Peregrine-backed op must use this one.
+  int peregrine_local_port() const {
+    return peregrine_adapter_ == nullptr ? 0 : peregrine_adapter_->local_port();
+  }
+
   // Closes the idle pooled connections to `peer` (lib::ConnPool::CloseIdle).
   // In-flight streams keep their sockets; the next push to `peer` dials
   // afresh. Returns how many connections were closed.
@@ -229,7 +236,8 @@ class BlockTransport final {
       uint64_t buffer_id, int parallelism, MajorOrder major_order,
       uint32_t remote_id, uint32_t local_id, int stream_idx = 0,
       BlockReceivedCallback on_block_received = nullptr,
-      uint16_t shard_mask = 0, int total_streams = 0);
+      uint16_t shard_mask = 0, int total_streams = 0, int32_t dst_block_id = -1,
+      int32_t src_block_id = -1, uint16_t chunk_idx = 0);
 
   // Builds the Requests of one block push for |shard_ids| only: `parallelism`
   // streams (stream_idx 0..parallelism-1) over an even block partition, each

@@ -275,6 +275,12 @@ absl::Status EndIncomingPush(const std::shared_ptr<TransferSession>& session,
 absl::Status ValidateChunks(BlockTransportDelegate* delegate, size_t l,
                             size_t sh, uint64_t uuid,
                             absl::Span<const BlockChunk> chunks) {
+  if (chunks.size() > std::numeric_limits<uint16_t>::max()) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "block has ", chunks.size(),
+        " chunks; RequestMetadataV1::chunk_idx is 16-bit (layer=", l,
+        " shard=", sh, " uuid=", uuid, ")"));
+  }
   ABSL_ASSIGN_OR_RETURN(const absl::Span<const char> span,
                         delegate->GetBlockArrayHostSpan(l, sh, uuid));
   // Some legacy delegates intentionally expose only scattered per-block

@@ -331,8 +331,20 @@ BlockTransport::BlockTransport(BlockTransportDelegate* delegate, int local_port,
   // default socket configuration never touches Peregrine.
   if (config_.uses_peregrine()) {
     absl::StatusOr<std::unique_ptr<lib::PeregrineTransportAdapter>> adapter =
-        lib::PeregrineTransportAdapter::Create(raw_transport_.bound_ip(),
-                                               /*port=*/0, parallelism_);
+        lib::PeregrineTransportAdapter::Create(
+            raw_transport_.bound_ip(), /*port=*/0, parallelism_,
+            lib::PeregrineTransportAdapter::RecvHooks{
+                .on_post_complete =
+                    [this](const lib::PostMetadata& post,
+                           const absl::Status& post_status) {
+                      return OnRecvComplete(post, /*requests=*/{}, post_status);
+                    },
+                .resolve_addr =
+                    [this](const lib::PostMetadata& post,
+                           const lib::RequestMetadata& req) {
+                      return ResolveRecvBuffer(post, req);
+                    },
+            });
     if (adapter.ok()) {
       peregrine_adapter_ = *std::move(adapter);
     } else {
@@ -354,6 +366,10 @@ BlockTransport::BlockTransport(BlockTransportDelegate* delegate, int local_port,
 }
 
 BlockTransport::~BlockTransport() {
+  // Stop Peregrine before tearing down the rest: its receive threads invoke
+  // ResolveRecvBuffer/OnRecvComplete on this object, and destroying the
+  // adapter joins those threads.
+  peregrine_adapter_.reset();
   stop_metrics_thread_.Notify();
   if (metrics_thread_.joinable()) {
     metrics_thread_.join();
@@ -687,6 +703,7 @@ absl::StatusOr<std::vector<int>> BlockTransport::SyncPullInternal(
       BuildBlockPullRequests(src_block_ids, allocated_ids, explicit_dst_ptrs,
                              major_order, uuid, P, on_block_received));
 
+  // TODO(swasthi): Support `kBlockPull` over Peregrine.
   ABSL_ASSIGN_OR_RETURN(lib::TransportAdapter* const adapter,
                         AdapterForOp(lib::TransferOp::kBlockPull));
   ABSL_RETURN_IF_ERROR(adapter->Post(peers, requests).status());
@@ -699,7 +716,8 @@ lib::Request BlockTransport::BuildBlockRequest(
     uint64_t buffer_id, int parallelism, MajorOrder major_order,
     uint32_t remote_id, uint32_t local_id, int stream_idx,
     BlockReceivedCallback on_block_received, uint16_t shard_mask,
-    int total_streams) {
+    int total_streams, int32_t dst_block_id, int32_t src_block_id,
+    uint16_t chunk_idx) {
   return lib::Request{
       .op = op,
       .laddr = laddr,
@@ -716,6 +734,9 @@ lib::Request BlockTransport::BuildBlockRequest(
       .stream_idx = stream_idx,
       .shard_mask = shard_mask,
       .total_streams = total_streams,
+      .dst_block_id = dst_block_id,
+      .src_block_id = src_block_id,
+      .chunk_idx = chunk_idx,
       .on_block_received = std::move(on_block_received),
   };
 }
@@ -823,12 +844,15 @@ absl::StatusOr<std::vector<lib::Request>> BlockTransport::BuildBlockRequests(
           const uint64_t buffer_id =
               (static_cast<uint64_t>(wire_layer) << 32) |
               static_cast<uint32_t>(sh);
-          for (const auto& chunk : chunks) {
+          for (size_t chunk_idx = 0; chunk_idx < chunks.size(); ++chunk_idx) {
+            const BlockChunk& chunk = chunks[chunk_idx];
             requests.push_back(BuildBlockRequest(
                 op, chunk.ptr, chunk.raddr, chunk.size, count_or_size,
                 request_id, uuid, buffer_id, parallelism, major_order,
                 remote_id, local_id, stream_idx,
-                /*on_block_received=*/nullptr, shard_mask, total_streams));
+                /*on_block_received=*/nullptr, shard_mask, total_streams,
+                static_cast<int32_t>(dst_id_val), src_id,
+                static_cast<uint16_t>(chunk_idx)));
           }
           ++request_id;
           return absl::OkStatus();

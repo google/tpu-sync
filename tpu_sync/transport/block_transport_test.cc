@@ -77,11 +77,13 @@ namespace tpu_raiden {
 namespace transport {
 namespace {
 
+using ::absl_testing::IsOkAndHolds;
 using ::absl_testing::StatusIs;
 using ::peregrine::v1::ConnectToPeer;
 using ::peregrine::v1::IsPspSupported;
 using ::peregrine::v1::ReadExact;
 using ::testing::Each;
+using ::testing::ElementsAre;
 using ::testing::Eq;
 using ::testing::HasSubstr;
 using ::testing::Not;
@@ -2462,6 +2464,144 @@ INSTANTIATE_TEST_SUITE_P(
     [](const ::testing::TestParamInfo<bool>& info) {
       return info.param ? "PSP" : "PlainTcp";
     });
+
+// Polls until `delegate` reports at least `count` completed layers; the
+// receiver's completion callback runs on a Peregrine thread and is not
+// ordered against the sender's acknowledgement.
+bool WaitForLayerCompletions(const MockDelegate& delegate, int count) {
+  const absl::Time deadline = absl::Now() + absl::Seconds(10);
+  while (delegate.layer_completion_count() < count && absl::Now() < deadline) {
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  return delegate.layer_completion_count() >= count;
+}
+
+TEST(TransportBackendTest, ExplicitPushOverPeregrineIsReceiverResolved) {
+  constexpr size_t kSize = 256;
+  constexpr size_t kLayers = 2;
+  constexpr size_t kShards = 2;
+  constexpr int kBlocks = 2;
+  auto cleanup =
+      absl::MakeCleanup([] { unsetenv("TPU_RAIDEN_ENABLE_PEREGRINE"); });
+  setenv("TPU_RAIDEN_ENABLE_PEREGRINE", "6", 1);
+  MockDelegate sender_delegate(kSize, kBlocks, kLayers, kShards);
+  MockDelegate receiver_delegate(kSize, kBlocks, kLayers, kShards);
+  // A distinct byte per (layer, shard, block) on the sender; receiver zeroed.
+  for (size_t layer = 0; layer < kLayers; ++layer) {
+    for (size_t shard = 0; shard < kShards; ++shard) {
+      for (int block = 0; block < kBlocks; ++block) {
+        std::memset(sender_delegate.block_data(block, layer, shard),
+                    0x10 * (layer + 1) + 0x4 * shard + block + 1, kSize);
+      }
+    }
+  }
+
+  BlockTransport sender(&sender_delegate, 0);
+  BlockTransport receiver(&receiver_delegate, 0);
+  // The Peregrine control endpoint is its own kernel-assigned port.
+  ASSERT_GT(receiver.peregrine_local_port(), 0);
+  ASSERT_NE(receiver.peregrine_local_port(), receiver.local_port());
+  const std::vector<std::string> peers = {
+      absl::StrCat("127.0.0.1:", receiver.peregrine_local_port())};
+
+  // Layer 1 only: sender block 0 -> receiver block 1 and 1 -> 0, both shards.
+  // The sender posts no destination addresses; the receiver resolves each
+  // request from its metadata.
+  ABSL_ASSERT_OK(sender
+                     .AsyncPush(peers, /*src_block_ids=*/{0, 1},
+                                /*dst_block_ids=*/{1, 0}, /*parallelism=*/1,
+                                MajorOrder::kLayerMajor, /*uuid=*/501,
+                                /*layer_idx=*/1)
+                     .Await());
+  ASSERT_TRUE(WaitForLayerCompletions(receiver_delegate, 1));
+  EXPECT_EQ(receiver_delegate.layer_completion_count(), 1);
+  for (size_t shard = 0; shard < kShards; ++shard) {
+    EXPECT_EQ(
+        std::memcmp(receiver_delegate.block_data(1, /*layer_idx=*/1, shard),
+                    sender_delegate.block_data(0, 1, shard), kSize),
+        0)
+        << "shard " << shard;
+    EXPECT_EQ(
+        std::memcmp(receiver_delegate.block_data(0, /*layer_idx=*/1, shard),
+                    sender_delegate.block_data(1, 1, shard), kSize),
+        0)
+        << "shard " << shard;
+    // Layer 0 is untouched by a layer-1 push.
+    EXPECT_EQ(receiver_delegate.block_data(0, /*layer_idx=*/0, shard)[0], 0);
+    EXPECT_EQ(receiver_delegate.block_data(1, /*layer_idx=*/0, shard)[0], 0);
+  }
+
+  // A second transfer completes layer 0 the same way.
+  ABSL_ASSERT_OK(sender
+                     .AsyncPush(peers, /*src_block_ids=*/{0, 1},
+                                /*dst_block_ids=*/{1, 0}, /*parallelism=*/1,
+                                MajorOrder::kLayerMajor, /*uuid=*/502,
+                                /*layer_idx=*/0)
+                     .Await());
+  ASSERT_TRUE(WaitForLayerCompletions(receiver_delegate, 2));
+  EXPECT_EQ(receiver_delegate.layer_completion_count(), 2);
+  for (size_t shard = 0; shard < kShards; ++shard) {
+    EXPECT_EQ(
+        std::memcmp(receiver_delegate.block_data(1, /*layer_idx=*/0, shard),
+                    sender_delegate.block_data(0, 0, shard), kSize),
+        0)
+        << "shard " << shard;
+    EXPECT_EQ(
+        std::memcmp(receiver_delegate.block_data(0, /*layer_idx=*/0, shard),
+                    sender_delegate.block_data(1, 0, shard), kSize),
+        0)
+        << "shard " << shard;
+  }
+}
+
+TEST(TransportBackendTest, AllLayerPushOverPeregrineWithUuidZero) {
+  constexpr size_t kSize = 128;
+  constexpr size_t kLayers = 3;
+  constexpr size_t kShards = 2;
+  constexpr int kBlocks = 2;
+  auto cleanup =
+      absl::MakeCleanup([] { unsetenv("TPU_RAIDEN_ENABLE_PEREGRINE"); });
+  setenv("TPU_RAIDEN_ENABLE_PEREGRINE", "6", 1);
+  MockDelegate sender_delegate(kSize, kBlocks, kLayers, kShards);
+  MockDelegate receiver_delegate(kSize, kBlocks, kLayers, kShards);
+  for (size_t layer = 0; layer < kLayers; ++layer) {
+    for (size_t shard = 0; shard < kShards; ++shard) {
+      for (int block = 0; block < kBlocks; ++block) {
+        std::memset(sender_delegate.block_data(block, layer, shard),
+                    0x10 * (layer + 1) + 0x4 * shard + block + 1, kSize);
+      }
+    }
+  }
+  BlockTransport sender(&sender_delegate, 0);
+  BlockTransport receiver(&receiver_delegate, 0);
+  ASSERT_GT(receiver.peregrine_local_port(), 0);
+
+  // uuid 0 is the staging-push shape (no transfer session); every layer is
+  // one Post, joined into a single result.
+  EXPECT_THAT(
+      sender
+          .AsyncPush(
+              {absl::StrCat("127.0.0.1:", receiver.peregrine_local_port())},
+              /*src_block_ids=*/{0, 1}, /*dst_block_ids=*/{1, 0},
+              /*parallelism=*/1, MajorOrder::kLayerMajor, /*uuid=*/0,
+              /*layer_idx=*/-1)
+          .Await(),
+      IsOkAndHolds(ElementsAre(1, 0)));
+  ASSERT_TRUE(WaitForLayerCompletions(receiver_delegate, kLayers));
+  EXPECT_EQ(receiver_delegate.layer_completion_count(), kLayers);
+  for (size_t layer = 0; layer < kLayers; ++layer) {
+    for (size_t shard = 0; shard < kShards; ++shard) {
+      EXPECT_EQ(std::memcmp(receiver_delegate.block_data(1, layer, shard),
+                            sender_delegate.block_data(0, layer, shard), kSize),
+                0)
+          << "layer " << layer << " shard " << shard;
+      EXPECT_EQ(std::memcmp(receiver_delegate.block_data(0, layer, shard),
+                            sender_delegate.block_data(1, layer, shard), kSize),
+                0)
+          << "layer " << layer << " shard " << shard;
+    }
+  }
+}
 
 TEST(PeregrineRecvCompleteTest, SplitPostsFromOneSenderCompleteLayerOnce) {
   MultiSenderReceiverDelegate delegate(/*slice_size=*/64, /*max_blocks=*/1,

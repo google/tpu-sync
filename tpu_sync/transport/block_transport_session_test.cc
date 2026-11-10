@@ -16,6 +16,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -298,6 +299,16 @@ TEST(ValidateChunksTest, SkipsDelegateWithoutFlatHostBase) {
        .size = 1024}};
 
   ABSL_EXPECT_OK(ValidateChunks(&delegate, 0, 0, /*uuid=*/7, past_end));
+}
+
+TEST(ValidateChunksTest, RejectsExcessiveChunkCount) {
+  MockSessionDelegate delegate(/*slice_size=*/1024, /*max_blocks=*/4);
+  const std::vector<BlockChunk> too_many(
+      static_cast<size_t>(std::numeric_limits<uint16_t>::max()) + 1);
+
+  EXPECT_THAT(ValidateChunks(&delegate, 0, 0, /*uuid=*/7, too_many),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("chunk_idx is 16-bit")));
 }
 
 }  // namespace

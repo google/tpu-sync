@@ -79,6 +79,12 @@ struct Request {
   // Post()'s `parallelism`. Sent as `ChunkHeader::reserved`.
   int total_streams = 0;
 
+  // Block push only; what the receiver needs to resolve the destination of
+  // this request itself (sent as `RequestMetadata` over Peregrine; the socket
+  // adapter ignores them).
+  int32_t dst_block_id = -1;
+  int32_t src_block_id = -1;
+  uint16_t chunk_idx = 0;
   BlockReceivedCallback on_block_received = nullptr;
 };
 

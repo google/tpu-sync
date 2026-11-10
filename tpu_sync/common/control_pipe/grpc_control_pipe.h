@@ -33,6 +33,7 @@
 #include "tpu_sync/common/control_pipe/control_pipe_client.h"
 #include "tpu_sync/common/control_pipe/control_pipe_server.h"
 #include "tpu_sync/common/control_pipe/control_pipe_types.h"
+#include "tpu_sync/platform/grpc_credential_factory.h"
 #include "tpu_sync/proto/control_pipe.grpc.pb.h"
 #include "tpu_sync/proto/control_pipe.pb.h"
 
@@ -40,7 +41,9 @@ namespace tpu_raiden {
 
 class GrpcControlPipeServer : public ControlPipeServer {
  public:
-  explicit GrpcControlPipeServer(const ControlPipeConfig& config);
+  explicit GrpcControlPipeServer(
+      const ControlPipeConfig& config,
+      std::shared_ptr<GrpcCredentialFactory> credential_factory = nullptr);
   ~GrpcControlPipeServer() override;
 
   absl::StatusOr<int> Start(int requested_port) override;
@@ -58,6 +61,7 @@ class GrpcControlPipeServer : public ControlPipeServer {
   class LegacyKVCacheServiceImpl;
 
   ControlPipeConfig config_;
+  std::shared_ptr<GrpcCredentialFactory> credential_factory_;
   ControlDispatcher dispatcher_;
   int bound_port_ = 0;
 
@@ -71,8 +75,16 @@ class GrpcControlPipeClient : public ControlPipeClient {
  public:
   static constexpr size_t kDefaultMaxCachedStubs = 100000;
 
-  explicit GrpcControlPipeClient(const ControlPipeConfig& config);
+  explicit GrpcControlPipeClient(
+      const ControlPipeConfig& config,
+      std::shared_ptr<GrpcCredentialFactory> credential_factory = nullptr);
   ~GrpcControlPipeClient() override = default;
+
+  // Returns a cached or newly created gRPC channel for `endpoint` using the
+  // configured credential factory and channel arguments, reusing the stub LRU
+  // cache.
+  absl::StatusOr<std::shared_ptr<grpc::Channel>> GetOrCreateChannel(
+      absl::string_view endpoint);
 
   absl::StatusOr<control_pipe::proto::ControlResponseEnvelope> SendRaw(
       absl::string_view endpoint,
@@ -96,11 +108,13 @@ class GrpcControlPipeClient : public ControlPipeClient {
     std::list<std::string>::iterator lru_it;
   };
 
-  std::pair<std::shared_ptr<grpc::Channel>,
-            std::shared_ptr<control_pipe::proto::ControlPipeService::Stub>>
+  absl::StatusOr<
+      std::pair<std::shared_ptr<grpc::Channel>,
+                std::shared_ptr<control_pipe::proto::ControlPipeService::Stub>>>
   GetOrCreateStub(absl::string_view endpoint);
 
   ControlPipeConfig config_;
+  std::shared_ptr<GrpcCredentialFactory> credential_factory_;
   mutable absl::Mutex stub_mu_;
   std::list<std::string> lru_order_ ABSL_GUARDED_BY(stub_mu_);
   absl::flat_hash_map<std::string, StubCacheEntry> stubs_

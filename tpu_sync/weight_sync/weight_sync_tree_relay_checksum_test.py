@@ -1910,7 +1910,7 @@ class WeightSyncTreeRelayChecksumTest(absltest.TestCase):
       t.start()
       return t
 
-    # 1. With MAX_ATTEMPTS=1 (no retries), a 700ms accept-queue overflow on the
+    # 1. With MAX_ATTEMPTS=1 (no retries), an accept-queue overflow on the
     # Round-1 seed receiver reproduces the exact production error:
     # RuntimeError: Raiden remote native execution failed: Failed to connect to
     # peer 127.0.2.1:...: connect timed out after 500ms
@@ -1919,7 +1919,12 @@ class WeightSyncTreeRelayChecksumTest(absltest.TestCase):
     self.controller.broadcast_pipeline_stages = 2
     self.controller._plan_cache.clear()
 
-    congest_thread = _fill_gate_and_drain_after(0.7, forward_after=False)
+    # Keep the gate congested well past the first data-plane connect attempt.
+    # The first transfer also pays for control-plane channel setup (LOAS2
+    # handshake, CRL loading), which can exceed 700ms under sanitizers; if the
+    # gate drains before the trainer connects, the connect succeeds and the
+    # transfer hangs instead of hitting the 500ms connect timeout.
+    congest_thread = _fill_gate_and_drain_after(5.0, forward_after=False)
     future_fail = self.controller.start_transfer(
         src_units=[src_unit],
         dst_units=dst_units,

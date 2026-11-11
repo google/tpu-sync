@@ -91,6 +91,41 @@ message VariableMetadataProto {
   repeated int64 global_shard_indices = 8;
 }
 
+// Identity of the process registering a work unit, for liveness tracking.
+//
+// Setting this message opts the unit in to lease tracking: the controller
+// expects to hear from the unit periodically (every registration counts) and
+// drops it after a lease interval without a message. A unit registered
+// without it stays registered until it unregisters, as before this message
+// existed.
+message HostInfo {
+  // Start time of the registering process, in microseconds since the Unix
+  // epoch. Must be positive. A later registration of the same unit with a
+  // newer start time means the process restarted: the controller discards
+  // everything it recorded for the previous process (versions, in-flight
+  // transfers, cached plans) and treats the registration as new, even when the
+  // payload is otherwise identical. A registration with an older start time
+  // than the one on record is rejected.
+  int64 process_start_time_us = 1;
+  // Number of hosts in the registering job, for example the hosts of a
+  // multi-host server. The controller considers the job live only once this
+  // many of its hosts are live. Zero means unknown and is treated as one.
+  int32 num_hosts = 2;
+}
+
+// Registration of one host of a job (one `RaidenIdProto`) with the controller.
+//
+// Besides `unit`, `shards`, and `control_plane_rpc_address`, which every
+// registration carries, the fields come in groups. Send one group whole; the
+// controller rejects a partial group.
+//
+//   * Legacy single-variable: `mesh_shape`, `layout`, `global_shape`,
+//     `itemsize`. Describes one tensor; superseded by `variables`.
+//   * Weight sync: `variables` (and `mesh_axes` when the variables do not
+//     carry `global_shard_indices`).
+//   * KV-cache pools: `pools`, `layout_fingerprint`, `page_tokens`,
+//     `transfer_parallelism`, `transfer_rank`.
+//   * Liveness: `host`. Optional with any of the above.
 message RegisterWorkUnitRequest {
   RaidenIdProto unit = 1;
   repeated string shards = 2;
@@ -118,6 +153,9 @@ message RegisterWorkUnitRequest {
   // Deprecated and ignored by the controller. Shard placement must be
   // expressed via VariableMetadataProto.global_shard_indices.
   repeated int64 host_subgrid = 16 [deprecated = true];
+
+  // Identity of the registering process; see HostInfo.
+  HostInfo host = 17;
 }
 
 // Defines an explicit 1D linear memory push operation from a local source to a
@@ -296,6 +334,12 @@ message ControlRequest {
     COMMAND_REGISTER_WORK_UNIT = 3;
     COMMAND_GET_METADATA = 4;
     COMMAND_REGISTER_TRANSFER_SCHEDULE = 5;
+    // Removes a work unit from the controller immediately on graceful
+    // teardown, e.g. when a model server unloads a model. Ungraceful host loss
+    // (crash, network partition) is instead handled by HostInfo lease
+    // expiration. Only `register_work_unit_request.unit` is read.
+    // Unregistering an unknown unit succeeds.
+    COMMAND_UNREGISTER_WORK_UNIT = 6;
   }
   Command command = 1;
   repeated string peers = 2;

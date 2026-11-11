@@ -426,8 +426,36 @@ class RaidenController:
       transfer_rank: Optional[int] = None,
       variables: Optional[Sequence[Any]] = None,
       mesh_axes: Optional[Sequence[str]] = None,
+      process_start_time_us: int = 0,
+      num_hosts: int = 0,
   ) -> None:
-    """Registers physical worker shard Data addresses and metadata on `unit`'s JobEntity."""
+    """Registers physical worker shard Data addresses and metadata on `unit`'s JobEntity.
+
+    Args:
+      unit: Work unit identifier of the registering host.
+      shards: Data-plane shard endpoints served by the host.
+      control_plane_rpc_address: Control-plane endpoint(s) of the host.
+      mesh_shape: Legacy single-variable mesh shape.
+      layout: Legacy single-variable layout.
+      global_shape: Legacy single-variable global shape.
+      itemsize: Legacy single-variable element size in bytes.
+      pool_manifest: KV-cache pool manifest.
+      layout_fingerprint: KV-cache physical layout identity.
+      page_tokens: KV-cache tokens per page.
+      transfer_parallelism: KV-cache producer group size.
+      transfer_rank: KV-cache rank within the producer group.
+      variables: Multi-variable weight-sync manifest.
+      mesh_axes: Logical mesh axis names.
+      process_start_time_us: Start time of the registering process, in µs
+        since the Unix epoch; 0 if the host did not report one. Accepted for
+        liveness tracking; not yet acted on.
+      num_hosts: Number of hosts in the unit's job; 0 means unknown. Accepted
+        for liveness tracking; not yet acted on.
+
+    Raises:
+      ValueError: On inconsistent metadata.
+    """
+    del process_start_time_us, num_hosts  # Consumed once liveness lands.
     has_metadata = (
         mesh_shape is not None or layout is not None or global_shape is not None
     )

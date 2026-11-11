@@ -1,0 +1,38 @@
+// Copyright 2026 Google LLC.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package tpu_sync.rpc;
+
+option java_multiple_files = true;
+option java_outer_classname = "WeightTransferCommonProto";
+
+// Messages shared by the worker-facing (`weight_transfer_worker_service.proto`)
+// and controller-facing (`weight_transfer_controller_service.proto`)
+// control-plane messages for versioned weight transfers.
+
+// Version of a model's weights, ordered lexicographically by
+// `(epoch, version_id)`. An unset message, or one with both fields 0, means
+// "no version".
+message WeightVersion {
+  // Optional major epoch that strictly increases when `version_id` may roll
+  // back (for example, when a restarted producer restores an older checkpoint
+  // on a host whose wall clock may be skewed). Callers whose `version_id` is
+  // already globally monotonic leave this 0.
+  int64 epoch = 1;
+  // Monotonically increasing version identifier within `epoch` (for example, a
+  // publish sequence number or step counter).
+  int64 version_id = 2;
+}

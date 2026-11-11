@@ -1,0 +1,118 @@
+// Copyright 2026 Google LLC.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package tpu_sync.rpc;
+
+import "tpu_sync/rpc/raiden_service.proto";
+import "tpu_sync/rpc/weight_transfer_common.proto";
+
+option java_multiple_files = true;
+option java_outer_classname = "WeightTransferControllerServiceProto";
+
+// Controller-facing control-plane messages for versioned weight transfers and
+// weight location discovery.
+//
+// Each request is dispatched over the control pipe by its full protobuf message
+// name (`ControlEnvelope.message_type`); errors are returned in
+// `ControlResponseEnvelope`. When a request names a work unit (or
+// `incarnation_id`) that the controller does not recognize—for example, after a
+// controller restart—the controller returns `NOT_FOUND` so the caller
+// re-registers its work unit before retrying.
+
+// Publishes that `src_units` hold `version` of `model`.
+//
+// Used both when a producer publishes a newly generated weight version (from
+// which the controller may push `version` into initial receiver units) and when
+// an individual worker reports that it now holds `version` in host staging or
+// device memory after a pull or commit. Returns `NOT_FOUND` if any unit in
+// `src_units` (or `incarnation_id`, when non-zero) is not registered.
+message PublishWeightsRequest {
+  // Registered work unit(s) holding `version` (all producer units when
+  // publishing a newly generated version, or `[unit]` when a single worker
+  // reports a version it holds). Required.
+  repeated RaidenIdProto src_units = 1;
+  // Weight version held by `src_units`. Required.
+  WeightVersion version = 2;
+  // Target weight-set / model name (`RaidenIdProto.data_name` of receivers)
+  // under which `version` is published. Required.
+  string model = 3;
+  // Memory space in which `src_units` hold `version`: `MEMORY_TYPE_DRAM` when
+  // complete in host staging buffers (eligible to serve peer pulls as a
+  // `WeightLocation`), or `MEMORY_TYPE_HBM` when resident in device HBM.
+  MemoryType memory_type = 4;
+  // Incarnation ID of the publishing host when a single worker reports its own
+  // buffer (`len(src_units) == 1`); 0 skips the per-host check.
+  int64 incarnation_id = 5;
+  // Optional transfer UUID when the controller pushes `version` from
+  // `src_units` into initial receivers; 0 when no push transfer is needed or to
+  // let the controller allocate one.
+  int64 uuid = 6;
+}
+
+message PublishWeightsResponse {
+  enum Outcome {
+    OUTCOME_UNSPECIFIED = 0;
+    // `version` was recorded by the controller (and pushed into at least one
+    // receiver when an initial push was required).
+    OUTCOME_PUBLISHED = 1;
+    // Every attempted initial push failed.
+    OUTCOME_FAILED = 2;
+    // Skipped because the previous version is still propagating.
+    OUTCOME_SKIPPED_IN_PROGRESS = 3;
+    // Skipped because no responsive receivers are registered for `model`.
+    OUTCOME_SKIPPED_NO_RECEIVERS = 4;
+    // Skipped because `version` is not newer than the latest published version.
+    OUTCOME_SKIPPED_NOT_NEWER = 5;
+  }
+  Outcome outcome = 1;
+}
+
+// A registered work unit that holds a weight version in host staging memory and
+// can serve peer pulls for the matching host slot.
+message WeightLocation {
+  RaidenIdProto unit = 1;
+  // Data-plane endpoint ("ip:port") for each local shard of `unit`, indexed
+  // 1:1 in local shard order (matching `RegisterWorkUnitRequest.shards`; on a
+  // multi-NIC host, shards on different NUMA nodes carry their respective NIC
+  // endpoints).
+  repeated string shard_endpoints = 2;
+  // Incarnation ID of `unit`, echoed as `target_incarnation_id` in every pull
+  // request so a restarted source rejects pulls meant for its predecessor.
+  int64 incarnation_id = 3;
+}
+
+// Queries the latest published weight version for `unit.data_name` and the
+// locations from which `unit` can pull it. Also renews `unit`'s liveness lease.
+// Returns `NOT_FOUND` if `(unit, incarnation_id)` is not registered.
+message GetCurrentWeightVersionRequest {
+  // Registered work unit querying the latest version of `unit.data_name` (also
+  // identifies the caller's host slot and layout when selecting compatible
+  // `WeightLocation` sources).
+  RaidenIdProto unit = 1;
+  // Incarnation ID of `unit`. Must be positive and strictly increase across
+  // restarts of the host; callers must not interpret it as a time.
+  int64 incarnation_id = 2;
+}
+
+message GetCurrentWeightVersionResponse {
+  // Latest published weight version for the requested model; unset when no
+  // version has been published yet.
+  WeightVersion current_version = 1;
+  // Compatible `WeightLocation` holders from which the caller can pull
+  // `current_version` (empty when `current_version` is unset, when the caller
+  // already holds `current_version`, or when no holder is available yet).
+  repeated WeightLocation sources = 2;
+}

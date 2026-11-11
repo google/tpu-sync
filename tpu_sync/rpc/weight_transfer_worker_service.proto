@@ -1,0 +1,107 @@
+// Copyright 2026 Google LLC.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package tpu_sync.rpc;
+
+import "tpu_sync/rpc/raiden_service.proto";
+import "tpu_sync/rpc/weight_transfer_common.proto";
+
+option java_multiple_files = true;
+option java_outer_classname = "WeightTransferWorkerServiceProto";
+
+// Worker-facing control-plane messages for versioned weight transfers.
+//
+// Each request is dispatched over the control pipe by its full protobuf message
+// name (`ControlEnvelope.message_type`); errors are returned in
+// `ControlResponseEnvelope`.
+//
+// Rendezvous protocol for a controller-driven resharded weight push from `S`
+// source workers to `D` destination workers (`D + S` control RPCs total):
+//   1. Prepare (`D` parallel RPCs, controller -> each destination worker):
+//      `PrepareWeightReceiveRequest` verifies `target_incarnation_id`, claims
+//      exclusive write ownership of the destination's staging buffer for
+//      `(uuid, version)` (draining any in-flight pull readers or claimed H2D
+//      copy), registers expected per-layer chunk counts, and returns before any
+//      bytes move.
+//   2. Push (`S` parallel RPCs, controller -> each source worker, issued only
+//      after all `D` destinations acknowledge step 1):
+//      `StartWeightPushRequest` verifies `target_incarnation_id`, stages source
+//      weights from HBM unless `skip_d2h` is set, streams the resharded byte
+//      slices over TCP to the armed destinations, and returns once every TCP
+//      batch ACK arrives. Each destination commits `version` into its staging
+//      buffer once its last layer finishes on-arrival tiling.
+
+// Phase 1 (controller -> destination worker): arms the destination's staging
+// buffer and chunk accounting for an incoming weight push.
+message PrepareWeightReceiveRequest {
+  // Unique transfer identifier shared with the matching
+  // `StartWeightPushRequest` calls. Required (> 0).
+  int64 uuid = 1;
+  // Weight version this transfer delivers. Required; committed into the
+  // destination's staging buffer only once every expected chunk has arrived and
+  // been tiled.
+  WeightVersion version = 2;
+  // Incarnation ID the controller expects of this destination worker. Rejected
+  // with FAILED_PRECONDITION when non-zero and different from the worker's own
+  // incarnation ID, so a restarted worker rejects commands meant for its
+  // predecessor. 0 skips the check.
+  int64 target_incarnation_id = 3;
+  // Total push chunks destined for this worker across all layers and shards;
+  // must equal the sum of `expected_layer_chunk_counts` values.
+  int64 expected_block_count = 4;
+  // Expected push chunks destined for this worker per layer index.
+  map<int32, int64> expected_layer_chunk_counts = 5;
+  // Layout in which the destination staging buffers are kept on arrival
+  // (for example, `HOST_TILING_MODE_ON_ARRIVAL` so peers can pull device-layout
+  // bytes directly).
+  HostTilingMode host_tiling_mode = 6;
+  // Per-layer flag skipping tiling when source and destination shards share an
+  // identical layout.
+  map<int32, bool> skip_tiling = 7;
+  // Optional correlation ID for logging and diagnostics.
+  string req_id = 8;
+}
+
+message PrepareWeightReceiveResponse {}
+
+// Phase 2 (controller -> source worker): executes the sender side of a weight
+// push into destinations already armed by `PrepareWeightReceiveRequest`.
+message StartWeightPushRequest {
+  // Unique transfer identifier matching `PrepareWeightReceiveRequest.uuid`.
+  // Required (> 0).
+  int64 uuid = 1;
+  // Incarnation ID the controller expects of this source worker. Rejected with
+  // FAILED_PRECONDITION when non-zero and different from the worker's own
+  // incarnation ID (for example, preventing a restarted worker from executing a
+  // `skip_d2h` push out of an empty staging buffer). 0 skips the check.
+  int64 target_incarnation_id = 2;
+  // Push schedules keyed by local (or global) source shard index.
+  map<int32, ShardPushScheduleProto> shard_push_schedules = 3;
+  // When true, streams directly from existing host staging buffers without a
+  // D2H copy.
+  bool skip_d2h = 4;
+  // Layout of the host buffers carried by this push.
+  HostTilingMode host_tiling_mode = 5;
+  // Per-layer flag skipping detiling when source and destination shards share
+  // an identical layout.
+  map<int32, bool> skip_tiling = 6;
+  // Optional stream parallelism override; 0 uses the worker's default.
+  int32 parallelism = 7;
+  // Optional correlation ID for logging and diagnostics.
+  string req_id = 8;
+}
+
+message StartWeightPushResponse {}

@@ -36,6 +36,7 @@ RAIDEN_SERVER_BAZEL_TARGETS=(
 RAIDEN_JAX_EXTENSION_BAZEL_TARGETS=(
   "//tpu_sync/frameworks/jax:_tpu_raiden_jax"
   "//tpu_sync/frameworks/jax:_weight_synchronizer_ffi"
+  "//tpu_sync/solutions/mooncake/jax:_mooncake_provider"
 )
 
 RAIDEN_JAX_E2E_BAZEL_TARGETS=(
@@ -82,6 +83,7 @@ raiden_stage_jax_artifacts() {
   echo "Copying JAX artifacts..."
   cp -f "${workspace_dir}/bazel-bin/tpu_sync/frameworks/jax/_tpu_raiden_jax.so" "${workspace_dir}/tpu_sync/frameworks/jax/"
   cp -f "${workspace_dir}/bazel-bin/tpu_sync/frameworks/jax/_weight_synchronizer_ffi.so" "${workspace_dir}/tpu_sync/frameworks/jax/"
+  cp -f "${workspace_dir}/bazel-bin/tpu_sync/solutions/mooncake/jax/_mooncake_provider.so" "${workspace_dir}/tpu_sync/solutions/mooncake/jax/"
 }
 
 # Stages all artifacts produced by a full JAX build (protos, server binaries,

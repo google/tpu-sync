@@ -237,7 +237,11 @@ void WeightSynchronizerListener::ExecuteControlRequest(
         LOG(INFO) << "C++ Listener executing PushWeights to " << peers.size()
                   << " peers";
         if (!peers.empty()) {
-          absl::Status status = engine->PushWeights(peers);
+          // PushWeights() takes no request, so the channels for its PSP-TCP
+          // key exchanges are recorded here.
+          absl::Status status = engine->RecordPeerControlEndpoints(
+              peers, req.start_transfer_request());
+          if (status.ok()) status = engine->PushWeights(peers);
           if (!status.ok()) {
             resp->set_success(false);
             resp->set_message(std::string(status.message()));

@@ -235,6 +235,14 @@ message StartTransferRequest {
   // sub-plan has settled. Both zero = the request is one plan (legacy).
   int32 sub_plan_index = 27;
   int32 sub_plan_count = 28;
+  // Sender-only: the listener endpoint (control_plane_rpc_address) of each
+  // receiver this sender pushes to, keyed by the receiver's data endpoint
+  // exactly as the push names it: ControlRequest.peers for a push without
+  // schedules, otherwise each schedule entry's dst_peers or, when that is
+  // empty, its dst_peer. The sender dials the endpoint for the PSP-TCP key
+  // exchange. A sender that requires PSP-TCP fails the push unless this
+  // request has an entry for every peer it pushes to.
+  map<string, string> peer_control_endpoints = 29;
 }
 
 // How a weight-sync transfer treats the device (tiled) layout of the host

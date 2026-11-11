@@ -46,10 +46,12 @@
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
+#include "grpcpp/channel.h"
 #include "peregrine/src/api/v1/rate_limiter.h"
 #include "xla/future.h"
 #include "xla/layout.h"
@@ -57,6 +59,8 @@
 #include "xla/shape_util.h"
 #include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/statusor.h"
+#include "tpu_sync/common/control_pipe/control_pipe_types.h"
+#include "tpu_sync/common/control_pipe/grpc_control_pipe.h"
 #include "tpu_sync/common/trace.h"
 #include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/core/numa_thread_pool.h"
@@ -93,6 +97,32 @@ std::vector<transport::ShardInfo> BuildDefaultShards(size_t num_shards) {
   }
   return shards;
 }
+
+// Bound of the reuse cache of the client that creates PSP-TCP key-exchange
+// channels. An evicted channel is created again on the next lookup; the
+// cost of a bound that is too small is re-created channels, not failures.
+// TODO(justinlu): Provisional; derive it from a production fan-out figure.
+constexpr size_t kMaxCachedPeerControlChannels = 1024;
+
+std::unique_ptr<GrpcControlPipeClient> CreatePeregrineChannelClient() {
+  ControlPipeConfig config;
+  config.backend_type = ControlPipeBackendType::kGrpc;
+  config.max_cached_grpc_stubs = kMaxCachedPeerControlChannels;
+  return std::make_unique<GrpcControlPipeClient>(config);
+}
+
+// Returns the data-plane peers |entry| pushes to: dst_peers when non-empty,
+// otherwise the deprecated dst_peer when set.
+std::vector<std::string> PushEntryPeers(
+    const tpu_sync::rpc::ShardPushEntryProto& entry) {
+  std::vector<std::string> peers;
+  if (!entry.dst_peers().empty()) {
+    peers.assign(entry.dst_peers().begin(), entry.dst_peers().end());
+  } else if (!entry.dst_peer().empty()) {
+    peers.push_back(entry.dst_peer());
+  }
+  return peers;
+}
 }  // namespace
 
 WeightSynchronizerBase::WeightSynchronizerBase(
@@ -108,6 +138,8 @@ WeightSynchronizerBase::WeightSynchronizerBase(
           raiden::DetectNumaNodes(layer_buffers), GetLocalHostNicAddresses(),
           /*socket_only_transport=*/true),
       auto_h2d_(auto_h2d),
+      peregrine_channel_client_(
+          psp_tcp_required() ? CreatePeregrineChannelClient() : nullptr),
       push_pool_(std::make_unique<tpu_raiden::NumaThreadPool>(
           std::max(parallelism_, 4))),
       shard_pool_(std::make_unique<tpu_raiden::NumaThreadPool>(
@@ -275,6 +307,8 @@ WeightSynchronizerBase::WeightSynchronizerBase(
           parallelism, bind_ip, std::move(numa_nodes), std::move(host_nics),
           /*socket_only_transport=*/true),
       auto_h2d_(auto_h2d),
+      peregrine_channel_client_(
+          psp_tcp_required() ? CreatePeregrineChannelClient() : nullptr),
       push_pool_(std::make_unique<tpu_raiden::NumaThreadPool>(
           std::max(parallelism_, 4))),
       shard_pool_(std::make_unique<tpu_raiden::NumaThreadPool>(
@@ -1359,6 +1393,70 @@ absl::Status WeightSynchronizerBase::PushWeightsLocal(
   return absl::OkStatus();
 }
 
+absl::Status WeightSynchronizerBase::RecordPeerControlEndpoints(
+    const std::vector<std::string>& peers,
+    const tpu_sync::rpc::StartTransferRequest& request) {
+  if (!psp_peer_channels_required()) return absl::OkStatus();
+
+  std::vector<std::string> unique_peers = peers;
+  std::sort(unique_peers.begin(), unique_peers.end());
+  unique_peers.erase(std::unique(unique_peers.begin(), unique_peers.end()),
+                     unique_peers.end());
+  const auto& endpoints = request.peer_control_endpoints();
+  std::vector<absl::string_view> unmapped_peers;
+  for (const std::string& peer : unique_peers) {
+    if (!endpoints.contains(peer)) unmapped_peers.push_back(peer);
+  }
+  if (!unmapped_peers.empty()) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "PSP-TCP is required but StartTransferRequest.peer_control_endpoints "
+        "has no listener endpoint for data-plane peer(s): ",
+        absl::StrJoin(unmapped_peers, ", ")));
+  }
+
+  for (const std::string& peer : unique_peers) {
+    if (endpoints.at(peer).empty()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "StartTransferRequest.peer_control_endpoints has an empty listener "
+          "endpoint for data-plane peer '",
+          peer, "'"));
+    }
+  }
+  absl::MutexLock lock(peer_control_endpoints_mu_);
+  for (const std::string& peer : unique_peers) {
+    peer_control_endpoints_.insert_or_assign(peer, endpoints.at(peer));
+  }
+  return absl::OkStatus();
+}
+
+std::shared_ptr<grpc::Channel> WeightSynchronizerBase::GetPeregrineChannel(
+    absl::string_view peer) {
+  if (peregrine_channel_client_ == nullptr) return nullptr;
+  std::string endpoint;
+  {
+    absl::MutexLock lock(peer_control_endpoints_mu_);
+    auto it = peer_control_endpoints_.find(peer);
+    if (it != peer_control_endpoints_.end()) endpoint = it->second;
+  }
+  if (endpoint.empty()) {
+    LOG_EVERY_N_SEC(ERROR, 10)
+        << "No listener endpoint is recorded for data-plane peer '" << peer
+        << "'; the PSP-TCP connection to it will fail";
+    return nullptr;
+  }
+  absl::StatusOr<std::shared_ptr<grpc::Channel>> channel =
+      peregrine_channel_client_->GetOrCreateChannel(endpoint);
+  if (!channel.ok()) {
+    LOG_EVERY_N_SEC(ERROR, 10)
+        << "Cannot create the PSP-TCP key-exchange channel to listener "
+           "endpoint '"
+        << endpoint << "' of data-plane peer '" << peer
+        << "': " << channel.status();
+    return nullptr;
+  }
+  return *std::move(channel);
+}
+
 absl::Status WeightSynchronizerBase::PushWeightsResharded(
     const tpu_sync::rpc::StartTransferRequest& request) {
   RAIDEN_TRACE("WeightSynchronizerBase::PushWeightsResharded");
@@ -1469,6 +1567,23 @@ WeightSynchronizerBase::ResolveShardPushSchedules(
   return shard_schedules;
 }
 
+absl::StatusOr<std::vector<std::string>>
+WeightSynchronizerBase::PushSchedulePeers(
+    const tpu_sync::rpc::StartTransferRequest& request) {
+  ABSL_ASSIGN_OR_RETURN(const std::vector<ShardPushSchedule> shard_schedules,
+                        ResolveShardPushSchedules(request));
+  std::vector<std::string> peers;
+  for (const ShardPushSchedule& shard_schedule : shard_schedules) {
+    for (const tpu_sync::rpc::ShardPushEntryProto& entry :
+         shard_schedule.schedule.entries()) {
+      std::vector<std::string> entry_peers = PushEntryPeers(entry);
+      peers.insert(peers.end(), std::make_move_iterator(entry_peers.begin()),
+                   std::make_move_iterator(entry_peers.end()));
+    }
+  }
+  return peers;
+}
+
 absl::StatusOr<std::vector<std::vector<transport::BufferPushTask>>>
 WeightSynchronizerBase::BuildLayerPushTasks(
     const tpu_sync::rpc::StartTransferRequest& request) {
@@ -1533,12 +1648,7 @@ WeightSynchronizerBase::BuildLayerPushTasks(
       }
       size_t shard_host_size = layers_[layer_idx_to_use].shards[i].host_size;
 
-      std::vector<std::string> peers;
-      if (!entry.dst_peers().empty()) {
-        peers.assign(entry.dst_peers().begin(), entry.dst_peers().end());
-      } else if (!entry.dst_peer().empty()) {
-        peers.push_back(entry.dst_peer());
-      }
+      const std::vector<std::string> peers = PushEntryPeers(entry);
       size_t dst_shard_idx = entry.dst_shard_idx();
       size_t count = entry.count() > 0 ? entry.count() : 1;
       size_t src_stride = entry.src_stride_bytes();
@@ -1660,6 +1770,12 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
       BuildLayerPushTasks(request));
   double staging_time_ms =
       absl::ToDoubleMilliseconds(absl::Now() - staging_start);
+
+  if (psp_peer_channels_required()) {
+    ABSL_ASSIGN_OR_RETURN(const std::vector<std::string> push_peers,
+                          PushSchedulePeers(request));
+    ABSL_RETURN_IF_ERROR(RecordPeerControlEndpoints(push_peers, request));
+  }
 
   bool already_completed = false;
   bool has_device_buffers = false;

@@ -32,14 +32,17 @@
 #include "absl/functional/any_invocable.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
+#include "grpcpp/channel.h"
 #include "peregrine/src/api/v1/rate_limiter.h"
 #include "xla/future.h"
 #include "xla/pjrt/c/pjrt_c_api.h"
 #include "xla/pjrt/c/pjrt_c_api_raw_buffer_extension.h"
+#include "tpu_sync/common/control_pipe/grpc_control_pipe.h"
 #include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/core/raiden_manager_base.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
@@ -197,6 +200,15 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
       const tpu_sync::rpc::StartTransferRequest& request);
   virtual absl::Status PushWeightsReshardedLocal(
       const tpu_sync::rpc::StartTransferRequest& request);
+
+  // RawBufferTransportDelegate. Returns the gRPC channel to the listener
+  // endpoint a push recorded for data-plane |peer| from
+  // StartTransferRequest.peer_control_endpoints. Returns nullptr, which fails
+  // the connection, when no endpoint is recorded for |peer| or the channel
+  // cannot be created. Called from transport send threads when PSP-TCP is
+  // required. Thread-safe.
+  std::shared_ptr<grpc::Channel> GetPeregrineChannel(absl::string_view peer)
+      override ABSL_LOCKS_EXCLUDED(peer_control_endpoints_mu_);
 
   const uint8_t* GetHostBufferPtr(size_t layer_idx, size_t shard_idx) const {
     if (layer_idx >= num_layers_ || shard_idx >= num_shards_) {
@@ -475,6 +487,10 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   }
 
  private:
+  // Calls RecordPeerControlEndpoints() for plan-less pushes.
+  friend class WeightSynchronizerListener;
+  friend class WeightSynchronizerBaseTestPeer;
+
   // Shared tail of InitDeviceBuffers()/InitHostBuffers(): starts the listener
   // on `listener_port` when set, creates the auto-H2D pool and per-shard
   // scratchpads, and records the initial host-buffer occupancy metric.
@@ -585,6 +601,20 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   // bytes, so that the next H2d() tiles them.
   void MarkHostBufferUntiled() ABSL_LOCKS_EXCLUDED(tile_ready_mu_);
 
+  // True when pushes must record peer control endpoints: the transport
+  // required PSP-TCP when this engine was constructed.
+  bool psp_peer_channels_required() const {
+    return peregrine_channel_client_ != nullptr;
+  }
+  // Creates and caches the key-exchange channels, keyed by listener endpoint.
+  // Non-null iff psp_tcp_required() held at construction.
+  const std::unique_ptr<GrpcControlPipeClient> peregrine_channel_client_;
+  mutable absl::Mutex peer_control_endpoints_mu_;
+  // Listener endpoint of each data-plane peer, keyed by the peer endpoint
+  // exactly as the push APIs name it.
+  absl::flat_hash_map<std::string, std::string> peer_control_endpoints_
+      ABSL_GUARDED_BY(peer_control_endpoints_mu_);
+
   std::unique_ptr<tpu_raiden::NumaThreadPool> h2d_pool_;
   absl_nonnull std::unique_ptr<tpu_raiden::NumaThreadPool> push_pool_;
   // Runs ForEachShardNumaLocal()'s per-shard tasks (tiling, H2D/D2H issue).
@@ -663,6 +693,32 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   // references point into `request`.
   absl::StatusOr<std::vector<ShardPushSchedule>> ResolveShardPushSchedules(
       const tpu_sync::rpc::StartTransferRequest& request);
+  // Returns the data-plane peers BuildLayerPushTasks() creates tasks for:
+  // the peers of every entry of |request|'s local shard schedules. May contain
+  // duplicates.
+  absl::StatusOr<std::vector<std::string>> PushSchedulePeers(
+      const tpu_sync::rpc::StartTransferRequest& request);
+  // Records, for every data-plane peer in |peers|, the listener endpoint
+  // |request|.peer_control_endpoints names for it, so that
+  // GetPeregrineChannel() can reach the peer's PeregrineService. Thread-safe.
+  //
+  // When PSP-TCP is not required, records nothing and returns OK. Otherwise
+  // only |request|'s own map counts, never what an earlier request recorded:
+  // FailedPrecondition names every peer it has no entry for, and
+  // InvalidArgument a peer with an empty endpoint. Nothing is recorded on
+  // error.
+  //
+  // A recorded endpoint stays until a later call names the peer again, which
+  // replaces it.
+  //
+  // PushWeightsResharded() does this itself, from its request. PushWeights()
+  // cannot (it has no request), so the listener does it before it calls
+  // PushWeights().
+  absl::Status RecordPeerControlEndpoints(
+      const std::vector<std::string>& peers,
+      const tpu_sync::rpc::StartTransferRequest& request)
+      ABSL_LOCKS_EXCLUDED(peer_control_endpoints_mu_);
+
   // Expands `request`'s shard_push_schedules into per-layer push tasks.
   absl::StatusOr<std::vector<std::vector<transport::BufferPushTask>>>
   BuildLayerPushTasks(const tpu_sync::rpc::StartTransferRequest& request);

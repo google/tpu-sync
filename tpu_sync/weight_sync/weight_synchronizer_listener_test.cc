@@ -30,6 +30,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/flags/flag.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/time/time.h"
@@ -50,11 +51,25 @@
 namespace tpu_raiden {
 namespace weight_sync {
 
+// Gives the tests access to WeightSynchronizerBase's private endpoint
+// recording.
+class WeightSynchronizerBaseTestPeer {
+ public:
+  static absl::Status RecordPeerControlEndpoints(
+      WeightSynchronizerBase& engine, const std::vector<std::string>& peers,
+      const tpu_sync::rpc::StartTransferRequest& request) {
+    return engine.RecordPeerControlEndpoints(peers, request);
+  }
+};
+
 using ::peregrine::internal::control::PeregrineService;
 using ::peregrine::internal::proto::PspToken;
 using ::peregrine::internal::proto::ReqMsg;
 using ::peregrine::internal::proto::RespMsg;
+using ::testing::AllOf;
 using ::testing::HasSubstr;
+using ::testing::Not;
+using ::testing::status::StatusIs;
 using ::tpu_sync::rpc::ControlRequest;
 using ::tpu_sync::rpc::ControlResponse;
 using ::tpu_sync::rpc::ShardPushEntryProto;
@@ -62,6 +77,15 @@ using ::tpu_sync::rpc::ShardPushScheduleProto;
 using ::tpu_sync::rpc::StartTransferRequest;
 
 namespace {
+
+// Data-plane peers and listener endpoints for tests that record key-exchange
+// channels without using them: creating a gRPC channel does not connect.
+constexpr char kPeerA[] = "10.0.0.1:7000";
+constexpr char kPeerB[] = "10.0.0.2:7000";
+constexpr char kPeerC[] = "10.0.0.3:7000";
+constexpr char kPeerD[] = "10.0.0.4:7000";
+constexpr char kEndpoint1[] = "10.0.1.1:9000";
+constexpr char kEndpoint2[] = "10.0.1.2:9000";
 
 class ScopedEnvVar {
  public:
@@ -805,6 +829,254 @@ TEST(WeightSynchronizerListenerTest,
       CallPeregrine(channel, PspTcpRequestWithoutToken());
   EXPECT_EQ(after_status.error_code(), grpc::StatusCode::UNAVAILABLE)
       << after_status.error_message();
+}
+
+// Creates a CPU-only engine with one layer and one shard, and with its own
+// listener when |listener_port| is set. Reads --peregrine_enable_psp_tcp.
+absl::StatusOr<std::unique_ptr<WeightSynchronizerBase>> CreateCpuEngine(
+    std::optional<int> listener_port = std::nullopt) {
+  return WeightSynchronizerBase::Create(
+      /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+      /*local_port=*/0, /*host_blocks_to_allocate=*/std::nullopt,
+      /*parallelism=*/1, listener_port);
+}
+
+// Adds an entry pushing two bytes of layer 0 to shard 0's schedule in
+// |request| and returns it for the caller to set its peers.
+ShardPushEntryProto* AddPushEntry(StartTransferRequest& request) {
+  ShardPushEntryProto* entry =
+      (*request.mutable_shard_push_schedules())[0].add_entries();
+  entry->set_layer_idx(0);
+  entry->set_size_bytes(2);
+  return entry;
+}
+
+TEST(WeightSynchronizerPspPeerChannelTest,
+     RecordsNothingWhenPspTcpNotRequired) {
+  ASSERT_FALSE(absl::GetFlag(FLAGS_peregrine_enable_psp_tcp));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> engine,
+                       CreateCpuEngine());
+  ASSERT_FALSE(engine->psp_tcp_required());
+  StartTransferRequest request;
+  (*request.mutable_peer_control_endpoints())[kPeerA] = kEndpoint1;
+
+  ABSL_EXPECT_OK(WeightSynchronizerBaseTestPeer::RecordPeerControlEndpoints(
+      *engine, {kPeerA}, request));
+  EXPECT_EQ(engine->GetPeregrineChannel(kPeerA), nullptr);
+  // A peer without an entry is not an error either.
+  ABSL_EXPECT_OK(WeightSynchronizerBaseTestPeer::RecordPeerControlEndpoints(
+      *engine, {kPeerB}, request));
+}
+
+TEST(WeightSynchronizerPspPeerChannelTest, ReturnsChannelForRecordedPeer) {
+  absl::SetFlag(&FLAGS_peregrine_enable_psp_tcp, true);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> engine,
+                       CreateCpuEngine());
+  ASSERT_TRUE(engine->psp_tcp_required());
+  StartTransferRequest request;
+  (*request.mutable_peer_control_endpoints())[kPeerA] = kEndpoint1;
+
+  EXPECT_EQ(engine->GetPeregrineChannel(kPeerA), nullptr);
+  ASSERT_OK(WeightSynchronizerBaseTestPeer::RecordPeerControlEndpoints(
+      *engine, {kPeerA}, request));
+  EXPECT_NE(engine->GetPeregrineChannel(kPeerA), nullptr);
+}
+
+TEST(WeightSynchronizerPspPeerChannelTest, SharesChannelPerEndpoint) {
+  absl::SetFlag(&FLAGS_peregrine_enable_psp_tcp, true);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> engine,
+                       CreateCpuEngine());
+  StartTransferRequest request;
+  (*request.mutable_peer_control_endpoints())[kPeerA] = kEndpoint1;
+  (*request.mutable_peer_control_endpoints())[kPeerB] = kEndpoint1;
+  (*request.mutable_peer_control_endpoints())[kPeerC] = kEndpoint2;
+
+  ASSERT_OK(WeightSynchronizerBaseTestPeer::RecordPeerControlEndpoints(
+      *engine, {kPeerA, kPeerB, kPeerC}, request));
+  std::shared_ptr<grpc::Channel> channel_a =
+      engine->GetPeregrineChannel(kPeerA);
+  ASSERT_NE(channel_a, nullptr);
+  EXPECT_EQ(engine->GetPeregrineChannel(kPeerB), channel_a);
+  EXPECT_NE(engine->GetPeregrineChannel(kPeerC), nullptr);
+  EXPECT_NE(engine->GetPeregrineChannel(kPeerC), channel_a);
+}
+
+TEST(WeightSynchronizerPspPeerChannelTest, NamesEveryPeerMissingFromRequest) {
+  absl::SetFlag(&FLAGS_peregrine_enable_psp_tcp, true);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> engine,
+                       CreateCpuEngine());
+  StartTransferRequest request;
+  (*request.mutable_peer_control_endpoints())[kPeerA] = kEndpoint1;
+
+  EXPECT_THAT(
+      WeightSynchronizerBaseTestPeer::RecordPeerControlEndpoints(
+          *engine, {kPeerA, kPeerB, kPeerC}, request),
+      StatusIs(absl::StatusCode::kFailedPrecondition,
+               AllOf(HasSubstr("peer_control_endpoints"), HasSubstr(kPeerB),
+                     HasSubstr(kPeerC), Not(HasSubstr(kPeerA)))));
+  // Nothing was recorded, not even for the peer that has an entry.
+  EXPECT_EQ(engine->GetPeregrineChannel(kPeerA), nullptr);
+}
+
+TEST(WeightSynchronizerPspPeerChannelTest, RejectsEmptyEndpoint) {
+  absl::SetFlag(&FLAGS_peregrine_enable_psp_tcp, true);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> engine,
+                       CreateCpuEngine());
+  StartTransferRequest request;
+  (*request.mutable_peer_control_endpoints())[kPeerA] = kEndpoint1;
+  (*request.mutable_peer_control_endpoints())[kPeerB] = "";
+
+  EXPECT_THAT(WeightSynchronizerBaseTestPeer::RecordPeerControlEndpoints(
+                  *engine, {kPeerA, kPeerB}, request),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       AllOf(HasSubstr(kPeerB), Not(HasSubstr(kPeerA)))));
+  EXPECT_EQ(engine->GetPeregrineChannel(kPeerA), nullptr);
+}
+
+TEST(WeightSynchronizerPspPeerChannelTest, DoesNotTrustEarlierRequests) {
+  absl::SetFlag(&FLAGS_peregrine_enable_psp_tcp, true);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> engine,
+                       CreateCpuEngine());
+  StartTransferRequest earlier_request;
+  (*earlier_request.mutable_peer_control_endpoints())[kPeerA] = kEndpoint1;
+  ASSERT_OK(WeightSynchronizerBaseTestPeer::RecordPeerControlEndpoints(
+      *engine, {kPeerA}, earlier_request));
+  ASSERT_NE(engine->GetPeregrineChannel(kPeerA), nullptr);
+
+  // The peer is recorded right now, but this request does not map it.
+  EXPECT_THAT(
+      WeightSynchronizerBaseTestPeer::RecordPeerControlEndpoints(
+          *engine, {kPeerA}, StartTransferRequest()),
+      StatusIs(absl::StatusCode::kFailedPrecondition, HasSubstr(kPeerA)));
+}
+
+TEST(WeightSynchronizerPspPeerChannelTest, LaterRequestReplacesEndpoint) {
+  absl::SetFlag(&FLAGS_peregrine_enable_psp_tcp, true);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> engine,
+                       CreateCpuEngine());
+  StartTransferRequest earlier_request;
+  (*earlier_request.mutable_peer_control_endpoints())[kPeerA] = kEndpoint1;
+  StartTransferRequest later_request;
+  (*later_request.mutable_peer_control_endpoints())[kPeerA] = kEndpoint2;
+
+  ASSERT_OK(WeightSynchronizerBaseTestPeer::RecordPeerControlEndpoints(
+      *engine, {kPeerA}, earlier_request));
+  std::shared_ptr<grpc::Channel> earlier_channel =
+      engine->GetPeregrineChannel(kPeerA);
+  ASSERT_NE(earlier_channel, nullptr);
+  ASSERT_OK(WeightSynchronizerBaseTestPeer::RecordPeerControlEndpoints(
+      *engine, {kPeerA}, later_request));
+  std::shared_ptr<grpc::Channel> later_channel =
+      engine->GetPeregrineChannel(kPeerA);
+  ASSERT_NE(later_channel, nullptr);
+  EXPECT_NE(later_channel, earlier_channel);
+}
+
+TEST(WeightSynchronizerPspPeerChannelTest,
+     PushWeightsReshardedNamesUnmappedPeersOfItsEntries) {
+  absl::SetFlag(&FLAGS_peregrine_enable_psp_tcp, true);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> engine,
+                       CreateCpuEngine());
+  StartTransferRequest request;
+  request.set_is_sender(true);
+  AddPushEntry(request)->add_dst_peers(kPeerA);
+  AddPushEntry(request)->set_dst_peer(kPeerB);
+  // The engine pushes this entry to dst_peers only, so its dst_peer needs no
+  // endpoint.
+  ShardPushEntryProto* both_fields_entry = AddPushEntry(request);
+  both_fields_entry->add_dst_peers(kPeerC);
+  both_fields_entry->set_dst_peer(kPeerD);
+
+  // Every unmapped peer is named, so a peer that is not named is not demanded.
+  EXPECT_THAT(engine->PushWeightsResharded(request),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       AllOf(HasSubstr("peer_control_endpoints"),
+                             HasSubstr(kPeerA), HasSubstr(kPeerB),
+                             HasSubstr(kPeerC), Not(HasSubstr(kPeerD)))));
+
+  (*request.mutable_peer_control_endpoints())[kPeerC] = kEndpoint1;
+  EXPECT_THAT(engine->PushWeightsResharded(request),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       AllOf(HasSubstr(kPeerA), HasSubstr(kPeerB),
+                             Not(HasSubstr(kPeerC)), Not(HasSubstr(kPeerD)))));
+  EXPECT_EQ(engine->GetPeregrineChannel(kPeerC), nullptr);
+}
+
+TEST(WeightSynchronizerPspPeerChannelTest,
+     ListenerFailsPlanlessSenderRequestNamingUnmappedPeer) {
+  absl::SetFlag(&FLAGS_peregrine_enable_psp_tcp, true);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> engine,
+                       CreateCpuEngine(/*listener_port=*/0));
+  ASSERT_TRUE(engine->listener_port().has_value());
+  ControlRequest req;
+  req.set_command(ControlRequest::COMMAND_START_TRANSFER);
+  req.add_peers(kPeerA);
+  req.add_peers(kPeerB);
+  StartTransferRequest* start_req = req.mutable_start_transfer_request();
+  start_req->set_is_sender(true);
+  (*start_req->mutable_peer_control_endpoints())[kPeerA] = kEndpoint1;
+
+  GrpcControlPipeClient client(GrpcClientConfig());
+  TF_ASSERT_OK_AND_ASSIGN(ControlResponse resp,
+                       (client.Call<ControlRequest, ControlResponse>(
+                           absl::StrCat("127.0.0.1:", *engine->listener_port()),
+                           req, absl::Seconds(10))));
+  EXPECT_FALSE(resp.success());
+  EXPECT_THAT(resp.message(), AllOf(HasSubstr("peer_control_endpoints"),
+                                    HasSubstr(kPeerB), Not(HasSubstr(kPeerA))));
+}
+
+TEST(WeightSynchronizerPspPeerChannelTest,
+     ListenerFailsPlannedSenderRequestNamingUnmappedPeer) {
+  absl::SetFlag(&FLAGS_peregrine_enable_psp_tcp, true);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> engine,
+                       CreateCpuEngine(/*listener_port=*/0));
+  ASSERT_TRUE(engine->listener_port().has_value());
+  ControlRequest req;
+  req.set_command(ControlRequest::COMMAND_START_TRANSFER);
+  StartTransferRequest* start_req = req.mutable_start_transfer_request();
+  start_req->set_is_sender(true);
+  AddPushEntry(*start_req)->add_dst_peers(kPeerA);
+  AddPushEntry(*start_req)->add_dst_peers(kPeerB);
+  (*start_req->mutable_peer_control_endpoints())[kPeerA] = kEndpoint1;
+
+  GrpcControlPipeClient client(GrpcClientConfig());
+  TF_ASSERT_OK_AND_ASSIGN(ControlResponse resp,
+                       (client.Call<ControlRequest, ControlResponse>(
+                           absl::StrCat("127.0.0.1:", *engine->listener_port()),
+                           req, absl::Seconds(10))));
+  EXPECT_FALSE(resp.success());
+  EXPECT_THAT(resp.message(), AllOf(HasSubstr("peer_control_endpoints"),
+                                    HasSubstr(kPeerB), Not(HasSubstr(kPeerA))));
+}
+
+TEST(WeightSynchronizerPspPeerChannelTest,
+     RecordedChannelReachesPeerPeregrineService) {
+  absl::SetFlag(&FLAGS_peregrine_enable_psp_tcp, true);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> receiver,
+                       CreateCpuEngine(/*listener_port=*/0));
+  ASSERT_TRUE(receiver->local_port().has_value());
+  ASSERT_TRUE(receiver->listener_port().has_value());
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> sender,
+                       CreateCpuEngine());
+  const std::string receiver_data_endpoint =
+      absl::StrCat("127.0.0.1:", *receiver->local_port());
+  StartTransferRequest request;
+  (*request.mutable_peer_control_endpoints())[receiver_data_endpoint] =
+      absl::StrCat("127.0.0.1:", *receiver->listener_port());
+
+  ASSERT_OK(WeightSynchronizerBaseTestPeer::RecordPeerControlEndpoints(
+      *sender, {receiver_data_endpoint}, request));
+  // What the sender's transport gets when it connects to the receiver.
+  std::shared_ptr<grpc::Channel> channel =
+      sender->GetPeregrineChannel(receiver_data_endpoint);
+  ASSERT_NE(channel, nullptr);
+
+  // Answered by the PeregrineService the receiver's listener registered: its
+  // own validation message. No key exchange is attempted.
+  grpc::Status status = CallPeregrine(channel, PspTcpRequestWithoutToken());
+  EXPECT_EQ(status.error_code(), grpc::StatusCode::INVALID_ARGUMENT);
+  EXPECT_THAT(status.error_message(), HasSubstr("psp token must be present"));
 }
 
 }  // namespace

@@ -30,6 +30,7 @@
 #include "absl/algorithm/container.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/functional/any_invocable.h"
+#include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
@@ -39,6 +40,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
+#include "grpcpp/impl/service_type.h"
 #include "peregrine/src/api/v1/rate_limiter.h"
 #include "xla/future.h"
 #include "tpu_sync/common/trace.h"
@@ -130,6 +132,20 @@ void RaidenManagerBase::StopTransportServer() {
   if (server_) {
     server_.reset();
   }
+}
+
+grpc::Service* RaidenManagerBase::peregrine_control_service() {
+  absl::MutexLock lock(server_init_mu_);
+  CHECK(server_ != nullptr)
+      << "peregrine_control_service() called after StopTransportServer()";
+  return server_->peregrine_control_service();
+}
+
+bool RaidenManagerBase::psp_tcp_required() const {
+  absl::MutexLock lock(server_init_mu_);
+  CHECK(server_ != nullptr)
+      << "psp_tcp_required() called after StopTransportServer()";
+  return server_->require_psp_tcp();
 }
 
 xla::Future<> RaidenManagerBase::ForEachShardNumaLocal(

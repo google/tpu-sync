@@ -31,6 +31,33 @@ class WeightSynchronizerBase;
 
 // Control-Plane Server Daemon that runs natively in C++ to accept management
 // RPC commands (like PushWeights and Shutdown) directly via ControlPipeServer.
+//
+// On the gRPC backend the listener also serves the engine's PeregrineService
+// (RaidenManagerBase::peregrine_control_service()) on the same port, so one
+// client channel reaches both. On any other backend that service cannot be
+// served, and constructing the listener CHECK-fails if the engine requires
+// PSP-TCP.
+//
+// Lifetime: the registered service is owned by the engine's transport, so the
+// listener must be destroyed before that transport is stopped. A listener
+// owned by the engine is destroyed first thing in ~WeightSynchronizerBase,
+// ahead of StopTransportServer(); a standalone listener must be destroyed
+// before its engine.
+//
+// The listener serves until its destructor returns. Consequences for an
+// engine-owned listener:
+// - Its handlers still run after every class derived from
+//   WeightSynchronizerBase has been destroyed (that was already so before the
+//   listener served PeregrineService); a handler must not rely on derived
+//   state.
+// - The transport is still running during the whole listener shutdown, so
+//   transport receive callbacks (OnDataReceived, OnLayerDataReceived) keep
+//   arriving. A derived class with state those callbacks touch must stop the
+//   transport in its own destructor (StopTransportServer()).
+// - Destruction waits for every in-flight handler. A handler stuck pushing to
+//   an unresponsive peer can block it indefinitely: the transport's read and
+//   write timeouts are unset by default, and the transport has no public
+//   cancel, so nothing ends the operation early.
 class WeightSynchronizerListener final {
  public:
   WeightSynchronizerListener(
@@ -54,6 +81,9 @@ class WeightSynchronizerListener final {
   static ControlPipeBackendType ResolveBackendType(
       std::optional<ControlPipeBackendType> backend_type = std::nullopt);
 
+  // Stops the server and waits for in-flight handlers. Must not run
+  // concurrently with another Shutdown() or with destruction: only the first
+  // caller waits (see GrpcControlPipeServer::Stop()).
   void Shutdown();
 
   // Executes a single ControlRequest against |engine| and populates |resp|.

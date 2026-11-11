@@ -458,8 +458,14 @@ WeightSynchronizerBase::get_local_endpoints() const {
 }
 
 WeightSynchronizerBase::~WeightSynchronizerBase() {
-  StopTransportServer();
+  // The listener's gRPC server dispatches into the transport-owned
+  // PeregrineService, so it must be fully stopped before the transport is
+  // destroyed. Both steps stay ahead of member destruction. The transport
+  // keeps delivering receive callbacks during the listener shutdown, which
+  // waits for in-flight handlers without a time limit; see
+  // weight_synchronizer_listener.h.
   listener_.reset();
+  StopTransportServer();
   {
     absl::MutexLock op_lock(d2h_op_mu_);
     WaitForInFlightD2h();

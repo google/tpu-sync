@@ -41,7 +41,10 @@
 #include "grpcpp/create_channel.h"
 #include "grpcpp/security/credentials.h"
 #include "grpcpp/security/server_credentials.h"
+#include "grpcpp/server_context.h"
 #include "grpcpp/support/status.h"
+#include "peregrine/src/internal/control/message.pb.h"
+#include "peregrine/src/internal/control/service.grpc.pb.h"
 #include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/common/control_pipe/control_dispatcher.h"
 #include "tpu_sync/common/control_pipe/control_pipe_client.h"
@@ -58,6 +61,9 @@
 namespace tpu_raiden {
 namespace {
 
+using ::peregrine::internal::control::PeregrineService;
+using ::peregrine::internal::proto::ReqMsg;
+using ::peregrine::internal::proto::RespMsg;
 using ::tpu_raiden::control_plane::proto::AckRequest;
 using ::tpu_raiden::control_plane::proto::AckResponse;
 using ::tpu_raiden::control_plane::proto::KVCacheControlPlaneService;
@@ -922,6 +928,177 @@ TEST(ControlPipeTest, GrpcStopCompletesInFlightHandlerWithinGracePeriod) {
   EXPECT_EQ(resp.status(), 0);
   EXPECT_EQ(resp.num_layers(), 42);
 }
+
+// Stands in for the transport-owned PeregrineService: counts the calls it
+// receives and answers OK.
+class FakePeregrineService final : public PeregrineService::Service {
+ public:
+  grpc::Status ProcessUnary(grpc::ServerContext* /*context*/,
+                            const ReqMsg* /*request*/,
+                            RespMsg* /*response*/) override {
+    calls_.fetch_add(1);
+    return grpc::Status::OK;
+  }
+
+  int calls() const { return calls_.load(); }
+
+ private:
+  std::atomic<int> calls_{0};
+};
+
+void RegisterPullStreamEchoHandler(ControlPipeServer& server) {
+  server.dispatcher().RegisterHandler<PullStreamRequest, PullStreamResponse>(
+      [](const ControlContext& /*ctx*/,
+         const PullStreamRequest& req) -> absl::StatusOr<PullStreamResponse> {
+        PullStreamResponse resp;
+        resp.set_status(0);
+        resp.set_num_layers(static_cast<int32_t>(req.uuid()));
+        return resp;
+      });
+}
+
+TEST(ControlPipeTest, GrpcRegisteredServiceSharesPortAndChannel) {
+  ControlPipeConfig cfg;
+  cfg.backend_type = ControlPipeBackendType::kGrpc;
+
+  // Declared before the server: a registered service must outlive Stop().
+  FakePeregrineService peregrine_service;
+  GrpcControlPipeServer server(cfg);
+  RegisterPullStreamEchoHandler(server);
+  ABSL_ASSERT_OK(server.RegisterGrpcService(&peregrine_service));
+  TF_ASSERT_OK_AND_ASSIGN(int port, server.Start(0));
+
+  GrpcControlPipeClient client(cfg);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<grpc::Channel> channel,
+      client.GetOrCreateChannel(absl::StrCat("127.0.0.1:", port)));
+
+  // A built-in, dispatcher-backed service answers on the channel...
+  std::unique_ptr<KVCacheControlPlaneService::Stub> kv_stub =
+      KVCacheControlPlaneService::NewStub(channel);
+  grpc::ClientContext pull_ctx;
+  PullStreamRequest pull_req;
+  pull_req.set_uuid(23);
+  PullStreamResponse pull_resp;
+  grpc::Status pull_status =
+      kv_stub->PullStream(&pull_ctx, pull_req, &pull_resp);
+  ASSERT_TRUE(pull_status.ok()) << pull_status.error_message();
+  EXPECT_EQ(pull_resp.num_layers(), 23);
+
+  // ...and so does the registered service, on the very same channel.
+  std::unique_ptr<PeregrineService::Stub> peregrine_stub =
+      PeregrineService::NewStub(channel);
+  grpc::ClientContext peregrine_ctx;
+  RespMsg peregrine_resp;
+  grpc::Status peregrine_status =
+      peregrine_stub->ProcessUnary(&peregrine_ctx, ReqMsg(), &peregrine_resp);
+  EXPECT_TRUE(peregrine_status.ok()) << peregrine_status.error_message();
+  EXPECT_EQ(peregrine_service.calls(), 1);
+  EXPECT_EQ(client.TEST_CachedStubCount(), 1);
+
+  server.Stop();
+}
+
+TEST(ControlPipeTest, GrpcUnregisteredServiceIsUnimplemented) {
+  ControlPipeConfig cfg;
+  cfg.backend_type = ControlPipeBackendType::kGrpc;
+
+  GrpcControlPipeServer server(cfg);
+  RegisterPullStreamEchoHandler(server);
+  TF_ASSERT_OK_AND_ASSIGN(int port, server.Start(0));
+
+  GrpcControlPipeClient client(cfg);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<grpc::Channel> channel,
+      client.GetOrCreateChannel(absl::StrCat("127.0.0.1:", port)));
+
+  // The server is reachable on this channel...
+  std::unique_ptr<KVCacheControlPlaneService::Stub> kv_stub =
+      KVCacheControlPlaneService::NewStub(channel);
+  grpc::ClientContext pull_ctx;
+  PullStreamResponse pull_resp;
+  grpc::Status pull_status =
+      kv_stub->PullStream(&pull_ctx, PullStreamRequest(), &pull_resp);
+  ASSERT_TRUE(pull_status.ok()) << pull_status.error_message();
+
+  // ...but a service nobody registered is not served.
+  std::unique_ptr<PeregrineService::Stub> peregrine_stub =
+      PeregrineService::NewStub(channel);
+  grpc::ClientContext peregrine_ctx;
+  RespMsg peregrine_resp;
+  grpc::Status peregrine_status =
+      peregrine_stub->ProcessUnary(&peregrine_ctx, ReqMsg(), &peregrine_resp);
+  EXPECT_EQ(peregrine_status.error_code(), grpc::StatusCode::UNIMPLEMENTED)
+      << peregrine_status.error_message();
+
+  server.Stop();
+}
+
+TEST(ControlPipeTest, GrpcRegisterGrpcServiceRejectsNull) {
+  ControlPipeConfig cfg;
+  cfg.backend_type = ControlPipeBackendType::kGrpc;
+  GrpcControlPipeServer server(cfg);
+
+  EXPECT_THAT(
+      server.RegisterGrpcService(nullptr),
+      ::absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                               ::testing::HasSubstr("service is null")));
+}
+
+TEST(ControlPipeTest, GrpcRegisterGrpcServiceAfterStartFails) {
+  ControlPipeConfig cfg;
+  cfg.backend_type = ControlPipeBackendType::kGrpc;
+  FakePeregrineService peregrine_service;
+  GrpcControlPipeServer server(cfg);
+  TF_ASSERT_OK_AND_ASSIGN(int port, server.Start(0));
+
+  EXPECT_THAT(server.RegisterGrpcService(&peregrine_service),
+              ::absl_testing::StatusIs(
+                  absl::StatusCode::kFailedPrecondition,
+                  ::testing::AllOf(::testing::HasSubstr("after Start()"),
+                                   ::testing::HasSubstr(absl::StrCat(port)))));
+
+  server.Stop();
+}
+
+TEST(ControlPipeTest, GrpcRegisterGrpcServiceTwiceFails) {
+  ControlPipeConfig cfg;
+  cfg.backend_type = ControlPipeBackendType::kGrpc;
+  FakePeregrineService peregrine_service;
+  GrpcControlPipeServer server(cfg);
+
+  ABSL_EXPECT_OK(server.RegisterGrpcService(&peregrine_service));
+  EXPECT_THAT(
+      server.RegisterGrpcService(&peregrine_service),
+      ::absl_testing::StatusIs(absl::StatusCode::kAlreadyExists,
+                               ::testing::HasSubstr("already registered")));
+}
+
+class NonGrpcControlPipeServerTest
+    : public ::testing::TestWithParam<ControlPipeBackendType> {};
+
+TEST_P(NonGrpcControlPipeServerTest, RejectsGrpcService) {
+  ControlPipeConfig cfg;
+  cfg.backend_type = GetParam();
+  FakePeregrineService peregrine_service;
+  std::unique_ptr<ControlPipeServer> server = CreateControlPipeServer(cfg);
+  ASSERT_NE(server, nullptr);
+  ASSERT_EQ(server->backend_type(), GetParam());
+
+  EXPECT_THAT(server->RegisterGrpcService(&peregrine_service),
+              ::absl_testing::StatusIs(
+                  absl::StatusCode::kUnimplemented,
+                  ::testing::HasSubstr(absl::StrCat(
+                      "'", ControlPipeBackendTypeName(GetParam()), "'"))));
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    NonGrpcBackends, NonGrpcControlPipeServerTest,
+    ::testing::Values(ControlPipeBackendType::kTcp,
+                      ControlPipeBackendType::kZmq),
+    [](const ::testing::TestParamInfo<ControlPipeBackendType>& info) {
+      return std::string(ControlPipeBackendTypeName(info.param));
+    });
 
 }  // namespace
 }  // namespace tpu_raiden

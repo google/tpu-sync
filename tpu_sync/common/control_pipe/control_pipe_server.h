@@ -17,7 +17,10 @@
 
 #include <memory>
 
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
+#include "grpcpp/impl/service_type.h"
 #include "tpu_sync/common/control_pipe/control_dispatcher.h"
 #include "tpu_sync/common/control_pipe/control_pipe_types.h"
 
@@ -35,6 +38,21 @@ class ControlPipeServer {
   // to complete. Safe to call multiple times. Must not be called from inside
   // a handler executing on this server (including registered gRPC services).
   virtual void Stop() = 0;
+
+  // Registers |service| on the server so that it is served on the same port
+  // as the control pipe, and one client channel reaches both. Must be called
+  // before Start(). |service| is not owned and must outlive Stop(). Handlers
+  // of |service| must not call Stop() on this server.
+  //
+  // Only the gRPC backend can serve an extra gRPC service. Every other
+  // backend returns an Unimplemented error naming the backend; callers must
+  // not ignore it.
+  virtual absl::Status RegisterGrpcService(grpc::Service* service) {
+    return absl::UnimplementedError(
+        absl::StrCat("ControlPipeServer backend '",
+                     ControlPipeBackendTypeName(backend_type()),
+                     "' cannot serve a gRPC service"));
+  }
 
   virtual int bound_port() const = 0;
   virtual ControlDispatcher& dispatcher() = 0;

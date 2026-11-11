@@ -114,6 +114,10 @@ class RawBufferTransport final {
   // Return the local IP addresses.
   absl::Span<const std::string> local_ips() const { return local_ips_; }
 
+  // True when this transport requires PSP-TCP on its connections
+  // (--peregrine_enable_psp_tcp, read once at construction).
+  bool require_psp_tcp() const { return require_psp_tcp_; }
+
   // Borrows a connection from the connection pool, resolving the gRPC channel
   // for PSP key exchange if enabled.
   absl::StatusOr<int> BorrowConnection(absl::string_view peer,

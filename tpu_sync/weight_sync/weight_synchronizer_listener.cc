@@ -105,6 +105,19 @@ WeightSynchronizerListener::WeightSynchronizerListener(
           HandlerOptions<::tpu_sync::rpc::ControlRequest>().WithMaxPayloadBytes(
               cfg.max_frame_bytes));
 
+  if (pipe_server_->backend_type() == ControlPipeBackendType::kGrpc) {
+    CHECK_OK(
+        pipe_server_->RegisterGrpcService(engine_->peregrine_control_service()))
+        << "Failed to register PeregrineService on the listener";
+  } else {
+    // No gRPC server exists on this backend, so PeregrineService cannot be
+    // served. That is only acceptable when PSP-TCP is not required.
+    CHECK(!engine_->psp_tcp_required())
+        << "PSP-TCP is required but the listener backend '"
+        << ControlPipeBackendTypeName(pipe_server_->backend_type())
+        << "' cannot serve PeregrineService; use the gRPC control plane";
+  }
+
   absl::StatusOr<int> port = pipe_server_->Start(listener_port);
   CHECK_OK(port.status())
       << "Failed to start WeightSynchronizerListener ControlPipeServer";

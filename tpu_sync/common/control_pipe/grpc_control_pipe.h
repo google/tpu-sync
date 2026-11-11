@@ -20,14 +20,17 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "grpcpp/channel.h"
+#include "grpcpp/impl/service_type.h"
 #include "grpcpp/server.h"
 #include "tpu_sync/common/control_pipe/control_dispatcher.h"
 #include "tpu_sync/common/control_pipe/control_pipe_client.h"
@@ -52,6 +55,11 @@ class GrpcControlPipeServer : public ControlPipeServer {
   // executing on this server (including registered gRPC services).
   void Stop() override;
 
+  // Returns InvalidArgument for a null |service|, FailedPrecondition once the
+  // server is started (it stays started until Stop()), and AlreadyExists if
+  // |service| is already registered. Thread-safe.
+  absl::Status RegisterGrpcService(grpc::Service* service) override;
+
   int bound_port() const override { return bound_port_; }
   ControlDispatcher& dispatcher() override { return dispatcher_; }
   ControlPipeBackendType backend_type() const override {
@@ -69,6 +77,9 @@ class GrpcControlPipeServer : public ControlPipeServer {
 
   mutable absl::Mutex mu_;
   std::unique_ptr<grpc::Server> grpc_server_ ABSL_GUARDED_BY(mu_);
+  // Services added by RegisterGrpcService(), not owned. Start() registers them
+  // on the gRPC server after the two built-in services.
+  std::vector<grpc::Service*> extra_services_ ABSL_GUARDED_BY(mu_);
   std::unique_ptr<ControlPipeServiceImpl> pipe_service_;
   std::unique_ptr<LegacyKVCacheServiceImpl> kv_cache_service_;
 };

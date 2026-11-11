@@ -21,6 +21,7 @@
 #include <string>
 #include <utility>
 
+#include "absl/algorithm/container.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
@@ -37,6 +38,7 @@
 #include "grpcpp/client_context.h"
 #include "grpcpp/create_channel.h"
 #include "grpcpp/grpcpp.h"
+#include "grpcpp/impl/service_type.h"
 #include "grpcpp/security/credentials.h"
 #include "grpcpp/security/server_credentials.h"
 #include "grpcpp/server_builder.h"
@@ -323,6 +325,9 @@ absl::StatusOr<int> GrpcControlPipeServer::Start(int requested_port) {
                            &selected_port);
   builder.RegisterService(pipe_service_.get());
   builder.RegisterService(kv_cache_service_.get());
+  for (grpc::Service* service : extra_services_) {
+    builder.RegisterService(service);
+  }
 
   grpc_server_ = builder.BuildAndStart();
   if (!grpc_server_ || selected_port <= 0) {
@@ -332,6 +337,28 @@ absl::StatusOr<int> GrpcControlPipeServer::Start(int requested_port) {
   }
   bound_port_ = selected_port;
   return bound_port_;
+}
+
+absl::Status GrpcControlPipeServer::RegisterGrpcService(
+    grpc::Service* service) {
+  if (service == nullptr) {
+    return absl::InvalidArgumentError(
+        "GrpcControlPipeServer::RegisterGrpcService: service is null");
+  }
+  absl::MutexLock lock(mu_);
+  if (grpc_server_) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "GrpcControlPipeServer::RegisterGrpcService called after Start(); "
+        "the server is already serving on port ",
+        bound_port_));
+  }
+  if (absl::c_linear_search(extra_services_, service)) {
+    return absl::AlreadyExistsError(
+        "GrpcControlPipeServer::RegisterGrpcService: service is already "
+        "registered");
+  }
+  extra_services_.push_back(service);
+  return absl::OkStatus();
 }
 
 void GrpcControlPipeServer::Stop() {

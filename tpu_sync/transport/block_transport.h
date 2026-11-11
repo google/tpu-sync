@@ -115,6 +115,10 @@ class BlockTransport final {
     return peregrine_control_.get();
   }
 
+  // True when the transport requires PSP-TCP, so peers must reach
+  // peregrine_control_service() over gRPC before they can connect.
+  bool require_psp_tcp() const { return raw_transport_.require_psp_tcp(); }
+
   // Asynchronous Scatter-Gather Push (op = 1 / op = 6). `layer_idx` selects the
   // local block array; `wire_layer_idx`, when set, is the index the receiver
   // resolves the pushed blocks against (a sender whose pool table is a subset

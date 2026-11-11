@@ -32,6 +32,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
+#include "grpcpp/impl/service_type.h"
 #include "peregrine/src/api/v1/rate_limiter.h"
 #include "xla/future.h"
 #include "tpu_sync/core/numa_thread_pool.h"
@@ -135,6 +136,24 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
 
   // Stops and joins the underlying raw transport server if active.
   void StopTransportServer();
+
+  // Returns the transport-owned PeregrineService, for registration on a host
+  // gRPC server. The pointer is valid until StopTransportServer(); the server
+  // it is registered on must be stopped first. CHECK-fails after
+  // StopTransportServer(). Thread-safe.
+  //
+  // The weight-sync listener registers it on its gRPC control pipe port. An
+  // engine with no listener serves it nowhere, also when PSP-TCP is required:
+  // that is a valid configuration for a send-only engine, and for one whose
+  // embedding application registers the service on its own gRPC server. Used
+  // as a PSP-TCP receiver without either, nothing fails on this engine; the
+  // sender's key exchange fails.
+  grpc::Service* peregrine_control_service();
+
+  // True when the transport requires PSP-TCP, so peers must be able to reach
+  // peregrine_control_service() over gRPC. CHECK-fails after
+  // StopTransportServer(). Thread-safe.
+  bool psp_tcp_required() const;
 
   virtual std::optional<int> local_port() const;
   virtual std::string local_ip() const;

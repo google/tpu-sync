@@ -29,17 +29,31 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/flags/flag.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/time/time.h"
+#include "grpcpp/channel.h"
+#include "grpcpp/client_context.h"
+#include "grpcpp/support/status.h"
+#include "peregrine/src/api/v1/psp/psp.h"
+#include "peregrine/src/internal/control/message.pb.h"
+#include "peregrine/src/internal/control/message_internal.pb.h"
+#include "peregrine/src/internal/control/service.grpc.pb.h"
 #include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/common/control_pipe/control_pipe_client.h"
 #include "tpu_sync/common/control_pipe/control_pipe_types.h"
+#include "tpu_sync/common/control_pipe/grpc_control_pipe.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
 namespace tpu_raiden {
 namespace weight_sync {
 
+using ::peregrine::internal::control::PeregrineService;
+using ::peregrine::internal::proto::PspToken;
+using ::peregrine::internal::proto::ReqMsg;
+using ::peregrine::internal::proto::RespMsg;
 using ::testing::HasSubstr;
 using ::tpu_sync::rpc::ControlRequest;
 using ::tpu_sync::rpc::ControlResponse;
@@ -604,6 +618,193 @@ TEST(WeightSynchronizerListenerTest,
                                                     []() {});
   EXPECT_FALSE(resp.success());
   EXPECT_THAT(resp.message(), HasSubstr("summing to 2"));
+}
+
+ControlPipeConfig GrpcClientConfig() {
+  ControlPipeConfig cfg;
+  cfg.backend_type = ControlPipeBackendType::kGrpc;
+  return cfg;
+}
+
+// Sends |request| to PeregrineService over |channel|.
+grpc::Status CallPeregrine(const std::shared_ptr<grpc::Channel>& channel,
+                           const ReqMsg& request) {
+  std::unique_ptr<PeregrineService::Stub> stub =
+      PeregrineService::NewStub(channel);
+  grpc::ClientContext ctx;
+  RespMsg response;
+  return stub->ProcessUnary(&ctx, request, &response);
+}
+
+// A PSP-TCP request without a token. The transport's PeregrineService rejects
+// it during validation, before it reaches the transport.
+ReqMsg PspTcpRequestWithoutToken() {
+  ReqMsg request;
+  request.mutable_psp_tcp_req();
+  return request;
+}
+
+// A PSP-TCP request that passes every validation of the transport's
+// PeregrineService, so it is handed to the transport.
+ReqMsg ValidPspTcpRequest() {
+  ReqMsg request;
+  PspToken* psp = request.mutable_psp_tcp_req()->mutable_psp();
+  psp->set_spi(7);
+  psp->set_gen(1);
+  psp->set_key(std::string(16, 'k'));
+  request.mutable_psp_tcp_req()->mutable_peer_target()->set_ip_port(
+      "127.0.0.1:56789");
+  return request;
+}
+
+TEST(WeightSynchronizerListenerTest,
+     GrpcListenerServesControlRequestAndPeregrineOnOneChannel) {
+  ASSERT_FALSE(absl::GetFlag(FLAGS_peregrine_enable_psp_tcp));
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> engine_ptr,
+      WeightSynchronizerBase::Create(
+          /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+          /*local_port=*/0, /*host_blocks_to_allocate=*/std::nullopt,
+          /*parallelism=*/1, /*listener_port=*/std::nullopt));
+  EXPECT_FALSE(engine_ptr->psp_tcp_required());
+  WeightSynchronizerListener listener(engine_ptr.get(), /*listener_port=*/0);
+  ASSERT_EQ(listener.backend_type(), ControlPipeBackendType::kGrpc);
+  const std::string endpoint =
+      absl::StrCat("127.0.0.1:", listener.listener_port());
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> dst_engine_ptr,
+      WeightSynchronizerBase::Create(
+          /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+          /*local_port=*/0, /*host_blocks_to_allocate=*/1,
+          /*parallelism=*/1, /*listener_port=*/std::nullopt));
+  ASSERT_TRUE(dst_engine_ptr->local_port().has_value());
+
+  GrpcControlPipeClient client(GrpcClientConfig());
+  ControlRequest req;
+  req.set_command(ControlRequest::COMMAND_START_TRANSFER);
+  req.add_peers(absl::StrCat("127.0.0.1:", *dst_engine_ptr->local_port()));
+  TF_ASSERT_OK_AND_ASSIGN(ControlResponse resp,
+                       (client.Call<ControlRequest, ControlResponse>(
+                           endpoint, req, absl::Seconds(10))));
+  EXPECT_TRUE(resp.success()) << resp.message();
+
+  // The channel the control request just used.
+  TF_ASSERT_OK_AND_ASSIGN(std::shared_ptr<grpc::Channel> channel,
+                       client.GetOrCreateChannel(endpoint));
+  EXPECT_EQ(client.TEST_CachedStubCount(), 1);
+
+  // Answered by the transport's service: its own validation message.
+  grpc::Status no_token_status =
+      CallPeregrine(channel, PspTcpRequestWithoutToken());
+  EXPECT_EQ(no_token_status.error_code(), grpc::StatusCode::INVALID_ARGUMENT);
+  EXPECT_THAT(no_token_status.error_message(),
+              HasSubstr("psp token must be present"));
+
+  // A valid request goes through the service into this engine's transport,
+  // which refuses it because PSP-TCP is off. Only the transport produces this
+  // message.
+  grpc::Status valid_status = CallPeregrine(channel, ValidPspTcpRequest());
+  EXPECT_EQ(valid_status.error_code(), grpc::StatusCode::INVALID_ARGUMENT);
+  EXPECT_THAT(valid_status.error_message(),
+              HasSubstr("PSP is not enabled in transport"));
+  EXPECT_EQ(client.TEST_CachedStubCount(), 1);
+}
+
+TEST(WeightSynchronizerListenerTest,
+     GrpcListenerServesPeregrineWhenPspTcpRequired) {
+  absl::SetFlag(&FLAGS_peregrine_enable_psp_tcp, true);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> engine_ptr,
+      WeightSynchronizerBase::Create(
+          /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+          /*local_port=*/0, /*host_blocks_to_allocate=*/std::nullopt,
+          /*parallelism=*/1, /*listener_port=*/std::nullopt));
+  ASSERT_TRUE(engine_ptr->psp_tcp_required());
+  WeightSynchronizerListener listener(engine_ptr.get(), /*listener_port=*/0);
+  ASSERT_EQ(listener.backend_type(), ControlPipeBackendType::kGrpc);
+
+  GrpcControlPipeClient client(GrpcClientConfig());
+  TF_ASSERT_OK_AND_ASSIGN(std::shared_ptr<grpc::Channel> channel,
+                       client.GetOrCreateChannel(absl::StrCat(
+                           "127.0.0.1:", listener.listener_port())));
+
+  // The service's own validation answers; an unserved service would return
+  // UNIMPLEMENTED. No key exchange is attempted here.
+  grpc::Status status = CallPeregrine(channel, PspTcpRequestWithoutToken());
+  EXPECT_EQ(status.error_code(), grpc::StatusCode::INVALID_ARGUMENT);
+  EXPECT_THAT(status.error_message(), HasSubstr("psp token must be present"));
+}
+
+// Builds a PSP-TCP engine and a TCP-backend listener on it.
+void ConstructTcpListenerWithPspTcpRequired() {
+  absl::SetFlag(&FLAGS_peregrine_enable_psp_tcp, true);
+  absl::StatusOr<std::unique_ptr<WeightSynchronizerBase>> engine =
+      WeightSynchronizerBase::Create(
+          /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+          /*local_port=*/0, /*host_blocks_to_allocate=*/std::nullopt,
+          /*parallelism=*/1, /*listener_port=*/std::nullopt);
+  // Exit cleanly if the engine cannot be built, so that only the listener's
+  // own check can satisfy the death expectation.
+  if (!engine.ok()) {
+    return;
+  }
+  WeightSynchronizerListener listener(engine->get(), /*listener_port=*/0,
+                                      ControlPipeBackendType::kTcp);
+}
+
+// The flag-off counterpart is PushWeightsCommandTcpLegacySuccess: a TCP
+// listener starts without the service when PSP-TCP is not required.
+TEST(WeightSynchronizerListenerDeathTest, TcpListenerDiesWhenPspTcpRequired) {
+  EXPECT_DEATH(ConstructTcpListenerWithPspTcpRequired(),
+               "PSP-TCP is required but the listener backend 'tcp' cannot "
+               "serve PeregrineService");
+}
+
+// The assertions below show that the teardown sequence ran: shutdown command,
+// then engine destruction with a listener that served PeregrineService. They
+// do not show the lifetime property itself (no handler runs against a
+// destroyed transport); that is checked only when this test runs under ASan
+// and TSan.
+TEST(WeightSynchronizerListenerTest,
+     EngineOwnedListenerTearsDownAfterShutdownCommand) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> engine,
+      WeightSynchronizerBase::Create(
+          /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+          /*local_port=*/0, /*host_blocks_to_allocate=*/std::nullopt,
+          /*parallelism=*/1, /*listener_port=*/0));
+  ASSERT_TRUE(engine->listener_port().has_value());
+  ASSERT_TRUE(engine->is_listener_active());
+  const std::string endpoint =
+      absl::StrCat("127.0.0.1:", *engine->listener_port());
+
+  GrpcControlPipeClient client(GrpcClientConfig());
+  TF_ASSERT_OK_AND_ASSIGN(std::shared_ptr<grpc::Channel> channel,
+                       client.GetOrCreateChannel(endpoint));
+
+  // The engine-owned listener serves the transport's PeregrineService.
+  grpc::Status served_status =
+      CallPeregrine(channel, PspTcpRequestWithoutToken());
+  EXPECT_EQ(served_status.error_code(), grpc::StatusCode::INVALID_ARGUMENT);
+  EXPECT_THAT(served_status.error_message(),
+              HasSubstr("psp token must be present"));
+
+  ControlRequest shutdown_req;
+  shutdown_req.set_command(ControlRequest::COMMAND_SHUTDOWN);
+  TF_ASSERT_OK_AND_ASSIGN(ControlResponse shutdown_resp,
+                       (client.Call<ControlRequest, ControlResponse>(
+                           endpoint, shutdown_req, absl::Seconds(10))));
+  EXPECT_TRUE(shutdown_resp.success()) << shutdown_resp.message();
+  EXPECT_FALSE(engine->is_listener_active());
+
+  engine.reset();
+
+  // Nothing answers on the old channel once the engine is gone.
+  grpc::Status after_status =
+      CallPeregrine(channel, PspTcpRequestWithoutToken());
+  EXPECT_EQ(after_status.error_code(), grpc::StatusCode::UNAVAILABLE)
+      << after_status.error_message();
 }
 
 }  // namespace

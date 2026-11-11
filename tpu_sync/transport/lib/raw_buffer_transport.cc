@@ -375,11 +375,14 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
     const uint32_t size_bytes = header.count_or_size;
     const uint16_t buf_id = header.buffer_id;
 
-    uint8_t* const base_host_ptr =
-        raw_delegate_->GetHostPointer(buf_id, src_shard_idx);
-    const size_t host_size = raw_delegate_->GetHostSize(buf_id, src_shard_idx);
-    if (base_host_ptr == nullptr || size_bytes > host_size ||
-        src_offset > host_size - size_bytes) {
+    ABSL_ASSIGN_OR_RETURN(
+        const absl::Span<uint8_t> host_buffer,
+        raw_delegate_->GetHostBuffer(buf_id, src_shard_idx),
+        _.SetCode(absl::StatusCode::kInvalidArgument).SetPrepend()
+            << "Source out of bounds: ");
+    uint8_t* const base_host_ptr = host_buffer.data();
+    const size_t host_size = host_buffer.size();
+    if (size_bytes > host_size || src_offset > host_size - size_bytes) {
       return absl::InvalidArgumentError("Source out of bounds");
     }
     uint8_t* const src_ptr = base_host_ptr + src_offset;
@@ -396,11 +399,14 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
     const uint32_t size_bytes = header.count_or_size;
     const uint16_t buf_id = header.buffer_id;
 
-    uint8_t* const base_host_ptr =
-        raw_delegate_->GetHostPointer(buf_id, dst_shard_idx);
-    const size_t host_size = raw_delegate_->GetHostSize(buf_id, dst_shard_idx);
-    if (base_host_ptr == nullptr || size_bytes > host_size ||
-        dst_offset > host_size - size_bytes) {
+    ABSL_ASSIGN_OR_RETURN(
+        const absl::Span<uint8_t> host_buffer,
+        raw_delegate_->GetHostBuffer(buf_id, dst_shard_idx),
+        _.SetCode(absl::StatusCode::kInvalidArgument).SetPrepend()
+            << "Destination out of bounds: ");
+    uint8_t* const base_host_ptr = host_buffer.data();
+    const size_t host_size = host_buffer.size();
+    if (size_bytes > host_size || dst_offset > host_size - size_bytes) {
       return absl::InvalidArgumentError("Destination out of bounds");
     }
     uint8_t* const dest_ptr = base_host_ptr + dst_offset;
@@ -526,14 +532,13 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
 
     for (uint32_t i = 0; i < batch_size; ++i) {
       const auto& meta = metadata[i];
-      uint8_t* const base_host_ptr =
-          raw_delegate_->GetHostPointer(meta.layer_idx, meta.dst_shard_idx);
-      const size_t host_size =
-          raw_delegate_->GetHostSize(meta.layer_idx, meta.dst_shard_idx);
-      if (base_host_ptr == nullptr) {
-        return absl::InvalidArgumentError(
-            "Destination host pointer is null in batched push");
-      }
+      ABSL_ASSIGN_OR_RETURN(
+          const absl::Span<uint8_t> host_buffer,
+          raw_delegate_->GetHostBuffer(meta.layer_idx, meta.dst_shard_idx),
+          _.SetCode(absl::StatusCode::kInvalidArgument).SetPrepend()
+              << "Destination host pointer is null in batched push: ");
+      uint8_t* const base_host_ptr = host_buffer.data();
+      const size_t host_size = host_buffer.size();
       const uint32_t count = meta.count > 0 ? meta.count : 1;
       const size_t dst_stride =
           meta.dst_stride_bytes > 0 ? meta.dst_stride_bytes : meta.size_bytes;
@@ -864,12 +869,14 @@ absl::Status RawBufferTransport::PullBuffer(
     return absl::InvalidArgumentError("Source peer address cannot be empty");
   }
 
-  uint8_t* const base_host_ptr =
-      raw_delegate_->GetHostPointer(buffer_id, dst_shard_idx);
-  if (base_host_ptr == nullptr && size_bytes > 0) {
-    return absl::InvalidArgumentError("Destination host pointer is null");
-  }
-  const size_t host_size = raw_delegate_->GetHostSize(buffer_id, dst_shard_idx);
+  // A missing destination buffer is rejected for any |size_bytes|, including 0.
+  ABSL_ASSIGN_OR_RETURN(
+      const absl::Span<uint8_t> host_buffer,
+      raw_delegate_->GetHostBuffer(buffer_id, dst_shard_idx),
+      _.SetCode(absl::StatusCode::kInvalidArgument).SetPrepend()
+          << "Destination host pointer is null: ");
+  uint8_t* const base_host_ptr = host_buffer.data();
+  const size_t host_size = host_buffer.size();
   if (size_bytes > host_size || dst_offset_bytes > host_size - size_bytes) {
     return absl::InvalidArgumentError(absl::StrCat(
         "Destination offset out of bounds. Offset: ", dst_offset_bytes,

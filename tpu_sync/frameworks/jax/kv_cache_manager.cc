@@ -525,6 +525,30 @@ size_t NumaAwareKVCacheManager::GetHostSize(size_t layer_idx,
   return sub_managers_[sub_idx]->base()->GetHostSize(layer_idx, local_shard);
 }
 
+absl::StatusOr<absl::Span<const uint8_t>>
+NumaAwareKVCacheManager::GetHostBuffer(size_t layer_idx,
+                                       size_t shard_idx) const {
+  if (shard_idx >= global_shard_to_submanager_.size()) {
+    return absl::OutOfRangeError(
+        absl::StrCat("shard_idx ", shard_idx, " out of range: ",
+                     global_shard_to_submanager_.size(), " global shards"));
+  }
+  auto [sub_idx, local_shard] = global_shard_to_submanager_[shard_idx];
+  // `unique_ptr` does not propagate const; select the const overload.
+  const KVCacheManagerWithTransfer& sub_manager = *sub_managers_[sub_idx];
+  return sub_manager.base()->GetHostBuffer(layer_idx, local_shard);
+}
+
+absl::StatusOr<absl::Span<uint8_t>> NumaAwareKVCacheManager::GetHostBuffer(
+    size_t layer_idx, size_t shard_idx) {
+  ABSL_ASSIGN_OR_RETURN(
+      absl::Span<const uint8_t> host_buffer,
+      std::as_const(*this).GetHostBuffer(layer_idx, shard_idx));
+  // The span views sub-manager-owned mutable staging memory.
+  return absl::Span<uint8_t>(const_cast<uint8_t*>(host_buffer.data()),
+                             host_buffer.size());
+}
+
 int64_t NumaAwareKVCacheManager::NotifyForRead(
     const std::string& req_id, uint64_t uuid,
     const std::vector<int64_t>& block_ids) {

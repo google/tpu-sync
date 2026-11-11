@@ -174,5 +174,73 @@ TEST(RaidenManagerBaseHostBufferTest, NonNullPointerWithZeroSizeIsOkEmpty) {
   EXPECT_TRUE(buffer.empty());
 }
 
+TEST(RaidenManagerBaseHostBufferTest, BlockArrayHostSpanViewsHostBuffer) {
+  HostBufferTestManager manager(kNumLayers, kNumShards);
+  // storage[layer][shard], with a distinct size per buffer.
+  std::vector<std::vector<std::vector<uint8_t>>> storage = {
+      {std::vector<uint8_t>(64), std::vector<uint8_t>(128)},
+      {std::vector<uint8_t>(192), std::vector<uint8_t>(256)}};
+  manager.SetExternalHostPointers({storage[0][0].data(), storage[0][1].data(),
+                                   storage[1][0].data(), storage[1][1].data()},
+                                  {storage[0][0].size(), storage[0][1].size(),
+                                   storage[1][0].size(), storage[1][1].size()});
+
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    for (size_t s = 0; s < kNumShards; ++s) {
+      TF_ASSERT_OK_AND_ASSIGN(absl::Span<const char> span,
+                           manager.GetBlockArrayHostSpan(l, s));
+      EXPECT_EQ(reinterpret_cast<const uint8_t*>(span.data()),
+                storage[l][s].data());
+      EXPECT_EQ(span.size(), storage[l][s].size());
+    }
+  }
+}
+
+TEST(RaidenManagerBaseHostBufferTest,
+     BlockArrayHostSpanWithoutHostBufferIsOkEmpty) {
+  HostBufferTestManager manager(kNumLayers, kNumShards);
+  std::vector<uint8_t> storage(64);
+  // (0, 0) has a size but no pointer; (0, 1) is a real buffer.
+  manager.SetExternalHostPointers({nullptr, storage.data()},
+                                  {storage.size(), storage.size()});
+
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const char> with_buffer,
+                       manager.GetBlockArrayHostSpan(0, 1));
+  EXPECT_EQ(reinterpret_cast<const uint8_t*>(with_buffer.data()),
+            storage.data());
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const char> without_buffer,
+                       manager.GetBlockArrayHostSpan(0, 0));
+  EXPECT_EQ(without_buffer.data(), nullptr);
+  EXPECT_TRUE(without_buffer.empty());
+}
+
+TEST(RaidenManagerBaseHostBufferTest, BlockArrayHostSpanBadLayerIsOutOfRange) {
+  HostBufferTestManager manager(kNumLayers, kNumShards);
+  std::vector<uint8_t> storage(64);
+  manager.SetExternalHostPointers(
+      {storage.data(), storage.data(), storage.data(), storage.data()},
+      {storage.size(), storage.size(), storage.size(), storage.size()});
+
+  ABSL_EXPECT_OK(manager.GetBlockArrayHostSpan(1, 0));
+  EXPECT_THAT(manager.GetBlockArrayHostSpan(2, 0),
+              StatusIs(absl::StatusCode::kOutOfRange,
+                       HasSubstr("layer_idx 2 out of range: 2 host layers")));
+}
+
+TEST(RaidenManagerBaseHostBufferTest,
+     BlockArrayHostSpanLayerWithNoShardsIsOutOfRange) {
+  HostBufferTestManager manager(kNumLayers, kNumShards);
+  std::vector<uint8_t> storage(64);
+  manager.SetExternalHostPointers({storage.data(), storage.data()},
+                                  {storage.size(), storage.size()});
+  manager.ClearLayerShards(1);
+
+  ABSL_EXPECT_OK(manager.GetBlockArrayHostSpan(0, 1));
+  EXPECT_THAT(manager.GetBlockArrayHostSpan(1, 1),
+              StatusIs(absl::StatusCode::kOutOfRange,
+                       HasSubstr("shard_idx 1 out of range: layer 1 has no "
+                                 "shards")));
+}
+
 }  // namespace
 }  // namespace tpu_raiden

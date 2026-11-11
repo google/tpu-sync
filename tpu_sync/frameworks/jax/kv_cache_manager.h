@@ -133,6 +133,17 @@ class NumaAwareKVCacheManager {
   const uint8_t* GetHostPointer(size_t layer_idx, size_t shard_idx) const;
   size_t GetHostSize(size_t layer_idx, size_t shard_idx);
 
+  // Host staging buffer of (|layer_idx|, global |shard_idx|), forwarded to the
+  // owning sub-manager's const `GetHostBuffer()` at its local shard. Returns
+  // OutOfRange when |shard_idx| is not a global shard of this manager; the
+  // sub-manager's status is returned unchanged otherwise (OutOfRange: bad
+  // index; FailedPrecondition: the shard has no host buffer).
+  absl::StatusOr<absl::Span<const uint8_t>> GetHostBuffer(
+      size_t layer_idx, size_t shard_idx) const;
+  // Mutable view of the const `GetHostBuffer()`, with the same error contract.
+  absl::StatusOr<absl::Span<uint8_t>> GetHostBuffer(size_t layer_idx,
+                                                    size_t shard_idx);
+
   int64_t NotifyForRead(const std::string& req_id, uint64_t uuid,
                         const std::vector<int64_t>& block_ids);
 
@@ -395,6 +406,18 @@ class KVCacheManager {
   }
   size_t GetHostSize(size_t layer_idx, size_t shard_idx) {
     return numa_manager_->GetHostSize(layer_idx, shard_idx);
+  }
+
+  // Host staging buffer of (|layer_idx|, global |shard_idx|); same error
+  // contract as `NumaAwareKVCacheManager::GetHostBuffer()` (OutOfRange: bad
+  // index; FailedPrecondition: the shard has no host buffer).
+  absl::StatusOr<absl::Span<uint8_t>> GetHostBuffer(size_t layer_idx,
+                                                    size_t shard_idx) {
+    return numa_manager_->GetHostBuffer(layer_idx, shard_idx);
+  }
+  absl::StatusOr<absl::Span<const uint8_t>> GetHostBuffer(
+      size_t layer_idx, size_t shard_idx) const {
+    return std::as_const(*numa_manager_).GetHostBuffer(layer_idx, shard_idx);
   }
 
   void RegisterKVBackends(absl::Span<const kv_cache::BackendConfig> configs) {

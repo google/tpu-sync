@@ -38,11 +38,13 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/base/log_severity.h"
 #include "absl/base/thread_annotations.h"
 #include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/flags/flag.h"
 #include "absl/log/check.h"
+#include "absl/log/scoped_mock_log.h"
 #include "absl/random/random.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
@@ -914,6 +916,131 @@ TEST(RawBufferTransportDelegateTest,
                   absl::StatusCode::kFailedPrecondition,
                   ::testing::HasSubstr("buffer_id 3 shard 1 has no host "
                                        "buffer")));
+}
+
+// The receiver logs the status of a rejected peer request before it closes the
+// connection, so the log carries the InvalidArgument and its cause.
+TEST(RawBufferTransportNoHostBufferTest, PeerPullIsInvalidArgumentWithCause) {
+  absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);
+  EXPECT_CALL(log, Log(absl::LogSeverity::kError, ::testing::_,
+                       ::testing::HasSubstr(
+                           "ProcessPeerRequest failed: INVALID_ARGUMENT: "
+                           "Source out of bounds: buffer_id 3 shard 1 has no "
+                           "host buffer")));
+  log.StartCapturingLogs();
+  NoHostBufferDelegate src;
+  RawBufferTransport src_transport(&src, kLocalPort);
+  TF_ASSERT_OK_AND_ASSIGN(const int client_fd,
+                       ConnectToPeer(GetIpPort(src_transport)));
+  ChunkHeader header = {};
+  header.version = 1;
+  header.op = kOpBufferPull;
+  header.buffer_id = 3;
+  header.local_id = 1;
+  header.count_or_size = 16;
+  const auto s_header = SerializeChunkHeader(header);
+  ASSERT_OK(WriteExact(client_fd, s_header.data(), s_header.size()));
+
+  // The receiver closes the connection without sending data.
+  std::vector<uint8_t> data(16);
+  EXPECT_FALSE(ReadExact(client_fd, data.data(), data.size()).ok());
+  close(client_fd);
+}
+
+TEST(RawBufferTransportNoHostBufferTest, PeerPushIsInvalidArgumentWithCause) {
+  absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);
+  EXPECT_CALL(log, Log(absl::LogSeverity::kError, ::testing::_,
+                       ::testing::HasSubstr(
+                           "ProcessPeerRequest failed: INVALID_ARGUMENT: "
+                           "Destination out of bounds: buffer_id 3 shard 1 "
+                           "has no host buffer")));
+  log.StartCapturingLogs();
+  NoHostBufferDelegate dst;
+  RawBufferTransport dst_transport(&dst, kLocalPort);
+  TF_ASSERT_OK_AND_ASSIGN(const int client_fd,
+                       ConnectToPeer(GetIpPort(dst_transport)));
+  ChunkHeader header = {};
+  header.version = 1;
+  header.op = kOpBufferPush;
+  header.buffer_id = 3;
+  header.local_id = 1;
+  header.count_or_size = 16;
+  const auto s_header = SerializeChunkHeader(header);
+  ASSERT_OK(WriteExact(client_fd, s_header.data(), s_header.size()));
+
+  // The receiver closes the connection without sending ACK=1.
+  uint8_t ack = 0;
+  EXPECT_FALSE(ReadExact(client_fd, &ack, 1).ok());
+  close(client_fd);
+}
+
+TEST(RawBufferTransportNoHostBufferTest,
+     PeerBatchedPushIsInvalidArgumentWithCause) {
+  absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);
+  EXPECT_CALL(log, Log(absl::LogSeverity::kError, ::testing::_,
+                       ::testing::HasSubstr(
+                           "ProcessPeerRequest failed: INVALID_ARGUMENT: "
+                           "Destination host pointer is null in batched push: "
+                           "buffer_id 3 shard 1 has no host buffer")));
+  log.StartCapturingLogs();
+  NoHostBufferDelegate dst;
+  RawBufferTransport dst_transport(&dst, kLocalPort);
+  TF_ASSERT_OK_AND_ASSIGN(const int client_fd,
+                       ConnectToPeer(GetIpPort(dst_transport)));
+  constexpr uint16_t kVersion = 1;
+  ChunkHeader header = {};
+  header.version = kVersion;
+  header.op = kOpBufferPushBatched;
+  header.metadata_size = GetChunkMetadataSize(kVersion);
+  header.count_or_size = 1;
+  const auto s_header = SerializeChunkHeader(header);
+  const auto s_meta = SerializeChunkMetadata({.layer_idx = 3,
+                                              .dst_shard_idx = 1,
+                                              .dst_offset_bytes = 0,
+                                              .size_bytes = 16},
+                                             kVersion);
+  ASSERT_OK(WriteExact(client_fd, s_header.data(), s_header.size()));
+  ASSERT_OK(WriteExact(client_fd, s_meta.data(), s_meta.size()));
+
+  // The receiver closes the connection without sending ACK=1.
+  uint8_t ack = 0;
+  EXPECT_FALSE(ReadExact(client_fd, &ack, 1).ok());
+  close(client_fd);
+}
+
+TEST(RawBufferTransportNoHostBufferTest, PullBufferIsInvalidArgumentWithCause) {
+  RawMockDelegate src(/*buffer_size=*/64);
+  NoHostBufferDelegate dst;
+  RawBufferTransport src_transport(&src, kLocalPort);
+  RawBufferTransport dst_transport(&dst, kLocalPort);
+
+  EXPECT_THAT(
+      dst_transport.PullBuffer(GetIpPort(src_transport), /*buffer_id=*/3,
+                               kSrcShardIdx, /*src_offset_bytes=*/0,
+                               /*dst_shard_idx=*/1, /*dst_offset_bytes=*/0,
+                               /*size_bytes=*/16),
+      ::absl_testing::StatusIs(
+          absl::StatusCode::kInvalidArgument,
+          ::testing::HasSubstr("Destination host pointer is null: buffer_id 3 "
+                               "shard 1 has no host buffer")));
+}
+
+TEST(RawBufferTransportNoHostBufferTest,
+     ZeroBytePullBufferIsInvalidArgumentWithCause) {
+  RawMockDelegate src(/*buffer_size=*/64);
+  NoHostBufferDelegate dst;
+  RawBufferTransport src_transport(&src, kLocalPort);
+  RawBufferTransport dst_transport(&dst, kLocalPort);
+
+  EXPECT_THAT(
+      dst_transport.PullBuffer(GetIpPort(src_transport), /*buffer_id=*/3,
+                               kSrcShardIdx, /*src_offset_bytes=*/0,
+                               /*dst_shard_idx=*/1, /*dst_offset_bytes=*/0,
+                               /*size_bytes=*/0),
+      ::absl_testing::StatusIs(
+          absl::StatusCode::kInvalidArgument,
+          ::testing::HasSubstr("Destination host pointer is null: buffer_id 3 "
+                               "shard 1 has no host buffer")));
 }
 
 TEST_P(RawBufferTransportTest,

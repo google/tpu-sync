@@ -24,8 +24,11 @@
 #include <utility>
 #include <vector>
 
+#include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/types/span.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/plugin/xla_cpu/xla_cpu_pjrt_client.h"
 #include "xla/tsl/platform/statusor.h"
@@ -36,6 +39,7 @@
 #include "tpu_sync/core/controller/test_util.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/frameworks/jax/kv_cache_manager.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
@@ -44,6 +48,9 @@ namespace tpu_raiden {
 namespace kv_cache {
 namespace jax {
 namespace {
+
+using ::absl_testing::StatusIs;
+using ::testing::HasSubstr;
 
 struct StartReadCall {
   std::string req_id;
@@ -108,12 +115,26 @@ class MockSubManager : public KVCacheManagerWithTransfer {
       return std::make_pair(std::vector<int>(), raiden::PjRtCopyFuture());
     }
 
+    // Gives the manager |num_layers| host layers of one shard each, with no
+    // host buffer until `SetExternalHostPointers()` supplies one.
+    void InitHostLayers(size_t num_layers) {
+      std::vector<LayerInfoBase> layers(num_layers);
+      for (LayerInfoBase& layer : layers) {
+        layer.shards.resize(1);
+      }
+      layers_ = StagingArena(std::move(layers));
+    }
+
    private:
     MockSubManager* parent_;
   };
 
   MockSubManager()
       : KVCacheManagerWithTransfer(std::make_unique<MockBase>(this)) {}
+
+  void InitHostLayers(size_t num_layers) {
+    static_cast<MockBase*>(base())->InitHostLayers(num_layers);
+  }
 
   std::vector<std::string> sending, recving, failed;
   std::string started_ep;
@@ -801,6 +822,144 @@ TEST(KVCacheManagerWrapperTest, ConstructorWithRawPjRtBuffersSucceeds) {
   EXPECT_EQ(manager->num_layers(), 1);
   EXPECT_EQ(manager->num_shards(), 1);
   EXPECT_EQ(manager->slice_byte_size(), 1024 * sizeof(float));
+}
+
+constexpr size_t kNumHostLayers = 2;
+
+TEST(KVCacheManagerWrapperTest, GetHostBufferMapsGlobalShardToSubManager) {
+  auto sub0 = std::make_unique<MockSubManager>();
+  auto sub1 = std::make_unique<MockSubManager>();
+  MockSubManager* ptr0 = sub0.get();
+  MockSubManager* ptr1 = sub1.get();
+  ptr0->InitHostLayers(kNumHostLayers);
+  ptr1->InitHostLayers(kNumHostLayers);
+  // Distinct sizes per (sub-manager, layer) so a wrong mapping is visible.
+  std::vector<uint8_t> sub0_layer0(64), sub0_layer1(128);
+  std::vector<uint8_t> sub1_layer0(192), sub1_layer1(256);
+  ptr0->base()->SetExternalHostPointers(
+      {sub0_layer0.data(), sub0_layer1.data()},
+      {sub0_layer0.size(), sub0_layer1.size()});
+  ptr1->base()->SetExternalHostPointers(
+      {sub1_layer0.data(), sub1_layer1.data()},
+      {sub1_layer0.size(), sub1_layer1.size()});
+  std::vector<std::unique_ptr<KVCacheManagerWithTransfer>> subs;
+  subs.push_back(std::move(sub0));
+  subs.push_back(std::move(sub1));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<KVCacheManager> mgr,
+                       KVCacheManager::Create(std::move(subs)));
+
+  // Create(sub_managers) maps global shard i to local shard 0 of sub-manager i.
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> global0, mgr->GetHostBuffer(1, 0));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> sub0_own,
+                       ptr0->base()->GetHostBuffer(1, 0));
+  EXPECT_EQ(global0.data(), sub0_layer1.data());
+  EXPECT_EQ(global0.data(), sub0_own.data());
+  EXPECT_EQ(global0.size(), sub0_own.size());
+  EXPECT_EQ(global0.size(), 128);
+
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> global1, mgr->GetHostBuffer(1, 1));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> sub1_own,
+                       ptr1->base()->GetHostBuffer(1, 0));
+  EXPECT_EQ(global1.data(), sub1_layer1.data());
+  EXPECT_EQ(global1.data(), sub1_own.data());
+  EXPECT_EQ(global1.size(), sub1_own.size());
+  EXPECT_EQ(global1.size(), 256);
+}
+
+TEST(KVCacheManagerWrapperTest, GetHostBufferGlobalShardBeyondMapIsOutOfRange) {
+  auto sub0 = std::make_unique<MockSubManager>();
+  auto sub1 = std::make_unique<MockSubManager>();
+  sub0->InitHostLayers(kNumHostLayers);
+  sub1->InitHostLayers(kNumHostLayers);
+  std::vector<uint8_t> sub1_layer0(64), sub1_layer1(128);
+  sub1->base()->SetExternalHostPointers(
+      {sub1_layer0.data(), sub1_layer1.data()},
+      {sub1_layer0.size(), sub1_layer1.size()});
+  std::vector<std::unique_ptr<KVCacheManagerWithTransfer>> subs;
+  subs.push_back(std::move(sub0));
+  subs.push_back(std::move(sub1));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<KVCacheManager> mgr,
+                       KVCacheManager::Create(std::move(subs)));
+
+  // The last mapped global shard resolves; the next one is a bad index.
+  ABSL_EXPECT_OK(mgr->GetHostBuffer(0, 1));
+  EXPECT_THAT(mgr->GetHostBuffer(0, 2),
+              StatusIs(absl::StatusCode::kOutOfRange,
+                       HasSubstr("shard_idx 2 out of range: 2 global shards")));
+}
+
+TEST(KVCacheManagerWrapperTest, GetHostBufferPropagatesSubManagerBadLayer) {
+  auto sub0 = std::make_unique<MockSubManager>();
+  auto sub1 = std::make_unique<MockSubManager>();
+  sub0->InitHostLayers(kNumHostLayers);
+  sub1->InitHostLayers(kNumHostLayers);
+  std::vector<uint8_t> sub1_layer0(64), sub1_layer1(128);
+  sub1->base()->SetExternalHostPointers(
+      {sub1_layer0.data(), sub1_layer1.data()},
+      {sub1_layer0.size(), sub1_layer1.size()});
+  std::vector<std::unique_ptr<KVCacheManagerWithTransfer>> subs;
+  subs.push_back(std::move(sub0));
+  subs.push_back(std::move(sub1));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<KVCacheManager> mgr,
+                       KVCacheManager::Create(std::move(subs)));
+
+  ABSL_EXPECT_OK(mgr->GetHostBuffer(kNumHostLayers - 1, 1));
+  EXPECT_THAT(mgr->GetHostBuffer(kNumHostLayers, 1),
+              StatusIs(absl::StatusCode::kOutOfRange,
+                       HasSubstr("layer_idx 2 out of range: 2 host layers")));
+}
+
+TEST(KVCacheManagerWrapperTest, GetHostBufferPropagatesMissingHostBuffer) {
+  auto sub0 = std::make_unique<MockSubManager>();
+  auto sub1 = std::make_unique<MockSubManager>();
+  sub0->InitHostLayers(kNumHostLayers);
+  sub1->InitHostLayers(kNumHostLayers);
+  // Only sub-manager 0 (global shard 0) gets host buffers.
+  std::vector<uint8_t> sub0_layer0(64), sub0_layer1(128);
+  sub0->base()->SetExternalHostPointers(
+      {sub0_layer0.data(), sub0_layer1.data()},
+      {sub0_layer0.size(), sub0_layer1.size()});
+  std::vector<std::unique_ptr<KVCacheManagerWithTransfer>> subs;
+  subs.push_back(std::move(sub0));
+  subs.push_back(std::move(sub1));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<KVCacheManager> mgr,
+                       KVCacheManager::Create(std::move(subs)));
+
+  ABSL_EXPECT_OK(mgr->GetHostBuffer(0, 0));
+  EXPECT_THAT(mgr->GetHostBuffer(0, 1),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("layer 0 shard 0 has no host buffer")));
+}
+
+TEST(KVCacheManagerWrapperTest, ConstGetHostBufferForwardsToSubManager) {
+  auto sub0 = std::make_unique<MockSubManager>();
+  auto sub1 = std::make_unique<MockSubManager>();
+  MockSubManager* ptr1 = sub1.get();
+  sub0->InitHostLayers(kNumHostLayers);
+  ptr1->InitHostLayers(kNumHostLayers);
+  std::vector<uint8_t> sub1_layer0(64), sub1_layer1(128);
+  ptr1->base()->SetExternalHostPointers(
+      {sub1_layer0.data(), sub1_layer1.data()},
+      {sub1_layer0.size(), sub1_layer1.size()});
+  std::vector<std::unique_ptr<KVCacheManagerWithTransfer>> subs;
+  subs.push_back(std::move(sub0));
+  subs.push_back(std::move(sub1));
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<KVCacheManager> mgr,
+                       KVCacheManager::Create(std::move(subs)));
+  const KVCacheManager& const_mgr = *mgr;
+  const kv_cache::KVCacheManagerBase& const_sub1 = *ptr1->base();
+
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> global1,
+                       const_mgr.GetHostBuffer(1, 1));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> sub1_own,
+                       const_sub1.GetHostBuffer(1, 0));
+  EXPECT_EQ(global1.data(), sub1_layer1.data());
+  EXPECT_EQ(global1.data(), sub1_own.data());
+  EXPECT_EQ(global1.size(), sub1_own.size());
+  EXPECT_EQ(global1.size(), 128);
+  EXPECT_THAT(const_mgr.GetHostBuffer(1, 2),
+              StatusIs(absl::StatusCode::kOutOfRange,
+                       HasSubstr("shard_idx 2 out of range: 2 global shards")));
 }
 
 }  // namespace

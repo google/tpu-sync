@@ -2040,7 +2040,8 @@ TEST_P(BlockTransportTest, PushBufferCorrectness) {
       /*uuid=*/0);
   ABSL_EXPECT_OK(push_res) << push_res.message();
 
-  const uint8_t* dst_buf = dst.GetHostPointer(0, 0);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> dst_host, dst.GetHostBuffer(0, 0));
+  const uint8_t* dst_buf = dst_host.data();
   EXPECT_THAT(absl::MakeConstSpan(dst_buf, kDstOffset), Each(Eq(0)));
   EXPECT_THAT(absl::MakeConstSpan(dst_buf + kDstOffset, kLen),
               Pointwise(Eq(), absl::MakeConstSpan(push_payload)));
@@ -2057,7 +2058,8 @@ TEST_P(BlockTransportTest, PullBufferCorrectness) {
   constexpr size_t kLen = 62 * 1024;
   constexpr size_t kSrcOffset = 256;
   constexpr size_t kDstOffset = 512;
-  uint8_t* src_buf = src.GetHostPointer(0, 0);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> src_host, src.GetHostBuffer(0, 0));
+  uint8_t* src_buf = src_host.data();
   for (size_t i = 0; i < size; ++i) {
     src_buf[i] = static_cast<uint8_t>((i % 255) + 1);
   }
@@ -2075,7 +2077,8 @@ TEST_P(BlockTransportTest, PullBufferCorrectness) {
       /*dst_offset_bytes=*/kDstOffset, kLen);
   ABSL_EXPECT_OK(pull_res) << pull_res.message();
 
-  const uint8_t* dst_buf = dst.GetHostPointer(0, 0);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> dst_host, dst.GetHostBuffer(0, 0));
+  const uint8_t* dst_buf = dst_host.data();
   EXPECT_THAT(absl::MakeConstSpan(dst_buf, kDstOffset), Each(Eq(0)));
   EXPECT_THAT(absl::MakeConstSpan(dst_buf + kDstOffset, kLen),
               Pointwise(Eq(), absl::MakeConstSpan(src_buf + kSrcOffset, kLen)));

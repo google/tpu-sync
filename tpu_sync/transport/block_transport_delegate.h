@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
@@ -102,16 +103,23 @@ class BlockTransportDelegate : public lib::RawBufferTransportDelegate {
   // whose data() is nullptr means the delegate exposes no flat host base for
   // the array (only per-block pointers), so callers cannot bounds-check
   // against it. A non-OK status means the span could not be resolved, e.g.
-  // no staging slot is leased for |uuid| or the array does not fit its
-  // backing host buffer.
+  // no staging slot is leased for |uuid|, the array does not fit its
+  // backing host buffer, or |block_array_idx| / |shard_idx| is out of range.
+  // The default views GetHostBuffer(): a target without a host buffer yields
+  // the OK empty span, and every other error propagates (e.g. OutOfRange for
+  // a bad |block_array_idx| or a layer with no shards).
   virtual absl::StatusOr<absl::Span<const char>> GetBlockArrayHostSpan(
       size_t block_array_idx, size_t shard_idx, uint64_t uuid = 0) {
-    const uint8_t* ptr = GetHostPointer(block_array_idx, shard_idx);
-    if (ptr == nullptr) {
+    absl::StatusOr<absl::Span<const uint8_t>> host_buffer =
+        std::as_const(*this).GetHostBuffer(block_array_idx, shard_idx);
+    if (absl::IsFailedPrecondition(host_buffer.status())) {
+      // No host buffer: this delegate exposes no flat host base (see above).
       return absl::Span<const char>();
     }
-    return absl::Span<const char>(reinterpret_cast<const char*>(ptr),
-                                  GetHostSize(block_array_idx, shard_idx));
+    ABSL_RETURN_IF_ERROR(host_buffer.status());
+    return absl::Span<const char>(
+        reinterpret_cast<const char*>(host_buffer->data()),
+        host_buffer->size());
   }
 
   // Returns the active node ID (rank) of the worker.

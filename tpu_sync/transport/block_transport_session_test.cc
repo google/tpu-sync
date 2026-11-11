@@ -272,8 +272,9 @@ TEST(ValidateChunksTest, BoundsChecksChunksAgainstHostSpan) {
   MockSessionDelegate delegate(/*slice_size=*/1024, /*max_blocks=*/4);
   const std::vector<BlockChunk> in_bounds = delegate.GetBlockChunks(
       /*layer=*/0, /*shard=*/0, std::vector<int64_t>{0, 3});
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> host, delegate.GetHostBuffer(0, 0));
   const std::vector<BlockChunk> past_end = {
-      {.ptr = delegate.GetHostPointer(0, 0) + 3 * 1024 + 1, .size = 1024}};
+      {.ptr = host.data() + 3 * 1024 + 1, .size = 1024}};
 
   ABSL_EXPECT_OK(ValidateChunks(&delegate, 0, 0, /*uuid=*/7, in_bounds));
   EXPECT_THAT(ValidateChunks(&delegate, 0, 0, /*uuid=*/7, past_end),
@@ -294,9 +295,9 @@ TEST(ValidateChunksTest, PropagatesHostSpanError) {
 
 TEST(ValidateChunksTest, SkipsDelegateWithoutFlatHostBase) {
   FixedHostSpanDelegate delegate((absl::Span<const char>()));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> host, delegate.GetHostBuffer(0, 0));
   const std::vector<BlockChunk> past_end = {
-      {.ptr = delegate.GetHostPointer(0, 0) + delegate.GetHostSize(0, 0),
-       .size = 1024}};
+      {.ptr = host.data() + host.size(), .size = 1024}};
 
   ABSL_EXPECT_OK(ValidateChunks(&delegate, 0, 0, /*uuid=*/7, past_end));
 }

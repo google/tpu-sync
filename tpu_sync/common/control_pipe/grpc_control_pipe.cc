@@ -19,7 +19,6 @@
 #include <list>
 #include <memory>
 #include <string>
-#include <thread>  // NOLINT(build/c++11)
 #include <utility>
 
 #include "absl/log/log.h"
@@ -333,21 +332,6 @@ absl::StatusOr<int> GrpcControlPipeServer::Start(int requested_port) {
   }
   bound_port_ = selected_port;
   return bound_port_;
-}
-
-void GrpcControlPipeServer::StopAccepting() {
-  std::unique_ptr<grpc::Server> server_to_stop;
-  {
-    absl::MutexLock lock(mu_);
-    server_to_stop = std::move(grpc_server_);
-  }
-  if (server_to_stop) {
-    std::thread([server = std::move(server_to_stop)]() mutable {
-      server->Shutdown(std::chrono::system_clock::now() +
-                       std::chrono::milliseconds(500));
-      server->Wait();
-    }).detach();
-  }
 }
 
 void GrpcControlPipeServer::Stop() {

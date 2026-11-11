@@ -28,10 +28,12 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/cleanup/cleanup.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "grpcpp/channel.h"
@@ -780,6 +782,145 @@ TEST(ControlPipeTest, GrpcCustomCredentialFactoryPropagatesErrors) {
                                ::testing::HasSubstr("client creds denied")));
   EXPECT_EQ(client.TEST_CachedStubCount(), 0);
   EXPECT_EQ(client_fail_factory->client_calls(), 2);
+}
+
+TEST(ControlPipeTest, GrpcStopWaitsForInFlightHandler) {
+  ControlPipeConfig cfg;
+  cfg.backend_type = ControlPipeBackendType::kGrpc;
+  GrpcControlPipeServer server(cfg);
+
+  absl::Notification handler_entered;
+  absl::Notification release_handler;
+  absl::Notification stop_returned;
+  server.dispatcher().RegisterHandler<PullStreamRequest, PullStreamResponse>(
+      [&handler_entered, &release_handler](
+          const ControlContext& /*ctx*/,
+          const PullStreamRequest& req) -> absl::StatusOr<PullStreamResponse> {
+        handler_entered.Notify();
+        release_handler.WaitForNotification();
+        PullStreamResponse resp;
+        resp.set_status(0);
+        resp.set_num_layers(static_cast<int32_t>(req.uuid()));
+        return resp;
+      });
+
+  TF_ASSERT_OK_AND_ASSIGN(int port, server.Start(0));
+  std::string endpoint = absl::StrCat("127.0.0.1:", port);
+
+  GrpcControlPipeClient client(cfg);
+  absl::StatusOr<PullStreamResponse> client_resp;
+  std::jthread client_thread;
+  std::jthread stopper_thread;
+  auto release_guard = absl::MakeCleanup([&release_handler]() {
+    if (!release_handler.HasBeenNotified()) {
+      release_handler.Notify();
+    }
+  });
+
+  client_thread = std::jthread([&]() {
+    PullStreamRequest req;
+    req.set_uuid(123);
+    client_resp = client.Call<PullStreamRequest, PullStreamResponse>(
+        endpoint, req, absl::Seconds(30));
+  });
+
+  ASSERT_TRUE(
+      handler_entered.WaitForNotificationWithTimeout(absl::Seconds(10)));
+
+  stopper_thread = std::jthread([&]() {
+    server.Stop();
+    stop_returned.Notify();
+  });
+
+  // GrpcControlPipeServer::Stop() sets a 2s grpc::Server::Shutdown deadline.
+  // Waiting 3s exceeds that deadline while the synchronous handler is still
+  // blocked, proving Stop() waits in Server::Wait() until the handler exits.
+  EXPECT_FALSE(stop_returned.WaitForNotificationWithTimeout(absl::Seconds(3)));
+
+  release_handler.Notify();
+  ASSERT_TRUE(stop_returned.WaitForNotificationWithTimeout(absl::Seconds(10)));
+  stopper_thread.join();
+  client_thread.join();
+  // Exceeding grpc::Server::Shutdown's 2s deadline invokes
+  // Server::CancelAllCalls(), disconnecting the transport with
+  // UNAVAILABLE: Cancelling all calls.
+  EXPECT_THAT(client_resp, ::absl_testing::StatusIs(
+                               absl::StatusCode::kUnavailable,
+                               ::testing::HasSubstr("Cancelling all calls")));
+
+  PullStreamRequest after_req;
+  after_req.set_uuid(124);
+  absl::StatusOr<PullStreamResponse> after_resp =
+      client.Call<PullStreamRequest, PullStreamResponse>(endpoint, after_req,
+                                                         absl::Seconds(5));
+  EXPECT_THAT(after_resp,
+              ::absl_testing::StatusIs(absl::StatusCode::kUnavailable));
+
+  // ControlPipeServer::Stop() is safe to call multiple times.
+  server.Stop();
+}
+
+TEST(ControlPipeTest, GrpcStopCompletesInFlightHandlerWithinGracePeriod) {
+  ControlPipeConfig cfg;
+  cfg.backend_type = ControlPipeBackendType::kGrpc;
+  GrpcControlPipeServer server(cfg);
+
+  absl::Notification handler_entered;
+  absl::Notification release_handler;
+  absl::Notification stop_returned;
+  server.dispatcher().RegisterHandler<PullStreamRequest, PullStreamResponse>(
+      [&handler_entered, &release_handler](
+          const ControlContext& /*ctx*/,
+          const PullStreamRequest& req) -> absl::StatusOr<PullStreamResponse> {
+        handler_entered.Notify();
+        release_handler.WaitForNotification();
+        PullStreamResponse resp;
+        resp.set_status(0);
+        resp.set_num_layers(static_cast<int32_t>(req.uuid() + 1));
+        return resp;
+      });
+
+  TF_ASSERT_OK_AND_ASSIGN(int port, server.Start(0));
+  std::string endpoint = absl::StrCat("127.0.0.1:", port);
+
+  GrpcControlPipeClient client(cfg);
+  absl::StatusOr<PullStreamResponse> client_resp;
+  std::jthread client_thread;
+  std::jthread stopper_thread;
+  auto release_guard = absl::MakeCleanup([&release_handler]() {
+    if (!release_handler.HasBeenNotified()) {
+      release_handler.Notify();
+    }
+  });
+
+  client_thread = std::jthread([&]() {
+    PullStreamRequest req;
+    req.set_uuid(41);
+    client_resp = client.Call<PullStreamRequest, PullStreamResponse>(
+        endpoint, req, absl::Seconds(30));
+  });
+
+  ASSERT_TRUE(
+      handler_entered.WaitForNotificationWithTimeout(absl::Seconds(10)));
+
+  stopper_thread = std::jthread([&]() {
+    server.Stop();
+    stop_returned.Notify();
+  });
+
+  // Well inside the 2s Shutdown deadline: Stop() must still wait for the
+  // in-flight handler before returning.
+  EXPECT_FALSE(
+      stop_returned.WaitForNotificationWithTimeout(absl::Milliseconds(250)));
+
+  release_handler.Notify();
+  ASSERT_TRUE(stop_returned.WaitForNotificationWithTimeout(absl::Seconds(10)));
+  stopper_thread.join();
+  client_thread.join();
+
+  TF_ASSERT_OK_AND_ASSIGN(PullStreamResponse resp, client_resp);
+  EXPECT_EQ(resp.status(), 0);
+  EXPECT_EQ(resp.num_layers(), 42);
 }
 
 }  // namespace

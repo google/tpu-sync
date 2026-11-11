@@ -91,12 +91,15 @@ WeightSynchronizerListener::WeightSynchronizerListener(
                  const ::tpu_sync::rpc::ControlRequest& req)
               -> absl::StatusOr<::tpu_sync::rpc::ControlResponse> {
             ::tpu_sync::rpc::ControlResponse resp;
-            ExecuteControlRequest(engine_, req, &resp, [this]() {
-              stopping_.store(true);
-              if (pipe_server_) {
-                pipe_server_->StopAccepting();
-              }
-            });
+            if (req.command() ==
+                    ::tpu_sync::rpc::ControlRequest::COMMAND_START_TRANSFER &&
+                stopping_.load()) {
+              resp.set_success(false);
+              resp.set_message("WeightSynchronizerListener is stopping");
+              return resp;
+            }
+            ExecuteControlRequest(engine_, req, &resp,
+                                  [this]() { stopping_.store(true); });
             return resp;
           },
           HandlerOptions<::tpu_sync::rpc::ControlRequest>().WithMaxPayloadBytes(

@@ -32,13 +32,9 @@ class ControlPipeServer {
   virtual absl::StatusOr<int> Start(int requested_port) = 0;
 
   // Gracefully stops the server and waits for all in-flight handler tasks
-  // to complete. Safe to call multiple times.
+  // to complete. Safe to call multiple times. Must not be called from inside
+  // a handler executing on this server (including registered gRPC services).
   virtual void Stop() = 0;
-
-  // Immediately stops accepting new connections (closing the listening socket)
-  // while allowing currently executing handler tasks to finish sending their
-  // responses without deadlocking if called from inside a handler callback.
-  virtual void StopAccepting() {}
 
   virtual int bound_port() const = 0;
   virtual ControlDispatcher& dispatcher() = 0;

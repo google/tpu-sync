@@ -47,8 +47,10 @@ class GrpcControlPipeServer : public ControlPipeServer {
   ~GrpcControlPipeServer() override;
 
   absl::StatusOr<int> Start(int requested_port) override;
+  // Stops the gRPC server and waits for all in-flight handlers to complete.
+  // Safe to call multiple times. Must not be called from inside a handler
+  // executing on this server (including registered gRPC services).
   void Stop() override;
-  void StopAccepting() override;
 
   int bound_port() const override { return bound_port_; }
   ControlDispatcher& dispatcher() override { return dispatcher_; }

@@ -95,7 +95,6 @@ class TcpControlPipeServer : public ControlPipeServer {
 
   absl::StatusOr<int> Start(int requested_port) override;
   void Stop() override;
-  void StopAccepting() override;
 
   int bound_port() const override { return bound_port_; }
   ControlDispatcher& dispatcher() override { return dispatcher_; }

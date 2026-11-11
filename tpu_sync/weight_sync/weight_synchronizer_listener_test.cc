@@ -214,6 +214,11 @@ TEST(WeightSynchronizerListenerTest, ShutdownCommandGrpcStopsService) {
                            endpoint, req, absl::Seconds(10))));
   EXPECT_TRUE(resp.success());
   EXPECT_FALSE(listener.is_active());
+
+  listener.Shutdown();
+  EXPECT_FALSE((client->Call<ControlRequest, ControlResponse>(endpoint, req,
+                                                              absl::Seconds(5)))
+                   .ok());
 }
 
 TEST(WeightSynchronizerListenerTest, PushWeightsCommandTcpLegacySuccess) {
@@ -311,7 +316,72 @@ TEST(WeightSynchronizerListenerTest, ShutdownCommandTcpLegacyStopsService) {
   EXPECT_TRUE(resp.success());
 
   close(sock);
+  EXPECT_FALSE(listener.is_active());
+  int probe = ConnectToListenerPort(listener.listener_port());
+  EXPECT_GE(probe, 0);
+  if (probe >= 0) {
+    close(probe);
+  }
+  listener.Shutdown();
   EXPECT_LT(ConnectToListenerPort(listener.listener_port()), 0);
+}
+
+TEST(WeightSynchronizerListenerTest, StartTransferRejectedAfterShutdown) {
+  for (ControlPipeBackendType backend :
+       {ControlPipeBackendType::kGrpc, ControlPipeBackendType::kTcp}) {
+    SCOPED_TRACE(ControlPipeBackendTypeName(backend));
+    TF_ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<WeightSynchronizerBase> engine_ptr,
+        WeightSynchronizerBase::Create(
+            /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+            /*local_port=*/0, /*host_blocks_to_allocate=*/std::nullopt,
+            /*parallelism=*/1, /*listener_port=*/std::nullopt));
+    TF_ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<WeightSynchronizerBase> dst_engine_ptr,
+        WeightSynchronizerBase::Create(
+            /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+            /*local_port=*/0, /*host_blocks_to_allocate=*/1,
+            /*parallelism=*/1, /*listener_port=*/std::nullopt));
+    ASSERT_TRUE(dst_engine_ptr->local_port().has_value());
+
+    WeightSynchronizerListener listener(engine_ptr.get(), /*listener_port=*/0,
+                                        backend);
+    ASSERT_GT(listener.listener_port(), 0);
+    EXPECT_TRUE(listener.is_active());
+
+    ControlPipeConfig cfg;
+    cfg.backend_type = backend;
+    std::unique_ptr<ControlPipeClient> client = CreateControlPipeClient(cfg);
+    const std::string endpoint =
+        absl::StrCat("127.0.0.1:", listener.listener_port());
+
+    ControlRequest transfer_req;
+    transfer_req.set_command(ControlRequest::COMMAND_START_TRANSFER);
+    transfer_req.mutable_start_transfer_request()->set_is_sender(true);
+    transfer_req.add_peers(
+        absl::StrCat("127.0.0.1:", *dst_engine_ptr->local_port()));
+
+    TF_ASSERT_OK_AND_ASSIGN(ControlResponse pre_resp,
+                         (client->Call<ControlRequest, ControlResponse>(
+                             endpoint, transfer_req, absl::Seconds(10))));
+    EXPECT_TRUE(pre_resp.success()) << pre_resp.message();
+
+    ControlRequest shutdown_req;
+    shutdown_req.set_command(ControlRequest::COMMAND_SHUTDOWN);
+    TF_ASSERT_OK_AND_ASSIGN(ControlResponse shutdown_resp,
+                         (client->Call<ControlRequest, ControlResponse>(
+                             endpoint, shutdown_req, absl::Seconds(10))));
+    EXPECT_TRUE(shutdown_resp.success()) << shutdown_resp.message();
+    EXPECT_FALSE(listener.is_active());
+
+    // The server keeps accepting connections until Shutdown() / destruction,
+    // but new START_TRANSFER requests are rejected once stopping begins.
+    TF_ASSERT_OK_AND_ASSIGN(ControlResponse post_resp,
+                         (client->Call<ControlRequest, ControlResponse>(
+                             endpoint, transfer_req, absl::Seconds(10))));
+    EXPECT_FALSE(post_resp.success());
+    EXPECT_EQ(post_resp.message(), "WeightSynchronizerListener is stopping");
+  }
 }
 
 TEST(WeightSynchronizerListenerTest, PushWeightsReshardedSuccess) {

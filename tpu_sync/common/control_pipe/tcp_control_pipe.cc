@@ -442,15 +442,6 @@ void TcpControlPipeServer::Stop() {
   mu_.Await(absl::Condition(&all_handlers_done));
 }
 
-void TcpControlPipeServer::StopAccepting() {
-  absl::MutexLock lock(mu_);
-  if (server_fd_ >= 0) {
-    shutdown(server_fd_, SHUT_RDWR);
-    close(server_fd_);
-    server_fd_ = -1;
-  }
-}
-
 void TcpControlPipeServer::AcceptLoop() {
   while (true) {
     int current_server_fd = -1;

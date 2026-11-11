@@ -1088,10 +1088,14 @@ TEST_F(MetricsApiTest, InitializeFromEnvironmentReadsEnvVar) {
                   Pair("tpu_raiden_sent_bytes_total", ElementsAre(10.0))));
 }
 
-TEST_F(MetricsApiTest, InitializeFromEnvironmentEmptyOrUnsetNoOp) {
-  ASSERT_OK(store_.InitializeFromEnvironment());
-  EXPECT_FALSE(store_.HasBackends());
+TEST_F(MetricsApiTest, InitializeFromEnvironmentDefaultOrEmpty) {
+  {
+    ScopedEnvironmentVariable env_var(kTelemetryBackendsEnvVar, nullptr);
+    ASSERT_OK(store_.InitializeFromEnvironment());
+    EXPECT_TRUE(store_.HasBackends());
+  }
 
+  store_.SetBackends({});
   {
     ScopedEnvironmentVariable env_var(kTelemetryBackendsEnvVar, "   ,  , ");
     ASSERT_OK(store_.InitializeFromEnvironment());

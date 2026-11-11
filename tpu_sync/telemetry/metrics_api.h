@@ -68,8 +68,8 @@ class RaidenMetricStore {
   RaidenMetricStore& operator=(RaidenMetricStore&&) = delete;
 
   // Inspects the TPU_RAIDEN_TELEMETRY_BACKENDS environment variable and
-  // initializes backends. Returns OkStatus() if backends are already
-  // configured, if the variable is unset, or on success. Returns
+  // initializes backends (defaulting to "buffered" when unset). Returns
+  // OkStatus() if backends are already configured or on success. Returns
   // InvalidArgumentError if any backend token in the environment variable is
   // invalid.
   [[nodiscard]] absl::Status InitializeFromEnvironment();

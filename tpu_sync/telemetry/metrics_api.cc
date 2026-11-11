@@ -208,7 +208,7 @@ absl::Status RaidenMetricStore::InitializeFromEnvironment() {
   }
   const char* env = std::getenv(kTelemetryBackendsEnvVar);
   if (env == nullptr) {
-    return absl::OkStatus();
+    return InitializeFromBackendNames({kBuffered});
   }
   std::vector<absl::string_view> backend_names =
       absl::StrSplit(env, absl::ByChar(','), absl::SkipWhitespace());

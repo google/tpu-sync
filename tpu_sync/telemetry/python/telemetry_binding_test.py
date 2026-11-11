@@ -86,7 +86,9 @@ class TelemetryBindingTest(absltest.TestCase):
   def test_configure_telemetry_no_args_initializes_from_environment_unset(self):
     with mock.patch.dict(os.environ, {}, clear=True):
       telemetry_ext.configure_telemetry()
-      self.assertEqual(telemetry_ext.get_metric_metadata(), [])
+      self.assertEqual(
+          telemetry_ext.get_metric_metadata(), telemetry_ext.ALL_METRICS
+      )
       self.assertEqual(telemetry_ext.get_raiden_metrics_prometheus_text(), "")
 
   def test_configure_telemetry_no_args_initializes_from_environment_prometheus(

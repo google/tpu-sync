@@ -50,7 +50,6 @@ import importlib.metadata
 import os
 import pathlib
 import re
-import shutil
 import subprocess
 import sys
 import urllib.error
@@ -90,10 +89,7 @@ def _run(*args: str, **kwargs) -> None:
 
 
 def _pip_install(*args: str) -> None:
-  if shutil.which('uv'):
-    _run('uv', 'pip', 'install', '--quiet', '--python', sys.executable, *args)
-  else:
-    _run(sys.executable, '-m', 'pip', 'install', '--quiet', *args)
+  _run(sys.executable, '-m', 'pip', 'install', '--quiet', *args)
 
 
 def _authorize_torch_tpu_index() -> None:

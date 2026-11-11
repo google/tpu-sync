@@ -197,6 +197,7 @@ cc_library(
         "@com_google_absl//absl/functional:any_invocable",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
@@ -928,6 +929,25 @@ cc_test(
         "@xla//xla/tsl/platform:statusor",
         "@xla//xla/tsl/platform:test",
         "@xla//xla/tsl/platform:test_main",
+    ],
+)
+
+cc_test(
+    name = "raiden_manager_base_host_buffer_test",
+    srcs = ["raiden_manager_base_host_buffer_test.cc"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    tags = ["no_oss"],
+    deps = [
+        ":raiden_manager_base",
+        "//tpu_sync/transport:block_transport_delegate",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
     ],
 )
 

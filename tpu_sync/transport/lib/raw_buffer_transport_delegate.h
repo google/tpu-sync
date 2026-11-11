@@ -20,7 +20,10 @@
 #include <memory>
 
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "absl/types/span.h"
 #include "grpcpp/channel.h"
 
 namespace tpu_raiden::transport::lib {
@@ -38,6 +41,34 @@ class RawBufferTransportDelegate {
 
   // Authoritative total byte capacity of the target shard staging buffer.
   virtual size_t GetHostSize(size_t buffer_id, size_t shard_idx) = 0;
+
+  // Host staging buffer of (|buffer_id|, |shard_idx|). Returns
+  // FailedPrecondition exactly when the target has no host buffer, and
+  // OutOfRange exactly when |buffer_id| or |shard_idx| is out of range; callers
+  // rely on this distinction. An OK span has a non-null `data()` and may be
+  // empty. This default cannot tell the two cases apart, because
+  // `GetHostPointer()` returns nullptr for both, so it reports every nullptr
+  // as FailedPrecondition; overrides must distinguish them.
+  virtual absl::StatusOr<absl::Span<uint8_t>> GetHostBuffer(size_t buffer_id,
+                                                            size_t shard_idx) {
+    uint8_t* host_ptr = GetHostPointer(buffer_id, shard_idx);
+    if (host_ptr == nullptr) {
+      return absl::FailedPreconditionError(absl::StrCat("buffer_id ", buffer_id,
+                                                        " shard ", shard_idx,
+                                                        " has no host buffer"));
+    }
+    return absl::Span<uint8_t>(host_ptr, GetHostSize(buffer_id, shard_idx));
+  }
+  // Const view of (|buffer_id|, |shard_idx|) with the same error contract. The
+  // default delegates to mutable `GetHostBuffer(|buffer_id|, |shard_idx|)`
+  // because `GetHostPointer()`/`GetHostSize()` are non-const on legacy
+  // delegates.
+  virtual absl::StatusOr<absl::Span<const uint8_t>> GetHostBuffer(
+      size_t buffer_id, size_t shard_idx) const {
+    // `GetHostPointer()`/`GetHostSize()` are non-const on legacy delegates.
+    return const_cast<RawBufferTransportDelegate*>(this)->GetHostBuffer(
+        buffer_id, shard_idx);
+  }
 
   // Notification triggered upon verified data chunk arrival for a specific
   // layer/tensor.

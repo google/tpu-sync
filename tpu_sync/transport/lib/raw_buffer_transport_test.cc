@@ -869,6 +869,53 @@ TEST(BufferPushTaskTest, DefaultInitializers) {
   EXPECT_EQ(task.src_stride_bytes, 0);
 }
 
+TEST(RawBufferTransportDelegateTest, DefaultGetHostBufferSpansHostMemory) {
+  RawMockDelegate delegate(/*buffer_size=*/256);
+  const RawBufferTransportDelegate& const_delegate = delegate;
+
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> buffer,
+                       delegate.GetHostBuffer(kBufferId, kDstShardIdx));
+
+  EXPECT_EQ(buffer.data(), delegate.GetHostPointer(kBufferId, kDstShardIdx));
+  EXPECT_EQ(buffer.size(), 256);
+
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> const_buffer,
+                       const_delegate.GetHostBuffer(kBufferId, kDstShardIdx));
+  EXPECT_EQ(const_buffer.data(), buffer.data());
+  EXPECT_EQ(const_buffer.size(), 256);
+  TF_ASSERT_OK_AND_ASSIGN(
+      absl::Span<const uint8_t> direct_const_buffer,
+      std::as_const(delegate).GetHostBuffer(kBufferId, kDstShardIdx));
+  EXPECT_EQ(direct_const_buffer.data(), buffer.data());
+  EXPECT_EQ(direct_const_buffer.size(), 256);
+}
+
+// Delegate without host memory that relies on the default GetHostBuffer().
+class NoHostBufferDelegate : public RawBufferTransportDelegate {
+ public:
+  uint8_t* GetHostPointer(size_t buffer_id, size_t shard_idx) override {
+    return nullptr;
+  }
+  size_t GetHostSize(size_t buffer_id, size_t shard_idx) override { return 0; }
+};
+
+TEST(RawBufferTransportDelegateTest,
+     DefaultGetHostBufferWithoutHostMemoryIsFailedPrecondition) {
+  NoHostBufferDelegate delegate;
+  const RawBufferTransportDelegate& const_delegate = delegate;
+
+  EXPECT_THAT(delegate.GetHostBuffer(/*buffer_id=*/3, /*shard_idx=*/1),
+              ::absl_testing::StatusIs(
+                  absl::StatusCode::kFailedPrecondition,
+                  ::testing::HasSubstr("buffer_id 3 shard 1 has no host "
+                                       "buffer")));
+  EXPECT_THAT(const_delegate.GetHostBuffer(/*buffer_id=*/3, /*shard_idx=*/1),
+              ::absl_testing::StatusIs(
+                  absl::StatusCode::kFailedPrecondition,
+                  ::testing::HasSubstr("buffer_id 3 shard 1 has no host "
+                                       "buffer")));
+}
+
 TEST_P(RawBufferTransportTest,
        PushBuffersSourceStridedToContiguousCorrectness) {
   constexpr size_t slice_size = 128;

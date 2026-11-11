@@ -35,6 +35,7 @@
 #include "absl/memory/memory.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
+#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
@@ -2705,6 +2706,88 @@ TEST_F(WeightSynchronizerTest, GetHostPointerAndSizeLocalAndGlobalIndices) {
   EXPECT_EQ(const_ws->GetHostPointer(0, 3), ws->GetHostBufferPtr(0, 3));
   EXPECT_EQ(const_ws->GetHostSize(0, 2), slice_size);
   EXPECT_EQ(const_ws->GetHostSize(0, 3), slice_size);
+}
+
+TEST_F(WeightSynchronizerTest, GetHostBufferMapsGlobalShardIndices) {
+  const size_t num_layers = 2;
+  const size_t num_shards = 4;
+  const size_t slice_size = 1024;
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws,
+                       WeightSynchronizerBase::Create(
+                           num_layers, num_shards, slice_size,
+                           /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  ws->SetGlobalShardIndices({0, 2, 4, 6});
+  const WeightSynchronizerBase& const_ws = *ws;
+
+  // Global shard 6 is local slot 3 (modulo 4 would give slot 2).
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> buffer, ws->GetHostBuffer(1, 6));
+  EXPECT_EQ(buffer.data(), ws->GetHostBufferPtr(1, 3));
+  EXPECT_EQ(buffer.size(), slice_size);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> const_buffer,
+                       const_ws.GetHostBuffer(1, 2));
+  EXPECT_EQ(const_buffer.data(), ws->GetHostBufferPtr(1, 1));
+  EXPECT_EQ(const_buffer.size(), slice_size);
+}
+
+TEST_F(WeightSynchronizerTest, GetHostBufferMapsLocalShardIndices) {
+  const size_t num_layers = 1;
+  const size_t num_shards = 4;
+  const size_t slice_size = 1024;
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws,
+                       WeightSynchronizerBase::Create(
+                           num_layers, num_shards, slice_size,
+                           /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  ws->SetLocalShardIndices({3, 2, 1, 0});
+  const WeightSynchronizerBase& const_ws = *ws;
+
+  // Shard 3 is listed at local slot 0 (modulo 4 would give slot 3).
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> buffer, ws->GetHostBuffer(0, 3));
+  EXPECT_EQ(buffer.data(), ws->GetHostBufferPtr(0, 0));
+  EXPECT_EQ(buffer.size(), slice_size);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> const_buffer,
+                       const_ws.GetHostBuffer(0, 0));
+  EXPECT_EQ(const_buffer.data(), ws->GetHostBufferPtr(0, 3));
+  EXPECT_EQ(const_buffer.size(), slice_size);
+}
+
+TEST_F(WeightSynchronizerTest, GetHostBufferLayerOutOfRange) {
+  const size_t num_layers = 2;
+  const size_t num_shards = 4;
+  const size_t slice_size = 1024;
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws,
+                       WeightSynchronizerBase::Create(
+                           num_layers, num_shards, slice_size,
+                           /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  ws->SetGlobalShardIndices({0, 2, 4, 6});
+
+  ABSL_EXPECT_OK(ws->GetHostBuffer(1, 6));
+  EXPECT_THAT(ws->GetHostBuffer(2, 6),
+              ::absl_testing::StatusIs(
+                  absl::StatusCode::kOutOfRange,
+                  ::testing::HasSubstr("layer_idx 2 out of range")));
+}
+
+TEST_F(WeightSynchronizerTest, GetHostBufferMissingBufferIsFailedPrecondition) {
+  const size_t num_layers = 1;
+  const size_t num_shards = 2;
+  const size_t slice_size = 1024;
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws,
+                       WeightSynchronizerBase::Create(
+                           num_layers, num_shards, slice_size,
+                           /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  ws->SetGlobalShardIndices({4, 6});
+  // Local slot 0 (global shard 4) loses its host buffer; slot 1 keeps its own.
+  ws->SetExternalHostPointers({nullptr, ws->GetHostBufferPtr(0, 1)},
+                              {slice_size, slice_size});
+  const WeightSynchronizerBase& const_ws = *ws;
+
+  ABSL_EXPECT_OK(ws->GetHostBuffer(0, 6));
+  EXPECT_THAT(ws->GetHostBuffer(0, 4),
+              ::absl_testing::StatusIs(
+                  absl::StatusCode::kFailedPrecondition,
+                  ::testing::HasSubstr("layer 0 shard 4 has no host buffer")));
+  EXPECT_THAT(const_ws.GetHostBuffer(0, 4),
+              ::absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition));
 }
 
 TEST_F(WeightSynchronizerTest,

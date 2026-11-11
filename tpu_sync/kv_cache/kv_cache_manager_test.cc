@@ -36,10 +36,12 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/base/log_severity.h"
 #include "absl/base/thread_annotations.h"
 #include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/log/log.h"
+#include "absl/log/scoped_mock_log.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
@@ -73,19 +75,25 @@ namespace {
 
 using ::absl_testing::IsOkAndHolds;
 using ::absl_testing::StatusIs;
+using ::testing::_;
+using ::testing::AllOf;
 using ::testing::HasSubstr;
 
 class TestKVCacheManager : public KVCacheManagerBase {
  public:
   TestKVCacheManager(size_t num_layers, size_t num_shards,
-                     size_t slice_byte_size, int host_blocks = 0)
+                     size_t slice_byte_size, int host_blocks = 0,
+                     std::optional<int> num_staging_layers = std::nullopt)
       : KVCacheManagerBase(
             num_layers, num_shards, slice_byte_size,
             /*local_port=*/std::nullopt,
-            host_blocks > 0 ? std::make_optional(host_blocks) : std::nullopt) {
+            host_blocks > 0 ? std::make_optional(host_blocks) : std::nullopt,
+            /*parallelism=*/1, /*host_allocator=*/nullptr,
+            /*bind_ip=*/std::nullopt, num_staging_layers) {
     buffer_holds_.resize(num_layers);
     for (size_t l = 0; l < num_layers; ++l) {
       buffer_holds_[l].holds.resize(num_shards);
+      if (l >= layers_.size()) continue;
       for (size_t sh = 0; sh < num_shards; ++sh) {
         layers_[l].shards[sh].device_size = host_blocks > 0
                                                 ? host_blocks * slice_byte_size
@@ -614,6 +622,410 @@ TEST(KVCacheManagerTest, ImplicitPoolsMirrorStorages) {
   EXPECT_EQ(ref.ptr, manager.GetHostPointer(/*layer_idx=*/1,
                                             /*shard_idx=*/0) +
                          128);
+}
+
+TEST(KVCacheManagerTest,
+     GetBlockHostPointerValueMissingBufferIsFailedPrecondition) {
+  TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/1,
+                             /*slice_byte_size=*/128, /*host_blocks=*/2);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> layer1,
+                       manager.GetHostBuffer(/*layer_idx=*/1, /*shard_idx=*/0));
+  EXPECT_THAT(manager.GetBlockHostPointerValue(/*layer_idx=*/1,
+                                               /*shard_idx=*/0, /*block_id=*/1),
+              IsOkAndHolds(reinterpret_cast<uintptr_t>(layer1.data() + 128)));
+
+  manager.layers_[1].shards[0].ReleaseMemory();
+
+  EXPECT_THAT(manager.GetBlockHostPointerValue(/*layer_idx=*/1,
+                                               /*shard_idx=*/0, /*block_id=*/0),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("layer 1 shard 0 has no host buffer")));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> layer0,
+                       manager.GetHostBuffer(/*layer_idx=*/0, /*shard_idx=*/0));
+  EXPECT_THAT(manager.GetBlockHostPointerValue(/*layer_idx=*/0,
+                                               /*shard_idx=*/0, /*block_id=*/1),
+              IsOkAndHolds(reinterpret_cast<uintptr_t>(layer0.data() + 128)));
+}
+
+TEST(KVCacheManagerTest, GetBlockHostPointerValueBadLayerIsOutOfRange) {
+  TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/1,
+                             /*slice_byte_size=*/128, /*host_blocks=*/2);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> layer1,
+                       manager.GetHostBuffer(/*layer_idx=*/1, /*shard_idx=*/0));
+  EXPECT_THAT(manager.GetBlockHostPointerValue(/*layer_idx=*/1,
+                                               /*shard_idx=*/0, /*block_id=*/1),
+              IsOkAndHolds(reinterpret_cast<uintptr_t>(layer1.data() + 128)));
+
+  EXPECT_THAT(manager.GetBlockHostPointerValue(/*layer_idx=*/2,
+                                               /*shard_idx=*/0, /*block_id=*/0),
+              StatusIs(absl::StatusCode::kOutOfRange,
+                       HasSubstr("layer_idx 2 out of range: 2 host layers")));
+}
+
+TEST(KVCacheManagerTest, ImplicitBlockArrayHostSpanWithoutHostBufferIsEmpty) {
+  TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/1,
+                             /*slice_byte_size=*/128, /*host_blocks=*/2);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> layer1,
+                       manager.GetHostBuffer(/*layer_idx=*/1, /*shard_idx=*/0));
+  TF_ASSERT_OK_AND_ASSIGN(
+      absl::Span<const char> span,
+      manager.GetBlockArrayHostSpan(/*block_array_idx=*/1, /*shard_idx=*/0));
+  EXPECT_EQ(reinterpret_cast<const uint8_t*>(span.data()), layer1.data());
+  EXPECT_EQ(span.size(), 256);
+
+  manager.layers_[1].shards[0].ReleaseMemory();
+
+  TF_ASSERT_OK_AND_ASSIGN(span, manager.GetBlockArrayHostSpan(
+                                 /*block_array_idx=*/1, /*shard_idx=*/0));
+  EXPECT_EQ(span.data(), nullptr);
+  EXPECT_TRUE(span.empty());
+}
+
+TEST(KVCacheManagerTest, ImplicitBlockArrayHostSpanZeroShardLayerIsOutOfRange) {
+  TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/1,
+                             /*slice_byte_size=*/128, /*host_blocks=*/2);
+  manager.layers_[1].shards.clear();
+
+  EXPECT_THAT(
+      manager.GetBlockArrayHostSpan(/*block_array_idx=*/1, /*shard_idx=*/0),
+      StatusIs(absl::StatusCode::kOutOfRange,
+               HasSubstr("shard_idx 0 out of range: layer 1 has no shards")));
+  TF_ASSERT_OK_AND_ASSIGN(
+      absl::Span<const char> span,
+      manager.GetBlockArrayHostSpan(/*block_array_idx=*/0, /*shard_idx=*/0));
+  EXPECT_EQ(span.size(), 256);
+}
+
+TEST(KVCacheManagerTest,
+     ExplicitBlockArrayHostSpanWithoutHostBufferIsFailedPrecondition) {
+  TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/1,
+                             /*slice_byte_size=*/128, /*host_blocks=*/4);
+  ABSL_ASSERT_OK(manager.RegisterPools({DensePool(
+      "kind_a", /*storage_index=*/1, /*base_offset=*/128, /*stride=*/64,
+      /*num_blocks=*/4)}));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> storage1,
+                       manager.GetHostBuffer(/*layer_idx=*/1, /*shard_idx=*/0));
+  TF_ASSERT_OK_AND_ASSIGN(
+      absl::Span<const char> span,
+      manager.GetBlockArrayHostSpan(/*block_array_idx=*/0, /*shard_idx=*/0));
+  EXPECT_EQ(reinterpret_cast<const uint8_t*>(span.data()),
+            storage1.data() + 128);
+  EXPECT_EQ(span.size(), 4 * 64);
+
+  manager.layers_[1].shards[0].ReleaseMemory();
+
+  EXPECT_THAT(
+      manager.GetBlockArrayHostSpan(/*block_array_idx=*/0, /*shard_idx=*/0),
+      StatusIs(absl::StatusCode::kFailedPrecondition,
+               HasSubstr("pool 0 storage 1 host layer 1 shard 0 has no host "
+                         "buffer: layer 1 shard 0 has no host buffer")));
+}
+
+TEST(KVCacheManagerTest,
+     RegisterPoolsWithoutHostBufferLeavesStorageSizeUnknown) {
+  TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/1,
+                             /*slice_byte_size=*/128, /*host_blocks=*/2);
+  // 4 blocks x 128 bytes exceed the 256-byte host buffer of storage 1.
+  const PoolSpec oversized = DensePool("kind_a", /*storage_index=*/1,
+                                       /*base_offset=*/0, /*stride=*/128,
+                                       /*num_blocks=*/4);
+  EXPECT_THAT(manager.RegisterPools({oversized}),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("exceeds storage bytes")));
+
+  manager.layers_[1].shards[0].ReleaseMemory();
+
+  ABSL_EXPECT_OK(manager.RegisterPools({oversized}));
+}
+
+TEST(KVCacheManagerTest, RegisterPoolsRejectsZeroShardStorage) {
+  TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/1,
+                             /*slice_byte_size=*/128, /*host_blocks=*/2);
+  manager.layers_[1].shards.clear();
+
+  EXPECT_THAT(
+      manager.RegisterPools({DensePool("kind_a", /*storage_index=*/1,
+                                       /*base_offset=*/0, /*stride=*/128,
+                                       /*num_blocks=*/2)}),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("invalid pool 0: shard_idx 0 out of range: layer 1 "
+                         "has no shards")));
+  ABSL_EXPECT_OK(manager.RegisterPools({DensePool(
+      "kind_a", /*storage_index=*/0, /*base_offset=*/0, /*stride=*/128,
+      /*num_blocks=*/2)}));
+}
+
+TEST(KVCacheManagerTest,
+     RegisterPoolsWithoutHostLayerLeavesStorageSizeUnknown) {
+  TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/1,
+                             /*slice_byte_size=*/128, /*host_blocks=*/2,
+                             /*num_staging_layers=*/1);
+  ASSERT_EQ(manager.num_host_layers(), 1);
+  ASSERT_EQ(manager.buffer_holds_[1].physical_size, 0);
+  // 4 blocks x 128 bytes exceed the 256-byte host buffer of storage 0.
+  EXPECT_THAT(manager.RegisterPools(
+                  {DensePool("kind_a", /*storage_index=*/0, /*base_offset=*/0,
+                             /*stride=*/128, /*num_blocks=*/4)}),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("exceeds storage bytes")));
+
+  ABSL_EXPECT_OK(manager.RegisterPools({DensePool(
+      "kind_a", /*storage_index=*/1, /*base_offset=*/0, /*stride=*/128,
+      /*num_blocks=*/4)}));
+  EXPECT_TRUE(manager.has_explicit_pools());
+}
+
+TEST(KVCacheManagerTest, ImplicitPoolsSkipStorageWithoutHostLayer) {
+  TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/1,
+                             /*slice_byte_size=*/128, /*host_blocks=*/2,
+                             /*num_staging_layers=*/1);
+  ASSERT_EQ(manager.num_host_layers(), 1);
+
+  absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);
+  EXPECT_CALL(log, Log(absl::LogSeverity::kError, _,
+                       HasSubstr("No implicit pool for storage")))
+      .Times(0);
+  log.StartCapturingLogs();
+  EXPECT_EQ(manager.num_pools(), 1);
+  const PoolSpec* pool = manager.pool(0);
+  ASSERT_NE(pool, nullptr);
+  EXPECT_EQ(pool->storage_index, 0);
+  EXPECT_EQ(pool->num_blocks, 2);
+}
+
+TEST(KVCacheManagerTest, ImplicitPoolsSkipStorageWithoutHostBuffer) {
+  TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/1,
+                             /*slice_byte_size=*/128, /*host_blocks=*/2);
+  manager.layers_[0].shards[0].ReleaseMemory();
+
+  absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);
+  EXPECT_CALL(log, Log(absl::LogSeverity::kError, _,
+                       HasSubstr("No implicit pool for storage")))
+      .Times(0);
+  log.StartCapturingLogs();
+  EXPECT_EQ(manager.num_pools(), 1);
+  const PoolSpec* pool = manager.pool(0);
+  ASSERT_NE(pool, nullptr);
+  EXPECT_EQ(pool->storage_index, 1);
+  EXPECT_EQ(pool->num_blocks, 2);
+}
+
+TEST(KVCacheManagerTest, ImplicitPoolsSkipZeroShardStorage) {
+  TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/1,
+                             /*slice_byte_size=*/128, /*host_blocks=*/2);
+  manager.layers_[0].shards.clear();
+
+  absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);
+  EXPECT_CALL(log, Log(absl::LogSeverity::kError, _,
+                       AllOf(HasSubstr("No implicit pool for storage 0"),
+                             HasSubstr("layer 0 has no shards"))))
+      .Times(1);
+  log.StartCapturingLogs();
+  EXPECT_EQ(manager.num_pools(), 1);
+  const PoolSpec* pool = manager.pool(0);
+  ASSERT_NE(pool, nullptr);
+  EXPECT_EQ(pool->storage_index, 1);
+  EXPECT_EQ(pool->num_blocks, 2);
+}
+
+TEST(KVCacheManagerTest, ExplicitBlockChunksWithoutHostBufferAreEmpty) {
+  TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/1,
+                             /*slice_byte_size=*/128, /*host_blocks=*/4);
+  ABSL_ASSERT_OK(manager.RegisterPools({DensePool(
+      "kind_a", /*storage_index=*/1, /*base_offset=*/128, /*stride=*/64,
+      /*num_blocks=*/4)}));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> storage1,
+                       manager.GetHostBuffer(/*layer_idx=*/1, /*shard_idx=*/0));
+  const std::vector<int64_t> block_ids = {0, 2};
+  std::vector<transport::BlockChunk> chunks = manager.GetBlockChunks(
+      /*pool_idx=*/0, /*shard_idx=*/0, block_ids, /*total_bytes=*/128,
+      /*uuid=*/0);
+  ASSERT_EQ(chunks.size(), 2);
+  EXPECT_EQ(chunks[1].ptr, storage1.data() + 128 + 2 * 64);
+
+  manager.layers_[1].shards[0].ReleaseMemory();
+
+  absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);
+  EXPECT_CALL(log, Log(absl::LogSeverity::kError, _,
+                       HasSubstr("No block chunks for pool")))
+      .Times(0);
+  log.StartCapturingLogs();
+  chunks = manager.GetBlockChunks(/*pool_idx=*/0, /*shard_idx=*/0, block_ids,
+                                  /*total_bytes=*/128, /*uuid=*/0);
+  EXPECT_TRUE(chunks.empty());
+}
+
+TEST(KVCacheManagerTest, ExplicitBlockChunksZeroShardStorageLogsError) {
+  TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/1,
+                             /*slice_byte_size=*/128, /*host_blocks=*/4);
+  ABSL_ASSERT_OK(manager.RegisterPools({DensePool(
+      "kind_a", /*storage_index=*/1, /*base_offset=*/128, /*stride=*/64,
+      /*num_blocks=*/4)}));
+  const std::vector<int64_t> block_ids = {0, 2};
+  std::vector<transport::BlockChunk> chunks = manager.GetBlockChunks(
+      /*pool_idx=*/0, /*shard_idx=*/0, block_ids, /*total_bytes=*/128,
+      /*uuid=*/0);
+  ASSERT_EQ(chunks.size(), 2);
+
+  manager.layers_[1].shards.clear();
+
+  absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);
+  EXPECT_CALL(log,
+              Log(absl::LogSeverity::kError, _,
+                  AllOf(HasSubstr("No block chunks for pool 0 host layer 1"),
+                        HasSubstr("layer 1 has no shards"))))
+      .Times(1);
+  log.StartCapturingLogs();
+  chunks = manager.GetBlockChunks(/*pool_idx=*/0, /*shard_idx=*/0, block_ids,
+                                  /*total_bytes=*/128, /*uuid=*/0);
+  EXPECT_TRUE(chunks.empty());
+}
+
+TEST(KVCacheManagerTest, ImplicitBlockChunksWithoutHostBufferHaveNullPtrs) {
+  TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/1,
+                             /*slice_byte_size=*/128, /*host_blocks=*/2);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> layer1,
+                       manager.GetHostBuffer(/*layer_idx=*/1, /*shard_idx=*/0));
+  const std::vector<int64_t> block_ids = {0, 1};
+  std::vector<transport::BlockChunk> chunks = manager.GetBlockChunks(
+      /*layer_idx=*/1, /*shard_idx=*/0, block_ids, /*total_bytes=*/256,
+      /*uuid=*/0);
+  ASSERT_EQ(chunks.size(), 2);
+  EXPECT_EQ(chunks[1].ptr, layer1.data() + 128);
+
+  manager.layers_[1].shards[0].ReleaseMemory();
+
+  chunks = manager.GetBlockChunks(/*layer_idx=*/1, /*shard_idx=*/0, block_ids,
+                                  /*total_bytes=*/256, /*uuid=*/0);
+  ASSERT_EQ(chunks.size(), 2);
+  EXPECT_EQ(chunks[0].ptr, nullptr);
+  EXPECT_EQ(chunks[1].ptr, nullptr);
+  EXPECT_EQ(chunks[1].size, 128);
+}
+
+TEST(KVCacheManagerTest, ImplicitBlockChunksPastHostLayersAreEmpty) {
+  TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/1,
+                             /*slice_byte_size=*/128, /*host_blocks=*/2);
+  const std::vector<int64_t> block_ids = {0, 1};
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> layer1,
+                       manager.GetHostBuffer(/*layer_idx=*/1, /*shard_idx=*/0));
+  std::vector<transport::BlockChunk> chunks = manager.GetBlockChunks(
+      /*layer_idx=*/1, /*shard_idx=*/0, block_ids, /*total_bytes=*/256,
+      /*uuid=*/0);
+  ASSERT_EQ(chunks.size(), 2);
+  EXPECT_EQ(chunks[0].ptr, layer1.data());
+
+  // A layer past num_host_layers() is a bad index, so it is logged.
+  absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);
+  EXPECT_CALL(log,
+              Log(absl::LogSeverity::kError, _,
+                  AllOf(HasSubstr("No block chunks for layer 2 host layer 2"),
+                        HasSubstr("layer_idx 2 out of range: 2 host layers"))))
+      .Times(1);
+  log.StartCapturingLogs();
+  chunks = manager.GetBlockChunks(/*layer_idx=*/2, /*shard_idx=*/0, block_ids,
+                                  /*total_bytes=*/256, /*uuid=*/0);
+  EXPECT_TRUE(chunks.empty());
+}
+
+TEST(KVCacheManagerTest, BlockHostPointerWithoutHostLayerIsNull) {
+  TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/1,
+                             /*slice_byte_size=*/128, /*host_blocks=*/2,
+                             /*num_staging_layers=*/1);
+  ASSERT_EQ(manager.num_host_layers(), 1);
+  ABSL_ASSERT_OK(manager.RegisterPools({
+      DensePool("kind_a", /*storage_index=*/0, /*base_offset=*/0,
+                /*stride=*/128, /*num_blocks=*/2),
+      DensePool("kind_a", /*storage_index=*/1, /*base_offset=*/0,
+                /*stride=*/128, /*num_blocks=*/2),
+  }));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> storage0,
+                       manager.GetHostBuffer(/*layer_idx=*/0, /*shard_idx=*/0));
+
+  EXPECT_EQ(manager.GetBlockHostPointer(/*pool_idx=*/0, /*shard_idx=*/0,
+                                        /*block_id=*/1),
+            storage0.data() + 128);
+
+  // A storage past num_host_layers() is tolerated, not logged.
+  absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);
+  EXPECT_CALL(log, Log(absl::LogSeverity::kError, _,
+                       HasSubstr("No host pointer for pool")))
+      .Times(0);
+  log.StartCapturingLogs();
+  EXPECT_EQ(manager.GetBlockHostPointer(/*pool_idx=*/1, /*shard_idx=*/0,
+                                        /*block_id=*/1),
+            nullptr);
+}
+
+TEST(KVCacheManagerTest, BlockHostPointerWithoutHostBufferIsNull) {
+  TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/1,
+                             /*slice_byte_size=*/128, /*host_blocks=*/4);
+  ABSL_ASSERT_OK(manager.RegisterPools({DensePool(
+      "kind_a", /*storage_index=*/1, /*base_offset=*/128, /*stride=*/64,
+      /*num_blocks=*/4)}));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> storage1,
+                       manager.GetHostBuffer(/*layer_idx=*/1, /*shard_idx=*/0));
+  EXPECT_EQ(manager.GetBlockHostPointer(/*pool_idx=*/0, /*shard_idx=*/0,
+                                        /*block_id=*/2),
+            storage1.data() + 128 + 2 * 64);
+
+  manager.layers_[1].shards[0].ReleaseMemory();
+
+  // A missing host buffer is tolerated, not logged.
+  absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);
+  EXPECT_CALL(log, Log(absl::LogSeverity::kError, _,
+                       HasSubstr("No host pointer for pool")))
+      .Times(0);
+  log.StartCapturingLogs();
+  EXPECT_EQ(manager.GetBlockHostPointer(/*pool_idx=*/0, /*shard_idx=*/0,
+                                        /*block_id=*/2),
+            nullptr);
+}
+
+TEST(KVCacheManagerTest, BlockHostPointerZeroShardStorageLogsError) {
+  TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/1,
+                             /*slice_byte_size=*/128, /*host_blocks=*/4);
+  ABSL_ASSERT_OK(manager.RegisterPools({DensePool(
+      "kind_a", /*storage_index=*/1, /*base_offset=*/128, /*stride=*/64,
+      /*num_blocks=*/4)}));
+  manager.layers_[1].shards.clear();
+
+  absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);
+  EXPECT_CALL(log, Log(absl::LogSeverity::kError, _,
+                       AllOf(HasSubstr("No host pointer for pool 0 block 2"),
+                             HasSubstr("layer 1 has no shards"))))
+      .Times(1);
+  log.StartCapturingLogs();
+  EXPECT_EQ(manager.GetBlockHostPointer(/*pool_idx=*/0, /*shard_idx=*/0,
+                                        /*block_id=*/2),
+            nullptr);
+}
+
+TEST(KVCacheManagerTest, ResolveBlockSlicesRejectsBlockPastHostBuffer) {
+  TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/1,
+                             /*slice_byte_size=*/128, /*host_blocks=*/2);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> layer1,
+                       manager.GetHostBuffer(/*layer_idx=*/1, /*shard_idx=*/0));
+  std::vector<backends::HostBufferDescriptor> slices =
+      manager.ResolveBlockSlices(/*staging_block_id=*/1);
+  ASSERT_EQ(slices.size(), 2);
+  EXPECT_EQ(slices[1].ptr, layer1.data() + 128);
+  EXPECT_EQ(slices[1].size, 128);
+
+  // Block 2 starts at byte 256, the end of each 256-byte host buffer.
+  EXPECT_TRUE(manager.ResolveBlockSlices(/*staging_block_id=*/2).empty());
+  EXPECT_TRUE(manager.ResolveBlockSlices(/*staging_block_id=*/3).empty());
+
+  manager.layers_[1].shards[0].ReleaseMemory();
+  absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);
+  EXPECT_CALL(
+      log, Log(absl::LogSeverity::kError, _,
+               AllOf(HasSubstr("No host bytes for staging_block_id 0 in layer "
+                               "1, shard 0"),
+                     HasSubstr("layer 1 shard 0 has no host buffer"))))
+      .Times(1);
+  log.StartCapturingLogs();
+  EXPECT_TRUE(manager.ResolveBlockSlices(/*staging_block_id=*/0).empty());
 }
 
 TEST(KVCacheManagerTest, UnregisterActivePlanAllowsUuidReuse) {

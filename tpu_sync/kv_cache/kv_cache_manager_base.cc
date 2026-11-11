@@ -2196,14 +2196,18 @@ KVCacheManagerBase::GetBlockArrayHostSpan(size_t block_array_idx,
                                           size_t shard_idx, uint64_t uuid) {
   ABSL_ASSIGN_OR_RETURN(const size_t host_layer_idx,
                         ResolveBlockArrayHostLayer(block_array_idx, uuid));
-  const uint8_t* storage_base = GetHostPointer(host_layer_idx, shard_idx);
+  const absl::StatusOr<absl::Span<const uint8_t>> host_buffer =
+      std::as_const(*this).GetHostBuffer(host_layer_idx, shard_idx);
   if (!explicit_pools_) {
-    if (storage_base == nullptr) {
-      // Same contract as the delegate default: no flat host base.
+    if (absl::IsFailedPrecondition(host_buffer.status())) {
+      // Same contract as the delegate default: a storage without a host
+      // buffer exposes no flat host base.
       return absl::Span<const char>();
     }
-    return absl::Span<const char>(reinterpret_cast<const char*>(storage_base),
-                                  GetHostSize(host_layer_idx, shard_idx));
+    ABSL_RETURN_IF_ERROR(host_buffer.status());
+    return absl::Span<const char>(
+        reinterpret_cast<const char*>(host_buffer->data()),
+        host_buffer->size());
   }
   const PoolSpec& pool = pools_[block_array_idx];
   if (shard_idx >= num_shards_) {
@@ -2211,14 +2215,14 @@ KVCacheManagerBase::GetBlockArrayHostSpan(size_t block_array_idx,
         absl::StrCat("shard_idx ", shard_idx, " out of range for num_shards ",
                      num_shards_, " on pool ", block_array_idx));
   }
-  if (storage_base == nullptr) {
+  if (!host_buffer.ok()) {
     return absl::FailedPreconditionError(
         absl::StrCat("pool ", block_array_idx, " storage ", pool.storage_index,
                      " host layer ", host_layer_idx, " shard ", shard_idx,
-                     " has no host buffer"));
+                     " has no host buffer: ", host_buffer.status().message()));
   }
-  const char* ptr =
-      reinterpret_cast<const char*>(storage_base) + pool.base_offset_bytes;
+  const char* ptr = reinterpret_cast<const char*>(host_buffer->data() +
+                                                  pool.base_offset_bytes);
   const size_t base_offset = static_cast<size_t>(pool.base_offset_bytes);
   {
     // Bounded staging: the addressable host span is the whole arena (leased
@@ -2229,7 +2233,7 @@ KVCacheManagerBase::GetBlockArrayHostSpan(size_t block_array_idx,
       const PoolStagingStorage& st = pool_staging_[pool.storage_index];
       const uint64_t arena = static_cast<uint64_t>(st.num_slots) *
                              static_cast<uint64_t>(st.stride_bytes);
-      const size_t host_buffer_size = GetHostSize(host_layer_idx, shard_idx);
+      const size_t host_buffer_size = host_buffer->size();
       if (arena > host_buffer_size || base_offset > arena) {
         return absl::FailedPreconditionError(absl::StrCat(
             "Staging arena of pool ", block_array_idx, " (", arena,
@@ -2241,7 +2245,7 @@ KVCacheManagerBase::GetBlockArrayHostSpan(size_t block_array_idx,
                                     static_cast<size_t>(arena - base_offset));
     }
   }
-  const size_t storage_size = GetHostSize(host_layer_idx, shard_idx);
+  const size_t storage_size = host_buffer->size();
   const int64_t storage_end = pool.storage_extent_end_bytes();
   if (storage_end < pool.base_offset_bytes ||
       static_cast<uint64_t>(storage_end) > storage_size ||
@@ -2268,17 +2272,16 @@ absl::StatusOr<uintptr_t> KVCacheManagerBase::GetBlockHostPointerValue(
     return absl::InvalidArgumentError("block_id must be non-negative");
   }
   const size_t block_bytes = this->block_bytes(layer_idx);
-  const size_t host_size = GetHostSize(layer_idx, shard_idx);
-  const uint8_t* base = GetHostPointer(layer_idx, shard_idx);
-  if (base == nullptr) {
-    return absl::OutOfRangeError("layer or shard index out of range");
-  }
+  ABSL_ASSIGN_OR_RETURN(
+      const absl::Span<const uint8_t> host_buffer,
+      std::as_const(*this).GetHostBuffer(layer_idx, shard_idx));
+  const size_t host_size = host_buffer.size();
   const size_t block = static_cast<size_t>(block_id);
   if (block_bytes == 0 || block > host_size / block_bytes ||
       block * block_bytes + block_bytes > host_size) {
     return absl::OutOfRangeError("block range exceeds host buffer");
   }
-  return reinterpret_cast<uintptr_t>(base + block * block_bytes);
+  return reinterpret_cast<uintptr_t>(host_buffer.data() + block * block_bytes);
 }
 
 void KVCacheManagerBase::EnsureImplicitPools() const {
@@ -2293,9 +2296,24 @@ void KVCacheManagerBase::EnsureImplicitPools() const {
     if (stride <= 0) {
       continue;
     }
-    const size_t host_size =
-        const_cast<KVCacheManagerBase*>(this)->GetHostSize(storage_idx, 0);
-    const int64_t num_blocks = static_cast<int64_t>(host_size) / stride;
+    if (storage_idx >= layers_.size()) {
+      // Bounded staging: storages at or past num_host_layers() have no host
+      // layer, so there is nothing to mirror.
+      continue;
+    }
+    const absl::StatusOr<absl::Span<const uint8_t>> host_buffer =
+        GetHostBuffer(storage_idx, /*shard_idx=*/0);
+    if (absl::IsFailedPrecondition(host_buffer.status())) {
+      // The storage has no host buffer, so there is nothing to mirror.
+      continue;
+    }
+    if (!host_buffer.ok()) {
+      LOG(ERROR) << "No implicit pool for storage " << storage_idx << ": "
+                 << host_buffer.status();
+      continue;
+    }
+    const int64_t num_blocks =
+        static_cast<int64_t>(host_buffer->size()) / stride;
     if (num_blocks <= 0) {
       continue;
     }
@@ -2629,10 +2647,9 @@ absl::StatusOr<uint8_t*> KVCacheManagerBase::PoolBlockHostBase(
         absl::StrCat("block_id ", block_id, " out of range for pool ", pool.tag,
                      ": num_blocks=", pool.num_blocks));
   }
-  uint8_t* storage_base = GetHostPointer(pool.storage_index, shard_idx);
-  if (storage_base == nullptr) {
-    return absl::FailedPreconditionError("host pointer is null");
-  }
+  ABSL_ASSIGN_OR_RETURN(absl::Span<uint8_t> storage,
+                        GetHostBuffer(pool.storage_index, shard_idx));
+  uint8_t* storage_base = storage.data();
   std::shared_ptr<const PoolStagingLease> lease;
   {
     absl::MutexLock l(staging_mu_);
@@ -2695,11 +2712,21 @@ absl::Status KVCacheManagerBase::RegisterPools(std::vector<PoolSpec> pools,
         buffer_holds_[pool.storage_index].physical_size > 0) {
       storage_bytes =
           static_cast<int64_t>(buffer_holds_[pool.storage_index].physical_size);
-    } else {
-      const size_t host_size = GetHostSize(pool.storage_index, 0);
-      if (host_size > 0) {
-        storage_bytes = static_cast<int64_t>(host_size);
+    } else if (pool.storage_index < layers_.size()) {
+      // Storages at or past num_host_layers() (bounded staging) have no host
+      // layer and skip this branch, so their size stays unknown.
+      const absl::StatusOr<absl::Span<const uint8_t>> host_buffer =
+          std::as_const(*this).GetHostBuffer(pool.storage_index,
+                                             /*shard_idx=*/0);
+      if (host_buffer.ok() && !host_buffer->empty()) {
+        storage_bytes = static_cast<int64_t>(host_buffer->size());
+      } else if (!host_buffer.ok() &&
+                 !absl::IsFailedPrecondition(host_buffer.status())) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "invalid pool ", pool_idx, ": ", host_buffer.status().message()));
       }
+      // Otherwise the host buffer is missing (FailedPrecondition) or empty,
+      // and the size stays unknown.
     }
     absl::Status status = pool.Validate(storage_bytes);
     if (!status.ok()) {
@@ -3461,10 +3488,18 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
     } else if (layers_.size() < num_layers_) {
       return {};
     }
-    storage_base = GetHostPointer(host_layer_idx, shard_idx);
-    if (storage_base == nullptr) {
+    const absl::StatusOr<absl::Span<uint8_t>> storage =
+        GetHostBuffer(host_layer_idx, shard_idx);
+    if (absl::IsFailedPrecondition(storage.status())) {
+      // The storage has no host buffer: there is nothing to address.
       return {};
     }
+    if (!storage.ok()) {
+      LOG(ERROR) << "No block chunks for pool " << layer_idx << " host layer "
+                 << host_layer_idx << ": " << storage.status();
+      return {};
+    }
+    storage_base = storage->data();
     base_host_ptr = storage_base + pool.base_offset_bytes;
     staging_bounded = PoolStorageStagingBounded(pool.storage_index);
     if (staging_bounded) {
@@ -3488,7 +3523,18 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
       }
       host_layer_idx = *slot;
     }
-    base_host_ptr = GetHostPointer(host_layer_idx, shard_idx);
+    const absl::StatusOr<absl::Span<uint8_t>> host_buffer =
+        GetHostBuffer(host_layer_idx, shard_idx);
+    if (host_buffer.ok()) {
+      base_host_ptr = host_buffer->data();
+    } else if (!absl::IsFailedPrecondition(host_buffer.status())) {
+      LOG(ERROR) << "No block chunks for layer " << layer_idx << " host layer "
+                 << host_layer_idx << ": " << host_buffer.status();
+      return {};
+    }
+    // A missing host buffer keeps base_host_ptr and the chunk ptrs null (R5);
+    // only the Peregrine read path rejects them, and ValidateChunks accepts
+    // them when the span is empty.
   }
   // Host base of `block_id`: identity on full mirrors, leased slot otherwise.
   // `host_block` is the (possibly plan-remapped) host block id for full
@@ -3569,10 +3615,22 @@ uint8_t* KVCacheManagerBase::GetBlockHostPointer(size_t layer_idx,
       return nullptr;
     }
     const PoolSpec& pool = pools_[layer_idx];
-    uint8_t* storage_base = GetHostPointer(pool.storage_index, shard_idx);
-    if (storage_base == nullptr) {
+    if (pool.storage_index >= layers_.size()) {
+      // Bounded staging: the storage has no host layer.
       return nullptr;
     }
+    const absl::StatusOr<absl::Span<uint8_t>> storage =
+        GetHostBuffer(pool.storage_index, shard_idx);
+    if (absl::IsFailedPrecondition(storage.status())) {
+      // The storage has no host buffer.
+      return nullptr;
+    }
+    if (!storage.ok()) {
+      LOG(ERROR) << "No host pointer for pool " << layer_idx << " block "
+                 << block_id << ": " << storage.status();
+      return nullptr;
+    }
+    uint8_t* storage_base = storage->data();
     if (PoolStorageStagingBounded(pool.storage_index)) {
       // Plan-less per-block addressing has no meaning on a bounded storage
       // (host bytes exist only under a transfer's lease).
@@ -3958,22 +4016,40 @@ std::vector<backends::HostBufferDescriptor>
 KVCacheManagerBase::ResolveBlockSlices(int staging_block_id) const {
   std::vector<backends::HostBufferDescriptor> slices;
   slices.reserve(num_layers_ * num_shards_);
+  const auto log_missing = [&](size_t l, size_t s, absl::string_view suffix) {
+    LOG(ERROR) << "No host bytes for staging_block_id " << staging_block_id
+               << " in layer " << l << ", shard " << s << suffix;
+    return std::vector<backends::HostBufferDescriptor>{};
+  };
 
   // Deterministic Canonical Layer-Major Serialization Layout:
   for (size_t l = 0; l < num_layers_; ++l) {
     size_t slice_bytes = block_bytes(l);
     for (size_t s = 0; s < num_shards_; ++s) {
-      uint8_t* ptr = const_cast<KVCacheManagerBase*>(this)->GetBlockHostPointer(
-          l, s, staging_block_id);
-      // Explicit pools are bounded by GetBlockHostPointer; check buffer bounds
-      // for implicit pool.
-      if (ptr == nullptr ||
-          (!explicit_pools_ &&
-           (static_cast<size_t>(staging_block_id) + 1) * slice_bytes >
-               const_cast<KVCacheManagerBase*>(this)->GetHostSize(l, s))) {
-        LOG(ERROR) << "No host bytes for staging_block_id " << staging_block_id
-                   << " in layer " << l << ", shard " << s;
-        return {};
+      uint8_t* ptr = nullptr;
+      if (explicit_pools_) {
+        ptr = const_cast<KVCacheManagerBase*>(this)->GetBlockHostPointer(
+            l, s, staging_block_id);
+        if (ptr == nullptr) return log_missing(l, s, "");
+      } else if (staging_block_id < 0 || layers_.size() < num_layers_) {
+        return log_missing(l, s, "");
+      } else {
+        const absl::StatusOr<absl::Span<const uint8_t>> host_buffer =
+            GetHostBuffer(l, s);
+        if (!host_buffer.ok()) {
+          return log_missing(l, s, absl::StrCat(": ", host_buffer.status()));
+        }
+        const size_t block = static_cast<size_t>(staging_block_id);
+        if (host_buffer->data() == nullptr ||
+            slice_bytes > host_buffer->size() ||
+            (slice_bytes > 0 &&
+             block > (host_buffer->size() - slice_bytes) / slice_bytes)) {
+          return log_missing(l, s,
+                             absl::StrCat(": host buffer has ",
+                                          host_buffer->size(), " bytes"));
+        }
+        // Recall scatter-reads write into manager-owned staging memory.
+        ptr = const_cast<uint8_t*>(host_buffer->data()) + block * slice_bytes;
       }
       backends::HostBufferDescriptor desc;
       desc.ptr = ptr;

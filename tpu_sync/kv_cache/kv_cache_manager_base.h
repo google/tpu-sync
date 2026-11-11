@@ -545,7 +545,8 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // returns kOutOfRange when |shard_idx| is past num_shards(), and
   // kFailedPrecondition when the storage has no host buffer or the pool does
   // not fit it. Without explicit pools, returns an OK empty span when the
-  // storage has no host buffer.
+  // storage has no host buffer, and kOutOfRange when the host layer does not
+  // exist or has no shards.
   absl::StatusOr<absl::Span<const char>> GetBlockArrayHostSpan(
       size_t block_array_idx, size_t shard_idx, uint64_t uuid = 0) override;
 

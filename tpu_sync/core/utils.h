@@ -469,20 +469,63 @@ inline absl::Status ValidateCommonPoolReshardPlan(
 }
 
 // Validates that every block ID in |local_block_ids| fits within each
-// transferred pool's block capacity.
+// transferred pool's block capacity. Pools of different groups may hold
+// different numbers of blocks (e.g. a window-sized private pool beside the
+// global block pool), so with pool groups each scheduled block id is checked
+// only against the pools of its own group: the sender's source ids when
+// |is_sender|, else the receiver's destination ids (plus each group's
+// declared destination ids). Plans without groups keep the flat check.
 inline absl::Status ValidatePoolBlockBounds(
     const kv_cache::KVCacheManagerBase* base,
     const ::tpu_sync::rpc::StartTransferRequest& plan,
-    absl::Span<const int64_t> local_block_ids) {
-  for (int32_t encoded_pool_idx : plan.transfer_pool_indices()) {
-    const size_t pool_idx = static_cast<size_t>(encoded_pool_idx);
-    const kv_cache::PoolSpec* spec = base->pool(pool_idx);
-    for (int64_t block_id : local_block_ids) {
-      if (block_id >= spec->num_blocks) {
-        return absl::InvalidArgumentError(
-            absl::StrCat("local block id ", block_id,
-                         " is out of range for pool ", pool_idx));
+    absl::Span<const int64_t> local_block_ids, bool is_sender = false) {
+  if (plan.pool_groups_size() == 0) {
+    for (int32_t encoded_pool_idx : plan.transfer_pool_indices()) {
+      const size_t pool_idx = static_cast<size_t>(encoded_pool_idx);
+      const kv_cache::PoolSpec* spec = base->pool(pool_idx);
+      for (int64_t block_id : local_block_ids) {
+        if (block_id >= spec->num_blocks) {
+          return absl::InvalidArgumentError(
+              absl::StrCat("local block id ", block_id,
+                           " is out of range for pool ", pool_idx));
+        }
       }
+    }
+    return absl::OkStatus();
+  }
+  const auto check_group = [&](int32_t group_idx,
+                               int64_t block_id) -> absl::Status {
+    if (group_idx < 0 || group_idx >= plan.pool_groups_size()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "reshard entry declares an unknown pool group ", group_idx));
+    }
+    for (int32_t encoded_pool_idx :
+         plan.pool_groups(group_idx).pool_indices()) {
+      const size_t pool_idx = static_cast<size_t>(encoded_pool_idx);
+      const kv_cache::PoolSpec* spec = base->pool(pool_idx);
+      if (spec == nullptr) continue;
+      if (block_id < 0 || block_id >= spec->num_blocks) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "local block id ", block_id, " is out of range for pool ",
+            pool_idx, " (group ", group_idx, ", ", spec->num_blocks,
+            " blocks)"));
+      }
+    }
+    return absl::OkStatus();
+  };
+  if (!is_sender) {
+    for (int32_t g = 0; g < plan.pool_groups_size(); ++g) {
+      for (int64_t block_id : plan.pool_groups(g).dst_device_block_ids()) {
+        ABSL_RETURN_IF_ERROR(check_group(g, block_id));
+      }
+    }
+  }
+  for (const auto& [source_rank, schedule] : plan.shard_push_schedules()) {
+    for (const auto& entry : schedule.entries()) {
+      ABSL_RETURN_IF_ERROR(check_group(
+          entry.pool_group(),
+          is_sender ? static_cast<int64_t>(entry.src_block_id())
+                    : static_cast<int64_t>(entry.dst_block_id())));
     }
   }
   return absl::OkStatus();

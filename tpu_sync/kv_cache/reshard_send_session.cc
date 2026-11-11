@@ -235,7 +235,8 @@ absl::Status ReshardSendSession::ValidatePlan(
     absl::Span<const int64_t> src_block_ids) {
   ABSL_RETURN_IF_ERROR(
       ValidateCommonPoolReshardPlan(&base, plan, src_block_ids));
-  ABSL_RETURN_IF_ERROR(ValidatePoolBlockBounds(&base, plan, src_block_ids));
+  ABSL_RETURN_IF_ERROR(ValidatePoolBlockBounds(&base, plan, src_block_ids,
+                                               /*is_sender=*/true));
 
   absl::flat_hash_set<int64_t> local_ids(src_block_ids.begin(),
                                          src_block_ids.end());

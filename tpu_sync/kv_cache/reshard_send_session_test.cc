@@ -24,6 +24,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <tuple>
 #include <vector>
 
 #include <gmock/gmock.h>
@@ -267,6 +268,51 @@ TEST(ReshardSendSessionTest,
 
   ExpectInvalid(CreateStatus(base, plan, std::vector<int64_t>{0}),
                 "source span exceeds declared pool 0 live regions");
+}
+
+// Pools of different groups may hold different numbers of blocks (e.g. a
+// window-sized private pool beside the global block pool): each source block
+// id is bounded by the pools of its own group only.
+TEST(ReshardSendSessionTest, ChecksBlockIdsAgainstOwnGroupPools) {
+  kv_cache::KVCacheManagerBase base = MakeTestBase();
+  kv_cache::PoolSpec small = DensePool("window", 64);
+  small.num_blocks = 2;
+  ASSERT_TRUE(base.RegisterPools({DensePool("fa", 128), small}).ok());
+  auto make_plan = [](int64_t fa_block, int64_t window_block) {
+    StartTransferRequest plan = ValidPlan(
+        /*uuid=*/1110, /*dtype_tags=*/{"bf16", "bf16"},
+        /*transferred_pools=*/{0, 1});
+    plan.clear_pool_groups();
+    auto& entries = plan.mutable_shard_push_schedules()->at(0);
+    entries.clear_entries();
+    for (auto [group, src, size] :
+         {std::tuple<int32_t, int64_t, int64_t>{0, fa_block, 16},
+          {1, window_block, 8}}) {
+      auto* entry = entries.add_entries();
+      entry->set_dst_peer("127.0.0.1:1");
+      entry->set_dst_shard_idx(0);
+      entry->set_src_block_id(src);
+      entry->set_dst_block_id(group);
+      entry->set_size_bytes(size);
+      entry->set_count(1);
+      entry->set_pool_group(group);
+      auto* pool_group = plan.add_pool_groups();
+      pool_group->add_pool_indices(group);
+      pool_group->add_dst_device_block_ids(group);
+      pool_group->set_expected_pushes(1);
+      pool_group->add_dst_expected_extent_bytes(size);
+      pool_group->set_order_rank(group);
+    }
+    return plan;
+  };
+
+  // Block 3 exists in the 4-block FA pool though not in the 2-block window
+  // pool, which only its own group's block 1 reads.
+  EXPECT_TRUE(
+      CreateStatus(base, make_plan(3, 1), std::vector<int64_t>{3, 1}).ok());
+  ExpectInvalid(
+      CreateStatus(base, make_plan(1, 3), std::vector<int64_t>{1, 3}),
+      "out of range for pool 1");
 }
 
 TEST(ReshardSendSessionTest, IgnoresReceiverCoverageGap) {

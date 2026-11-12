@@ -34,6 +34,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/time/time.h"
+#include "absl/types/span.h"
 #include "grpcpp/channel.h"
 #include "grpcpp/client_context.h"
 #include "grpcpp/support/status.h"
@@ -456,9 +457,9 @@ TEST(WeightSynchronizerListenerTest, PushWeightsReshardedSuccess) {
   };
 
   for (size_t i = 0; i < 4; ++i) {
-    uint8_t* ptr = src_engine.GetHostPointer(0, i);
-    ASSERT_NE(ptr, nullptr);
-    std::memcpy(ptr, src_data[i].data(), 16);
+    TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> src_buf,
+                         src_engine.GetHostBuffer(0, i));
+    std::memcpy(src_buf.data(), src_data[i].data(), 16);
   }
 
   uint64_t test_uuid = 98765;
@@ -526,8 +527,9 @@ TEST(WeightSynchronizerListenerTest, PushWeightsReshardedSuccess) {
   EXPECT_TRUE(src_resp.success()) << src_resp.message();
 
   // Verify Destination Shard 0 final host memory!
-  uint8_t* dst_ptr = dst_engine.GetHostPointer(0, 0);
-  ASSERT_NE(dst_ptr, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> dst_buf,
+                       dst_engine.GetHostBuffer(0, 0));
+  const uint8_t* dst_ptr = dst_buf.data();
 
   std::vector<uint8_t> expected_d0 = {0,  1,  8,  9,  16, 17, 24, 25,
                                       32, 33, 40, 41, 48, 49, 56, 57};

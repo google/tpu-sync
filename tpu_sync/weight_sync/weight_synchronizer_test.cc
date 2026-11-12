@@ -120,17 +120,18 @@ TEST_F(WeightSynchronizerTest, PushWeightsCorrectnessE2e) {
 
   // 2. Populate the Trainer source buffer with distinct byte pattern (0xAB)
   // E2E!
-  uint8_t* src_host_ptr = const_cast<uint8_t*>(ws_source->GetHostPointer(0, 0));
-  ASSERT_NE(src_host_ptr, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> src_host_buf,
+                       ws_source->GetHostBuffer(0, 0));
+  uint8_t* src_host_ptr = src_host_buf.data();
   std::memset(src_host_ptr, 0xAB, slice_byte_size_);
 
   // Populate inference servers with zeros baseline
-  uint8_t* dest1_host_ptr =
-      const_cast<uint8_t*>(ws_dest1->GetHostPointer(0, 0));
-  uint8_t* dest2_host_ptr =
-      const_cast<uint8_t*>(ws_dest2->GetHostPointer(0, 0));
-  ASSERT_NE(dest1_host_ptr, nullptr);
-  ASSERT_NE(dest2_host_ptr, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> dest1_host_buf,
+                       ws_dest1->GetHostBuffer(0, 0));
+  uint8_t* dest1_host_ptr = dest1_host_buf.data();
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> dest2_host_buf,
+                       ws_dest2->GetHostBuffer(0, 0));
+  uint8_t* dest2_host_ptr = dest2_host_buf.data();
   std::memset(dest1_host_ptr, 0x00, slice_byte_size_);
   std::memset(dest2_host_ptr, 0x00, slice_byte_size_);
 
@@ -175,18 +176,22 @@ TEST_F(WeightSynchronizerTest, PushWeightsHeterogeneousCorrectness) {
   std::string dest_peer = "localhost:" + std::to_string(*ws_dest->local_port());
 
   // Populate source layers
-  uint8_t* src_l0_ptr = const_cast<uint8_t*>(ws_source->GetHostPointer(0, 0));
-  uint8_t* src_l1_ptr = const_cast<uint8_t*>(ws_source->GetHostPointer(1, 0));
-  ASSERT_NE(src_l0_ptr, nullptr);
-  ASSERT_NE(src_l1_ptr, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> src_l0_buf,
+                       ws_source->GetHostBuffer(0, 0));
+  uint8_t* src_l0_ptr = src_l0_buf.data();
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> src_l1_buf,
+                       ws_source->GetHostBuffer(1, 0));
+  uint8_t* src_l1_ptr = src_l1_buf.data();
   std::memset(src_l0_ptr, 0xAA, slice_byte_sizes[0]);
   std::memset(src_l1_ptr, 0xBB, slice_byte_sizes[1]);
 
   // Populate dest layers with zeros
-  uint8_t* dest_l0_ptr = const_cast<uint8_t*>(ws_dest->GetHostPointer(0, 0));
-  uint8_t* dest_l1_ptr = const_cast<uint8_t*>(ws_dest->GetHostPointer(1, 0));
-  ASSERT_NE(dest_l0_ptr, nullptr);
-  ASSERT_NE(dest_l1_ptr, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> dest_l0_buf,
+                       ws_dest->GetHostBuffer(0, 0));
+  uint8_t* dest_l0_ptr = dest_l0_buf.data();
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> dest_l1_buf,
+                       ws_dest->GetHostBuffer(1, 0));
+  uint8_t* dest_l1_ptr = dest_l1_buf.data();
   std::memset(dest_l0_ptr, 0x00, slice_byte_sizes[0]);
   std::memset(dest_l1_ptr, 0x00, slice_byte_sizes[1]);
 
@@ -249,10 +254,12 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedExactBoundary) {
   ASSERT_TRUE(ws_dest->local_port().has_value());
   std::string dest_peer = "localhost:" + std::to_string(*ws_dest->local_port());
 
-  uint8_t* src_host_ptr = const_cast<uint8_t*>(ws_source->GetHostPointer(0, 0));
-  uint8_t* dest_host_ptr = const_cast<uint8_t*>(ws_dest->GetHostPointer(0, 0));
-  ASSERT_NE(src_host_ptr, nullptr);
-  ASSERT_NE(dest_host_ptr, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> src_host_buf,
+                       ws_source->GetHostBuffer(0, 0));
+  uint8_t* src_host_ptr = src_host_buf.data();
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> dest_host_buf,
+                       ws_dest->GetHostBuffer(0, 0));
+  uint8_t* dest_host_ptr = dest_host_buf.data();
   std::memset(src_host_ptr, 0xAB, slice_byte_size);
   std::memset(dest_host_ptr, 0x00, slice_byte_size);
 
@@ -306,14 +313,15 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedMultiPeerBroadcast) {
   std::string dest_peer2 =
       "localhost:" + std::to_string(*ws_dest2->local_port());
 
-  uint8_t* src_host_ptr = const_cast<uint8_t*>(ws_source->GetHostPointer(0, 0));
-  uint8_t* dest_host_ptr1 =
-      const_cast<uint8_t*>(ws_dest1->GetHostPointer(0, 0));
-  uint8_t* dest_host_ptr2 =
-      const_cast<uint8_t*>(ws_dest2->GetHostPointer(0, 0));
-  ASSERT_NE(src_host_ptr, nullptr);
-  ASSERT_NE(dest_host_ptr1, nullptr);
-  ASSERT_NE(dest_host_ptr2, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> src_host_buf,
+                       ws_source->GetHostBuffer(0, 0));
+  uint8_t* src_host_ptr = src_host_buf.data();
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> dest_host_buf1,
+                       ws_dest1->GetHostBuffer(0, 0));
+  uint8_t* dest_host_ptr1 = dest_host_buf1.data();
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> dest_host_buf2,
+                       ws_dest2->GetHostBuffer(0, 0));
+  uint8_t* dest_host_ptr2 = dest_host_buf2.data();
   std::memset(src_host_ptr, 0xCD, slice_byte_size);
   std::memset(dest_host_ptr1, 0x00, slice_byte_size);
   std::memset(dest_host_ptr2, 0x00, slice_byte_size);
@@ -373,14 +381,15 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedMultiPeerBroadcastStrided) {
   std::string dest_peer2 =
       "localhost:" + std::to_string(*ws_dest2->local_port());
 
-  uint8_t* src_host_ptr = const_cast<uint8_t*>(ws_source->GetHostPointer(0, 0));
-  uint8_t* dest_host_ptr1 =
-      const_cast<uint8_t*>(ws_dest1->GetHostPointer(0, 0));
-  uint8_t* dest_host_ptr2 =
-      const_cast<uint8_t*>(ws_dest2->GetHostPointer(0, 0));
-  ASSERT_NE(src_host_ptr, nullptr);
-  ASSERT_NE(dest_host_ptr1, nullptr);
-  ASSERT_NE(dest_host_ptr2, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> src_host_buf,
+                       ws_source->GetHostBuffer(0, 0));
+  uint8_t* src_host_ptr = src_host_buf.data();
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> dest_host_buf1,
+                       ws_dest1->GetHostBuffer(0, 0));
+  uint8_t* dest_host_ptr1 = dest_host_buf1.data();
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> dest_host_buf2,
+                       ws_dest2->GetHostBuffer(0, 0));
+  uint8_t* dest_host_ptr2 = dest_host_buf2.data();
   std::memset(src_host_ptr, 0xEF, slice_byte_size);
   std::memset(dest_host_ptr1, 0x00, slice_byte_size);
   std::memset(dest_host_ptr2, 0x00, slice_byte_size);
@@ -437,10 +446,12 @@ TEST_F(WeightSynchronizerTest, PushWeightsResharded3DStridedSuccess) {
   ASSERT_TRUE(ws_dest->local_port().has_value());
   std::string dest_peer = "localhost:" + std::to_string(*ws_dest->local_port());
 
-  uint8_t* src_host_ptr = const_cast<uint8_t*>(ws_source->GetHostPointer(0, 0));
-  uint8_t* dest_host_ptr = const_cast<uint8_t*>(ws_dest->GetHostPointer(0, 0));
-  ASSERT_NE(src_host_ptr, nullptr);
-  ASSERT_NE(dest_host_ptr, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> src_host_buf,
+                       ws_source->GetHostBuffer(0, 0));
+  uint8_t* src_host_ptr = src_host_buf.data();
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> dest_host_buf,
+                       ws_dest->GetHostBuffer(0, 0));
+  uint8_t* dest_host_ptr = dest_host_buf.data();
   std::memset(src_host_ptr, 0x00, slice_byte_size);
   std::memset(dest_host_ptr, 0x00, slice_byte_size);
 
@@ -518,10 +529,12 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedStridedSuccess) {
   ASSERT_TRUE(ws_dest->local_port().has_value());
   std::string dest_peer = "localhost:" + std::to_string(*ws_dest->local_port());
 
-  uint8_t* src_host_ptr = const_cast<uint8_t*>(ws_source->GetHostPointer(0, 0));
-  uint8_t* dest_host_ptr = const_cast<uint8_t*>(ws_dest->GetHostPointer(0, 0));
-  ASSERT_NE(src_host_ptr, nullptr);
-  ASSERT_NE(dest_host_ptr, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> src_host_buf,
+                       ws_source->GetHostBuffer(0, 0));
+  uint8_t* src_host_ptr = src_host_buf.data();
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> dest_host_buf,
+                       ws_dest->GetHostBuffer(0, 0));
+  uint8_t* dest_host_ptr = dest_host_buf.data();
 
   for (size_t i = 0; i < total_payload; ++i) {
     src_host_ptr[i] = static_cast<uint8_t>((i * 7 + 1) & 0xFF);
@@ -584,10 +597,12 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedZeroBytes) {
   ASSERT_TRUE(ws_dest->local_port().has_value());
   std::string dest_peer = "localhost:" + std::to_string(*ws_dest->local_port());
 
-  uint8_t* src_host_ptr = const_cast<uint8_t*>(ws_source->GetHostPointer(0, 0));
-  uint8_t* dest_host_ptr = const_cast<uint8_t*>(ws_dest->GetHostPointer(0, 0));
-  ASSERT_NE(src_host_ptr, nullptr);
-  ASSERT_NE(dest_host_ptr, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> src_host_buf,
+                       ws_source->GetHostBuffer(0, 0));
+  uint8_t* src_host_ptr = src_host_buf.data();
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> dest_host_buf,
+                       ws_dest->GetHostBuffer(0, 0));
+  uint8_t* dest_host_ptr = dest_host_buf.data();
   std::memset(src_host_ptr, 0xAB, slice_byte_size);
   std::memset(dest_host_ptr, 0x00, slice_byte_size);
 
@@ -783,13 +798,15 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedFallbackByNameSuccess) {
   std::string dest_peer = "localhost:" + std::to_string(*ws_dest->local_port());
 
   // Populate source layer_B (index 1) with 0xAB
-  uint8_t* src_l1_ptr = const_cast<uint8_t*>(ws_source->GetHostPointer(1, 0));
-  ASSERT_NE(src_l1_ptr, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> src_l1_buf,
+                       ws_source->GetHostBuffer(1, 0));
+  uint8_t* src_l1_ptr = src_l1_buf.data();
   std::memset(src_l1_ptr, 0xAB, slice_byte_sizes[1]);
 
   // Populate dest layer_B with zeros
-  uint8_t* dest_l1_ptr = const_cast<uint8_t*>(ws_dest->GetHostPointer(1, 0));
-  ASSERT_NE(dest_l1_ptr, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> dest_l1_buf,
+                       ws_dest->GetHostBuffer(1, 0));
+  uint8_t* dest_l1_ptr = dest_l1_buf.data();
   std::memset(dest_l1_ptr, 0x00, slice_byte_sizes[1]);
 
   tpu_sync::rpc::StartTransferRequest request;
@@ -923,12 +940,14 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedSkipD2h) {
   ASSERT_TRUE(ws_dest->local_port().has_value());
   std::string dest_peer = "localhost:" + std::to_string(*ws_dest->local_port());
 
-  uint8_t* src_host_ptr = const_cast<uint8_t*>(ws_source->GetHostPointer(0, 0));
-  ASSERT_NE(src_host_ptr, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> src_host_buf,
+                       ws_source->GetHostBuffer(0, 0));
+  uint8_t* src_host_ptr = src_host_buf.data();
   std::memset(src_host_ptr, 0xAA, slice_byte_size);
 
-  uint8_t* dest_host_ptr = const_cast<uint8_t*>(ws_dest->GetHostPointer(0, 0));
-  ASSERT_NE(dest_host_ptr, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> dest_host_buf,
+                       ws_dest->GetHostBuffer(0, 0));
+  uint8_t* dest_host_ptr = dest_host_buf.data();
   std::memset(dest_host_ptr, 0x00, slice_byte_size);
 
   tpu_sync::rpc::StartTransferRequest request;
@@ -987,10 +1006,12 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedMultiLayerPipelineGrouped) {
 
   for (size_t l = 0; l < num_layers; ++l) {
     for (size_t s = 0; s < num_shards; ++s) {
-      uint8_t* src_ptr = const_cast<uint8_t*>(ws_source->GetHostPointer(l, s));
-      uint8_t* dst_ptr = const_cast<uint8_t*>(ws_dest->GetHostPointer(l, s));
-      ASSERT_NE(src_ptr, nullptr);
-      ASSERT_NE(dst_ptr, nullptr);
+      TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> src_buf,
+                           ws_source->GetHostBuffer(l, s));
+      uint8_t* src_ptr = src_buf.data();
+      TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> dst_buf,
+                           ws_dest->GetHostBuffer(l, s));
+      uint8_t* dst_ptr = dst_buf.data();
       std::memset(src_ptr, static_cast<int>(l * 16 + s + 1), slice_byte_size);
       std::memset(dst_ptr, 0x00, slice_byte_size);
     }
@@ -1026,7 +1047,9 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedMultiLayerPipelineGrouped) {
 
   for (size_t l = 0; l < num_layers; ++l) {
     for (size_t s = 0; s < num_shards; ++s) {
-      uint8_t* dst_ptr = const_cast<uint8_t*>(ws_dest->GetHostPointer(l, s));
+      TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> dst_buf,
+                           ws_dest->GetHostBuffer(l, s));
+      const uint8_t* dst_ptr = dst_buf.data();
       uint8_t expected_val = static_cast<uint8_t>(l * 16 + s + 1);
       for (size_t b = 0; b < slice_byte_size; ++b) {
         EXPECT_EQ(dst_ptr[b], expected_val)
@@ -1038,8 +1061,9 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedMultiLayerPipelineGrouped) {
   // Test 2: Pipeline group size = 1 (layer-by-layer)
   for (size_t l = 0; l < num_layers; ++l) {
     for (size_t s = 0; s < num_shards; ++s) {
-      std::memset(const_cast<uint8_t*>(ws_dest->GetHostPointer(l, s)), 0x00,
-                  slice_byte_size);
+      TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> dst_buf,
+                           ws_dest->GetHostBuffer(l, s));
+      std::memset(dst_buf.data(), 0x00, slice_byte_size);
     }
   }
   ws_source->SetPipelineGroupSize(1);
@@ -1053,7 +1077,9 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedMultiLayerPipelineGrouped) {
 
   for (size_t l = 0; l < num_layers; ++l) {
     for (size_t s = 0; s < num_shards; ++s) {
-      uint8_t* dst_ptr = const_cast<uint8_t*>(ws_dest->GetHostPointer(l, s));
+      TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> dst_buf,
+                           ws_dest->GetHostBuffer(l, s));
+      const uint8_t* dst_ptr = dst_buf.data();
       uint8_t expected_val = static_cast<uint8_t>(l * 16 + s + 1);
       for (size_t b = 0; b < slice_byte_size; ++b) {
         EXPECT_EQ(dst_ptr[b], expected_val)
@@ -1065,8 +1091,9 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedMultiLayerPipelineGrouped) {
   // Test 3: Pipeline group size = 0 (all layers in 1 group)
   for (size_t l = 0; l < num_layers; ++l) {
     for (size_t s = 0; s < num_shards; ++s) {
-      std::memset(const_cast<uint8_t*>(ws_dest->GetHostPointer(l, s)), 0x00,
-                  slice_byte_size);
+      TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> dst_buf,
+                           ws_dest->GetHostBuffer(l, s));
+      std::memset(dst_buf.data(), 0x00, slice_byte_size);
     }
   }
   ws_source->SetPipelineGroupSize(0);
@@ -1080,7 +1107,9 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedMultiLayerPipelineGrouped) {
 
   for (size_t l = 0; l < num_layers; ++l) {
     for (size_t s = 0; s < num_shards; ++s) {
-      uint8_t* dst_ptr = const_cast<uint8_t*>(ws_dest->GetHostPointer(l, s));
+      TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> dst_buf,
+                           ws_dest->GetHostBuffer(l, s));
+      const uint8_t* dst_ptr = dst_buf.data();
       uint8_t expected_val = static_cast<uint8_t>(l * 16 + s + 1);
       for (size_t b = 0; b < slice_byte_size; ++b) {
         EXPECT_EQ(dst_ptr[b], expected_val)
@@ -1092,8 +1121,9 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedMultiLayerPipelineGrouped) {
   // Test 4: Pipeline group size configured via environment variable
   for (size_t l = 0; l < num_layers; ++l) {
     for (size_t s = 0; s < num_shards; ++s) {
-      std::memset(const_cast<uint8_t*>(ws_dest->GetHostPointer(l, s)), 0x00,
-                  slice_byte_size);
+      TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> dst_buf,
+                           ws_dest->GetHostBuffer(l, s));
+      std::memset(dst_buf.data(), 0x00, slice_byte_size);
     }
   }
   ws_source->SetPipelineGroupSize(std::nullopt);
@@ -1109,7 +1139,9 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedMultiLayerPipelineGrouped) {
 
   for (size_t l = 0; l < num_layers; ++l) {
     for (size_t s = 0; s < num_shards; ++s) {
-      uint8_t* dst_ptr = const_cast<uint8_t*>(ws_dest->GetHostPointer(l, s));
+      TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> dst_buf,
+                           ws_dest->GetHostBuffer(l, s));
+      const uint8_t* dst_ptr = dst_buf.data();
       uint8_t expected_val = static_cast<uint8_t>(l * 16 + s + 1);
       for (size_t b = 0; b < slice_byte_size; ++b) {
         EXPECT_EQ(dst_ptr[b], expected_val)
@@ -1464,8 +1496,9 @@ TEST_F(WeightSynchronizerTest, TilingSkipScenarios) {
     auto src_ws = runner.CreateWS(xla::PrimitiveType::F32, {8, 8}, layout,
                                   src_device_placeholder);
 
-    float* src_host = reinterpret_cast<float*>(
-        const_cast<uint8_t*>(src_ws.ws->GetHostPointer(0, 0)));
+    TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> src_host_buf,
+                         src_ws.ws->GetHostBuffer(0, 0));
+    float* src_host = reinterpret_cast<float*>(src_host_buf.data());
     for (int i = 0; i < 64; ++i) {
       src_host[i] = static_cast<float>(i);
     }
@@ -1570,8 +1603,9 @@ TEST_F(WeightSynchronizerTest, TilingActiveByDefault) {
     auto src_ws = runner.CreateWS(xla::PrimitiveType::F32, {8, 8}, layout,
                                   src_device_placeholder);
 
-    float* src_host = reinterpret_cast<float*>(
-        const_cast<uint8_t*>(src_ws.ws->GetHostPointer(0, 0)));
+    TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> src_host_buf,
+                         src_ws.ws->GetHostBuffer(0, 0));
+    float* src_host = reinterpret_cast<float*>(src_host_buf.data());
     for (int i = 0; i < 64; ++i) {
       src_host[i] = static_cast<float>(i);
     }
@@ -1647,8 +1681,9 @@ TEST_F(WeightSynchronizerTest, H2dTilesAllShardsAndLayersConcurrently) {
   };
   for (int l = 0; l < kNumLayers; ++l) {
     for (int s = 0; s < kNumShards; ++s) {
-      float* host = reinterpret_cast<float*>(ws->GetHostPointer(l, s));
-      ASSERT_NE(host, nullptr);
+      TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> host_buf,
+                           ws->GetHostBuffer(l, s));
+      float* host = reinterpret_cast<float*>(host_buf.data());
       for (int i = 0; i < kElems; ++i) host[i] = value_at(l, s, i);
     }
   }
@@ -1741,8 +1776,9 @@ TEST_F(WeightSynchronizerTest, LazyTiledBufferAllocationSavesMemory) {
   // allocation saves memory)
   EXPECT_EQ(src_ws.ws->GetTiledPointer(0, 0), nullptr);
 
-  float* src_host = reinterpret_cast<float*>(
-      const_cast<uint8_t*>(src_ws.ws->GetHostPointer(0, 0)));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> src_host_buf,
+                       src_ws.ws->GetHostBuffer(0, 0));
+  float* src_host = reinterpret_cast<float*>(src_host_buf.data());
   for (int i = 0; i < 64; ++i) {
     src_host[i] = static_cast<float>(i);
   }
@@ -1837,8 +1873,9 @@ TEST_F(WeightSynchronizerTest, OneDimensionalTiledTensorH2dAndD2hRoundtrip) {
   auto ws_wrap = runner.CreateWS(xla::PrimitiveType::F32, {64}, layout,
                                  device_placeholder);
 
-  float* host_ptr = reinterpret_cast<float*>(
-      const_cast<uint8_t*>(ws_wrap.ws->GetHostPointer(0, 0)));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> host_buf,
+                       ws_wrap.ws->GetHostBuffer(0, 0));
+  float* host_ptr = reinterpret_cast<float*>(host_buf.data());
   for (int i = 0; i < 64; ++i) {
     host_ptr[i] = static_cast<float>(i + 1);
   }
@@ -1913,7 +1950,8 @@ TEST_F(WeightSynchronizerTest, DeferredH2dTilesHostBufferOnDataReceived) {
           /*listener_port=*/std::nullopt, /*bind_ip=*/std::nullopt,
           /*layer_names=*/std::vector<std::string>{}, /*auto_h2d=*/false));
 
-  float* host = reinterpret_cast<float*>(ws->GetHostPointer(0, 0));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> host_buf, ws->GetHostBuffer(0, 0));
+  float* host = reinterpret_cast<float*>(host_buf.data());
   for (int i = 0; i < 64; ++i) {
     host[i] = static_cast<float>(i);
   }
@@ -1976,7 +2014,8 @@ TEST_F(WeightSynchronizerTest, H2dTracksPerLayerHostLayout) {
           /*listener_port=*/std::nullopt, /*bind_ip=*/std::nullopt,
           /*layer_names=*/std::vector<std::string>{}, /*auto_h2d=*/false));
 
-  float* host = reinterpret_cast<float*>(ws->GetHostPointer(0, 0));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> host_buf, ws->GetHostBuffer(0, 0));
+  float* host = reinterpret_cast<float*>(host_buf.data());
   for (int i = 0; i < 64; ++i) {
     host[i] = static_cast<float>(i);
   }
@@ -2086,7 +2125,8 @@ TEST_F(WeightSynchronizerTest, DeferredReceiverKeepsHostBufferLogical) {
             /*listener_port=*/std::nullopt, /*bind_ip=*/std::nullopt,
             /*layer_names=*/std::vector<std::string>{}, auto_h2d));
 
-    float* host = reinterpret_cast<float*>(ws->GetHostPointer(0, 0));
+    TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> host_buf, ws->GetHostBuffer(0, 0));
+    float* host = reinterpret_cast<float*>(host_buf.data());
     for (int i = 0; i < 64; ++i) {
       host[i] = static_cast<float>(i);
     }
@@ -2163,7 +2203,9 @@ TEST_F(WeightSynchronizerTest, AutoH2dWaitsForEveryShardOfBlockPush) {
           /*listener_port=*/std::nullopt, /*bind_ip=*/std::nullopt,
           /*layer_names=*/std::vector<std::string>{}, /*auto_h2d=*/true));
   for (int sh = 0; sh < kShards; ++sh) {
-    float* host = reinterpret_cast<float*>(ws->GetHostPointer(0, sh));
+    TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> host_buf,
+                         ws->GetHostBuffer(0, sh));
+    float* host = reinterpret_cast<float*>(host_buf.data());
     for (int i = 0; i < 64; ++i) {
       host[i] = static_cast<float>(i);
     }
@@ -2287,7 +2329,8 @@ TEST_F(WeightSynchronizerTest, H2dWaitsForArmedInPlaceTiling) {
           /*listener_port=*/std::nullopt, /*bind_ip=*/std::nullopt,
           /*layer_names=*/std::vector<std::string>{}, /*auto_h2d=*/false));
 
-  float* host = reinterpret_cast<float*>(ws->GetHostPointer(0, 0));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> host_buf, ws->GetHostBuffer(0, 0));
+  float* host = reinterpret_cast<float*>(host_buf.data());
   for (int i = 0; i < 64; ++i) {
     host[i] = static_cast<float>(i);
   }
@@ -2468,7 +2511,8 @@ TEST_F(WeightSynchronizerTest, PreTiledReceiverCopiesHostBufferAsIs) {
             /*layer_names=*/std::vector<std::string>{}, auto_h2d));
 
     // The bytes as relayed: already in device layout.
-    float* host = reinterpret_cast<float*>(ws->GetHostPointer(0, 0));
+    TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> host_buf, ws->GetHostBuffer(0, 0));
+    float* host = reinterpret_cast<float*>(host_buf.data());
     for (int i = 0; i < 64; ++i) {
       host[i] = static_cast<float>(i);
     }
@@ -2548,10 +2592,12 @@ TEST_F(WeightSynchronizerTest, PreTiledPushSendsWholeShardAfterTiling) {
   const std::string relay_peer =
       absl::StrCat("localhost:", *ws_relay->local_port());
 
-  uint8_t* seed_host = ws_seed->GetHostPointer(0, 0);
-  uint8_t* relay_host = ws_relay->GetHostPointer(0, 0);
-  ASSERT_NE(seed_host, nullptr);
-  ASSERT_NE(relay_host, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> seed_buf,
+                       ws_seed->GetHostBuffer(0, 0));
+  uint8_t* seed_host = seed_buf.data();
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> relay_buf,
+                       ws_relay->GetHostBuffer(0, 0));
+  uint8_t* relay_host = relay_buf.data();
   std::memset(seed_host, 0xAB, kSliceBytes);
   std::memset(relay_host, 0x00, kSliceBytes);
 
@@ -2610,22 +2656,21 @@ TEST_F(WeightSynchronizerTest, GetHostPointerAndSizeNonContiguousGlobalShards) {
   // {0, 2, 4, 6}
   ws->SetGlobalShardIndices({0, 2, 4, 6});
 
-  // Check that GetHostPointer correctly maps global shard indices to internal
+  // Check that GetHostBuffer correctly maps global shard indices to internal
   // slots 0, 1, 2, 3
-  uint8_t* ptr_shard0 = ws->GetHostPointer(0, 0);
-  uint8_t* ptr_shard2 = ws->GetHostPointer(0, 2);
-  uint8_t* ptr_shard4 = ws->GetHostPointer(0, 4);
-  uint8_t* ptr_shard6 = ws->GetHostPointer(0, 6);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> shard0_buf, ws->GetHostBuffer(0, 0));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> shard2_buf, ws->GetHostBuffer(0, 2));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> shard4_buf, ws->GetHostBuffer(0, 4));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> shard6_buf, ws->GetHostBuffer(0, 6));
+  uint8_t* ptr_shard0 = shard0_buf.data();
+  uint8_t* ptr_shard2 = shard2_buf.data();
+  uint8_t* ptr_shard4 = shard4_buf.data();
+  uint8_t* ptr_shard6 = shard6_buf.data();
 
-  ASSERT_NE(ptr_shard0, nullptr);
-  ASSERT_NE(ptr_shard2, nullptr);
-  ASSERT_NE(ptr_shard4, nullptr);
-  ASSERT_NE(ptr_shard6, nullptr);
-
-  EXPECT_EQ(ptr_shard0, const_cast<uint8_t*>(ws->GetHostBufferPtr(0, 0)));
-  EXPECT_EQ(ptr_shard2, const_cast<uint8_t*>(ws->GetHostBufferPtr(0, 1)));
-  EXPECT_EQ(ptr_shard4, const_cast<uint8_t*>(ws->GetHostBufferPtr(0, 2)));
-  EXPECT_EQ(ptr_shard6, const_cast<uint8_t*>(ws->GetHostBufferPtr(0, 3)));
+  EXPECT_EQ(ptr_shard0, ws->GetHostBufferPtr(0, 0));
+  EXPECT_EQ(ptr_shard2, ws->GetHostBufferPtr(0, 1));
+  EXPECT_EQ(ptr_shard4, ws->GetHostBufferPtr(0, 2));
+  EXPECT_EQ(ptr_shard6, ws->GetHostBufferPtr(0, 3));
 
   // Ensure all 4 resolved pointers are distinct
   EXPECT_NE(ptr_shard0, ptr_shard2);
@@ -2636,19 +2681,27 @@ TEST_F(WeightSynchronizerTest, GetHostPointerAndSizeNonContiguousGlobalShards) {
   EXPECT_NE(ptr_shard4, ptr_shard6);
 
   // Check sizes
-  EXPECT_EQ(ws->GetHostSize(0, 0), slice_size);
-  EXPECT_EQ(ws->GetHostSize(0, 2), slice_size);
-  EXPECT_EQ(ws->GetHostSize(0, 4), slice_size);
-  EXPECT_EQ(ws->GetHostSize(0, 6), slice_size);
+  EXPECT_EQ(shard0_buf.size(), slice_size);
+  EXPECT_EQ(shard2_buf.size(), slice_size);
+  EXPECT_EQ(shard4_buf.size(), slice_size);
+  EXPECT_EQ(shard6_buf.size(), slice_size);
 
   // Const overloads
   const auto* const_ws = ws.get();
-  EXPECT_EQ(const_ws->GetHostPointer(0, 0), ws->GetHostBufferPtr(0, 0));
-  EXPECT_EQ(const_ws->GetHostPointer(0, 2), ws->GetHostBufferPtr(0, 1));
-  EXPECT_EQ(const_ws->GetHostPointer(0, 4), ws->GetHostBufferPtr(0, 2));
-  EXPECT_EQ(const_ws->GetHostPointer(0, 6), ws->GetHostBufferPtr(0, 3));
-  EXPECT_EQ(const_ws->GetHostSize(0, 0), slice_size);
-  EXPECT_EQ(const_ws->GetHostSize(0, 2), slice_size);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> const_shard0_buf,
+                       const_ws->GetHostBuffer(0, 0));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> const_shard2_buf,
+                       const_ws->GetHostBuffer(0, 2));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> const_shard4_buf,
+                       const_ws->GetHostBuffer(0, 4));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> const_shard6_buf,
+                       const_ws->GetHostBuffer(0, 6));
+  EXPECT_EQ(const_shard0_buf.data(), ws->GetHostBufferPtr(0, 0));
+  EXPECT_EQ(const_shard2_buf.data(), ws->GetHostBufferPtr(0, 1));
+  EXPECT_EQ(const_shard4_buf.data(), ws->GetHostBufferPtr(0, 2));
+  EXPECT_EQ(const_shard6_buf.data(), ws->GetHostBufferPtr(0, 3));
+  EXPECT_EQ(const_shard0_buf.size(), slice_size);
+  EXPECT_EQ(const_shard2_buf.size(), slice_size);
 
   // Verify memory writes do not collide
   std::memset(ptr_shard0, 0x11, slice_size);
@@ -2678,34 +2731,41 @@ TEST_F(WeightSynchronizerTest, GetHostPointerAndSizeLocalAndGlobalIndices) {
 
   // Local slot indices should map directly to internal slots 0, 1, 2, 3
   // without being falsely remapped by global shard indices {2, 3, 6, 7}.
-  uint8_t* ptr_slot0 = ws->GetHostPointer(0, 0);
-  uint8_t* ptr_slot1 = ws->GetHostPointer(0, 1);
-  uint8_t* ptr_slot2 = ws->GetHostPointer(0, 2);
-  uint8_t* ptr_slot3 = ws->GetHostPointer(0, 3);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> slot0_buf, ws->GetHostBuffer(0, 0));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> slot1_buf, ws->GetHostBuffer(0, 1));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> slot2_buf, ws->GetHostBuffer(0, 2));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> slot3_buf, ws->GetHostBuffer(0, 3));
+  uint8_t* ptr_slot0 = slot0_buf.data();
+  uint8_t* ptr_slot1 = slot1_buf.data();
+  uint8_t* ptr_slot2 = slot2_buf.data();
+  uint8_t* ptr_slot3 = slot3_buf.data();
 
-  ASSERT_NE(ptr_slot0, nullptr);
-  ASSERT_NE(ptr_slot1, nullptr);
-  ASSERT_NE(ptr_slot2, nullptr);
-  ASSERT_NE(ptr_slot3, nullptr);
-
-  EXPECT_EQ(ptr_slot0, const_cast<uint8_t*>(ws->GetHostBufferPtr(0, 0)));
-  EXPECT_EQ(ptr_slot1, const_cast<uint8_t*>(ws->GetHostBufferPtr(0, 1)));
-  EXPECT_EQ(ptr_slot2, const_cast<uint8_t*>(ws->GetHostBufferPtr(0, 2)));
-  EXPECT_EQ(ptr_slot3, const_cast<uint8_t*>(ws->GetHostBufferPtr(0, 3)));
+  EXPECT_EQ(ptr_slot0, ws->GetHostBufferPtr(0, 0));
+  EXPECT_EQ(ptr_slot1, ws->GetHostBufferPtr(0, 1));
+  EXPECT_EQ(ptr_slot2, ws->GetHostBufferPtr(0, 2));
+  EXPECT_EQ(ptr_slot3, ws->GetHostBufferPtr(0, 3));
 
   // Global shard indices not matching local slots (e.g. 6 and 7) should still
   // map to their corresponding internal slots (slots 2 and 3).
-  uint8_t* ptr_global6 = ws->GetHostPointer(0, 6);
-  uint8_t* ptr_global7 = ws->GetHostPointer(0, 7);
-  EXPECT_EQ(ptr_global6, const_cast<uint8_t*>(ws->GetHostBufferPtr(0, 2)));
-  EXPECT_EQ(ptr_global7, const_cast<uint8_t*>(ws->GetHostBufferPtr(0, 3)));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> global6_buf,
+                       ws->GetHostBuffer(0, 6));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> global7_buf,
+                       ws->GetHostBuffer(0, 7));
+  uint8_t* ptr_global6 = global6_buf.data();
+  uint8_t* ptr_global7 = global7_buf.data();
+  EXPECT_EQ(ptr_global6, ws->GetHostBufferPtr(0, 2));
+  EXPECT_EQ(ptr_global7, ws->GetHostBufferPtr(0, 3));
 
   // Const overloads
   const auto* const_ws = ws.get();
-  EXPECT_EQ(const_ws->GetHostPointer(0, 2), ws->GetHostBufferPtr(0, 2));
-  EXPECT_EQ(const_ws->GetHostPointer(0, 3), ws->GetHostBufferPtr(0, 3));
-  EXPECT_EQ(const_ws->GetHostSize(0, 2), slice_size);
-  EXPECT_EQ(const_ws->GetHostSize(0, 3), slice_size);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> const_slot2_buf,
+                       const_ws->GetHostBuffer(0, 2));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> const_slot3_buf,
+                       const_ws->GetHostBuffer(0, 3));
+  EXPECT_EQ(const_slot2_buf.data(), ws->GetHostBufferPtr(0, 2));
+  EXPECT_EQ(const_slot3_buf.data(), ws->GetHostBufferPtr(0, 3));
+  EXPECT_EQ(const_slot2_buf.size(), slice_size);
+  EXPECT_EQ(const_slot3_buf.size(), slice_size);
 }
 
 TEST_F(WeightSynchronizerTest, GetHostBufferMapsGlobalShardIndices) {
@@ -2819,10 +2879,12 @@ TEST_F(WeightSynchronizerTest,
 
   const uint8_t fill_bytes[4] = {0x11, 0x22, 0x33, 0x44};
   for (size_t s = 0; s < num_shards; ++s) {
-    uint8_t* src_ptr = const_cast<uint8_t*>(ws_source->GetHostPointer(0, s));
-    uint8_t* dst_ptr = const_cast<uint8_t*>(ws_dest->GetHostPointer(0, s));
-    ASSERT_NE(src_ptr, nullptr);
-    ASSERT_NE(dst_ptr, nullptr);
+    TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> src_buf,
+                         ws_source->GetHostBuffer(0, s));
+    uint8_t* src_ptr = src_buf.data();
+    TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> dst_buf,
+                         ws_dest->GetHostBuffer(0, s));
+    uint8_t* dst_ptr = dst_buf.data();
     std::memset(src_ptr, fill_bytes[s], slice_byte_size);
     std::memset(dst_ptr, 0x00, slice_byte_size);
   }
@@ -2884,10 +2946,12 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedLocalShardIndicesFallback) {
 
   const uint8_t fill_bytes[4] = {0x11, 0x22, 0x33, 0x44};
   for (size_t s = 0; s < num_shards; ++s) {
-    uint8_t* src_ptr = const_cast<uint8_t*>(ws_source->GetHostPointer(0, s));
-    uint8_t* dst_ptr = const_cast<uint8_t*>(ws_dest->GetHostPointer(0, s));
-    ASSERT_NE(src_ptr, nullptr);
-    ASSERT_NE(dst_ptr, nullptr);
+    TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> src_buf,
+                         ws_source->GetHostBuffer(0, s));
+    uint8_t* src_ptr = src_buf.data();
+    TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> dst_buf,
+                         ws_dest->GetHostBuffer(0, s));
+    uint8_t* dst_ptr = dst_buf.data();
     std::memset(src_ptr, fill_bytes[s], slice_byte_size);
     std::memset(dst_ptr, 0x00, slice_byte_size);
   }
@@ -2948,10 +3012,12 @@ TEST_F(WeightSynchronizerTest,
   ws_source->SetGlobalShardIndices({3});
   ws_dest->SetGlobalShardIndices({3});
 
-  uint8_t* src_ptr = const_cast<uint8_t*>(ws_source->GetHostPointer(0, 0));
-  uint8_t* dst_ptr = const_cast<uint8_t*>(ws_dest->GetHostPointer(0, 0));
-  ASSERT_NE(src_ptr, nullptr);
-  ASSERT_NE(dst_ptr, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> src_buf,
+                       ws_source->GetHostBuffer(0, 0));
+  uint8_t* src_ptr = src_buf.data();
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> dst_buf,
+                       ws_dest->GetHostBuffer(0, 0));
+  uint8_t* dst_ptr = dst_buf.data();
   std::memset(src_ptr, 0x5A, slice_byte_size);
   std::memset(dst_ptr, 0x00, slice_byte_size);
 
@@ -3473,12 +3539,15 @@ TEST_F(WeightSynchronizerTest,
   // Initialize source and destination host staging buffers with zeros so only
   // completed D2H copies can populate 0x30 + l.
   for (size_t l = 0; l < kNumLayers; ++l) {
-    std::memset(const_cast<uint8_t*>(ws_source->GetHostPointer(l, 0)), 0x00,
-                kSliceByteSize);
-    std::memset(const_cast<uint8_t*>(ws_dest1->GetHostPointer(l, 0)), 0x00,
-                kSliceByteSize);
-    std::memset(const_cast<uint8_t*>(ws_dest2->GetHostPointer(l, 0)), 0x00,
-                kSliceByteSize);
+    TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> src_buf,
+                         ws_source->GetHostBuffer(l, 0));
+    std::memset(src_buf.data(), 0x00, kSliceByteSize);
+    TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> dst1_buf,
+                         ws_dest1->GetHostBuffer(l, 0));
+    std::memset(dst1_buf.data(), 0x00, kSliceByteSize);
+    TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> dst2_buf,
+                         ws_dest2->GetHostBuffer(l, 0));
+    std::memset(dst2_buf.data(), 0x00, kSliceByteSize);
   }
 
   constexpr uint64_t kSharedUuid = 90001;
@@ -3522,8 +3591,12 @@ TEST_F(WeightSynchronizerTest,
   EXPECT_EQ(ws_source->GetMetrics().d2h_call_count, 1);
   for (size_t l = 0; l < kNumLayers; ++l) {
     const uint8_t expected = static_cast<uint8_t>(0x30 + l);
-    const uint8_t* dst1_ptr = ws_dest1->GetHostPointer(l, 0);
-    const uint8_t* dst2_ptr = ws_dest2->GetHostPointer(l, 0);
+    TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> dst1_buf,
+                         ws_dest1->GetHostBuffer(l, 0));
+    const uint8_t* dst1_ptr = dst1_buf.data();
+    TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> dst2_buf,
+                         ws_dest2->GetHostBuffer(l, 0));
+    const uint8_t* dst2_ptr = dst2_buf.data();
     for (size_t b = 0; b < kSliceByteSize; ++b) {
       EXPECT_EQ(dst1_ptr[b], expected) << "dest1 layer " << l << " byte " << b;
       EXPECT_EQ(dst2_ptr[b], expected) << "dest2 layer " << l << " byte " << b;
@@ -4404,7 +4477,9 @@ TEST_F(WeightSynchronizerTest, PreTiledRelayAndActivePushGuards) {
   relay->StoreSkipTiling(kRelayUuid, recv_req);
   relay->StoreSkipTiling(kRelayUuid, relay_req);
   ABSL_ASSERT_OK(relay->RegisterExpectedLayerChunks(kRelayUuid, {{1, 1}}));
-  std::memset(relay->GetHostPointer(0, 0), 0xC1, kBytes);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> relay_l0_buf,
+                       relay->GetHostBuffer(0, 0));
+  std::memset(relay_l0_buf.data(), 0xC1, kBytes);
   auto push_fut = PushAsync(*relay, relay_req);
   ASSERT_TRUE(dest->layer_received(0).WaitForNotificationWithTimeout(
       absl::Seconds(10)));
@@ -4417,7 +4492,9 @@ TEST_F(WeightSynchronizerTest, PreTiledRelayAndActivePushGuards) {
   ExpectErr(relay->BindWeights({{h0}, {h1}}),
             absl::StatusCode::kFailedPrecondition, {"active_h2h_pushes=1"});
   ABSL_EXPECT_OK(relay->BindWeights({}));
-  std::memset(relay->GetHostPointer(1, 0), 0xD2, kBytes);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> relay_l1_buf,
+                       relay->GetHostBuffer(1, 0));
+  std::memset(relay_l1_buf.data(), 0xD2, kBytes);
   ABSL_ASSERT_OK(relay->OnLayerDataReceived(1, kRelayUuid));
   ABSL_ASSERT_OK(relay->OnDataReceived(kRelayUuid));
   ABSL_ASSERT_OK(push_fut.get());

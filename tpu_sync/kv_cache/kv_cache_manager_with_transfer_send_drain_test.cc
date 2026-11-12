@@ -50,6 +50,7 @@
 #include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "absl/types/span.h"
 #include "xla/future.h"
 #include "tpu_sync/core/metrics_collector.h"
 #include "tpu_sync/core/raw_transfer_core.h"
@@ -1730,8 +1731,9 @@ TEST(RecvLifecycleTest, StagingLayerManagerCyclesHostLayerBuffers) {
   EXPECT_EQ(base->num_host_layers(), kNumStagingLayers);
   EXPECT_EQ(base->GetAllocatedHostDramBytes(),
             full_dram_bytes / (kNumLayers / kNumStagingLayers));
-  EXPECT_NE(base->GetHostPointer(kNumStagingLayers - 1, 0), nullptr);
-  EXPECT_EQ(base->GetHostPointer(kNumStagingLayers, 0), nullptr);
+  ABSL_EXPECT_OK(base->GetHostBuffer(kNumStagingLayers - 1, 0));
+  EXPECT_THAT(base->GetHostBuffer(kNumStagingLayers, 0),
+              StatusIs(absl::StatusCode::kOutOfRange));
 
   consumer.AddRecv("req_staging_layers", /*uuid=*/104);
   TF_ASSERT_OK_AND_ASSIGN(std::shared_ptr<TransferSession> session,
@@ -1745,7 +1747,9 @@ TEST(RecvLifecycleTest, StagingLayerManagerCyclesHostLayerBuffers) {
       /*uuid=*/104);
   ASSERT_EQ(chunks.size(), 1);
   ASSERT_THAT(session->ResolveStagingSlot(0), IsOkAndHolds(0u));
-  EXPECT_EQ(chunks[0].ptr, base->GetHostPointer(0, 0));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> layer0_buffer,
+                       base->GetHostBuffer(0, 0));
+  EXPECT_EQ(chunks[0].ptr, layer0_buffer.data());
 
   // Layers 0..3 lease the four buffers in arrival order, without waiting, and
   // upload from them.
@@ -1868,7 +1872,9 @@ TEST(RecvLifecycleTest,
       /*uuid=*/202);
   ASSERT_EQ(chunks.size(), 1);
   // Layer 0 holds the head host layer buffer.
-  EXPECT_EQ(chunks[0].ptr, base->GetHostPointer(0, 0));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> layer0_buffer,
+                       base->GetHostBuffer(0, 0));
+  EXPECT_EQ(chunks[0].ptr, layer0_buffer.data());
   EXPECT_THAT(session202->ResolveStagingSlot(0), IsOkAndHolds(0u));
   EXPECT_EQ(consumer.free_slots(), kSlots - 1);
 
@@ -1928,8 +1934,9 @@ TEST(SendLifecycleTest, StagingLayerManagerCyclesHostLayerBuffers) {
   EXPECT_EQ(base->num_host_layers(), kNumStagingLayers);
   EXPECT_EQ(base->GetAllocatedHostDramBytes(),
             full_dram_bytes / (kNumLayers / kNumStagingLayers));
-  EXPECT_NE(base->GetHostPointer(kNumStagingLayers - 1, 0), nullptr);
-  EXPECT_EQ(base->GetHostPointer(kNumStagingLayers, 0), nullptr);
+  ABSL_EXPECT_OK(base->GetHostBuffer(kNumStagingLayers - 1, 0));
+  EXPECT_THAT(base->GetHostBuffer(kNumStagingLayers, 0),
+              StatusIs(absl::StatusCode::kOutOfRange));
 
   ASSERT_GT(producer.NotifyForRead("req_send_staging_layers", /*uuid=*/304,
                                    /*block_ids=*/{0}),
@@ -1967,9 +1974,11 @@ TEST(SendLifecycleTest, StagingLayerManagerCyclesHostLayerBuffers) {
   for (size_t layer = 0; layer < kNumStagingLayers; ++layer) {
     EXPECT_THAT(session->ResolveStagingSlot(layer), IsOkAndHolds(layer));
     EXPECT_NE(producer.h2h_chunk_ptr(layer), nullptr);
-    EXPECT_GE(producer.h2h_chunk_ptr(layer), base->GetHostPointer(layer, 0));
-    EXPECT_LT(producer.h2h_chunk_ptr(layer),
-              base->GetHostPointer(layer, 0) + base->GetHostSize(layer, 0));
+    TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> layer_buffer,
+                         base->GetHostBuffer(layer, 0));
+    uint8_t* layer_begin = layer_buffer.data();
+    EXPECT_GE(producer.h2h_chunk_ptr(layer), layer_begin);
+    EXPECT_LT(producer.h2h_chunk_ptr(layer), layer_begin + layer_buffer.size());
   }
 
   // Completing layer 1's H2H push frees buffer 1, which layer 4 acquires for
@@ -1982,9 +1991,11 @@ TEST(SendLifecycleTest, StagingLayerManagerCyclesHostLayerBuffers) {
   EXPECT_EQ(producer.copy_destination(4), 1);
   producer.FinishCopy(4, absl::OkStatus());
   ASSERT_TRUE(producer.WaitForH2hIssued(5, absl::Seconds(5)));
-  EXPECT_GE(producer.h2h_chunk_ptr(4), base->GetHostPointer(1, 0));
-  EXPECT_LT(producer.h2h_chunk_ptr(4),
-            base->GetHostPointer(1, 0) + base->GetHostSize(1, 0));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> slot1_buffer,
+                       base->GetHostBuffer(1, 0));
+  uint8_t* slot1_begin = slot1_buffer.data();
+  EXPECT_GE(producer.h2h_chunk_ptr(4), slot1_begin);
+  EXPECT_LT(producer.h2h_chunk_ptr(4), slot1_begin + slot1_buffer.size());
 
   // Stream the remaining layers through the manager: each takes the buffer of
   // the H2H push completed just before it.
@@ -2001,11 +2012,11 @@ TEST(SendLifecycleTest, StagingLayerManagerCyclesHostLayerBuffers) {
               static_cast<int64_t>(freed_slot));
     producer.FinishCopy(layer, absl::OkStatus());
     ASSERT_TRUE(producer.WaitForH2hIssued(layer + 1, absl::Seconds(5)));
-    EXPECT_GE(producer.h2h_chunk_ptr(layer),
-              base->GetHostPointer(freed_slot, 0));
-    EXPECT_LT(
-        producer.h2h_chunk_ptr(layer),
-        base->GetHostPointer(freed_slot, 0) + base->GetHostSize(freed_slot, 0));
+    TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> freed_buffer,
+                         base->GetHostBuffer(freed_slot, 0));
+    uint8_t* freed_begin = freed_buffer.data();
+    EXPECT_GE(producer.h2h_chunk_ptr(layer), freed_begin);
+    EXPECT_LT(producer.h2h_chunk_ptr(layer), freed_begin + freed_buffer.size());
   }
 
   for (size_t layer = kNumLayers - kNumStagingLayers; layer < kNumLayers;

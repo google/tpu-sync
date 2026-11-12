@@ -32,6 +32,7 @@
 #include "absl/status/status_matchers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "absl/types/span.h"
 #include "tpu_sync/core/metrics_collector.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
@@ -110,9 +111,10 @@ class HostPoolManager : public KVCacheManagerWithTransfer {
     for (size_t layer = 0; layer < base()->num_layers(); ++layer) {
       for (size_t shard = 0; shard < base()->num_shards(); ++shard) {
         for (int block = 0; block < host_blocks_; ++block) {
-          std::memcpy(
-              base()->GetHostPointer(layer, shard) + block * kBlockBytes,
-              Pattern(tag, layer, shard, block).data(), kBlockBytes);
+          TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> host_buffer,
+                               base()->GetHostBuffer(layer, shard));
+          std::memcpy(host_buffer.data() + block * kBlockBytes,
+                      Pattern(tag, layer, shard, block).data(), kBlockBytes);
         }
       }
     }
@@ -142,8 +144,10 @@ class HostPoolManager : public KVCacheManagerWithTransfer {
               expected_block = expected.source_block;
             }
           }
-          const char* host_layer = reinterpret_cast<const char*>(
-              base()->GetHostPointer(layer, shard));
+          TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> host_buffer,
+                               base()->GetHostBuffer(layer, shard));
+          const char* host_layer =
+              reinterpret_cast<const char*>(host_buffer.data());
           EXPECT_EQ(
               absl::string_view(host_layer + block * kBlockBytes, kBlockBytes),
               Pattern(expected_tag, layer, shard, expected_block))

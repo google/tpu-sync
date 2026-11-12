@@ -31,6 +31,7 @@
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
@@ -397,10 +398,9 @@ class FakeD2hBase : public kv_cache::KVCacheManagerBase {
         it != fill_byte_.end() && host_layer_idx.has_value()) {
       const kv_cache::PoolSpec* spec = pool(pool_idx);
       if (spec != nullptr) {
-        uint8_t* dst = GetHostPointer(*host_layer_idx, 0);
-        if (dst != nullptr) {
-          std::memset(dst + spec->base_offset_bytes, it->second, 16);
-        }
+        ABSL_ASSIGN_OR_RETURN(absl::Span<uint8_t> dst,
+                              GetHostBuffer(*host_layer_idx, /*shard_idx=*/0));
+        std::memset(dst.data() + spec->base_offset_bytes, it->second, 16);
       }
     }
     ++copies_issued_[pool_idx];
@@ -862,8 +862,9 @@ class RecordingH2dReceiverBase : public kv_cache::KVCacheManagerBase {
     if (spec == nullptr) {
       return absl::InvalidArgumentError("unknown pool_idx");
     }
-    const uint8_t* src = GetHostPointer(*host_layer_idx, /*shard_idx=*/0) +
-                         spec->base_offset_bytes +
+    ABSL_ASSIGN_OR_RETURN(absl::Span<const uint8_t> host_buffer,
+                          GetHostBuffer(*host_layer_idx, /*shard_idx=*/0));
+    const uint8_t* src = host_buffer.data() + spec->base_offset_bytes +
                          static_cast<size_t>(block_ids[0]) *
                              static_cast<size_t>(spec->block_stride_bytes);
     {

@@ -231,7 +231,9 @@ TEST(KVCacheManagerTest, GetPoolBlockRefPointerMath) {
       DensePool("kind_b", 0, 256, 64, 4),
   }));
 
-  uint8_t* base = manager.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> host,
+                       manager.GetHostBuffer(/*layer_idx=*/0, /*shard_idx=*/0));
+  uint8_t* base = host.data();
 
   TF_ASSERT_OK_AND_ASSIGN(
       auto ref,
@@ -264,8 +266,9 @@ TEST(KVCacheManagerTest, GetPoolBlockRefPointerMath) {
 TEST(KVCacheManagerTest, RegisterPoolsGrowsDeviceBackedHostMirror) {
   TestKVCacheManager manager(/*num_layers=*/1, /*num_shards=*/1,
                              /*slice_byte_size=*/64, /*host_blocks=*/1);
-  uint8_t* original = manager.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
-  ASSERT_NE(original, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> original_buffer,
+                       manager.GetHostBuffer(/*layer_idx=*/0, /*shard_idx=*/0));
+  uint8_t* original = original_buffer.data();
   for (size_t i = 0; i < 64; ++i) {
     original[i] = static_cast<uint8_t>(i);
   }
@@ -274,10 +277,11 @@ TEST(KVCacheManagerTest, RegisterPoolsGrowsDeviceBackedHostMirror) {
                                       /*physical_size=*/256,
                                       /*major_dim_size=*/1);
   ABSL_ASSERT_OK(manager.RegisterPools({DensePool("kind_a", 0, 0, 64, 4)}));
-  EXPECT_GE(manager.GetHostSize(/*layer_idx=*/0, /*shard_idx=*/0), 256);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> grown_buffer,
+                       manager.GetHostBuffer(/*layer_idx=*/0, /*shard_idx=*/0));
+  EXPECT_GE(grown_buffer.size(), 256);
 
-  uint8_t* grown = manager.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
-  ASSERT_NE(grown, nullptr);
+  uint8_t* grown = grown_buffer.data();
   for (size_t i = 0; i < 64; ++i) {
     EXPECT_EQ(grown[i], static_cast<uint8_t>(i));
   }
@@ -346,9 +350,9 @@ TEST(KVCacheManagerTest, ExplicitPoolAddressingUsesPoolBaseAndStride) {
                 /*num_blocks=*/4),
   }));
 
-  uint8_t* storage_base =
-      manager.GetHostPointer(/*layer_idx=*/1, /*shard_idx=*/0);
-  ASSERT_NE(storage_base, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> storage_buffer,
+                       manager.GetHostBuffer(/*layer_idx=*/1, /*shard_idx=*/0));
+  uint8_t* storage_base = storage_buffer.data();
   EXPECT_EQ(manager.GetBlockHostPointer(/*pool_idx=*/0, /*shard_idx=*/0,
                                         /*block_id=*/2),
             storage_base + 128 + 2 * 64);
@@ -404,20 +408,22 @@ TEST(KVCacheManagerTest,
       /*layer_idx=*/0));
   EXPECT_EQ(std::memcmp(dst_ref.ptr, pattern.data(), pattern.size()), 0);
 
-  const uint8_t* receiver_storage0 =
-      receiver.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
-  ASSERT_NE(receiver_storage0, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(
+      absl::Span<const uint8_t> receiver_storage0_buffer,
+      receiver.GetHostBuffer(/*layer_idx=*/0, /*shard_idx=*/0));
+  const uint8_t* receiver_storage0 = receiver_storage0_buffer.data();
   EXPECT_TRUE(std::all_of(receiver_storage0, receiver_storage0 + 8 * 64,
                           [](uint8_t value) { return value == 0; }));
 
   // Block 2 is outside the pool but still falls inside storage 1. It must not
   // expose or overwrite the neighboring storage bytes.
-  uint8_t* sender_storage1 =
-      sender.GetHostPointer(/*layer_idx=*/1, /*shard_idx=*/0);
-  uint8_t* receiver_storage1 =
-      receiver.GetHostPointer(/*layer_idx=*/1, /*shard_idx=*/0);
-  ASSERT_NE(sender_storage1, nullptr);
-  ASSERT_NE(receiver_storage1, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> sender_storage1_buffer,
+                       sender.GetHostBuffer(/*layer_idx=*/1, /*shard_idx=*/0));
+  TF_ASSERT_OK_AND_ASSIGN(
+      absl::Span<uint8_t> receiver_storage1_buffer,
+      receiver.GetHostBuffer(/*layer_idx=*/1, /*shard_idx=*/0));
+  uint8_t* sender_storage1 = sender_storage1_buffer.data();
+  uint8_t* receiver_storage1 = receiver_storage1_buffer.data();
   std::memset(sender_storage1 + 64 + 2 * 128, 0xD4, 128);
   auto rejected = sender.H2hWriteDirect(
       absl::StrCat(receiver.local_ip(), ":", *receiver_port),
@@ -444,10 +450,13 @@ TEST(KVCacheManagerTest,
   ABSL_ASSERT_OK(sender.RegisterPools(pools));
   ABSL_ASSERT_OK(receiver.RegisterPools(pools));
 
-  uint8_t* src = sender.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
-  uint8_t* dst = receiver.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
-  ASSERT_NE(src, nullptr);
-  ASSERT_NE(dst, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> src_buffer,
+                       sender.GetHostBuffer(/*layer_idx=*/0, /*shard_idx=*/0));
+  TF_ASSERT_OK_AND_ASSIGN(
+      absl::Span<uint8_t> dst_buffer,
+      receiver.GetHostBuffer(/*layer_idx=*/0, /*shard_idx=*/0));
+  uint8_t* src = src_buffer.data();
+  uint8_t* dst = dst_buffer.data();
   std::memset(src, 0xA5, 256);
   std::memset(dst, 0xEE, 256);
   std::memset(src + 32, 0x11, 32);
@@ -619,9 +628,9 @@ TEST(KVCacheManagerTest, ImplicitPoolsMirrorStorages) {
   TF_ASSERT_OK_AND_ASSIGN(
       auto ref, manager.GetPoolBlockRef(/*pool_idx=*/1, /*shard_idx=*/0,
                                         /*block_id=*/1));
-  EXPECT_EQ(ref.ptr, manager.GetHostPointer(/*layer_idx=*/1,
-                                            /*shard_idx=*/0) +
-                         128);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> layer1_buffer,
+                       manager.GetHostBuffer(/*layer_idx=*/1, /*shard_idx=*/0));
+  EXPECT_EQ(ref.ptr, layer1_buffer.data() + 128);
 }
 
 TEST(KVCacheManagerTest,
@@ -1182,8 +1191,9 @@ TEST(KVCacheManagerTest, AsymmetricBlockSizesGetBlockChunks) {
   ASSERT_EQ(sender_chunks.size(), 1);
   EXPECT_EQ(sender_chunks[0].size, 128);
   // Verify pointer offset
-  uint8_t* sender_base =
-      sender.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> sender_host_buffer,
+                       sender.GetHostBuffer(/*layer_idx=*/0, /*shard_idx=*/0));
+  uint8_t* sender_base = sender_host_buffer.data();
   EXPECT_EQ(sender_chunks[0].ptr, sender_base + 64);
 
   // 4. Resolve chunks on Receiver (should return offset 192 from block 0 base)
@@ -1195,8 +1205,10 @@ TEST(KVCacheManagerTest, AsymmetricBlockSizesGetBlockChunks) {
   ASSERT_EQ(receiver_chunks.size(), 1);
   EXPECT_EQ(receiver_chunks[0].size, 128);
   // Verify pointer offset
-  uint8_t* receiver_base =
-      receiver.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
+  TF_ASSERT_OK_AND_ASSIGN(
+      absl::Span<uint8_t> receiver_host_buffer,
+      receiver.GetHostBuffer(/*layer_idx=*/0, /*shard_idx=*/0));
+  uint8_t* receiver_base = receiver_host_buffer.data();
   EXPECT_EQ(receiver_chunks[0].ptr, receiver_base + 192);
 }
 
@@ -1459,11 +1471,13 @@ TEST(KVCacheManagerTest, D2hWritePipelinedSuccess) {
   std::string receiver_peer =
       absl::StrCat(receiver.local_ip(), ":", *receiver_port);
 
-  uint8_t* sender_buf = sender.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
-  uint8_t* receiver_buf =
-      receiver.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
-  ASSERT_NE(sender_buf, nullptr);
-  ASSERT_NE(receiver_buf, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> sender_buffer,
+                       sender.GetHostBuffer(/*layer_idx=*/0, /*shard_idx=*/0));
+  TF_ASSERT_OK_AND_ASSIGN(
+      absl::Span<uint8_t> receiver_buffer,
+      receiver.GetHostBuffer(/*layer_idx=*/0, /*shard_idx=*/0));
+  uint8_t* sender_buf = sender_buffer.data();
+  uint8_t* receiver_buf = receiver_buffer.data();
 
   std::memset(sender_buf, 0xAB, 128);
   std::memset(sender_buf + 128, 0xCD, 128);
@@ -1501,13 +1515,15 @@ TEST(KVCacheManagerTest, H2dReadSuccess) {
   ASSERT_TRUE(sender_port.has_value());
   std::string sender_peer = absl::StrCat(sender.local_ip(), ":", *sender_port);
 
-  uint8_t* sender_buf = sender.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
-  ASSERT_NE(sender_buf, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> sender_buffer,
+                       sender.GetHostBuffer(/*layer_idx=*/0, /*shard_idx=*/0));
+  uint8_t* sender_buf = sender_buffer.data();
   std::memset(sender_buf, 0xEF, 128);
 
-  uint8_t* receiver_buf =
-      receiver.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
-  ASSERT_NE(receiver_buf, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(
+      absl::Span<uint8_t> receiver_buffer,
+      receiver.GetHostBuffer(/*layer_idx=*/0, /*shard_idx=*/0));
+  uint8_t* receiver_buf = receiver_buffer.data();
   std::memset(receiver_buf, 0, 256);
 
   // Test empty src_offsets returns OK empty future
@@ -1537,11 +1553,13 @@ TEST(KVCacheManagerTest, H2dReadPipelinedSuccess) {
   ASSERT_TRUE(sender_port.has_value());
   std::string sender_peer = absl::StrCat(sender.local_ip(), ":", *sender_port);
 
-  uint8_t* sender_buf = sender.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
-  uint8_t* receiver_buf =
-      receiver.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
-  ASSERT_NE(sender_buf, nullptr);
-  ASSERT_NE(receiver_buf, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> sender_buffer,
+                       sender.GetHostBuffer(/*layer_idx=*/0, /*shard_idx=*/0));
+  TF_ASSERT_OK_AND_ASSIGN(
+      absl::Span<uint8_t> receiver_buffer,
+      receiver.GetHostBuffer(/*layer_idx=*/0, /*shard_idx=*/0));
+  uint8_t* sender_buf = sender_buffer.data();
+  uint8_t* receiver_buf = receiver_buffer.data();
 
   std::memset(sender_buf, 0x55, 128);
   std::memset(sender_buf + 128, 0x66, 128);
@@ -1574,8 +1592,9 @@ TEST(KVCacheManagerTest, H2dReadCallsH2dForTpuHbmDestination) {
   ASSERT_TRUE(sender_port.has_value());
   std::string sender_peer = absl::StrCat(sender.local_ip(), ":", *sender_port);
 
-  uint8_t* sender_buf = sender.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
-  ASSERT_NE(sender_buf, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> sender_buffer,
+                       sender.GetHostBuffer(/*layer_idx=*/0, /*shard_idx=*/0));
+  uint8_t* sender_buf = sender_buffer.data();
   std::memset(sender_buf, 0x77, 128);
 
   TF_ASSERT_OK_AND_ASSIGN(
@@ -1603,11 +1622,13 @@ TEST(KVCacheManagerTest, H2dWriteSuccess) {
   std::string receiver_peer =
       absl::StrCat(receiver.local_ip(), ":", *receiver_port);
 
-  uint8_t* sender_buf = sender.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
-  uint8_t* receiver_buf =
-      receiver.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
-  ASSERT_NE(sender_buf, nullptr);
-  ASSERT_NE(receiver_buf, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> sender_buffer,
+                       sender.GetHostBuffer(/*layer_idx=*/0, /*shard_idx=*/0));
+  TF_ASSERT_OK_AND_ASSIGN(
+      absl::Span<uint8_t> receiver_buffer,
+      receiver.GetHostBuffer(/*layer_idx=*/0, /*shard_idx=*/0));
+  uint8_t* sender_buf = sender_buffer.data();
+  uint8_t* receiver_buf = receiver_buffer.data();
 
   std::memset(sender_buf, 0xCD, 128);
   std::memset(receiver_buf, 0, 256);
@@ -1640,11 +1661,13 @@ TEST(KVCacheManagerTest, H2dWritePipelinedSuccess) {
   std::string receiver_peer =
       absl::StrCat(receiver.local_ip(), ":", *receiver_port);
 
-  uint8_t* sender_buf = sender.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
-  uint8_t* receiver_buf =
-      receiver.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
-  ASSERT_NE(sender_buf, nullptr);
-  ASSERT_NE(receiver_buf, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> sender_buffer,
+                       sender.GetHostBuffer(/*layer_idx=*/0, /*shard_idx=*/0));
+  TF_ASSERT_OK_AND_ASSIGN(
+      absl::Span<uint8_t> receiver_buffer,
+      receiver.GetHostBuffer(/*layer_idx=*/0, /*shard_idx=*/0));
+  uint8_t* sender_buf = sender_buffer.data();
+  uint8_t* receiver_buf = receiver_buffer.data();
 
   std::memset(sender_buf, 0x33, 128);
   std::memset(sender_buf + 128, 0x44, 128);
@@ -1681,11 +1704,13 @@ TEST(KVCacheManagerTest, H2dReadExplicitStagingDoesNotClobberAliasedBlock) {
   ASSERT_TRUE(sender_port.has_value());
   std::string sender_peer = absl::StrCat(sender.local_ip(), ":", *sender_port);
 
-  uint8_t* sender_buf = sender.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
-  uint8_t* receiver_buf =
-      receiver.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
-  ASSERT_NE(sender_buf, nullptr);
-  ASSERT_NE(receiver_buf, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> sender_buffer,
+                       sender.GetHostBuffer(/*layer_idx=*/0, /*shard_idx=*/0));
+  TF_ASSERT_OK_AND_ASSIGN(
+      absl::Span<uint8_t> receiver_buffer,
+      receiver.GetHostBuffer(/*layer_idx=*/0, /*shard_idx=*/0));
+  uint8_t* sender_buf = sender_buffer.data();
+  uint8_t* receiver_buf = receiver_buffer.data();
 
   std::memset(sender_buf, 0xEF, 128);
   // Sentinel in receiver's local block 0 -- same id as the REMOTE src block.
@@ -1722,11 +1747,13 @@ TEST(KVCacheManagerTest, D2hWriteExplicitStagingIsPushedNotAliasedBlock) {
   std::string receiver_peer =
       absl::StrCat(receiver.local_ip(), ":", *receiver_port);
 
-  uint8_t* sender_buf = sender.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
-  uint8_t* receiver_buf =
-      receiver.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
-  ASSERT_NE(sender_buf, nullptr);
-  ASSERT_NE(receiver_buf, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> sender_buffer,
+                       sender.GetHostBuffer(/*layer_idx=*/0, /*shard_idx=*/0));
+  TF_ASSERT_OK_AND_ASSIGN(
+      absl::Span<uint8_t> receiver_buffer,
+      receiver.GetHostBuffer(/*layer_idx=*/0, /*shard_idx=*/0));
+  uint8_t* sender_buf = sender_buffer.data();
+  uint8_t* receiver_buf = receiver_buffer.data();
 
   // Staging block 0 holds the payload (the mocked D2h stage is a no-op, so
   // the pre-seeded content is what gets pushed). Local block 1 -- same id as
@@ -3216,9 +3243,10 @@ TEST(KVCacheManagerTest, AllLayerDispatchWithBoundedStagingFailsImmediately) {
   ASSERT_NO_FATAL_FAILURE(rig.Init(/*num_staging_layers=*/1));
   ASSERT_EQ(rig.manager->num_host_layers(), 1);
 
-  uint8_t* host_ptr =
-      rig.manager->GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
-  ASSERT_NE(host_ptr, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(
+      absl::Span<uint8_t> host,
+      rig.manager->GetHostBuffer(/*layer_idx=*/0, /*shard_idx=*/0));
+  uint8_t* host_ptr = host.data();
   std::memset(host_ptr, 0x55, BoundedStagingTestRig::kBlockBytes);
 
   // Sync and async all-layer dispatches (`layer_idx` unset) fail immediately
@@ -3265,9 +3293,10 @@ TEST(KVCacheManagerTest, SingleLayerDispatchWithBoundedStagingSucceeds) {
   ASSERT_NO_FATAL_FAILURE(rig.Init(/*num_staging_layers=*/1));
   ASSERT_EQ(rig.manager->num_host_layers(), 1);
 
-  uint8_t* host_ptr =
-      rig.manager->GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
-  ASSERT_NE(host_ptr, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(
+      absl::Span<uint8_t> host,
+      rig.manager->GetHostBuffer(/*layer_idx=*/0, /*shard_idx=*/0));
+  uint8_t* host_ptr = host.data();
 
   TF_ASSERT_OK_AND_ASSIGN(
       raiden::PjRtCopyFuture layer1_d2h,
@@ -3327,8 +3356,9 @@ TEST(KVCacheManagerTest, NumStagingLayersBoundsHostLayerBuffers) {
   std::unique_ptr<KVCacheManagerBase> bounded = rig.CreateManager(1);
   EXPECT_EQ(bounded->num_layers(), BoundedStagingTestRig::kNumLayers);
   EXPECT_EQ(bounded->num_host_layers(), 1);
-  EXPECT_NE(bounded->GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0), nullptr);
-  EXPECT_EQ(bounded->GetHostPointer(/*layer_idx=*/1, /*shard_idx=*/0), nullptr);
+  ABSL_EXPECT_OK(bounded->GetHostBuffer(/*layer_idx=*/0, /*shard_idx=*/0));
+  EXPECT_THAT(bounded->GetHostBuffer(/*layer_idx=*/1, /*shard_idx=*/0),
+              StatusIs(absl::StatusCode::kOutOfRange));
 
   // Out-of-range values are rejected rather than silently clamped.
   EXPECT_THROW(rig.CreateManager(0), std::invalid_argument);

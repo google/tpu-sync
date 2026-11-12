@@ -591,10 +591,11 @@ TEST(ReshardReceiveSessionTest,
   TF_ASSERT_OK_AND_ASSIGN(const absl::Span<const char> pool1_span,
                        base.GetBlockArrayHostSpan(/*block_array_idx=*/1,
                                                   /*shard_idx=*/0, kUuid));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> layer0_buffer,
+                       base.GetHostBuffer(/*layer_idx=*/0, /*shard_idx=*/0));
   EXPECT_EQ(pool1_span.data(),
-            reinterpret_cast<const char*>(
-                base.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0) +
-                pools[1].base_offset_bytes));
+            reinterpret_cast<const char*>(layer0_buffer.data() +
+                                          pools[1].base_offset_bytes));
   EXPECT_EQ(
       pool1_span.size(),
       static_cast<size_t>(pools[1].num_blocks * pools[1].block_stride_bytes));
@@ -612,10 +613,11 @@ TEST(ReshardReceiveSessionTest,
   TF_ASSERT_OK_AND_ASSIGN(const absl::Span<const char> pool0_span,
                        base.GetBlockArrayHostSpan(/*block_array_idx=*/0,
                                                   /*shard_idx=*/0, kUuid));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> layer1_buffer,
+                       base.GetHostBuffer(/*layer_idx=*/1, /*shard_idx=*/0));
   EXPECT_EQ(pool0_span.data(),
-            reinterpret_cast<const char*>(
-                base.GetHostPointer(/*layer_idx=*/1, /*shard_idx=*/0) +
-                pools[0].base_offset_bytes));
+            reinterpret_cast<const char*>(layer1_buffer.data() +
+                                          pools[0].base_offset_bytes));
   EXPECT_EQ(
       pool0_span.size(),
       static_cast<size_t>(pools[0].num_blocks * pools[0].block_stride_bytes));

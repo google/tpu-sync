@@ -813,27 +813,35 @@ KVCacheManagerBase::KVCacheManagerBase(
             << " size: " << device_info.physical_size;
 
     // Record this layer's row, the width that indexes it everywhere else.
-    // row_byte_size divides by the shared major_dim_size_, which is only this
-    // layer's own row if the layer really does hold that many blocks.
+    // A layer's row is its on-device size over its OWN major dimension:
+    // layers may hold different numbers of blocks (e.g. a window-sized
+    // private pool next to the global block pool) because every transfer
+    // addresses a layer through its own row width and every pool validates
+    // block ids against its own num_blocks.
+    int64_t layer_major_dim = major_dim_size_;
     if (major_dim_size_ > 0 && logical_dimensions.empty()) {
       const xla::Shape& layer_shape = layer_buffers[layer_idx][0].shape;
-      if (!layer_shape.dimensions().empty() &&
-          layer_shape.dimensions(0) != major_dim_size_) {
-        throw std::runtime_error(absl::StrCat(
-            "Layer ", layer_idx, " has major dimension ",
-            layer_shape.dimensions(0), " but layer 0 has ", major_dim_size_,
-            "; every layer must hold the same number of blocks because they "
-            "share one block-id space (layers may differ only in row width)"));
+      if (!layer_shape.dimensions().empty()) {
+        layer_major_dim = layer_shape.dimensions(0);
       }
-      if (device_info.physical_size % static_cast<size_t>(major_dim_size_) !=
-          0) {
+      if (layer_major_dim <= 0 ||
+          device_info.physical_size % static_cast<size_t>(layer_major_dim) !=
+              0) {
         throw std::runtime_error(absl::StrCat(
             "Layer ", layer_idx, " on-device size ", device_info.physical_size,
             " is not a whole number of blocks at major dimension ",
-            major_dim_size_));
+            layer_major_dim));
+      }
+      if (layer_major_dim != major_dim_size_) {
+        VLOG(1) << "KVCacheManagerBase: layer " << layer_idx << " holds "
+                << layer_major_dim << " blocks (layer 0 holds "
+                << major_dim_size_ << ")";
       }
     }
-    layer_row_bytes_.push_back(row_byte_size(device_info.physical_size));
+    layer_row_bytes_.push_back(
+        layer_major_dim > 0
+            ? static_cast<int64_t>(device_info.physical_size) / layer_major_dim
+            : row_byte_size(device_info.physical_size));
 
     device_info.holds.reserve(num_shards_);
     for (size_t i = 0; i < num_shards_; ++i) {
@@ -981,6 +989,16 @@ KVCacheManagerBase::AllocateHostLayers(
       size_t alloc_size =
           num_host_blocks * (shared_buffers ? shared_row_bytes
                                             : layer_block_byte_size(layer_idx));
+      // A dedicated host layer never needs more than its device layer: when a
+      // layer holds fewer, wider blocks than num_host_blocks (e.g. a
+      // window-sized private pool whose block is a whole multi-layer page),
+      // num_host_blocks x row would exceed the device buffer many times over.
+      // Pool registration grows the buffer to the declared extent if needed.
+      if (!shared_buffers && layer_idx < device_layers.size() &&
+          device_layers[layer_idx].physical_size > 0) {
+        alloc_size =
+            std::min(alloc_size, device_layers[layer_idx].physical_size);
+      }
       if (host_allocator) {
         absl::StatusOr<HostBufferAllocation> host_alloc =
             host_allocator(alloc_size, shard_info.device);

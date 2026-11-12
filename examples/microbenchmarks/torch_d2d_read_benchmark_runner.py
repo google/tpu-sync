@@ -99,19 +99,78 @@ _NUM_SLOTS = flags.DEFINE_integer(
 _ENABLE_METRICS = flags.DEFINE_bool(
     'enable_metrics', False, 'Enable Raiden internal C++ metrics'
 )
+_DTYPE = flags.DEFINE_string(
+    'dtype',
+    'float32',
+    'Data type of cache: float32, bfloat16, fp8 (float8_e4m3fn).',
+)
+
+
+def _resolve_dtype(dtype_name: str) -> tuple[torch.dtype, int]:
+  """Resolves the cache dtype name to a torch.dtype and item size in bytes."""
+  normalized = dtype_name.lower()
+  if normalized in ('float32', 'fp32'):
+    return torch.float32, 4
+  elif normalized in ('bfloat16', 'bf16'):
+    return torch.bfloat16, 2
+  elif normalized in ('fp8', 'float8', 'float8_e4m3fn'):
+    return torch.float8_e4m3fn, 1
+  else:
+    raise ValueError(
+        f'Unsupported dtype: {dtype_name}. Expected float32, bfloat16, or fp8.'
+    )
+
+
+def _make_base_tensor(
+    shape: Sequence[int], device: torch.device
+) -> torch.Tensor:
+  """Creates the 5D base tensor on device using broadcasted 1D aranges.
+
+  Values stay within the finite range of low-precision dtypes such as
+  float8_e4m3fn (max 448.0) while remaining distinct along each axis.
+  """
+  b = (
+      torch.arange(shape[0], device=device, dtype=torch.float32).view(
+          -1, 1, 1, 1, 1
+      )
+      % 16.0
+  ) * 0.5
+  t = (
+      torch.arange(shape[1], device=device, dtype=torch.float32).view(
+          1, -1, 1, 1, 1
+      )
+      % 64.0
+  ) * 0.25
+  h = (
+      torch.arange(shape[2], device=device, dtype=torch.float32).view(
+          1, 1, -1, 1, 1
+      )
+      % 8.0
+  ) * 1.0
+  kv = (
+      torch.arange(shape[3], device=device, dtype=torch.float32).view(
+          1, 1, 1, -1, 1
+      )
+      % 2.0
+  ) * 2.0
+  d = (
+      torch.arange(shape[4], device=device, dtype=torch.float32).view(
+          1, 1, 1, 1, -1
+      )
+      % 128.0
+  ) * (1.0 / 128.0)
+  return b + t + h + kv + d
 
 
 def populate_deterministic_cache(
-    num_layers: int, shape: Sequence[int]
+    num_layers: int, shape: Sequence[int], dtype: torch.dtype
 ) -> list[torch.Tensor]:
+  """Populates deterministic cache layers on device."""
   device = torch.device('tpu')
+  base = _make_base_tensor(shape, device)
   tensors = []
   for layer_idx in range(num_layers):
-    # Every layer has distinct values: layer 0 starts at 0, layer 1 at 1000, etc.
-    base = torch.arange(int(np.prod(shape)), dtype=torch.float32).reshape(
-        shape
-    ) + float(layer_idx * 1000.0)
-    tensors.append(base.to(device))
+    tensors.append((base + float(layer_idx % 32)).to(dtype))
   torch.accelerator.synchronize()
   return tensors
 
@@ -120,14 +179,18 @@ def verify_deterministic_cache(
     num_layers: int,
     shape: Sequence[int],
     received_tensors: list[torch.Tensor],
+    dtype: torch.dtype,
 ) -> bool:
+  """Verifies data consistency across all cache layers on device."""
   print('Verifying data consistency across all cache layers...')
+  device = received_tensors[0].device
+  base = _make_base_tensor(shape, device)
   for layer_idx in range(num_layers):
-    expected = torch.arange(int(np.prod(shape)), dtype=torch.float32).reshape(
-        shape
-    ) + float(layer_idx * 1000.0)
-    actual = received_tensors[layer_idx].cpu()
-    if not torch.equal(actual, expected):
+    expected = (base + float(layer_idx % 32)).to(dtype)
+    actual = received_tensors[layer_idx]
+    if not bool(
+        torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+    ):
       print(f'Verification FAILED on Layer {layer_idx}!')
       return False
   print('Data consistency verified successfully! 0% corruption.')
@@ -154,19 +217,21 @@ def main(_):
     os.environ['ENABLE_RAIDEN_METRICS'] = 'true'
 
   device = torch.device('tpu')
-  # KV-cache shape: (num_blocks, num_heads, block_size, num_kv_heads, head_dim)
-  cache_shape = (_NUM_BLOCKS.value, 32, _BLOCK_SIZE.value, 8, 128)
+  cache_dtype, itemsize = _resolve_dtype(_DTYPE.value)
+  # KV-cache shape: (num_blocks, block_size, num_heads, num_kv, head_dim)
+  cache_shape = (_NUM_BLOCKS.value, _BLOCK_SIZE.value, 8, 2, 128)
 
-  # Size of a single block in bytes (float32 = 4 bytes)
-  block_bytes = int(np.prod(cache_shape[1:])) * 4
+  # Size of a single block in bytes
+  block_bytes = int(np.prod(cache_shape[1:])) * itemsize
   payload_bytes = _NUM_LAYERS.value * _NUM_BLOCKS.value * block_bytes
   print(
       f'Config: role={_ROLE.value} parallelism={_PARALLELISM.value} '
       f'num_slots={_NUM_SLOTS.value} num_layers={_NUM_LAYERS.value} '
-      f'num_blocks={_NUM_BLOCKS.value} block_size={_BLOCK_SIZE.value}'
+      f'num_blocks={_NUM_BLOCKS.value} block_size={_BLOCK_SIZE.value} '
+      f'dtype={_DTYPE.value}'
   )
   print(
-      f'Cache: shape={cache_shape} dtype=float32 '
+      f'Cache: shape={cache_shape} dtype={_DTYPE.value} '
       f'block={block_bytes / (1024 * 1024):.2f} MiB '
       f'payload={payload_bytes / (1024 * 1024):.2f} MiB'
   )
@@ -176,7 +241,9 @@ def main(_):
     t0 = time.perf_counter()
 
     # 1. Populate deterministic cache on TPU
-    tpu_src_arr = populate_deterministic_cache(_NUM_LAYERS.value, cache_shape)
+    tpu_src_arr = populate_deterministic_cache(
+        _NUM_LAYERS.value, cache_shape, cache_dtype
+    )
     print(
         f'Populated {_NUM_LAYERS.value} source layers on device in '
         f'{time.perf_counter() - t0:.2f}s'
@@ -252,10 +319,10 @@ def main(_):
     if not _PEER.value:
       raise ValueError('A peer address MUST be provided')
 
-    # 2. Allocate empty destination tensors on TPU
+    # 2. Allocate zero-filled destination tensors on TPU
     t0 = time.perf_counter()
     device_tensors = [
-        torch.empty(cache_shape, dtype=torch.float32, device='tpu')
+        torch.zeros(cache_shape, dtype=cache_dtype, device=device)
         for _ in range(_NUM_LAYERS.value)
     ]
     torch.accelerator.synchronize()
@@ -385,7 +452,7 @@ def main(_):
     print('===================================\n')
     t0 = time.perf_counter()
     success = verify_deterministic_cache(
-        _NUM_LAYERS.value, cache_shape, device_tensors
+        _NUM_LAYERS.value, cache_shape, device_tensors, cache_dtype
     )
     print(f'Verification took {time.perf_counter() - t0:.2f}s')
     if not success:

@@ -139,15 +139,16 @@ class RecvRecorder {
               completions_.push_back({post, status, resolves_.size()});
               return absl::OkStatus();
             },
-        .resolve_addr = [this](const PostMetadata& post,
-                               const RequestMetadata& req) -> uint8_t* {
+        .resolve_addr = [this](
+                            const PostMetadata& post,
+                            const RequestMetadata& req) -> absl::Span<uint8_t> {
           absl::MutexLock lock(mu_);
           resolves_.push_back({post, req});
           if (req.block_id < 0 ||
               static_cast<size_t>(req.block_id) >= blocks_.size()) {
-            return nullptr;
+            return {};
           }
-          return blocks_[req.block_id]->data();
+          return absl::MakeSpan(*blocks_[req.block_id]);
         },
     };
   }
@@ -303,17 +304,16 @@ TEST(PeregrineTransportAdapterTest, PollUnknownHandleFails) {
 }
 
 TEST(PeregrineTransportAdapterTest, EndToEndTcpWriteOverLoopback) {
+  std::vector<uint8_t> src_buf = {10, 20, 30, 40, 50, 60, 70, 80};
+  std::vector<uint8_t> remote_buf(src_buf.size(), 0);
   absl::StatusOr<std::unique_ptr<PeregrineTransportAdapter>> local =
       CreateAdapter(/*num_conns_per_peer=*/2);
   ABSL_ASSERT_OK(local);
-  std::vector<uint8_t> src_buf = {10, 20, 30, 40, 50, 60, 70, 80};
-  std::vector<uint8_t> remote_buf(src_buf.size(), 0);
   absl::StatusOr<std::unique_ptr<PeregrineTransportAdapter>> remote =
       CreateAdapter(
           /*num_conns_per_peer=*/2,
-          {.resolve_addr = [&](const PostMetadata&, const RequestMetadata&) {
-            return remote_buf.data();
-          }});
+          {.resolve_addr = [&](const PostMetadata&, const RequestMetadata&)
+               -> absl::Span<uint8_t> { return absl::MakeSpan(remote_buf); }});
   ABSL_ASSERT_OK(remote);
   const std::string remote_endpoint =
       absl::StrCat("127.0.0.1:", (*remote)->local_port());

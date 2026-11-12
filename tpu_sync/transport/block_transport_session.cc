@@ -281,7 +281,7 @@ absl::Status ValidateChunks(BlockTransportDelegate* delegate, size_t l,
         " chunks; RequestMetadataV1::chunk_idx is 16-bit (layer=", l,
         " shard=", sh, " uuid=", uuid, ")"));
   }
-  ABSL_ASSIGN_OR_RETURN(const absl::Span<const char> span,
+  ABSL_ASSIGN_OR_RETURN(const absl::Span<const uint8_t> span,
                         delegate->GetBlockArrayHostSpan(l, sh, uuid));
   // Some legacy delegates intentionally expose only scattered per-block
   // pointers and no flat array base. Preserve that contract; pool-aware

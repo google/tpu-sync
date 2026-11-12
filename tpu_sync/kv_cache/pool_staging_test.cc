@@ -163,12 +163,11 @@ TEST(PoolStagingTest, BlockArrayHostSpanRejectsShardPastNumShards) {
       /*staging_blocks_per_request=*/0)}));
 
   TF_ASSERT_OK_AND_ASSIGN(
-      const absl::Span<const char> last_shard_span,
+      const absl::Span<const uint8_t> last_shard_span,
       manager.GetBlockArrayHostSpan(/*block_array_idx=*/0, /*shard_idx=*/1));
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> last_shard_buffer,
                        manager.GetHostBuffer(0, 1));
-  EXPECT_EQ(last_shard_span.data(),
-            reinterpret_cast<const char*>(last_shard_buffer.data()));
+  EXPECT_EQ(last_shard_span.data(), last_shard_buffer.data());
   EXPECT_EQ(last_shard_span.size(), static_cast<size_t>(kStride * kNumBlocks));
   EXPECT_THAT(
       manager.GetBlockArrayHostSpan(/*block_array_idx=*/0, /*shard_idx=*/2),
@@ -215,6 +214,35 @@ TEST(PoolStagingTest, BlockArrayHostSpanRejectsStorageExtentPastHostBuffer) {
               StatusIs(absl::StatusCode::kFailedPrecondition,
                        HasSubstr("Storage extent [0, 256) of pool 0 does not "
                                  "fit host layer 0 shard 0 (255 bytes)")));
+}
+
+TEST(PoolStagingTest, BlockArrayHostSpanRejectsBaseOffsetPastHostBuffer) {
+  constexpr int64_t kBaseOffset = 64;
+  constexpr int64_t kStride = 64;
+  constexpr int64_t kNumBlocks = 3;
+  StagingTestManager manager(/*num_layers=*/1, /*num_shards=*/1,
+                             /*slice_byte_size=*/kStride,
+                             /*host_blocks=*/4);
+  ABSL_ASSERT_OK(manager.RegisterPools(
+      {DensePool("fa", /*storage_index=*/0, kBaseOffset, kStride, kNumBlocks,
+                 /*staging_blocks_per_request=*/0)}));
+  TF_ASSERT_OK_AND_ASSIGN(
+      const absl::Span<const uint8_t> valid_span,
+      manager.GetBlockArrayHostSpan(/*block_array_idx=*/0, /*shard_idx=*/0));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> initial_host,
+                       manager.GetHostBuffer(0, 0));
+  EXPECT_EQ(valid_span.data(), initial_host.data() + kBaseOffset);
+  EXPECT_EQ(valid_span.size(), static_cast<size_t>(kStride * kNumBlocks));
+
+  // Host buffer shorter than base_offset_bytes must fail before pointer math.
+  std::vector<uint8_t> short_host_buffer(32);
+  manager.SetExternalHostPointers({short_host_buffer.data()},
+                                  {short_host_buffer.size()});
+
+  EXPECT_THAT(manager.GetBlockArrayHostSpan(/*block_array_idx=*/0, 0),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("Storage extent [64, 256) of pool 0 does not "
+                                 "fit host layer 0 shard 0 (32 bytes)")));
 }
 
 TEST(PoolStagingTest, BlockArrayHostSpanRejectsStagingArenaPastHostBuffer) {
@@ -272,7 +300,7 @@ TEST(PoolStagingTest, BoundedArenaLeasesAndAddressing) {
   EXPECT_EQ(summary[0].blocks_per_lease, 2);
   EXPECT_EQ(summary[0].free_slots, 4);
   // The transport's bounds span is the whole arena.
-  TF_ASSERT_OK_AND_ASSIGN(const absl::Span<const char> arena_span,
+  TF_ASSERT_OK_AND_ASSIGN(const absl::Span<const uint8_t> arena_span,
                        manager.GetBlockArrayHostSpan(/*block_array_idx=*/0, 0));
   EXPECT_EQ(arena_span.size(), static_cast<size_t>(4 * kStride));
 
@@ -781,18 +809,18 @@ TEST(PoolStagingTest, BoundedHostLayersPoolStaging) {
   uint8_t* expected_host_base = layer1_buffer.data();
   EXPECT_EQ(chunks[0].ptr, expected_host_base + 1 * kStride);
   for (size_t i = 0; i < kNumLayers; ++i) {
-    TF_ASSERT_OK_AND_ASSIGN(const absl::Span<const char> span,
+    TF_ASSERT_OK_AND_ASSIGN(const absl::Span<const uint8_t> span,
                          manager.GetBlockArrayHostSpan(i, 0, /*uuid=*/42));
     TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> host,
                          manager.GetHostBuffer(i % 2, 0));
-    EXPECT_EQ(span.data(), reinterpret_cast<const char*>(host.data()));
+    EXPECT_EQ(span.data(), host.data());
     EXPECT_EQ(span.size(), static_cast<size_t>(4 * kStride));
   }
   TF_ASSERT_OK_AND_ASSIGN(
-      const absl::Span<const char> span3,
+      const absl::Span<const uint8_t> span3,
       manager.GetBlockArrayHostSpan(/*block_array_idx=*/3, 0, /*uuid=*/42));
-  const char* chunk_begin = reinterpret_cast<const char*>(chunks[0].ptr);
-  ASSERT_EQ(span3.data(), reinterpret_cast<const char*>(expected_host_base));
+  const uint8_t* chunk_begin = chunks[0].ptr;
+  ASSERT_EQ(span3.data(), expected_host_base);
   EXPECT_EQ(span3.size(), static_cast<size_t>(4 * kStride));
   EXPECT_GE(chunk_begin, span3.data());
   EXPECT_LE(chunk_begin + chunks[0].size, span3.data() + span3.size());
@@ -873,9 +901,9 @@ TEST(PoolStagingTest, BoundedHostLayersUnboundedPoolBlocksHostPointerAndSize) {
   uint8_t* expected_base =
       layer1_buffer.data() + static_cast<size_t>(kBaseOffset);
   TF_ASSERT_OK_AND_ASSIGN(
-      const absl::Span<const char> leased_span,
+      const absl::Span<const uint8_t> leased_span,
       manager.GetBlockArrayHostSpan(/*block_array_idx=*/3, 0, /*uuid=*/42));
-  EXPECT_EQ(leased_span.data(), reinterpret_cast<const char*>(expected_base));
+  EXPECT_EQ(leased_span.data(), expected_base);
   EXPECT_EQ(leased_span.size(), static_cast<size_t>(kStride * kNumBlocks));
 }
 

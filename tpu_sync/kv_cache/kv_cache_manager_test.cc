@@ -469,9 +469,9 @@ TEST(KVCacheManagerTest,
                                              /*block_id=*/1));
   EXPECT_EQ(last_ref.ptr, src + 160);
   TF_ASSERT_OK_AND_ASSIGN(
-      const absl::Span<const char> pool_span,
+      const absl::Span<const uint8_t> pool_span,
       sender.GetBlockArrayHostSpan(/*block_array_idx=*/0, /*shard_idx=*/0));
-  EXPECT_EQ(pool_span.data(), reinterpret_cast<const char*>(src + 32));
+  EXPECT_EQ(pool_span.data(), src + 32);
   EXPECT_EQ(pool_span.size(), 224);
 
   const std::optional<int> receiver_port = receiver.local_port();
@@ -677,9 +677,9 @@ TEST(KVCacheManagerTest, ImplicitBlockArrayHostSpanWithoutHostBufferIsEmpty) {
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> layer1,
                        manager.GetHostBuffer(/*layer_idx=*/1, /*shard_idx=*/0));
   TF_ASSERT_OK_AND_ASSIGN(
-      absl::Span<const char> span,
+      absl::Span<const uint8_t> span,
       manager.GetBlockArrayHostSpan(/*block_array_idx=*/1, /*shard_idx=*/0));
-  EXPECT_EQ(reinterpret_cast<const uint8_t*>(span.data()), layer1.data());
+  EXPECT_EQ(span.data(), layer1.data());
   EXPECT_EQ(span.size(), 256);
 
   manager.layers_[1].shards[0].ReleaseMemory();
@@ -700,7 +700,7 @@ TEST(KVCacheManagerTest, ImplicitBlockArrayHostSpanZeroShardLayerIsOutOfRange) {
       StatusIs(absl::StatusCode::kOutOfRange,
                HasSubstr("shard_idx 0 out of range: layer 1 has no shards")));
   TF_ASSERT_OK_AND_ASSIGN(
-      absl::Span<const char> span,
+      absl::Span<const uint8_t> span,
       manager.GetBlockArrayHostSpan(/*block_array_idx=*/0, /*shard_idx=*/0));
   EXPECT_EQ(span.size(), 256);
 }
@@ -715,10 +715,9 @@ TEST(KVCacheManagerTest,
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> storage1,
                        manager.GetHostBuffer(/*layer_idx=*/1, /*shard_idx=*/0));
   TF_ASSERT_OK_AND_ASSIGN(
-      absl::Span<const char> span,
+      absl::Span<const uint8_t> span,
       manager.GetBlockArrayHostSpan(/*block_array_idx=*/0, /*shard_idx=*/0));
-  EXPECT_EQ(reinterpret_cast<const uint8_t*>(span.data()),
-            storage1.data() + 128);
+  EXPECT_EQ(span.data(), storage1.data() + 128);
   EXPECT_EQ(span.size(), 4 * 64);
 
   manager.layers_[1].shards[0].ReleaseMemory();

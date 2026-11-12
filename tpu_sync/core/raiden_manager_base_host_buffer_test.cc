@@ -187,10 +187,9 @@ TEST(RaidenManagerBaseHostBufferTest, BlockArrayHostSpanViewsHostBuffer) {
 
   for (size_t l = 0; l < kNumLayers; ++l) {
     for (size_t s = 0; s < kNumShards; ++s) {
-      TF_ASSERT_OK_AND_ASSIGN(absl::Span<const char> span,
+      TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> span,
                            manager.GetBlockArrayHostSpan(l, s));
-      EXPECT_EQ(reinterpret_cast<const uint8_t*>(span.data()),
-                storage[l][s].data());
+      EXPECT_EQ(span.data(), storage[l][s].data());
       EXPECT_EQ(span.size(), storage[l][s].size());
     }
   }
@@ -204,11 +203,10 @@ TEST(RaidenManagerBaseHostBufferTest,
   manager.SetExternalHostPointers({nullptr, storage.data()},
                                   {storage.size(), storage.size()});
 
-  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const char> with_buffer,
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> with_buffer,
                        manager.GetBlockArrayHostSpan(0, 1));
-  EXPECT_EQ(reinterpret_cast<const uint8_t*>(with_buffer.data()),
-            storage.data());
-  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const char> without_buffer,
+  EXPECT_EQ(with_buffer.data(), storage.data());
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> without_buffer,
                        manager.GetBlockArrayHostSpan(0, 0));
   EXPECT_EQ(without_buffer.data(), nullptr);
   EXPECT_TRUE(without_buffer.empty());

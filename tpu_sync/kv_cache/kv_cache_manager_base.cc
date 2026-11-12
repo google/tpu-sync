@@ -2191,7 +2191,7 @@ absl::StatusOr<size_t> KVCacheManagerBase::ResolveBlockArrayHostLayer(
   return host_layer_idx;
 }
 
-absl::StatusOr<absl::Span<const char>>
+absl::StatusOr<absl::Span<const uint8_t>>
 KVCacheManagerBase::GetBlockArrayHostSpan(size_t block_array_idx,
                                           size_t shard_idx, uint64_t uuid) {
   ABSL_ASSIGN_OR_RETURN(const size_t host_layer_idx,
@@ -2202,12 +2202,10 @@ KVCacheManagerBase::GetBlockArrayHostSpan(size_t block_array_idx,
     if (absl::IsFailedPrecondition(host_buffer.status())) {
       // Same contract as the delegate default: a storage without a host
       // buffer exposes no flat host base.
-      return absl::Span<const char>();
+      return absl::Span<const uint8_t>();
     }
     ABSL_RETURN_IF_ERROR(host_buffer.status());
-    return absl::Span<const char>(
-        reinterpret_cast<const char*>(host_buffer->data()),
-        host_buffer->size());
+    return *host_buffer;
   }
   const PoolSpec& pool = pools_[block_array_idx];
   if (shard_idx >= num_shards_) {
@@ -2221,8 +2219,11 @@ KVCacheManagerBase::GetBlockArrayHostSpan(size_t block_array_idx,
                      " host layer ", host_layer_idx, " shard ", shard_idx,
                      " has no host buffer: ", host_buffer.status().message()));
   }
-  const char* ptr = reinterpret_cast<const char*>(host_buffer->data() +
-                                                  pool.base_offset_bytes);
+  if (pool.base_offset_bytes < 0) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "pool ", block_array_idx, " has negative base_offset_bytes ",
+        pool.base_offset_bytes));
+  }
   const size_t base_offset = static_cast<size_t>(pool.base_offset_bytes);
   {
     // Bounded staging: the addressable host span is the whole arena (leased
@@ -2241,8 +2242,9 @@ KVCacheManagerBase::GetBlockArrayHostSpan(size_t block_array_idx,
             host_layer_idx, " shard ", shard_idx, " (", host_buffer_size,
             " bytes)"));
       }
-      return absl::Span<const char>(ptr,
-                                    static_cast<size_t>(arena - base_offset));
+      return absl::Span<const uint8_t>(
+          host_buffer->data() + base_offset,
+          static_cast<size_t>(arena - base_offset));
     }
   }
   const size_t storage_size = host_buffer->size();
@@ -2255,8 +2257,9 @@ KVCacheManagerBase::GetBlockArrayHostSpan(size_t block_array_idx,
         ") of pool ", block_array_idx, " does not fit host layer ",
         host_layer_idx, " shard ", shard_idx, " (", storage_size, " bytes)"));
   }
-  return absl::Span<const char>(
-      ptr, static_cast<size_t>(storage_end - pool.base_offset_bytes));
+  return absl::Span<const uint8_t>(
+      host_buffer->data() + base_offset,
+      static_cast<size_t>(storage_end - pool.base_offset_bytes));
 }
 
 int64_t KVCacheManagerBase::LayerBlockByteSize(size_t layer_idx) const {

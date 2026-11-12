@@ -1004,12 +1004,11 @@ BlockTransport::BuildBlockPullRequests(
           uint8_t* explicit_base = nullptr;
           if (!explicit_dst_ptrs.empty()) {
             ABSL_ASSIGN_OR_RETURN(
-                const absl::Span<const char> span,
+                const absl::Span<const uint8_t> span,
                 block_delegate_->GetBlockArrayHostSpan(l, sh, uuid));
             // Receive destination: the span views delegate-owned mutable
             // storage.
-            default_base = const_cast<uint8_t*>(
-                reinterpret_cast<const uint8_t*>(span.data()));
+            default_base = const_cast<uint8_t*>(span.data());
             explicit_base =
                 explicit_dst_ptrs[l * block_delegate_->num_shards() + sh];
           }

@@ -108,18 +108,16 @@ class BlockTransportDelegate : public lib::RawBufferTransportDelegate {
   // The default views GetHostBuffer(): a target without a host buffer yields
   // the OK empty span, and every other error propagates (e.g. OutOfRange for
   // a bad |block_array_idx| or a layer with no shards).
-  virtual absl::StatusOr<absl::Span<const char>> GetBlockArrayHostSpan(
+  virtual absl::StatusOr<absl::Span<const uint8_t>> GetBlockArrayHostSpan(
       size_t block_array_idx, size_t shard_idx, uint64_t uuid = 0) {
     absl::StatusOr<absl::Span<const uint8_t>> host_buffer =
         std::as_const(*this).GetHostBuffer(block_array_idx, shard_idx);
     if (absl::IsFailedPrecondition(host_buffer.status())) {
       // No host buffer: this delegate exposes no flat host base (see above).
-      return absl::Span<const char>();
+      return absl::Span<const uint8_t>();
     }
     ABSL_RETURN_IF_ERROR(host_buffer.status());
-    return absl::Span<const char>(
-        reinterpret_cast<const char*>(host_buffer->data()),
-        host_buffer->size());
+    return *host_buffer;
   }
 
   // Returns the active node ID (rank) of the worker.
@@ -210,15 +208,14 @@ class BlockTransportDelegate : public lib::RawBufferTransportDelegate {
 
   virtual uint8_t* GetBlockHostPointer(size_t layer_idx, size_t shard_idx,
                                        int block_id) {
-    const absl::StatusOr<absl::Span<const char>> span =
+    const absl::StatusOr<absl::Span<const uint8_t>> span =
         GetBlockArrayHostSpan(layer_idx, shard_idx);
     if (!span.ok() || span->data() == nullptr || block_id < 0) {
       return nullptr;
     }
     // The span views delegate-owned mutable storage; callers write received
     // blocks through the returned pointer.
-    uint8_t* base =
-        const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(span->data()));
+    uint8_t* base = const_cast<uint8_t*>(span->data());
     return base + static_cast<size_t>(block_id) * block_bytes(layer_idx);
   }
 

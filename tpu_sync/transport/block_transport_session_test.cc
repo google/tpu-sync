@@ -256,16 +256,16 @@ TEST(BlockTransportServerPullSessionTest, Cancel) {
 // Delegate whose GetBlockArrayHostSpan() returns a fixed result.
 class FixedHostSpanDelegate : public MockSessionDelegate {
  public:
-  explicit FixedHostSpanDelegate(absl::StatusOr<absl::Span<const char>> span)
+  explicit FixedHostSpanDelegate(absl::StatusOr<absl::Span<const uint8_t>> span)
       : span_(std::move(span)) {}
 
-  absl::StatusOr<absl::Span<const char>> GetBlockArrayHostSpan(
+  absl::StatusOr<absl::Span<const uint8_t>> GetBlockArrayHostSpan(
       size_t block_array_idx, size_t shard_idx, uint64_t uuid) override {
     return span_;
   }
 
  private:
-  const absl::StatusOr<absl::Span<const char>> span_;
+  const absl::StatusOr<absl::Span<const uint8_t>> span_;
 };
 
 TEST(ValidateChunksTest, BoundsChecksChunksAgainstHostSpan) {
@@ -294,7 +294,7 @@ TEST(ValidateChunksTest, PropagatesHostSpanError) {
 }
 
 TEST(ValidateChunksTest, SkipsDelegateWithoutFlatHostBase) {
-  FixedHostSpanDelegate delegate((absl::Span<const char>()));
+  FixedHostSpanDelegate delegate((absl::Span<const uint8_t>()));
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> host, delegate.GetHostBuffer(0, 0));
   const std::vector<BlockChunk> past_end = {
       {.ptr = host.data() + host.size(), .size = 1024}};

@@ -588,18 +588,17 @@ TEST(ReshardReceiveSessionTest,
       /*total_bytes=*/16, kUuid, /*sender_node_id=*/0);
   ASSERT_EQ(chunks1.size(), 1u);
   EXPECT_THAT(session->ResolveStagingSlot(1), IsOkAndHolds(0u));
-  TF_ASSERT_OK_AND_ASSIGN(const absl::Span<const char> pool1_span,
+  TF_ASSERT_OK_AND_ASSIGN(const absl::Span<const uint8_t> pool1_span,
                        base.GetBlockArrayHostSpan(/*block_array_idx=*/1,
                                                   /*shard_idx=*/0, kUuid));
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> layer0_buffer,
                        base.GetHostBuffer(/*layer_idx=*/0, /*shard_idx=*/0));
   EXPECT_EQ(pool1_span.data(),
-            reinterpret_cast<const char*>(layer0_buffer.data() +
-                                          pools[1].base_offset_bytes));
+            layer0_buffer.data() + pools[1].base_offset_bytes);
   EXPECT_EQ(
       pool1_span.size(),
       static_cast<size_t>(pools[1].num_blocks * pools[1].block_stride_bytes));
-  const char* chunk1_begin = reinterpret_cast<const char*>(chunks1[0].ptr);
+  const uint8_t* chunk1_begin = chunks1[0].ptr;
   EXPECT_GE(chunk1_begin, pool1_span.data());
   EXPECT_LE(chunk1_begin + chunks1[0].size,
             pool1_span.data() + pool1_span.size());
@@ -610,18 +609,17 @@ TEST(ReshardReceiveSessionTest,
       /*total_bytes=*/16, kUuid, /*sender_node_id=*/0);
   ASSERT_EQ(chunks0.size(), 1u);
   EXPECT_THAT(session->ResolveStagingSlot(0), IsOkAndHolds(1u));
-  TF_ASSERT_OK_AND_ASSIGN(const absl::Span<const char> pool0_span,
+  TF_ASSERT_OK_AND_ASSIGN(const absl::Span<const uint8_t> pool0_span,
                        base.GetBlockArrayHostSpan(/*block_array_idx=*/0,
                                                   /*shard_idx=*/0, kUuid));
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> layer1_buffer,
                        base.GetHostBuffer(/*layer_idx=*/1, /*shard_idx=*/0));
   EXPECT_EQ(pool0_span.data(),
-            reinterpret_cast<const char*>(layer1_buffer.data() +
-                                          pools[0].base_offset_bytes));
+            layer1_buffer.data() + pools[0].base_offset_bytes);
   EXPECT_EQ(
       pool0_span.size(),
       static_cast<size_t>(pools[0].num_blocks * pools[0].block_stride_bytes));
-  const char* chunk0_begin = reinterpret_cast<const char*>(chunks0[0].ptr);
+  const uint8_t* chunk0_begin = chunks0[0].ptr;
   EXPECT_GE(chunk0_begin, pool0_span.data());
   EXPECT_LE(chunk0_begin + chunks0[0].size,
             pool0_span.data() + pool0_span.size());
@@ -644,10 +642,10 @@ TEST(ReshardReceiveSessionTest,
 bool ChunkPassesTransportValidation(kv_cache::KVCacheManagerBase& base,
                                     size_t pool_idx, uint64_t uuid,
                                     const transport::BlockChunk& chunk) {
-  absl::StatusOr<absl::Span<const char>> span =
+  absl::StatusOr<absl::Span<const uint8_t>> span =
       base.GetBlockArrayHostSpan(pool_idx, /*shard_idx=*/0, uuid);
   if (!span.ok() || span->data() == nullptr) return true;
-  const char* begin = reinterpret_cast<const char*>(chunk.ptr);
+  const uint8_t* begin = chunk.ptr;
   if (begin < span->data()) return false;
   const size_t offset = static_cast<size_t>(begin - span->data());
   return offset <= span->size() && chunk.size <= span->size() - offset;
@@ -702,11 +700,10 @@ TEST(ReshardReceiveSessionTest, FullHostMirrorAddressesPoolsInPlace) {
         pool_idx, /*shard_idx=*/0, {0}, /*total_bytes=*/16, plan.uuid(),
         /*sender_node_id=*/0);
     ASSERT_EQ(chunks.size(), 1u) << "pool " << pool_idx;
-    TF_ASSERT_OK_AND_ASSIGN(const absl::Span<const char> span,
-                         base.GetBlockArrayHostSpan(pool_idx, /*shard_idx=*/0,
-                                                    plan.uuid()));
-    EXPECT_EQ(reinterpret_cast<const char*>(chunks[0].ptr), span.data())
-        << "pool " << pool_idx;
+    TF_ASSERT_OK_AND_ASSIGN(
+        const absl::Span<const uint8_t> span,
+        base.GetBlockArrayHostSpan(pool_idx, /*shard_idx=*/0, plan.uuid()));
+    EXPECT_EQ(chunks[0].ptr, span.data()) << "pool " << pool_idx;
     EXPECT_TRUE(ChunkPassesTransportValidation(base, pool_idx, plan.uuid(),
                                                chunks[0]))
         << "pool " << pool_idx;

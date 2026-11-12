@@ -242,6 +242,28 @@ TEST(BlockTransportServerPushSessionTest,
   EXPECT_FALSE(session->HasAdmittedPosts());
 }
 
+TEST(BlockTransportServerPushSessionTest, ResolveRecvBufferReturnsChunkSpan) {
+  MockSessionDelegate delegate(/*slice_size=*/1024, /*max_blocks=*/4);
+  BlockTransportConfig config;
+  auto session = std::make_shared<BlockTransportServerPushSession>(
+      /*uuid=*/0, &delegate, config);
+
+  const lib::PostMetadata post{.uuid = 0, .remote_id = 0, .local_id = 0};
+  const absl::StatusOr<absl::Span<uint8_t>> resolved =
+      session->ResolveRecvBuffer(
+          post, {.shard = 0, .block_id = 2, .chunk_idx = 0, .len = 1024});
+  ABSL_ASSERT_OK(resolved);
+  const absl::StatusOr<absl::Span<const uint8_t>> host_buf =
+      delegate.GetHostBuffer(0, 0);
+  ABSL_ASSERT_OK(host_buf);
+  EXPECT_EQ(resolved->data(), host_buf->data() + 2 * 1024);
+  EXPECT_EQ(resolved->size(), 1024);
+
+  EXPECT_THAT(
+      session->ResolveRecvBuffer(
+          post, {.shard = 0, .block_id = 2, .chunk_idx = 0, .len = 512}),
+      StatusIs(absl::StatusCode::kInvalidArgument));
+}
 TEST(BlockTransportServerPullSessionTest, InvalidArgumentsRejected) {
   MockSessionDelegate delegate;
   BlockTransportConfig config;

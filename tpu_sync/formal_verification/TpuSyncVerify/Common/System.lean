@@ -121,6 +121,45 @@ theorem settles_of_rank {Inv Done : S → Prop} (rank : S → Nat)
       simp only [runFrom, List.foldlM_cons, hse]
       exact hrun
 
+/-- Multi-step transition relation (reflexive-transitive closure of `step`,
+independent of `init` so systems sharing `step` share `StepsOf`). -/
+inductive StepsOf {S Ev : Type} (step : S → Ev → Option S) : S → S → Prop
+  | refl (s : S) : StepsOf step s s
+  | step {s₁ s₂ s₃ : S} {e : Ev} :
+      step s₁ e = some s₂ → StepsOf step s₂ s₃ → StepsOf step s₁ s₃
+
+theorem StepsOf.single {S Ev : Type} {step : S → Ev → Option S} {s₁ s₂ : S} {e : Ev}
+    (h : step s₁ e = some s₂) : StepsOf step s₁ s₂ :=
+  .step h (.refl _)
+
+theorem StepsOf.two {S Ev : Type} {step : S → Ev → Option S} {s₁ s₂ s₃ : S} {e₁ e₂ : Ev}
+    (h₁ : step s₁ e₁ = some s₂) (h₂ : step s₂ e₂ = some s₃) : StepsOf step s₁ s₃ :=
+  .step h₁ (.single h₂)
+
+theorem StepsOf.preserve {S Ev : Type} {step : S → Ev → Option S} {P : S → Prop}
+    (hstep : ∀ s e s', P s → step s e = some s' → P s')
+    {s s' : S} (hp : P s) (hs : StepsOf step s s') : P s' := by
+  induction hs with
+  | refl => exact hp
+  | step h1 _ ih => exact ih (hstep _ _ _ hp h1)
+
+theorem Reachable.steps {s s' : S} (hr : sys.Reachable s) (hs : StepsOf sys.step s s') :
+    sys.Reachable s' := by
+  induction hs with
+  | refl => exact hr
+  | step h1 _ ih => exact ih (hr.step h1)
+
+/-- Stuttering simulation: if `proj` maps `sub.init` into an `abs`-reachable
+state and maps every `sub.step` into zero or more `abs.step`s (`StepsOf abs.step`),
+then every `sub`-reachable state projects to an `abs`-reachable state. -/
+theorem simulates_reachable {S₁ Ev₁ S₂ Ev₂ : Type}
+    (sub : System S₁ Ev₁) (abs : System S₂ Ev₂) (proj : S₁ → S₂)
+    (hinit : abs.Reachable (proj sub.init))
+    (hstep : ∀ s e s', sub.step s e = some s' → StepsOf abs.step (proj s) (proj s'))
+    {s : S₁} (hr : sub.Reachable s) : abs.Reachable (proj s) :=
+  sub.reachable_induction (P := fun s => abs.Reachable (proj s)) hinit
+    (fun _ _ _ h hs => Reachable.steps abs h (hstep _ _ _ hs)) hr
+
 end System
 
 end TpuSyncVerify

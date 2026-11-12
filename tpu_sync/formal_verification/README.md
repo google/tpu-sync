@@ -9,12 +9,15 @@ data paths and machine-checked proofs about them.
 ## What is modelled
 
 **Prefill-to-decode transfer** — [prefill_decode.md](docs/transfer/prefill_decode.md)
-- C++: `TransferSendSession`, `TransferReceiveSession`,
+- C++: `TransferSendSession`, `TransferReceiveSession`, `StagingLayerManager`,
   `KVCacheManagerWithTransfer`, the receiver side of `BlockTransport`
   (`BlockTransportServerPushSession`).
 - Lean: [`Transfer/Session.lean`](TpuSyncVerify/Transfer/Session.lean),
+  [`Transfer/LayerStaging.lean`](TpuSyncVerify/Transfer/LayerStaging.lean),
   [`Transfer/PrefillDecode/`](TpuSyncVerify/Transfer/PrefillDecode/).
-- Proved: data correctness on publication, HBM and staging safety,
+- Proved: data correctness on publication (both full host mirror and bounded
+  host layer staging under `TPU_RAIDEN_NUM_STAGING_LAYERS`), HBM and staging
+  safety, host-slot conservation/exclusivity and `1`-slot sufficiency,
   drain-to-settle termination, cross-peer isolation.
 
 **Pool resharding** — [reshard.md](docs/transfer/reshard.md)
@@ -41,6 +44,7 @@ TpuSyncVerify.lean            imports every model
 TpuSyncVerify/
   Common/                     transition-system core, list lemmas, bounded model checker
   Transfer/Session.lean       settle protocol shared by every transfer session
+  Transfer/LayerStaging.lean  per-session bounded host layer buffer manager (StagingLayerManager)
   Transfer/Caller.lean        engine caller contract above poll_stats() shared by both transfer paths
   Transfer/PrefillDecode/     prefill-to-decode sessions, pipeline, transport
   Transfer/Reshard/           pool-resharding sessions, staging arena, registry, coordinator

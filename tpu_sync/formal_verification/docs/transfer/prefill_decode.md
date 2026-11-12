@@ -14,6 +14,7 @@ answers "is test X modelled".
 
 File aliases: `recv.{h,cc}` = `tpu_sync/kv_cache/transfer_receive_session.{h,cc}`,
 `send.{h,cc}` = `tpu_sync/kv_cache/transfer_send_session.{h,cc}`,
+`session.h` = `tpu_sync/kv_cache/transfer_session.h`,
 `mgr.cc` = `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`,
 `bt.{h,cc}` = `tpu_sync/transport/block_transport.{h,cc}`,
 `bts.{h,cc}` = `tpu_sync/transport/block_transport_session.{h,cc}`,
@@ -30,7 +31,8 @@ statement column is the one-line form, the module docstring has the exact one.
 |---|---|---|
 | Data correctness and attention safety across requests | `Pipeline.system_data_correct`, `Pipeline.system_attention_safe` | In any reachable state of `multiSys` (concurrent, overlapped and recycled requests), a request that publishes `done_recving` has `decodeHbm = good n` and keeps it across every later transition. |
 | Progress across requests | `Pipeline.system_progress` | From any reachable state, any request can settle, return both staging buffers and publish both outcomes (`HandedOff`) in finitely many steps. |
-| Publication correctness, one request | `Pipeline.reachable_safe` (`PublicationCorrect`) | `recv.published = some true → decodeHbm = good n`. |
+| Publication correctness, one request | `Pipeline.reachable_safe` (`PublicationCorrect`), `LayerStaging.reachable_safe` (`PublicationCorrect`) | `recv.published = some true → decodeHbm = good n` (both on the full host mirror and when cycling arbitrarily few `numSendSlots`, `numRecvSlots` host layer buffers under `TPU_RAIDEN_NUM_STAGING_LAYERS`). |
+| Bounded host layer staging (`TPU_RAIDEN_NUM_STAGING_LAYERS`) | `StagingLayerManager.lookup_injective`, `LayerStaging.reachable_safe`, `LayerStaging.sendLookupStagingSlot_active`, `LayerStaging.recvLookupStagingSlot_active`, `LayerStaging.reachable_can_settle`, `LayerStaging.no_slots_cannot_publish_ok`, `LayerStaging.exists_complete_trace` | Host layer slots are conserved (`free.length + leases.length = numSlots`), mutually exclusive across layers (`sendLookupStagingSlot_injective`, `recvLookupStagingSlot_injective`), always resolve a live in-bounds `.kv l` buffer on every active producer lookup and open-stream consumer `ExecuteLayerH2d` precheck (`slotFault = false`), and are returned in full on settlement (`done → leases = []`); `0` slots on either side cannot publish `done_recving` for `n > 0`, whereas `1` slot on each side suffices for arbitrary `n` and every reachable state drains to settlement without deadlock. |
 | Within-layer blocks: gather, reordering, coalescing, custom staging | `BlockOrdering.execCoalesced_buildCoalescedSpec`, `BlockOrdering.landStage_get_requested`, `BlockOrdering.h2dStage_get_requested`, `BlockOrdering.BlockPipeline.reachable_safe` | Coalesced DMA equals elementwise copy; the two permutations of `BuildLoadCopyPlan` (`remote_order`, `local_order`) cancel, so on `done_recving` every requested block `t` of layer `l` holds `.kv l t.remote` and unrequested blocks stay blank; custom host staging holds the same until reseated. |
 | Decode HBM safety and quietness | `Recv.PublishedQuiet`, `Pipeline.DecodeHbmSafe`, `decodeHbm_quiet`, `attention_safe` | Once the receive is published no H2D copy is pending or unretired, so `decodeHbm` never changes afterwards. |
 | Prefill HBM safety and quietness | `Send.PublishedQuiet`, `Pipeline.PrefillHbmSafe`, `prefillHbm_quiet` | Once the send is published no D2H copy is pending or unretired, so the caller may reclaim prefill HBM. |
@@ -45,7 +47,10 @@ statement column is the one-line form, the module docstring has the exact one.
 ## Modules
 
 Higher modules compose the lower `step` functions as-is: `Pipeline` = `Send.step` +
-`Recv.step` + per-layer memories and guards; `BlockOrdering` refines `Pipeline`'s
+`Recv.step` + per-layer memories and guards; `LayerStaging` refines `Pipeline`
+(`LayerStaging.step_pipe_steps` is a lockstep simulation over `Pipeline.step`)
+by multiplexing `numLayers` layers over `numSendSlots` and `numRecvSlots` host
+layer buffers through `StagingLayerManager`; `BlockOrdering` refines `Pipeline`'s
 layer cell into a block array (`BlockPipeline.step_pipe` is a lockstep
 simulation over `Pipeline.step`); `MultiRequest` runs `reqs : List Pipeline`
 over the four shared buffers.
@@ -54,10 +59,12 @@ over the four shared buffers.
 |---|---|---|
 | `Common/ListAux.lean` | `List` indexing / `countTrue` pigeonhole helpers | `all_true_of_countTrue_eq_length`, `exists_false_lt` |
 | `Transfer/Session.lean` | settle protocol (`in_flight_`, `draining_`, `done_`, staging) shared by all session classes | `Lifecycle.Consistent` preserved by `beginOp` / `finish*` / `endOpLocked` |
+| `Transfer/LayerStaging.lean` | `StagingLayerManager` FIFO free queue, active leases, idempotent re-acquire, `Shutdown`, `ReleaseAll`, `ResolveEnvNumStagingLayers` | `StagingLayerManager.acquire_inv`, `release_inv`, `releaseAll_inv`, `lookup_injective`, `lookup_lt`, `acquire_idempotent`, `shutdown_cancels` |
 | `PrefillDecode/Receive.lean` | one `TransferReceiveSession` + manager poll/publication | `Recv.reachable_safe`, `Recv.reachable_can_settle` |
 | `PrefillDecode/ReceivePoll.lean` | the poll-side `IsReadyToComplete` finish, with (`stepM true`, shipping) and without (`stepM false`) it; `metrics` ghost | `Recv.reachable_callbackFinishes`, `Recv.pollReady_window`, `Recv.noPoll_safe`, `Recv.noPoll_metrics_on_success`, `Recv.noPoll_zero_layers_never_succeeds` |
 | `PrefillDecode/Send.lean` | one `TransferSendSession`: pull claim, `StartPush`, D2H loop, H2H chain | `Send.reachable_safe` (`PullClaimed`), `Send.reachable_can_settle` |
 | `PrefillDecode/Pipeline.lean` | single request: handshake rendezvous + five layer-indexed memories, reclaim, reseat, handoff | `Pipeline.reachable_safe`, `Pipeline.reachable_unregistered_safe`, `Pipeline.attention_safe`, `Pipeline.reachable_can_settle`, `Pipeline.handedOff_quiet`, `Pipeline.inv_can_handoff` |
+| `PrefillDecode/LayerStaging.lean` | bounded host layer staging (`TPU_RAIDEN_NUM_STAGING_LAYERS`): `BoundedPipeline` over `numSendSlots` / `numRecvSlots` host buffers, unlocked `AcquireStagingSlot` gaps, 4 GTest replays, 3 mutants | `LayerStaging.reachable_safe`, `reachable_unregistered_safe`, `sendLookupStagingSlot_injective`, `recvLookupStagingSlot_injective`, `reachable_can_settle`, `no_slots_cannot_publish_ok`, `exists_complete_trace` |
 | `PrefillDecode/MultiRequest.lean` | `multiSys`: concurrent/overlapped requests, read- and write-after-release checks (`wroteReleased`) | `Pipeline.system_data_correct`, `Pipeline.system_attention_safe`, `Pipeline.system_progress` |
 | `PrefillDecode/PeerIsolation.lean` | one consumer, `Peer.sick` / `Peer.healthy` producers, `StagingBlockAllocator` slots, `push_pool_` (`tcpBlocking` vs `grpcAsync`) | `PeerIsolation.reachable_safe`, `PeerIsolation.reachable_inv`, `tcp_healthy_blocked_when_pool_full`, `grpc_healthy_can_complete`, `trace_sick_peer_starves_staging_slots` |
 | `PrefillDecode/UuidTable.lean` | `active_recv_sessions_` / `send_sessions_` tables, drain-before-reuse, `req_id` idempotency, `CompleteReadWithDetails` sweep | `UuidTable.reachable_inv`, `active_recv_preserved`, `active_send_preserved` |
@@ -117,10 +124,14 @@ load failures and preemption, prefix caching and chunked prefill.
 
 Modelled: the session–transport callback protocol — the incoming-push lease
 (`begin_incoming_push` / `end_incoming_push`) that pins staging across session
-expiry, `OnLayerReceived` before `OnBlockShardsReceived` (Receive A4), the
-within-layer block plans (`BlockOrdering.lean`), the control-plane worker pool
-(`PeerIsolation.lean`), and `BlockTransport`'s receiver-side stream accounting
-(`Transport.lean`: the per-uuid `BlockTransportServerPushSession` that
+expiry, bounded host layer staging (`acquire_recv_staging` /
+`lookup_send_staging` in `GetBlockChunks` → `AcquireStagingSlot` /
+`LookupStagingSlot` and `StagingLayerManager` in `PrefillDecode/LayerStaging.lean`
+and `Transfer/LayerStaging.lean`), `OnLayerReceived` before
+`OnBlockShardsReceived` (Receive A4), the within-layer block plans
+(`BlockOrdering.lean`), the control-plane worker pool (`PeerIsolation.lean`),
+and `BlockTransport`'s receiver-side stream accounting (`Transport.lean`: the
+per-uuid `BlockTransportServerPushSession` that
 `BlockTransport::HandleIncomingPush` delegates each stream to; it discharges
 Receive A1 and the coarsening behind A4 under one named assumption, honest
 senders).
@@ -128,23 +139,17 @@ senders).
 Not modelled: raw socket I/O and wire framing (`ReadExact` / `WriteExact` and
 their timeouts, headers, length checks, connection pooling, `memcpy`),
 collapsed into the atomic `land l`, `h2hDone l ok` and `cancel` + `pushEnd`;
-the Peregrine data plane (`BlockTransport::AsyncPush` when
+and the Peregrine data plane (`BlockTransport::AsyncPush` when
 `TPU_RAIDEN_ENABLE_PEREGRINE` selects it, and the receive path
 `BlockTransport::OnRecvComplete` →
 `BlockTransportServerPushSession::OnPeregrinePostComplete`, `is_peregrine`,
-which has no production caller yet); and bounded host layer staging
-(`TPU_RAIDEN_NUM_STAGING_LAYERS`, `StagingLayerManager`,
-`TransferSendSession::AcquireStagingSlot` /
-`TransferReceiveSession::AcquireStagingSlot`), under which successive layers
-reuse one host buffer — the models are the full per-layer mirror; `Receive.lean`
-and `Send.lean` §"Bounded host layer staging" argue the session properties
-carry over. Read `block_transport.cc` and `block_transport_session.cc` directly
-for wire behaviour.
+which has no production caller yet). Read `block_transport.cc` and
+`block_transport_session.cc` directly for wire behaviour.
 
 ## Assumptions and how each is discharged
 
 Every module numbers its assumptions (`Receive` A1–A4, `Send` A1–A7, `Pipeline`
-A1–A4, `Transport` A1–A4, `Caller` B1–B3); the full statements and arguments
+A1–A4, `LayerStaging` LS1–LS2, `Transport` A1–A4, `Caller` B1–B3); the full statements and arguments
 are in the module docstrings. This table is the index: what each one says in a
 line, and whether it is discharged by another Lean module, enforced by C++
 control flow, or an external contract.
@@ -163,6 +168,7 @@ control flow, or an external contract.
 | Send A7 — connection-release window | Under `TPU_RAIDEN_DATA_CONN_REUSE=per_transfer` the last `EndSendOp` drops `mu_` before `EndSendOpLocked`; nothing modelled changes in the window. | Soundness argument in `Send.lean`. |
 | Pipeline A1 — whole-layer cells | A layer moves as one unit. | Discharged: `BlockOrdering.BlockPipeline.step_pipe` (lockstep simulation over blocks). |
 | Pipeline A2 — delivery after the push callback | The model lands a layer at or after its push callback; C++ lands it before the ack. Sound because the push pins staging. | Soundness argument in `Pipeline.lean`. |
+| LayerStaging LS1–LS2 — pre-land consumer `AcquireStagingSlot` touches; `Shutdown` before `Release` on error callbacks | Under `Pipeline` A3, `GetBlockChunks(l)` runs only before `CompleteIncomingPush` marks `l` landed (possibly repeatedly across chunks/shards); on callback error `FinishLocked` sets `shutdown_ = true` monotonically before `Release(l)` wakes waiters. | LS1 follows from `Pipeline` A3 (`StartStream` payload loop precedes `CompleteIncomingPush`); LS2 enforced by C++ call order in `TransferSendSession` and `TransferReceiveSession`. |
 | Transport A1–A4 — one lock, contract latched by the first stream, uniform declaration, honest senders | `Transport.lean` §Assumptions. | Stated there: `ExpectedPushSenders` enters `sender_streams` only on non-pool receiver `RegisterActivePlan` plans (`pool_groups_size() == 0` with `shard_push_schedules_size() > 0`); A2 holds whenever senders are dispatched after `RegisterActivePlan` returns (as on in-repo controller hops that arm receivers before dispatching senders) and is assumed only against concurrent or pre-registration pushes; A3 is bypassed on pool reshard (which checks unique contiguous `transfer_rank`s) and store transfers, and is unchecked on legacy non-pool `RegisterActivePlan` plans; A4 is the one the C++ does not enforce and the traces drop. |
 | Caller B1–B3 — multi-worker `KVOutputAggregator` threshold (`expectedP = 2`, `expectedD = 2`) with one settled outcome per worker (`ENABLE_MULTI_NUMA=0`), whole-transfer failure, no preemption/prefix caching/chunked prefill | `Caller.lean` §Assumptions. | B1's `KVOutputAggregator` combining step is modelled directly for both `AggChannel.latchedReq` (`_failed_recving_pending`) and `AggChannel.eagerBlock` (`invalid_block_ids`) in `Caller/MultiWorker.lean` (`mw_contract_safe`, `applyRecv_eager_eq_latched`, `applyRecv_staggered_eq_batch`; `trace_mw_overcounted_expected_leaks` shows what breaks when `get_finished_count()` exceeds participating workers), and `Caller/NumaBarrier.lean` models the intra-worker `NumaAwareKVCacheManager` barrier (assuming one report per sub-manager, its N1, and proving `NumaPolicy.settledCounts` aggregates them into one worker-level publication under `ENABLE_MULTI_NUMA=1` and `req_id` reuse); B2 matches single-outcome `CompleteReadWithDetails` publication; B3 does not change which event frees a transfer-held block. |
 
@@ -202,6 +208,9 @@ Each mutant removes a specific C++ guard or ordering constraint and yields a
 | `Pipeline.dispatchEarly` (`trace_dispatch_early`) | `ExecuteLayerH2d(l)` only dispatched after layer `l` landed in `CompleteIncomingPush` | Publication correctness (`decodeHbm` receives `.junk`) |
 | `Pipeline.h2dReadyByRank` (`trace_h2d_by_rank`) | H2D copy for layer `l` reads staging slot `l` rather than a completion-counter index | Publication correctness (out-of-order landing produces `[kv 1, junk]`) |
 | `Pipeline.reseatAtFinish` (`trace_reseat_at_finish`) | Prefill staging released only when settling (`done_ = true`, `in_flight_ == 0`), not immediately on `FinishLocked` (`draining_ = true`) | Publication correctness / staging safety |
+| `LayerStaging.sysEarlySendRelease` (`mutant_early_send_release_corrupts_hbm`) | Producer host slot released inside `H2hWriteDirectAsync` completion callback (`h2hDone`), not at `H2hWriteDirectAsync` dispatch (`sendH2hIssue`) | Publication correctness under bounded staging (`decodeHbmB` receives `[.kv 1, .kv 1]` when layer 1's D2H overwrites slot 0 mid-push) |
+| `LayerStaging.sysEarlyRecvRelease` (`mutant_early_recv_release_corrupts_hbm`) | Consumer host slot released inside `ExecuteLayerH2d` `future.OnReady` (`h2dDone`), not immediately after `H2dSyncDispatch` (`h2dIssue`) | Publication correctness under bounded staging (`decodeHbmB` receives `[.kv 1, .kv 1]` when layer 1's `land` overwrites slot 0 mid-H2D) |
+| `LayerStaging.sysNoReleaseAll` (`mutant_missing_release_all_leaks_slot`) | `ReleaseStagingLocked()` / `ReleaseStagingBlocksLocked()` call `staging_layer_manager_.ReleaseAll()` when `done_` flips `false → true` | Wholesale slot cleanup (`SettledSlotsFree`: an aborted incoming push after `GetBlockChunks` leased slot 0 settles with `leases = [(0, 0)]` leaked) |
 | `UuidTable.stepOverwriteDraining` | `EmplaceRecvSessionLocked` rejects a duplicate UUID while an expired incumbent is still draining (`draining = true, done = false`) rather than overwriting it | Staging slot conservation (`freeSlots + activeStaging = numSlots`) |
 | `PeerIsolation.stepReleaseOnCancel` | `TransferReceiveSession` releases its `StagingBlockAllocator` slot only on `Lifecycle.settleLocked` (`in_flight_ == 0`), not on `.cancel` while the pull handshake (`inFlight = 1`) is still outstanding | Staging slot conservation (`PeerIsolation.Safe`: `freeSlots + activeStaging = numSlots`) |
 | `PeerIsolation.stepPerPeerQuota` (candidate fix, not a mutant) | adds a per-peer cap `peerStaging peer < maxPerPeer` on `StartRead` staging admission (`DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer`) | none within the search depth (`= .outOfFuel`), where shipping `step` hits `starvesFirstHealthy` at depth 3 (`trace_per_peer_quota_admits_healthy`) |
@@ -216,11 +225,12 @@ Per C++ symbol: the Lean module that owns it, the model events or definitions
 it becomes, and the theorems to open first. The `Lines` column is generated by
 `tools/resolve_anchors.py`.
 
-### Receive session (`recv.{h,cc}`)
+### Receive session and slot manager (`session.h`, `recv.{h,cc}`)
 
 <!-- source-map:begin -->
 | File | Symbol / anchor | Lines | Lean module | Model events / definitions | Key theorems / mutants |
 |---|---|---|---|---|---|
+| `session.h` | `StagingLayerManager` | `:40-75` | `Transfer/LayerStaging.lean`, `PrefillDecode/LayerStaging.lean` | `StagingLayerManager` (`free`, `leases`, `shutdown`, `acquire`, `lookup`, `release`, `releaseAll`, `doShutdown`) | `StagingLayerManager.lookup_injective`, `lookup_lt`, `acquire_idempotent`, `shutdown_cancels`, `LayerStaging.reachable_safe` |
 | `recv.h` | `TransferReceiveSession::TryBeginRecvOp` | `:121-126` | `Transfer/Session.lean`, `PrefillDecode/Receive.lean` | `Lifecycle.beginOp`, `Recv.pushBegin` | `Lifecycle.Consistent`, `Recv.reachable_safe` |
 | `recv.h` | `TransferReceiveSession` (`std::vector<int64_t> blocks_received_per_shard_` .. `std::vector<raiden::PjRtCopyFuture> h2d_futures_`) | `:308-331` | `Transfer/Session.lean`, `PrefillDecode/Receive.lean` | `in_flight_`, `draining_`, `done_`, `failed_phase_`, `handshake_pending_`, `blocks_received_per_shard_`, `num_completed_shards_`, `num_completed_layers_`, `network_completed_`, `h2d_futures_` | `Recv.reachable_safe` (`SettleSafe`, `StagingIntegrity`, `SettlesPromptly`) |
 | `recv.cc` | `TransferReceiveSession::Create(remote_block_ids)` | `:164-190` | `PrefillDecode/Receive.lean`, `PrefillDecode/BlockOrdering.lean` | `Recv.initLoad` | `BlockOrdering.landStage_get_requested` |
@@ -229,8 +239,8 @@ it becomes, and the theorems to open first. The `Lines` column is generated by
 | `recv.cc` | `TransferReceiveSession::AllocateStagingForLoad` | `:299-345` | `PrefillDecode/BlockOrdering.lean` | custom vs. dynamic host staging | `BlockOrdering.CustomHostStagingCorrect` |
 | `recv.cc` | `TransferReceiveSession::BuildLoadCopyPlan` | `:347-415` | `PrefillDecode/BlockOrdering.lean` | `buildCopyPlanFromTriples` (`CopyPlan.remoteSorted`, `.producerRemoteBlocks`, `.transportHostBlocks`, `.localSorted`, `.h2dPairs`) | `BlockOrdering.landStage_get_requested`, `BlockOrdering.h2dStage_get_requested`, mutant `trace_mutant_mismatched_transport_order` |
 | `recv.cc` | `TransferReceiveSession::InitFromLoadPlan` | `:417-437` | `PrefillDecode/Receive.lean` | `Recv.initLoad` (`handshake_pending_ = true`, `in_flight_ = 1`) | `Recv.reachable_safe` |
-| `recv.cc` | `TransferReceiveSession::ReleaseStagingLocked` | `:439-442` | `Transfer/Session.lean` | `Lifecycle.settleLocked` | `Recv.StagingIntegrity` |
-| `recv.cc` | `TransferReceiveSession::FinishLocked` | `:449-464` | `Transfer/Session.lean`, `PrefillDecode/Receive.lean` | `Lifecycle.finishLocked`, `Recv.failedPhase` | `Recv.reachable_safe`, `Recv.trace_details_*`, mutant `Recv.cancelEager` |
+| `recv.cc` | `TransferReceiveSession::ReleaseStagingLocked` | `:439-442` | `Transfer/Session.lean`, `PrefillDecode/LayerStaging.lean` | `Lifecycle.settleLocked`, `LayerStaging.syncMgr` (`releaseAll`) | `Recv.StagingIntegrity`, `LayerStaging.SettledSlotsFree`, mutant `mutant_missing_release_all_leaks_slot` |
+| `recv.cc` | `TransferReceiveSession::FinishLocked` | `:449-464` | `Transfer/Session.lean`, `PrefillDecode/Receive.lean`, `PrefillDecode/LayerStaging.lean` | `Lifecycle.finishLocked`, `Recv.failedPhase`, `LayerStaging.syncMgr` (`doShutdown`) | `Recv.reachable_safe`, `LayerStaging.DrainingShutsDown`, `Recv.trace_details_*`, mutant `Recv.cancelEager` |
 | `recv.cc` | `TransferReceiveSession::Details` | `:477-493` | `PrefillDecode/Receive.lean` | `TransferDetails` reporting | `Recv.trace_details_*` |
 | `recv.cc` | `TransferReceiveSession::CurrentPhaseLocked` | `:495-498` | `PrefillDecode/Receive.lean` | `Recv.Phase`, `Recv.phase` | `Recv.trace_details_*` |
 | `recv.cc` | `TransferReceiveSession::EndRecvOpLocked` | `:500-511` | `Transfer/Session.lean`, `PrefillDecode/Receive.lean` | `Lifecycle.endOpLocked` | `Recv.SettleSafe`, `Recv.SettlesPromptly` |
@@ -242,8 +252,8 @@ it becomes, and the theorems to open first. The `Lines` column is generated by
 | `recv.cc` | `TransferReceiveSession::OnRecvProgress` | `:685-697` | `PrefillDecode/Transport.lean` | Peregrine per-push progress hook (`is_peregrine` path, unmodelled) | — |
 | `recv.cc` | `TransferReceiveSession::OnRecvNetworkComplete` | `:699-709` | `PrefillDecode/Receive.lean`, `PrefillDecode/Transport.lean` | Peregrine network-completion callback (`RecordNetworkCompleteLocked`) | `Recv.ReadinessSound`, `Recv.reachable_callbackFinishes` |
 | `recv.cc` | `TransferReceiveSession::OnBlockShardsReceived` | `:711-758` | `PrefillDecode/Receive.lean`, `PrefillDecode/ReceivePoll.lean` | `Recv.Ev.netAccount` | `Recv.netAccount_frame`, `Recv.trace_late_net_account_after_retire` |
-| `recv.cc` | `TransferReceiveSession::AcquireStagingSlot` | `:760-784` | `PrefillDecode/Receive.lean` | bounded host layer staging: an op nested inside the push lease while a layer waits for a host buffer (unmodelled; `Receive.lean` §"Bounded host layer staging") | — |
-| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` | `:786-925` | `PrefillDecode/Receive.lean`, `PrefillDecode/Pipeline.lean` | `h2dBegin`, `h2dIssue`, `h2dReady`, `h2dDone` | `Recv.NoOpLeak`, `Recv.NoRetiredCallback`, `Recv.trace_finish_between_locks`, `Pipeline.DecodeHbmSafe`, mutant `Recv.h2dIssueLeak` |
+| `recv.cc` | `TransferReceiveSession::AcquireStagingSlot` | `:760-784` | `PrefillDecode/LayerStaging.lean` | `recvAcquireBegin`, `recvAcquireWait`, `recvAcquireFinish` | `LayerStaging.reachable_safe`, `recvLookupStagingSlot_injective`, `reachable_can_settle`, `trace_recv_cycles_host_layer_buffers`, `trace_recv_fail_*` |
+| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` | `:786-925` | `PrefillDecode/Receive.lean`, `PrefillDecode/Pipeline.lean`, `PrefillDecode/LayerStaging.lean` | `h2dBegin`, `h2dIssue`, `h2dReady`, `h2dDone`, `recvLookupStagingSlot` | `Recv.NoOpLeak`, `Recv.NoRetiredCallback`, `Pipeline.DecodeHbmSafe`, `LayerStaging.PublicationCorrect`, mutants `Recv.h2dIssueLeak`, `mutant_early_recv_release_corrupts_hbm` |
 <!-- source-map:end -->
 
 ### Send session (`send.{h,cc}`)
@@ -256,16 +266,17 @@ it becomes, and the theorems to open first. The `Lines` column is generated by
 | `send.cc` | `TransferSendSession::PopulateRegisteredBlocks` | `:106-124` | `PrefillDecode/BlockOrdering.lean` | `validateRegistration` | `BlockOrdering.validateRegistration_iff` |
 | `send.cc` | `TransferSendSession::ValidateRequestedBlocksLocked` | `:126-143` | `PrefillDecode/BlockOrdering.lean` | `validateRequestedBlocks` | `BlockOrdering.validateRequestedBlocks_iff` |
 | `send.cc` | `TransferSendSession::ValidateAndBeginPull` | `:145-159` | `PrefillDecode/Send.lean`, `PrefillDecode/Pipeline.lean` | `Send.Ev.beginPull` (`pull_started_` claim) | `Send.PullClaimed`, `Pipeline.HandshakeSafe` |
-| `send.cc` | `TransferSendSession::ReleaseStagingBlocksLocked` | `:186-190` | `Transfer/Session.lean` | `Lifecycle.settleLocked` | `Send.StagingIntegrity` |
-| `send.cc` | `TransferSendSession::AcquireStagingSlot` | `:197-226` | `PrefillDecode/Send.lean` | bounded host layer staging: D2H loop waits for a host layer buffer before `++in_flight_` (unmodelled; `Send.lean` §"Bounded host layer staging") | — |
-| `send.cc` | `TransferSendSession::FinishLocked` | `:245-260` | `Transfer/Session.lean`, `PrefillDecode/Send.lean` | `Lifecycle.finishOnceLocked`, `Send.Ev.cancel` | `Lifecycle.finishOnceLocked_decided`, `Send.trace_cancel_after_ok_finish`, `Send.trace_ok_after_cancel_keeps_failure`, mutant `Send.cancelEager` |
+| `send.cc` | `TransferSendSession::ReleaseStagingBlocksLocked` | `:186-190` | `Transfer/Session.lean`, `PrefillDecode/LayerStaging.lean` | `Lifecycle.settleLocked`, `LayerStaging.syncMgr` (`releaseAll`) | `Send.StagingIntegrity`, `LayerStaging.SettledSlotsFree` |
+| `send.cc` | `TransferSendSession::AcquireStagingSlot` | `:197-226` | `PrefillDecode/LayerStaging.lean` | `sendAcquireBegin`, `sendAcquireDone`, `sendD2hBegin` | `LayerStaging.reachable_safe`, `reachable_can_settle`, `trace_send_cycles_host_layer_buffers`, `trace_send_fail_*` |
+| `send.cc` | `TransferSendSession::LookupStagingSlot` | `:228-243` | `PrefillDecode/LayerStaging.lean` | `sendLookupStagingSlot` | `LayerStaging.sendLookupStagingSlot_injective`, `NoSlotFault` |
+| `send.cc` | `TransferSendSession::FinishLocked` | `:245-260` | `Transfer/Session.lean`, `PrefillDecode/Send.lean`, `PrefillDecode/LayerStaging.lean` | `Lifecycle.finishOnceLocked`, `Send.Ev.cancel`, `LayerStaging.syncMgr` (`doShutdown`) | `Lifecycle.finishOnceLocked_decided`, `LayerStaging.DrainingShutsDown`, `Send.trace_cancel_after_ok_finish`, mutant `Send.cancelEager` |
 | `send.cc` | `TransferSendSession::Details` | `:279-295` | `PrefillDecode/Send.lean` | `TransferDetails` reporting | `Send.trace_details_*` |
 | `send.cc` | `TransferSendSession::CurrentPhaseLocked` | `:297-305` | `PrefillDecode/Send.lean` | `Send.Phase`, `Send.phase`, `Send.failedPhase` | `Send.trace_details_*` |
 | `send.cc` | `TransferSendSession::EndSendOpLocked` | `:307-314` | `Transfer/Session.lean`, `PrefillDecode/Send.lean` | `Lifecycle.endOpLocked` | `Send.SettleSafe`, `Send.Drained` |
 | `send.cc` | `TransferSendSession::EndSendOp` | `:316-343` | `PrefillDecode/Send.lean` | `EndSendOp` (`TPU_RAIDEN_DATA_CONN_REUSE=per_transfer` connection-close window, Send A7) | `Send.reachable_safe` |
 | `send.cc` | `TransferSendSession::BuildCoalescedCopySpec` | `:345-374` | `PrefillDecode/BlockOrdering.lean` | `buildCoalescedSpec` | `BlockOrdering.execCoalesced_buildCoalescedSpec` |
-| `send.cc` | `TransferSendSession::StartPush` | `:412-559` | `PrefillDecode/Send.lean`, `PrefillDecode/Pipeline.lean` | `start` (pre-creates `d2h_promises` and calls `SendNextLayer(0)`), `d2hBegin`, `d2hIssue`, `d2hReady`, `d2hEnd`, `fail_unissued_layers` | `Send.reachable_safe`, `Pipeline.PrefillHbmSafe`, mutants `Send.startUncounted`, `Send.stepWithoutFailUnissued` |
-| `send.cc` | `TransferSendSession::SendNextLayer` | `:561-660` | `PrefillDecode/Send.lean`, `PrefillDecode/Pipeline.lean` | `wake`, `h2hIssue`, `sendNext`, `h2hDone` | `Send.reachable_can_settle`, mutants `Send.sendNextUncounted`, `Send.sendNextUnbounded` |
+| `send.cc` | `TransferSendSession::StartPush` | `:412-559` | `PrefillDecode/Send.lean`, `PrefillDecode/Pipeline.lean`, `PrefillDecode/LayerStaging.lean` | `start` (pre-creates `d2h_promises` and calls `SendNextLayer(0)`), `sendAcquireBegin`, `sendAcquireDone`, `sendD2hBegin`, `d2hIssue`, `d2hReady`, `d2hEnd`, `fail_unissued_layers` | `Send.reachable_safe`, `Pipeline.PrefillHbmSafe`, `LayerStaging.exists_complete_trace`, mutants `Send.startUncounted`, `Send.stepWithoutFailUnissued` |
+| `send.cc` | `TransferSendSession::SendNextLayer` | `:561-660` | `PrefillDecode/Send.lean`, `PrefillDecode/Pipeline.lean`, `PrefillDecode/LayerStaging.lean` | `wake`, `h2hIssue`, `sendNext`, `h2hDone` | `Send.reachable_can_settle`, `LayerStaging.PublicationCorrect`, mutants `Send.sendNextUncounted`, `Send.sendNextUnbounded`, `mutant_early_send_release_corrupts_hbm` |
 <!-- source-map:end -->
 
 ### Manager (`mgr.cc`, `base.cc`)
@@ -275,6 +286,7 @@ it becomes, and the theorems to open first. The `Lines` column is generated by
 |---|---|---|---|---|---|
 | `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.begin_incoming_push =`) | `:364-389` | `PrefillDecode/Receive.lean`, `PrefillDecode/Pipeline.lean` | `pushBegin` | `Recv.StagingIntegrity`, `Recv.trace_push_lease_pins_staging_on_cancel`, `Recv.trace_push_lease_outlives_h2d`, `Pipeline.StagingSafe` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.end_incoming_push =`) | `:390-436` | `PrefillDecode/Receive.lean`, `PrefillDecode/Pipeline.lean` | `pushEnd` | `Recv.StagingIntegrity`, `Recv.trace_push_lease_pins_staging_on_cancel`, `Recv.trace_push_lease_outlives_h2d`, `Pipeline.StagingSafe` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.acquire_recv_staging =` .. `base_->SetTransferEventHooks`) | `:461-489` | `PrefillDecode/LayerStaging.lean` | `recvAcquireBegin` / `recvAcquireWait` / `recvAcquireFinish`, `sendLookupStagingSlot` | `LayerStaging.reachable_safe`, `sendLookupStagingSlot_injective`, `recvLookupStagingSlot_injective` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::NotifyForRead` | `:654-701` | `PrefillDecode/UuidTable.lean`, `PrefillDecode/Pipeline.lean`, `PrefillDecode/BlockOrdering.lean` | `UuidTable.Ev.notifyForRead`, `Pipeline.Ev.notifyForRead`, `validateRegistration` | `UuidTable.active_send_preserved`, `UuidTable.trace_duplicate_send_cannot_replace_live_offer`, `BlockOrdering.validateRegistration_iff` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::EmplaceRecvSessionLocked` | `:703-719` | `PrefillDecode/UuidTable.lean` | drain-before-reuse on `active_recv_sessions_[uuid]` | `UuidTable.active_recv_preserved`, `UuidTable.trace_duplicate_uuid_rejected_until_drained`, mutant `UuidTable.stepOverwriteDraining` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::RegisterActivePlan` | `:721-809` | `PrefillDecode/UuidTable.lean`, `PrefillDecode/Receive.lean` | `UuidTable.Ev.registerRecv`, Receive A2 | `UuidTable.reachable_inv` |
@@ -283,7 +295,9 @@ it becomes, and the theorems to open first. The `Lines` column is generated by
 | `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` | `:1151-1292` | `PrefillDecode/Send.lean`, `PrefillDecode/Receive.lean`, `PrefillDecode/Pipeline.lean`, `PrefillDecode/UuidTable.lean`, `Transfer/Caller.lean` | `cancel`, `pollReady`, `publish`, `sweepSend`, `sweepRecv`, `Caller.Ev.pOutcome`, `Caller.Ev.dOutcome` | `Send.trace_deadline_during_copy`, `Recv.trace_deadline_during_copy`, `Pipeline.PrefillHbmSafe`, `Pipeline.DecodeHbmSafe`, `Pipeline.StagingSafe`, `Caller.contract_safe` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadRaw` | `:1295-1300` | `PrefillDecode/Receive.lean` | `CompleteReadRaw` wrapper around `CompleteReadWithDetails` | `Recv.ReadinessSound` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::HandlePullStream` | `:1431-1557` | `PrefillDecode/Pipeline.lean`, `PrefillDecode/PipelineChecks.lean`, `PrefillDecode/Send.lean` | `Pipeline.Ev.pullWait`, `Send.Ev.beginPull`, `Send.Ev.cancel` | `Pipeline.HandshakeSafe`, `Pipeline.reachable_unregistered_safe`, `Pipeline.trace_pull_ahead_of_registration`, `Pipeline.trace_unregistered_pull_rejected`, `Send.trace_pull_spawn_failure_cleanup` |
+| `base.cc` | `*` (`size_t ResolveEnvNumStagingLayers(size_t num_layers) {` .. `return requested;`) | `:420-429` | `Transfer/LayerStaging.lean` | `Transfer.resolveEnvNumStagingLayers` | `Transfer.resolveEnvNumStagingLayers_bounds` |
 | `base.cc` | `KVCacheManagerBase::ExpectedPushSenders` | `:2745-2762` | `PrefillDecode/Transport.lean` | sender-declared vs. chunk-count contract | `Transport.trace_chunk_two_senders`, `Transport.trace_dup_declared_rejected` |
+| `base.cc` | `KVCacheManagerBase::GetBlockChunks` (`if (layers_.size() < num_layers_)` .. `host_layer_idx = *slot;`) | `:3333-3351` | `PrefillDecode/LayerStaging.lean` | `sendLookupStagingSlot`, `recvAcquireBegin` / `recvAcquireWait` / `recvAcquireFinish` | `LayerStaging.reachable_safe`, `NoSlotFault`, `trace_recv_cycles_host_layer_buffers`, `trace_send_cycles_host_layer_buffers` |
 | `tpu_sync/frameworks/jax/kv_cache_manager.h` | `NumaAwareKVCacheManager` (`std::map<std::string, int> done_sending_counts_;` .. `std::set<std::string> failed_recving_set_;`) | `:287-290` | `Transfer/Caller.lean` | `NumaMgr` (`doneSendingCounts`, `doneRecvingCounts`, `reqExpected`, `failedRecvingSet`) | `Caller.numa_settledCounts_maps_clean`, `Caller.trace_eagerFailSet_single_sub_reuse_leaks` |
 | `tpu_sync/frameworks/jax/kv_cache_manager.cc` | `NumaAwareKVCacheManager::StartRead(remote_descriptors)` | `:574-618` | `Transfer/Caller.lean` | `NumaCfg.setExpected = true`, `numaInitDExpected` | `Caller.numaProcessSettled_expected_numSubs_eq_none`, `Caller.numa_settledCounts_safe` |
 | `tpu_sync/frameworks/jax/kv_cache_manager.cc` | `NumaAwareKVCacheManager::StartRead(remote_endpoint)` | `:620-635` | `Transfer/Caller.lean` | `NumaCfg.setExpected = false`, `numaInitDExpected` | `Caller.numaProcessSettled_expected_numSubs_eq_none`, `Caller.numa_settledCounts_safe` |

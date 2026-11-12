@@ -24,6 +24,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "tpu_sync/transport/block_transport.h"
+#include "tpu_sync/transport/peer_endpoint.h"
 
 namespace tpu_raiden {
 
@@ -66,9 +67,9 @@ absl::StatusOr<DataConnectionReuse> ResolveDataConnectionReuse();
 // kPerTransfer, from their last in-flight op before they are marked done (so
 // the transport outlives the call) and outside their own lock. A no-op when
 // `transport` is null. Returns the number of connections closed.
-size_t ReleaseDataConnectionsAfterSend(transport::BlockTransport* transport,
-                                       absl::Span<const std::string> peers,
-                                       uint64_t uuid);
+size_t ReleaseDataConnectionsAfterSend(
+    transport::BlockTransport* transport,
+    absl::Span<const transport::PeerEndpoint> peers, uint64_t uuid);
 
 }  // namespace tpu_raiden
 

@@ -85,6 +85,7 @@
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/transport/block_transport.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
+#include "tpu_sync/transport/peer_endpoint.h"
 #include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
@@ -1430,7 +1431,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hSyncDispatch(
 }
 
 absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dWrite(
-    absl::string_view peer,
+    transport::PeerEndpoint peer,
     const std::vector<int64_t>& src_host_offsets_major_dim,
     const std::vector<int64_t>& dst_host_offsets_major_dim,
     const std::vector<int64_t>& dst_device_offsets_major_dim,
@@ -1461,9 +1462,8 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dWrite(
   // is not yet executed by this call; dst_device_offsets_major_dim identifies
   // the eventual remote HBM destination for the receiver-side device copy.
   if (num_chunks == 1 || !push_pool_) {
-    ABSL_ASSIGN_OR_RETURN(
-        auto h2h_res,
-        H2hWrite(std::string(peer), src_block_ids, staging_block_ids));
+    ABSL_ASSIGN_OR_RETURN(auto h2h_res, H2hWrite(std::move(peer), src_block_ids,
+                                                 staging_block_ids));
     return h2h_res.second;
   }
 
@@ -1472,7 +1472,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dWrite(
       num_chunks, std::move(promise), raiden::BufferHolders{});
 
   std::shared_ptr<NumaThreadPool> pool = push_pool_;
-  std::string peer_str(peer);
+  transport::PeerEndpoint peer_str = std::move(peer);
   for (size_t i = 0; i < num_chunks; ++i) {
     int src_block_id = src_block_ids[i];
     int staging_block_id = staging_block_ids[i];
@@ -1495,7 +1495,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dWrite(
 }
 
 absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dRead(
-    absl::string_view peer,
+    transport::PeerEndpoint peer,
     const std::vector<int64_t>& src_host_offsets_major_dim,
     const std::vector<int64_t>& dst_host_offsets_major_dim,
     const std::vector<int64_t>& dst_device_offsets_major_dim,
@@ -1526,7 +1526,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dRead(
   if (num_chunks == 1 || !pull_pool_) {
     ABSL_ASSIGN_OR_RETURN(
         auto h2h_fut,
-        H2hReadExplicit(std::string(peer), src_block_ids, staging_block_ids,
+        H2hReadExplicit(std::move(peer), src_block_ids, staging_block_ids,
                         /*explicit_dst_ptrs=*/{}));
     ABSL_RETURN_IF_ERROR(h2h_fut.Await());
 
@@ -1546,7 +1546,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dRead(
   auto state = std::make_shared<TransferPipelinedState>(
       num_chunks, std::move(promise), std::move(all_holds));
 
-  std::string peer_str(peer);
+  transport::PeerEndpoint peer_str = std::move(peer);
   for (size_t i = 0; i < num_chunks; ++i) {
     int src_block_id = src_block_ids[i];
     int staging_block_id = staging_block_ids[i];
@@ -1604,7 +1604,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dRead(
 }
 
 absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hWrite(
-    absl::string_view peer,
+    transport::PeerEndpoint peer,
     const std::vector<int64_t>& src_device_offsets_major_dim,
     const std::vector<int64_t>& src_host_offsets_major_dim,
     const std::vector<int64_t>& dst_host_offsets_major_dim,
@@ -1641,7 +1641,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hWrite(
 
     ABSL_ASSIGN_OR_RETURN(
         auto h2h_res,
-        H2hWrite(std::string(peer), staging_block_ids, dst_block_ids));
+        H2hWrite(std::move(peer), staging_block_ids, dst_block_ids));
     return h2h_res.second;
   }
 
@@ -1689,7 +1689,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hWrite(
       num_chunks, std::move(promise), std::move(all_holds));
 
   std::shared_ptr<NumaThreadPool> pool = push_pool_;
-  std::string peer_str(peer);
+  transport::PeerEndpoint peer_str = std::move(peer);
   for (size_t i = 0; i < num_chunks; ++i) {
     int staging_block_id = chunks[i].staging_block_id;
     int dst_block_id = chunks[i].dst_block_id;
@@ -1770,7 +1770,7 @@ KVCacheManagerBase::D2hAutoAllocate(
 }
 
 absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>>
-KVCacheManagerBase::H2hWrite(const std::vector<std::string>& peers,
+KVCacheManagerBase::H2hWrite(const std::vector<transport::PeerEndpoint>& peers,
                              const std::vector<int>& src_block_ids,
                              const std::vector<int>& dst_block_ids,
                              uint64_t uuid, int layer_idx) {
@@ -1783,16 +1783,16 @@ KVCacheManagerBase::H2hWrite(const std::vector<std::string>& peers,
 }
 
 absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>>
-KVCacheManagerBase::H2hWrite(std::string peer,
+KVCacheManagerBase::H2hWrite(transport::PeerEndpoint peer,
                              const std::vector<int>& src_block_ids,
                              const std::vector<int>& dst_block_ids,
                              uint64_t uuid, int layer_idx) {
-  return H2hWrite(std::vector<std::string>{std::move(peer)}, src_block_ids,
-                  dst_block_ids, uuid, layer_idx);
+  return H2hWrite(std::vector<transport::PeerEndpoint>{std::move(peer)},
+                  src_block_ids, dst_block_ids, uuid, layer_idx);
 }
 
 absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>>
-KVCacheManagerBase::H2hRead(const std::vector<std::string>& peers,
+KVCacheManagerBase::H2hRead(const std::vector<transport::PeerEndpoint>& peers,
                             const std::vector<int>& src_block_ids) {
   ABSL_ASSIGN_OR_RETURN(std::vector<int> allocated_ids,
                         H2hReadDirect(peers, src_block_ids));
@@ -1802,9 +1802,10 @@ KVCacheManagerBase::H2hRead(const std::vector<std::string>& peers,
 }
 
 absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>>
-KVCacheManagerBase::H2hRead(std::string peer,
+KVCacheManagerBase::H2hRead(transport::PeerEndpoint peer,
                             const std::vector<int>& src_block_ids) {
-  return H2hRead(std::vector<std::string>{std::move(peer)}, src_block_ids);
+  return H2hRead(std::vector<transport::PeerEndpoint>{std::move(peer)},
+                 src_block_ids);
 }
 
 // Pulls remote host blocks into EXPLICIT local blocks.
@@ -1820,7 +1821,7 @@ KVCacheManagerBase::H2hRead(std::string peer,
 // gate to find. See current_work/global_prefix_cache_0727/
 // uuid_readiness_gate_issue.md.
 absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2hReadExplicit(
-    std::string peer, const std::vector<int>& src_block_ids,
+    transport::PeerEndpoint peer, const std::vector<int>& src_block_ids,
     const std::vector<int>& local_block_ids,
     const std::vector<uint8_t*>& explicit_dst_ptrs, int parallelism,
     tpu_raiden::transport::MajorOrder major_order,
@@ -1833,7 +1834,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2hReadExplicit(
   }
   ABSL_ASSIGN_OR_RETURN(
       std::vector<int> allocated_ids,
-      transport->SyncPull({peer}, src_block_ids, local_block_ids,
+      transport->SyncPull({std::move(peer)}, src_block_ids, local_block_ids,
                           explicit_dst_ptrs, parallelism, major_order,
                           on_block_received, kLeaseAuthorizedPullUuid));
   return raiden::PjRtCopyFuture(std::vector<raiden::BufferHolder>{});

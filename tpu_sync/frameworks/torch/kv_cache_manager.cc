@@ -47,6 +47,7 @@
 #include "tpu_sync/kv_cache/kv_cache_listener.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/transport/block_transport.h"
+#include "tpu_sync/transport/peer_endpoint.h"
 
 namespace tpu_raiden {
 namespace torch {
@@ -62,13 +63,6 @@ std::vector<std::vector<at::Tensor>> SingleShardLayers(
     layers.push_back({kv_cache});
   }
   return layers;
-}
-
-std::string FormatAddressWithPort(absl::string_view ip, int port) {
-  if (absl::StrContains(ip, ':')) {
-    return absl::StrCat("[", ip, "]:", port);
-  }
-  return absl::StrCat(ip, ":", port);
 }
 
 }  // namespace
@@ -209,20 +203,26 @@ bool TorchKVCacheManager::is_listener_active() const {
 std::string TorchKVCacheManager::transfer_address() const {
   auto port = base_->local_port();
   if (!port.has_value()) return "";
-  return FormatAddressWithPort(base_->local_ip(), *port);
+  return transport::FormatIpPort(base_->local_ip(), *port);
+}
+
+std::string TorchKVCacheManager::peregrine_transfer_address() const {
+  const int port = base_->peregrine_local_port();
+  if (port <= 0) return "";
+  return transport::FormatIpPort(base_->local_ip(), port);
 }
 
 std::string TorchKVCacheManager::listener_address() const {
   auto port = listener_port();
   if (!port.has_value()) return "";
-  return FormatAddressWithPort(base_->local_ip(), *port);
+  return transport::FormatIpPort(base_->local_ip(), *port);
 }
 
 absl::Status TorchKVCacheManager::PushRegisteredPlan(
-    uint64_t uuid, const std::string& peer,
+    uint64_t uuid, const transport::PeerEndpoint& peer,
     const std::vector<int>& src_block_ids,
     const std::vector<int>& dst_block_ids, int layer_idx, int parallelism) {
-  if (peer.empty()) {
+  if (peer.data.empty()) {
     return absl::InvalidArgumentError("peer must not be empty");
   }
   if (src_block_ids.empty()) {

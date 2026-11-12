@@ -23,6 +23,7 @@
 
 #include "tpu_sync/proto/worker_service.pb.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
+#include "tpu_sync/transport/peer_endpoint.h"
 
 namespace tpu_raiden {
 
@@ -30,6 +31,11 @@ struct RaidenTransferEndpoint {
   std::string endpoint;
   std::vector<int64_t> shards;
   std::vector<::tpu_sync::rpc::PoolHostAddrsProto> layer_host_addrs;
+  std::string peregrine_endpoint;
+
+  transport::PeerEndpoint peer_endpoint() const {
+    return {endpoint, peregrine_endpoint};
+  }
 
   ::tpu_sync::proto::RaidenTransferEndpointProto ToProto() const {
     ::tpu_sync::proto::RaidenTransferEndpointProto proto;
@@ -38,6 +44,9 @@ struct RaidenTransferEndpoint {
     proto.mutable_layer_host_addrs()->Reserve(layer_host_addrs.size());
     for (const auto& addr : layer_host_addrs) {
       *proto.add_layer_host_addrs() = addr;
+    }
+    if (!peregrine_endpoint.empty()) {
+      proto.set_peregrine_endpoint(peregrine_endpoint);
     }
     return proto;
   }
@@ -49,11 +58,13 @@ struct RaidenTransferEndpoint {
         .shards = {proto.shards().begin(), proto.shards().end()},
         .layer_host_addrs = {proto.layer_host_addrs().begin(),
                              proto.layer_host_addrs().end()},
+        .peregrine_endpoint = proto.peregrine_endpoint(),
     };
   }
 
   bool operator==(const RaidenTransferEndpoint& other) const {
     if (endpoint != other.endpoint || shards != other.shards ||
+        peregrine_endpoint != other.peregrine_endpoint ||
         layer_host_addrs.size() != other.layer_host_addrs.size()) {
       return false;
     }

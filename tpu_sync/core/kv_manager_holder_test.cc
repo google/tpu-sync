@@ -15,13 +15,17 @@
 #include "tpu_sync/core/kv_manager_holder.h"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "tpu_sync/core/controller/test_util.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/kv_cache/backends/backend.h"
+#include "tpu_sync/transport/peer_endpoint.h"
 
 namespace tpu_raiden {
 namespace {
@@ -97,6 +101,36 @@ TEST(KVManagerHolderTest, VectorH2dReadOnNullHolderFails) {
   KVManagerHolder holder;
   auto result = holder.H2dRead(TwoShardEndpoints(), {10}, {20}, {30}, {64});
   EXPECT_FALSE(result.ok());
+}
+
+TEST(KVManagerHolderTest, SinglePeerH2dReadForwardsPeregrineEndpoint) {
+  MockTransferManager mock;
+  KVManagerHolder holder(&mock);
+
+  auto result = holder.H2dRead(
+      transport::PeerEndpoint("10.0.0.9:41000", "10.0.0.9:52000"),
+      /*src_host_offsets=*/{10}, /*dst_host_offsets=*/{20},
+      /*dst_device_offsets=*/{30}, /*copy_sizes=*/{64});
+  ASSERT_TRUE(result.ok()) << result.status().message();
+
+  EXPECT_EQ(mock.h2d_read_calls, 1);
+  EXPECT_EQ(mock.last_peer, "10.0.0.9:41000");
+  EXPECT_EQ(mock.last_peregrine_peer, "10.0.0.9:52000");
+}
+
+TEST(KVManagerHolderTest, SinglePeerH2hReadForwardsPeregrineEndpoint) {
+  MockTransferManager mock;
+  KVManagerHolder holder(&mock);
+
+  auto result = holder.H2hRead(
+      transport::PeerEndpoint("10.0.0.9:41000", "10.0.0.9:52000"),
+      /*src_offsets=*/{1, 2}, /*dst_offsets=*/{});
+  ASSERT_TRUE(result.ok()) << result.status().message();
+
+  EXPECT_EQ(mock.h2h_read_calls, 1);
+  EXPECT_EQ(mock.last_peer, "10.0.0.9:41000");
+  EXPECT_EQ(mock.last_peregrine_peer, "10.0.0.9:52000");
+  EXPECT_THAT(mock.last_src_offsets, ElementsAre(1, 2));
 }
 
 struct MockManagerWithSlices : public MockTransferManager {

@@ -52,6 +52,7 @@
 #include "tpu_sync/transport/block_transport.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/transport/buffer_push_task.h"
+#include "tpu_sync/transport/peer_endpoint.h"
 
 namespace tpu_raiden {
 
@@ -288,6 +289,10 @@ std::vector<std::string> RaidenManagerBase::local_ips() const {
   return local_ips_;
 }
 
+int RaidenManagerBase::peregrine_local_port() const {
+  return server_ ? server_->peregrine_local_port() : 0;
+}
+
 std::optional<int> RaidenManagerBase::shard_numa_node(size_t shard_idx) const {
   if (shard_idx < shards_.size()) {
     const int node = shards_[shard_idx].numa_node;
@@ -436,7 +441,7 @@ void RaidenManagerBase::SetExternalHostPointers(
 }
 
 absl::StatusOr<std::vector<int>> RaidenManagerBase::H2hWriteDirect(
-    const std::vector<std::string>& peers,
+    const std::vector<transport::PeerEndpoint>& peers,
     const std::vector<int>& src_block_ids,
     const std::vector<int>& dst_block_ids, uint64_t uuid, int layer_idx) {
   RAIDEN_TRACE_FN("RaidenBase::H2hWriteDirect", [&]() {
@@ -451,7 +456,7 @@ absl::StatusOr<std::vector<int>> RaidenManagerBase::H2hWriteDirect(
 }
 
 void RaidenManagerBase::H2hWriteDirectAsync(
-    const std::vector<std::string>& peers,
+    const std::vector<transport::PeerEndpoint>& peers,
     const std::vector<int>& src_block_ids,
     const std::vector<int>& dst_block_ids, uint64_t uuid, int layer_idx,
     std::function<void(absl::StatusOr<std::vector<int>>)> on_complete) {
@@ -472,7 +477,7 @@ void RaidenManagerBase::H2hWriteDirectAsync(
 }
 
 absl::StatusOr<std::vector<int>> RaidenManagerBase::H2hReadDirect(
-    const std::vector<std::string>& peers,
+    const std::vector<transport::PeerEndpoint>& peers,
     const std::vector<int>& src_block_ids) {
   RAIDEN_TRACE_FN("RaidenBase::H2hReadDirect", [&]() {
     return absl::StrCat("blocks=", src_block_ids.size(),

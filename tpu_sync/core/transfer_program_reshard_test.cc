@@ -108,6 +108,7 @@ std::string Canonical(const ::tpu_sync::rpc::StartTransferRequest& msg) {
     ::tpu_sync::rpc::ShardPushEntryProto entry = MakeEntry(5, 11, 0, 0, 65536);
     entry.set_layer_idx(7);
     entry.set_pool_group(0);
+    entry.set_dst_peregrine_peer("10.0.0.2:24579");
     *schedule0.add_entries() = entry;
     *schedule0.add_entries() = MakeEntry(6, 12, 128, 256, 4096);
   }

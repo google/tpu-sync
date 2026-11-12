@@ -67,6 +67,7 @@
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/telemetry/mock_metrics_backend.h"
 #include "tpu_sync/transport/block_transport.h"
+#include "tpu_sync/transport/peer_endpoint.h"
 #include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
@@ -4047,6 +4048,63 @@ TEST(KVCacheManagerTest, StorageIoTimeMsSkippedOnFailedTransfers) {
                        manager.H2dReadFromBackend({partial_fail_backend}, keys,
                                                   block_ids, block_ids));
   EXPECT_THAT(read_fail.Await(), StatusIs(absl::StatusCode::kNotFound));
+}
+
+// D2hWrite (pipelined, 2 chunks) and H2dWrite (single chunk) both push with
+// explicit destinations (op 6); with op 6 on Peregrine they must carry the
+// receiver's Peregrine endpoint through to the transport.
+TEST(KVCacheManagerTest, D2hWriteAndH2dWriteOverPeregrineOp6Succeed) {
+  auto cleanup =
+      absl::MakeCleanup([] { unsetenv("TPU_RAIDEN_ENABLE_PEREGRINE"); });
+  setenv("TPU_RAIDEN_ENABLE_PEREGRINE", "6", 1);
+
+  TestD2hKVCacheManager sender(/*num_layers=*/1, /*num_shards=*/1,
+                               /*slice_byte_size=*/128, /*host_blocks=*/2);
+  TestKVCacheManager receiver(/*num_layers=*/1, /*num_shards=*/1,
+                              /*slice_byte_size=*/128, /*host_blocks=*/2);
+
+  ASSERT_TRUE(receiver.local_port().has_value());
+  ASSERT_GT(receiver.peregrine_local_port(), 0);
+  const std::string data_ep =
+      absl::StrCat(receiver.local_ip(), ":", *receiver.local_port());
+  const transport::PeerEndpoint receiver_peer(
+      data_ep,
+      absl::StrCat(receiver.local_ip(), ":", receiver.peregrine_local_port()));
+
+  uint8_t* sender_buf = sender.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
+  uint8_t* receiver_buf =
+      receiver.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
+  ASSERT_NE(sender_buf, nullptr);
+  ASSERT_NE(receiver_buf, nullptr);
+
+  std::memset(sender_buf, 0xA5, 128);
+  std::memset(sender_buf + 128, 0x5A, 128);
+  std::memset(receiver_buf, 0, 256);
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto d2h_res,
+      sender.D2hWrite(receiver_peer, /*src_device=*/{0, 1}, /*src_host=*/{0, 1},
+                      /*dst_host=*/{0, 1}, /*copy_sizes=*/{1, 1}));
+  ABSL_ASSERT_OK(d2h_res.Await());
+  EXPECT_TRUE(std::all_of(receiver_buf, receiver_buf + 128,
+                          [](uint8_t v) { return v == 0xA5; }));
+  EXPECT_TRUE(std::all_of(receiver_buf + 128, receiver_buf + 256,
+                          [](uint8_t v) { return v == 0x5A; }));
+
+  std::memset(sender_buf, 0x3C, 128);
+  std::memset(receiver_buf, 0, 256);
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto h2d_res,
+      sender.H2dWrite(receiver_peer, /*src_host=*/{0}, /*dst_host=*/{1},
+                      /*dst_device=*/{0}, /*copy_sizes=*/{1}));
+  ABSL_ASSERT_OK(h2d_res.Await());
+  EXPECT_TRUE(std::all_of(receiver_buf + 128, receiver_buf + 256,
+                          [](uint8_t v) { return v == 0x3C; }));
+
+  // Negative control: the data endpoint alone fails closed under Peregrine.
+  EXPECT_THAT(sender.H2dWrite(data_ep, /*src_host=*/{0}, /*dst_host=*/{1},
+                              /*dst_device=*/{0}, /*copy_sizes=*/{1}),
+              StatusIs(absl::StatusCode::kFailedPrecondition));
 }
 }  // namespace
 }  // namespace kv_cache

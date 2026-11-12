@@ -305,6 +305,14 @@ class KVCacheManager:
     return self._impl.transfer_address
 
   @property
+  def peregrine_transfer_address(self) -> str:
+    """Returns the Peregrine control endpoint string (host:port).
+
+    Returns an empty string when Peregrine is not enabled.
+    """
+    return self._impl.peregrine_transfer_address
+
+  @property
   def listener_address(self) -> str:
     """Returns the formatted control listener endpoint string (host:port)."""
     return self._impl.listener_address
@@ -361,6 +369,7 @@ class KVCacheManager:
       dst_block_ids: Sequence[int],
       layer_idx: int = -1,
       parallelism: int = 1,
+      peregrine_endpoint: str = "",
   ) -> None:
     """Synchronously pushes host blocks using an already registered plan."""
     self._impl.push_registered_plan(
@@ -370,6 +379,7 @@ class KVCacheManager:
         list(dst_block_ids),
         layer_idx,
         parallelism,
+        peregrine_endpoint,
     )
 
   def read_block_bytes(self, layer_idx: int, block_id: int) -> bytes:

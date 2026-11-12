@@ -556,6 +556,8 @@ absl::Status TransferReceiveSession::Start() {
   req_spec.ep_idx = 0;
   req_spec.consumer_data_port =
       static_cast<uint32_t>(manager->local_data_port_);
+  req_spec.consumer_peregrine_port =
+      static_cast<uint32_t>(manager->local_peregrine_port_);
   req_spec.consumer_ips = base_->local_ips();
   req_spec.layer_host_addrs = base_->LayerHostAddrs(uuid_);
 

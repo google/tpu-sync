@@ -88,6 +88,9 @@ tpu_sync::rpc::ControlRequest ReshardClient::BuildRegisterWorkUnit(
       req.mutable_register_work_unit_request();
   *reg->mutable_unit() = RaidenIdProtoOf(args.unit);
   for (const std::string& shard : args.shards) reg->add_shards(shard);
+  for (const std::string& ep : args.peregrine_endpoints) {
+    reg->add_peregrine_endpoints(ep);
+  }
   // Python assigns "" when None; proto3 implicit presence drops it either
   // way, so unconditional set_ matches the wire exactly.
   reg->set_control_plane_rpc_address(args.control_plane_rpc_address);

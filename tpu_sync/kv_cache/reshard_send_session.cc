@@ -54,6 +54,7 @@
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/transport/block_transport.h"
 #include "tpu_sync/transport/block_transport_session.h"
+#include "tpu_sync/transport/peer_endpoint.h"
 #include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
@@ -79,7 +80,7 @@ class ReshardSendSession final
                      int remaining_pool_peer_pushes,
                      std::chrono::steady_clock::time_point deadline,
                      TransferPlan transfer_plan,
-                     std::vector<std::string> dst_peers,
+                     std::vector<transport::PeerEndpoint> dst_peers,
                      DataConnectionReuse data_connection_reuse);
 
   // Validates |plan| against |base| and |src_block_ids|.
@@ -209,7 +210,7 @@ class ReshardSendSession final
   const int parallelism_ = 8;
   const std::chrono::steady_clock::time_point deadline_;
   // Data endpoints the sender schedule pushes to.
-  const std::vector<std::string> dst_peers_;
+  const std::vector<transport::PeerEndpoint> dst_peers_;
   // TPU_RAIDEN_DATA_CONN_REUSE as resolved when the session was created.
   const DataConnectionReuse data_connection_reuse_;
   const std::shared_ptr<const TransferPlan> transfer_plan_;
@@ -227,6 +228,11 @@ class ReshardSendSession final
   StagingLayerManager staging_layer_manager_;
   std::atomic<bool> cancelled_{false};
 };
+
+transport::PeerEndpoint EntryPeer(
+    const ::tpu_sync::rpc::ShardPushEntryProto& entry) {
+  return transport::PeerEndpoint{entry.dst_peer(), entry.dst_peregrine_peer()};
+}
 
 }  // namespace
 
@@ -302,9 +308,9 @@ absl::StatusOr<std::shared_ptr<TransferSession>> CreateReshardSendSession(
     }
     schedule_it = plan.shard_push_schedules().begin();
   }
-  std::set<std::string> peers;
+  std::set<transport::PeerEndpoint> peers;
   for (const auto& entry : schedule_it->second.entries()) {
-    peers.insert(entry.dst_peer());
+    peers.insert(EntryPeer(entry));
   }
   if (peers.empty()) {
     return absl::InvalidArgumentError("sender plan contains no peers");
@@ -329,7 +335,7 @@ absl::StatusOr<std::shared_ptr<TransferSession>> CreateReshardSendSession(
       base, std::vector<int64_t>(src_block_ids.begin(), src_block_ids.end()),
       parallelism, remaining_pool_peer_pushes, deadline,
       std::move(transfer_plan),
-      std::vector<std::string>(peers.begin(), peers.end()),
+      std::vector<transport::PeerEndpoint>(peers.begin(), peers.end()),
       data_connection_reuse));
   return session;
 }
@@ -338,7 +344,7 @@ ReshardSendSession::ReshardSendSession(
     kv_cache::KVCacheManagerBase* base, std::vector<int64_t> src_block_ids,
     int parallelism, int remaining_pool_peer_pushes,
     std::chrono::steady_clock::time_point deadline, TransferPlan transfer_plan,
-    std::vector<std::string> dst_peers,
+    std::vector<transport::PeerEndpoint> dst_peers,
     DataConnectionReuse data_connection_reuse)
     : base_(base),
       src_block_ids_(std::move(src_block_ids)),
@@ -610,16 +616,18 @@ void ReshardSendSession::StartPoolPush(size_t pool_idx) {
       break;
     }
   }
-  std::map<std::string, std::vector<std::pair<int, int>>> transfers_by_peer;
-  std::map<std::string, std::set<std::pair<int, int>>> seen_by_peer;
+  std::map<transport::PeerEndpoint, std::vector<std::pair<int, int>>>
+      transfers_by_peer;
+  std::map<transport::PeerEndpoint, std::set<std::pair<int, int>>> seen_by_peer;
   for (const auto& entry : schedule_it->second.entries()) {
     if (entry.pool_group() != pool_group_idx) {
       continue;
     }
     const std::pair<int, int> pair{static_cast<int>(entry.src_block_id()),
                                    static_cast<int>(entry.dst_block_id())};
-    if (seen_by_peer[entry.dst_peer()].insert(pair).second) {
-      transfers_by_peer[entry.dst_peer()].push_back(pair);
+    const transport::PeerEndpoint peer = EntryPeer(entry);
+    if (seen_by_peer[peer].insert(pair).second) {
+      transfers_by_peer[peer].push_back(pair);
     }
   }
 

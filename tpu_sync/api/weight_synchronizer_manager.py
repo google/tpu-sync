@@ -165,6 +165,7 @@ class WeightSynchronizerManager:
       transfer_rank: Optional[int] = None,
       variables: Optional[Sequence[Any]] = None,
       mesh_axes: Optional[Sequence[str]] = None,
+      peregrine_endpoints: Sequence[str] = (),
   ) -> None:
     """Registers physical worker shard Data addresses and metadata.
 
@@ -183,6 +184,8 @@ class WeightSynchronizerManager:
       transfer_rank: Optional transfer rank.
       variables: Optional list of registered variables metadata.
       mesh_axes: Optional list of mesh axis names (e.g. ['fsdp', 'tp']).
+      peregrine_endpoints: Peregrine control endpoints (``ip:peregrine_port``)
+        index-aligned with `shards`; empty when Peregrine is not enabled.
     """
     return self._controller.register_work_unit(
         unit=unit,
@@ -199,6 +202,7 @@ class WeightSynchronizerManager:
         transfer_rank=transfer_rank,
         variables=variables,
         mesh_axes=mesh_axes,
+        peregrine_endpoints=peregrine_endpoints,
     )
 
   def clear_plan_cache(self) -> None:

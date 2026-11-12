@@ -21,6 +21,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <string>
@@ -31,10 +33,12 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/base/thread_annotations.h"
+#include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
@@ -48,6 +52,7 @@
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/telemetry/mock_metrics_backend.h"
+#include "tpu_sync/transport/peer_endpoint.h"
 #include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
@@ -1183,6 +1188,72 @@ TEST(PoolReshardSessionLookupTest,
   EXPECT_FALSE((*recv_session)->IsDraining());
   ABSL_EXPECT_OK((*recv_session)->GetStatus());
   ABSL_EXPECT_OK(manager.UnregisterActivePlan(/*uuid=*/8003));
+}
+
+TEST(ActivePlanTest, RegisteredPlanRetainsPeregrineEndpointForExplicitH2hPush) {
+  auto cleanup =
+      absl::MakeCleanup([] { unsetenv("TPU_RAIDEN_ENABLE_PEREGRINE"); });
+  setenv("TPU_RAIDEN_ENABLE_PEREGRINE", "6", 1);
+
+  TestManager sender;
+  TestManager receiver;
+  ASSERT_GT(receiver.base()->peregrine_local_port(), 0);
+  const std::string receiver_data_ep =
+      absl::StrCat(receiver.base()->local_ip(), ":",
+                   receiver.base()->local_port().value_or(0));
+
+  std::memset(sender.base()->GetHostPointer(0, 0), 0x5A, 128);
+  std::memset(receiver.base()->GetHostPointer(0, 0), 0x00, 128);
+
+  StartTransferRequest recv_plan = BlockPlan(8004, {0}, {1}, MEMORY_TYPE_DRAM);
+  recv_plan.set_expected_block_count(1);
+  (*recv_plan.mutable_shard_push_schedules())[0]
+      .mutable_entries(0)
+      ->set_dst_peer(receiver_data_ep);
+  (*recv_plan.mutable_shard_push_schedules())[0]
+      .mutable_entries(0)
+      ->set_size_bytes(128);
+  ABSL_ASSERT_OK(
+      receiver.RegisterActivePlan(8004, recv_plan, /*is_sender=*/false));
+
+  StartTransferRequest send_plan = recv_plan;
+  send_plan.set_is_sender(true);
+  (*send_plan.mutable_shard_push_schedules())[0]
+      .mutable_entries(0)
+      ->set_dst_peregrine_peer(
+          absl::StrCat(receiver.base()->local_ip(), ":",
+                       receiver.base()->peregrine_local_port()));
+  ABSL_ASSERT_OK(
+      sender.RegisterActivePlan(8004, send_plan, /*is_sender=*/true));
+
+  TF_ASSERT_OK_AND_ASSIGN(auto send_session, sender.GetSession(8004));
+  ASSERT_TRUE(send_session->plan().has_value());
+  const auto& entry = (*send_session->plan())
+                          ->request()
+                          .shard_push_schedules()
+                          .at(0)
+                          .entries(0);
+  ASSERT_FALSE(entry.dst_peregrine_peer().empty());
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto push_res,
+      sender.base()->H2hWrite(
+          transport::PeerEndpoint{entry.dst_peer(), entry.dst_peregrine_peer()},
+          /*src_block_ids=*/{0},
+          /*dst_block_ids=*/{1}, /*uuid=*/8004,
+          /*layer_idx=*/0));
+  ABSL_ASSERT_OK(push_res.second.Await());
+
+  const absl::Time deadline = absl::Now() + absl::Seconds(10);
+  while (std::memcmp(receiver.base()->GetHostPointer(0, 0) + 128,
+                     sender.base()->GetHostPointer(0, 0), 128) != 0 &&
+         absl::Now() < deadline) {
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  EXPECT_EQ(std::memcmp(receiver.base()->GetHostPointer(0, 0) + 128,
+                        sender.base()->GetHostPointer(0, 0), 128),
+            0);
+  ABSL_EXPECT_OK(sender.UnregisterActivePlan(8004));
+  ABSL_EXPECT_OK(receiver.UnregisterActivePlan(8004));
 }
 
 }  // namespace

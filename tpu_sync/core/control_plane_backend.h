@@ -41,6 +41,7 @@ struct PullStreamRequestSpec {
   uint64_t uuid = 0;
   uint32_t ep_idx = 0;
   uint32_t consumer_data_port = 0;
+  uint32_t consumer_peregrine_port = 0;
   std::vector<std::string> consumer_ips;
   std::vector<int64_t> src_block_ids;
   std::vector<int64_t> dst_block_ids;

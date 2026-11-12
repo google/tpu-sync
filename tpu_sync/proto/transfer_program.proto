@@ -107,6 +107,8 @@ message TransferStep {
   int32 source_rank = 7;
   // Pass-through of ShardPushEntryProto.layer_idx (presence preserved).
   optional int32 layer_idx = 8;
+  // Pass-through of ShardPushEntryProto.dst_peregrine_peer.
+  string dst_peregrine_peer = 9;
 }
 
 // --- Completion contracts ---------------------------------------------------

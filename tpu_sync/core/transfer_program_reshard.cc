@@ -222,6 +222,7 @@ absl::StatusOr<::tpu_sync::proto::TransferProgramRequest> CompileStartTransfer(
       if (entry.has_layer_idx()) {
         step->set_layer_idx(entry.layer_idx());
       }
+      step->set_dst_peregrine_peer(entry.dst_peregrine_peer());
     }
   }
   return out;
@@ -310,6 +311,7 @@ absl::StatusOr<::tpu_sync::rpc::StartTransferRequest> LowerToStartTransfer(
     if (step.has_group()) {
       entry->set_pool_group(step.group());
     }
+    entry->set_dst_peregrine_peer(step.dst_peregrine_peer());
   }
   return out;
 }

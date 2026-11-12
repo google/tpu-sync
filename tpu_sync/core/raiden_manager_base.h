@@ -42,6 +42,7 @@
 #include "tpu_sync/transport/block_transport.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/transport/buffer_push_task.h"
+#include "tpu_sync/transport/peer_endpoint.h"
 #include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
@@ -75,34 +76,34 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
 
   // Direct C++ H2H network write (Push)
   absl::StatusOr<std::vector<int>> H2hWriteDirect(
-      const std::vector<std::string>& peers,
+      const std::vector<transport::PeerEndpoint>& peers,
       const std::vector<int>& src_block_ids,
       const std::vector<int>& dst_block_ids = {}, uint64_t uuid = 0,
       int layer_idx = -1);
 
   virtual void H2hWriteDirectAsync(
-      const std::vector<std::string>& peers,
+      const std::vector<transport::PeerEndpoint>& peers,
       const std::vector<int>& src_block_ids,
       const std::vector<int>& dst_block_ids, uint64_t uuid, int layer_idx,
       std::function<void(absl::StatusOr<std::vector<int>>)> on_complete);
 
   // Direct C++ H2H network read (Pull)
   absl::StatusOr<std::vector<int>> H2hReadDirect(
-      const std::vector<std::string>& peers,
+      const std::vector<transport::PeerEndpoint>& peers,
       const std::vector<int>& src_block_ids);
 
-  // Backward-compatible overloads
+  // Single-peer overloads
   absl::StatusOr<std::vector<int>> H2hWriteDirect(
-      absl::string_view peer, const std::vector<int>& src_block_ids,
+      transport::PeerEndpoint peer, const std::vector<int>& src_block_ids,
       const std::vector<int>& dst_block_ids = {}, uint64_t uuid = 0,
       int layer_idx = -1) {
-    return H2hWriteDirect(std::vector<std::string>{std::string(peer)},
+    return H2hWriteDirect(std::vector<transport::PeerEndpoint>{std::move(peer)},
                           src_block_ids, dst_block_ids, uuid, layer_idx);
   }
 
   absl::StatusOr<std::vector<int>> H2hReadDirect(
-      absl::string_view peer, const std::vector<int>& src_block_ids) {
-    return H2hReadDirect(std::vector<std::string>{std::string(peer)},
+      transport::PeerEndpoint peer, const std::vector<int>& src_block_ids) {
+    return H2hReadDirect(std::vector<transport::PeerEndpoint>{std::move(peer)},
                          src_block_ids);
   }
 
@@ -158,6 +159,7 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
   virtual std::optional<int> local_port() const;
   virtual std::string local_ip() const;
   virtual std::vector<std::string> local_ips() const;
+  int peregrine_local_port() const;
   std::optional<int> assigned_numa_node() const { return assigned_numa_node_; }
 
   // Placement of every local shard (`local_index` order, one entry per

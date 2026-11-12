@@ -363,6 +363,8 @@ tpu_sync::rpc::ControlResponse ReshardService::HandleRaidenCommand(
       WorkUnitRegistration registration;
       registration.unit = RaidenIdFromProto(reg.unit());
       registration.shards.assign(reg.shards().begin(), reg.shards().end());
+      registration.peregrine_endpoints.assign(reg.peregrine_endpoints().begin(),
+                                              reg.peregrine_endpoints().end());
       if (!reg.control_plane_rpc_address().empty()) {
         registration.control_plane_rpc_address =
             reg.control_plane_rpc_address();

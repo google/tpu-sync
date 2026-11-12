@@ -163,6 +163,7 @@ class ReshardClient:
       transfer_parallelism: Optional[int] = None,
       transfer_rank: Optional[int] = None,
       variables: Optional[typing.Sequence[Any]] = None,
+      peregrine_endpoints: Optional[list[str]] = None,
   ) -> None:
     self._impl.register_work_unit(
         _unit_tuple(unit),
@@ -173,14 +174,14 @@ class ReshardClient:
         [int(v) for v in global_shape] if global_shape else [],
         int(itemsize) if itemsize else 0,
         pool_manifest is not None,
-        [_pool_dict(p) for p in (pool_manifest or ())],
+        [_pool_dict(p) for p in pool_manifest or ()],
         layout_fingerprint,
         int(page_tokens) if page_tokens is not None else None,
-        int(transfer_parallelism)
-        if transfer_parallelism is not None else None,
+        int(transfer_parallelism) if transfer_parallelism is not None else None,
         int(transfer_rank) if transfer_rank is not None else None,
         variables is not None,
-        [v.SerializeToString() for v in (variables or ())],
+        [v.SerializeToString() for v in variables or ()],
+        [str(ep) for ep in peregrine_endpoints or ()],
     )
 
   def register_request_blocks(

@@ -49,6 +49,7 @@ cc_library(
     deps = [
         "//tpu_sync/proto:worker_service_cc_proto",
         "//tpu_sync/rpc:raiden_service_cc_proto",
+        "//tpu_sync/transport:peer_endpoint",
     ],
 )
 
@@ -190,6 +191,7 @@ cc_library(
         "//tpu_sync/transport:block_transport",
         "//tpu_sync/transport:block_transport_delegate",
         "//tpu_sync/transport:buffer_push_task",
+        "//tpu_sync/transport:peer_endpoint",
         "//tpu_sync/transport:transfer_session",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/algorithm:container",
@@ -525,6 +527,7 @@ cc_library(
         ":raw_transfer_core",
         "//tpu_sync/kv_cache/backends:backend",
         "//tpu_sync/rpc:raiden_service_cc_proto",
+        "//tpu_sync/transport:peer_endpoint",
         "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_macros",
@@ -579,6 +582,9 @@ cc_test(
         ":raiden_transfer_endpoint",
         "//tpu_sync/core/controller:test_util",
         "//tpu_sync/kv_cache/backends:backend",
+        "//tpu_sync/transport:peer_endpoint",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
         "@com_google_googletest//:gtest_main",
     ],
 )

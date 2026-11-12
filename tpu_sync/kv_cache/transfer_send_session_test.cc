@@ -43,6 +43,7 @@
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/transport/block_transport.h"
+#include "tpu_sync/transport/peer_endpoint.h"
 #include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
@@ -163,7 +164,7 @@ class FakeSendBase : public kv_cache::KVCacheManagerBase {
     return raiden::PjRtCopyFuture(std::move(future), raiden::BufferHolders{});
   }
 
-  void H2hWriteDirectAsync(const std::vector<std::string>& peers,
+  void H2hWriteDirectAsync(const std::vector<transport::PeerEndpoint>& peers,
                            const std::vector<int>& src_block_ids,
                            const std::vector<int>& dst_block_ids, uint64_t uuid,
                            int layer_idx,

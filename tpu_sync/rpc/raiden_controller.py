@@ -203,6 +203,7 @@ class RaidenController:
     )
     self._registered_variables: dict[RaidenId, list[Any]] = {}
     self._registered_control_plane_endpoints: dict[RaidenId, list[str]] = {}
+    self._registered_peregrine_endpoints: dict[RaidenId, list[str]] = {}
     # Explicit per-unit registration snapshots for GetMetadataResponse.hosts;
     # guarded by self._lock.
     self._registration_records: dict[RaidenId, _HostRecord] = {}
@@ -452,6 +453,7 @@ class RaidenController:
       transfer_rank: Optional[int] = None,
       variables: Optional[Sequence[Any]] = None,
       mesh_axes: Optional[Sequence[str]] = None,
+      peregrine_endpoints: Sequence[str] = (),
   ) -> None:
     """Registers physical worker shard Data addresses and metadata on `unit`'s JobEntity."""
     has_metadata = (
@@ -540,10 +542,14 @@ class RaidenController:
     )
     new_transfer_rank = transfer_rank if has_reshard_metadata else None
     new_variables = list(variables) if variables is not None else None
+    new_peregrine_endpoints = list(peregrine_endpoints)
 
     with self._lock:
       old_shards = self._registered_shards.get(unit)
       old_endpoints = self._registered_control_plane_endpoints.get(unit, [])
+      old_peregrine_endpoints = self._registered_peregrine_endpoints.get(
+          unit, []
+      )
       is_topology_identical = (
           old_shards is not None
           and len(old_shards) == len(normalized_shards)
@@ -565,6 +571,7 @@ class RaidenController:
           is_topology_identical
           and old_shards == normalized_shards
           and old_endpoints == endpoints
+          and old_peregrine_endpoints == new_peregrine_endpoints
       )
 
       if is_idempotent:
@@ -605,10 +612,12 @@ class RaidenController:
           transfer_rank=new_transfer_rank,
           variables=new_variables,
           unit=unit,
+          peregrine_endpoints=new_peregrine_endpoints,
       )
 
       self._registered_shards[unit] = normalized_shards
       self._registered_control_plane_endpoints[unit] = endpoints
+      self._registered_peregrine_endpoints[unit] = new_peregrine_endpoints
       self._registration_records[unit] = _HostRecord(
           endpoints=tuple(endpoints),
           shards=tuple(normalized_shards),
@@ -908,6 +917,9 @@ class RaidenController:
     reg_req.mesh_axes.extend(self._registered_mesh_axes.get(unit, ()))
     reg_req.layout.extend(self._registered_layouts.get(unit, ()))
     reg_req.global_shape.extend(self._registered_global_shapes.get(unit, ()))
+    reg_req.peregrine_endpoints.extend(
+        self._registered_peregrine_endpoints.get(unit, ())
+    )
     for pool in self._registered_pool_manifests.get(unit, ()):
       reg_req.pools.add().CopyFrom(pool)
     if unit in self._registered_variables:

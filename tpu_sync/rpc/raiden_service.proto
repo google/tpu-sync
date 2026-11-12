@@ -130,6 +130,9 @@ message RegisterWorkUnitRequest {
   // RegisterWorkUnit call. Empty otherwise. That controller rejects a
   // registration that sets this field.
   repeated HostEndpointsProto hosts = 17;
+  // Peregrine control endpoint per entry of `shards` (same index); empty when
+  // the worker does not run the Peregrine backend.
+  repeated string peregrine_endpoints = 18;
 }
 
 // Defines an explicit 1D linear memory push operation from a local source to a
@@ -170,6 +173,9 @@ message ShardPushEntryProto {
   repeated int64 outer_src_strides_bytes = 14;
   repeated int64 outer_dst_strides_bytes = 15;
   repeated int32 outer_counts = 16;
+  // Destination worker's Peregrine control endpoint ("ip:peregrine_port");
+  // empty when that receiver has no Peregrine backend.
+  string dst_peregrine_peer = 17;
 }
 
 // A collection of network push entries orchestrated by a specific source TPU

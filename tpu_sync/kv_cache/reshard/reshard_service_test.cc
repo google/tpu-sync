@@ -227,7 +227,8 @@ class ReshardStackTest : public ::testing::Test {
   void RegisterDstUnit(int idx, int num_src, int64_t live, int64_t stride,
                        int64_t num_blocks,
                        const std::string& fingerprint = "fp1",
-                       const std::string& shard_override = "") {
+                       const std::string& shard_override = "",
+                       const std::string& peregrine_endpoint = "") {
     tpu_sync::rpc::ControlRequest req;
     req.set_command(tpu_sync::rpc::ControlRequest::COMMAND_REGISTER_WORK_UNIT);
     auto* reg = req.mutable_register_work_unit_request();
@@ -235,6 +236,9 @@ class ReshardStackTest : public ::testing::Test {
     reg->add_shards(shard_override.empty()
                         ? absl::StrCat("10.0.0.2:", 9400 + idx)
                         : shard_override);
+    if (!peregrine_endpoint.empty()) {
+      reg->add_peregrine_endpoints(peregrine_endpoint);
+    }
     reg->set_control_plane_rpc_address(absl::StrCat("10.0.0.2:", 9600 + idx));
     *reg->add_pools() = MakePool("fa", live, stride, num_blocks);
     reg->set_layout_fingerprint(fingerprint);
@@ -742,6 +746,7 @@ TEST(ReshardControlPipeTest, TcpBackendRoundTrip) {
   RegisterWorkUnitArgs args;
   args.unit = Unit(0);
   args.shards = {"10.0.0.1:9000"};
+  args.peregrine_endpoints = {"10.0.0.1:19000"};
   args.control_plane_rpc_address = "10.0.0.1:9100";
   ASSERT_TRUE(reshard_client.RegisterWorkUnit(args).ok());
 
@@ -872,6 +877,39 @@ TEST_F(ReshardStackTest, FullPoolReshardFlowEmitsArmThenDispatch) {
   ASSERT_TRUE(status_resp.success());
   EXPECT_EQ(status_resp.get_transfer_status_response().status(),
             tpu_sync::rpc::GetTransferStatusResponse::STATUS_COMPLETED);
+}
+
+TEST_F(ReshardStackTest,
+       RegisteredDestinationPeregrineEndpointsEmittedOnScheduleEntries) {
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16, /*num_dst=*/2);
+  // Dst 0 advertises Peregrine; Dst 1 is socket-only.
+  RegisterDstUnit(/*idx=*/0, /*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                  /*num_blocks=*/16, /*fingerprint=*/"fp1",
+                  /*shard_override=*/"",
+                  /*peregrine_endpoint=*/"10.0.0.2:19400");
+
+  RegisterSpans(0, "req-pg", 420, 1024, /*src_block=*/3, /*dst_index=*/0,
+                /*dst_offset=*/0, /*size=*/1024);
+  RegisterSpans(1, "req-pg", 420, 1024, /*src_block=*/5, /*dst_index=*/1,
+                /*dst_offset=*/0, /*size=*/512);
+
+  tpu_sync::rpc::ControllerResponse resp =
+      Coordinate("req-pg", 420, 2, {7, 9}, /*dst_skip=*/{}, /*num_dst=*/2);
+  ASSERT_TRUE(resp.success()) << resp.message();
+  ASSERT_EQ(transport_.calls_.size(), 4u);
+
+  for (int i = 2; i < 4; ++i) {
+    tpu_sync::rpc::ControlRequest dispatch;
+    ASSERT_TRUE(dispatch.ParseFromString(transport_.calls_[i].second));
+    const auto& schedule =
+        dispatch.start_transfer_request().shard_push_schedules().at(0);
+    ASSERT_EQ(schedule.entries_size(), 2);
+    EXPECT_EQ(schedule.entries(0).dst_peer(), "10.0.0.2:9400");
+    EXPECT_EQ(schedule.entries(0).dst_peregrine_peer(), "10.0.0.2:19400");
+    EXPECT_EQ(schedule.entries(1).dst_peer(), "10.0.0.2:9401");
+    EXPECT_EQ(schedule.entries(1).dst_peregrine_peer(), "");
+  }
 }
 
 TEST_F(ReshardStackTest, GlobalSpaceSpansSplitAtPageBoundaries) {

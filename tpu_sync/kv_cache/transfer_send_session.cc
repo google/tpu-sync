@@ -48,6 +48,7 @@
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/transfer_plan.h"
+#include "tpu_sync/transport/peer_endpoint.h"
 
 namespace tpu_raiden {
 
@@ -336,7 +337,11 @@ TransferDetails TransferSendSession::Details() const {
                            completed_at_ - register_start_)
                            .count();
   if (!remote_data_endpoints_.empty()) {
-    details.peer = absl::StrJoin(remote_data_endpoints_, ",");
+    details.peer =
+        absl::StrJoin(remote_data_endpoints_, ",",
+                      [](std::string* out, const transport::PeerEndpoint& ep) {
+                        absl::StrAppend(out, ep.data);
+                      });
   }
   if (!status_.ok()) {
     details.phase = std::string(failed_phase_);
@@ -376,7 +381,7 @@ void TransferSendSession::EndOp() {
   // share a critical section so a Finish() that starts draining in between
   // cannot settle the send unreleased.
   while (true) {
-    std::vector<std::string> peers;
+    std::vector<transport::PeerEndpoint> peers;
     {
       absl::MutexLock lock(mu_);
       const bool release_due =
@@ -462,7 +467,7 @@ absl::Status TransferSendSession::AcquireStagingWithRetry(int64_t num_blocks) {
 }
 
 void TransferSendSession::StartPush(
-    const std::vector<std::string>& remote_data_endpoints,
+    const std::vector<transport::PeerEndpoint>& remote_data_endpoints,
     const std::vector<int64_t>& src_block_ids,
     const std::vector<int64_t>& dst_block_ids) {
   RAIDEN_TRACE_FN("KVTransfer::StartPush", [&]() {
@@ -681,7 +686,7 @@ void TransferSendSession::SendNextLayer(size_t l) {
     std::move(end_op).Cancel();
     self->base_->push_pool()->Schedule([self, l]() {
       absl::Cleanup end_op = [self]() { self->EndOp(); };
-      std::vector<std::string> remote_data_endpoints;
+      std::vector<transport::PeerEndpoint> remote_data_endpoints;
       std::vector<int> src_ints;
       std::vector<int> dst_ints;
       {

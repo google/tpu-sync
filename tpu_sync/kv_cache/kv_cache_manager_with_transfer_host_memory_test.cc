@@ -33,7 +33,10 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
+#include "tpu_sync/core/kv_manager_holder.h"
 #include "tpu_sync/core/metrics_collector.h"
+#include "tpu_sync/core/raiden_transfer_endpoint.h"
+#include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
@@ -417,6 +420,67 @@ TEST(HostMemoryTransferTest, AFailedPushFailsTheSendAndExpiresTheReceive) {
   EXPECT_EQ(received.details.code, "DEADLINE_EXCEEDED");
   EXPECT_EQ(received.details.phase, "receive");
   c.ExpectBlocks('c');
+}
+
+TEST(HostMemoryTransferTest,
+     TransferEndpointProtoRoundTripPreservesPeregrineEndpoint) {
+  RaidenTransferEndpoint ep{
+      .endpoint = "10.0.0.1:10000",
+      .shards = {0, 1},
+      .layer_host_addrs = {},
+      .peregrine_endpoint = "10.0.0.1:20000",
+  };
+  const ::tpu_sync::proto::RaidenTransferEndpointProto proto = ep.ToProto();
+  EXPECT_EQ(proto.peregrine_endpoint(), "10.0.0.1:20000");
+
+  const RaidenTransferEndpoint round_tripped =
+      RaidenTransferEndpoint::FromProto(proto);
+  EXPECT_EQ(round_tripped, ep);
+  EXPECT_EQ(round_tripped.peregrine_endpoint, "10.0.0.1:20000");
+
+  RaidenTransferEndpoint different_pg = ep;
+  different_pg.peregrine_endpoint = "10.0.0.1:20001";
+  EXPECT_FALSE(ep == different_pg);
+}
+
+TEST(HostMemoryTransferTest,
+     BuildEndpointsPopulatesPeregrineEndpointWhenEnabled) {
+  auto cleanup =
+      absl::MakeCleanup([] { unsetenv("TPU_RAIDEN_ENABLE_PEREGRINE"); });
+  setenv("TPU_RAIDEN_ENABLE_PEREGRINE", "6", 1);
+
+  HostPoolManager sender({.control_port = -1});
+  HostPoolManager receiver({.control_port = -1});
+  sender.Fill('s');
+  receiver.Fill('r');
+
+  ASSERT_GT(receiver.base()->peregrine_local_port(), 0);
+  const std::string expected_pg_ep =
+      absl::StrCat(receiver.base()->local_ip(), ":",
+                   receiver.base()->peregrine_local_port());
+
+  const std::vector<RaidenTransferEndpoint> data_eps =
+      receiver.get_local_data_endpoints();
+  ASSERT_FALSE(data_eps.empty());
+  for (const auto& ep : data_eps) {
+    EXPECT_EQ(ep.peregrine_endpoint, expected_pg_ep);
+  }
+  const std::vector<RaidenTransferEndpoint> local_eps =
+      receiver.get_local_endpoints();
+  ASSERT_FALSE(local_eps.empty());
+  for (const auto& ep : local_eps) {
+    EXPECT_EQ(ep.peregrine_endpoint, expected_pg_ep);
+  }
+
+  // KVManagerHolder H2hWrite with RaidenTransferEndpoint descriptors registers
+  // the peer's Peregrine endpoint on the sender and completes the explicit push
+  // over Peregrine.
+  KVManagerHolder sender_holder(&sender);
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture write_fut,
+                       sender_holder.H2hWrite(data_eps, /*src_offsets=*/{1, 3},
+                                              /*dst_offsets=*/{2, 0}));
+  ABSL_ASSERT_OK(write_fut.Await());
+  receiver.ExpectBlocks('r', {{2, 's', 1}, {0, 's', 3}});
 }
 
 }  // namespace

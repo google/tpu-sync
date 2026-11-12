@@ -346,6 +346,7 @@ class KVCacheManagerWithTransfer {
   int64_t node_id_ = 0;
   int local_control_port_ = 0;
   int local_data_port_ = 0;
+  int local_peregrine_port_ = 0;
 
   // Pull-serve workers launched by ProcessPullStream. The destructor waits
   // for them; staging_allocator_->Shutdown() ends a worker's staging wait

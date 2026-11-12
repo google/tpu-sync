@@ -43,6 +43,7 @@
 #include "tpu_sync/kv_cache/staging_manager.h"
 #include "tpu_sync/kv_cache/transfer_plan.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
+#include "tpu_sync/transport/peer_endpoint.h"
 #include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
@@ -142,9 +143,10 @@ class TransferSendSession
   // |dst_block_ids|: stages device blocks into host staging and runs the
   // multi-layer D2H copy and pipelined H2H push, or pushes host-resident
   // blocks directly.
-  void StartPush(const std::vector<std::string>& remote_data_endpoints,
-                 const std::vector<int64_t>& src_block_ids,
-                 const std::vector<int64_t>& dst_block_ids);
+  void StartPush(
+      const std::vector<transport::PeerEndpoint>& remote_data_endpoints,
+      const std::vector<int64_t>& src_block_ids,
+      const std::vector<int64_t>& dst_block_ids);
 
   // Coalesces contiguous (src_block_ids, dst_block_ids) block runs into
   // CopySpec segments.
@@ -247,7 +249,8 @@ class TransferSendSession
   std::chrono::steady_clock::time_point completed_at_ ABSL_GUARDED_BY(mu_);
   std::vector<raiden::PjRtCopyFuture> d2h_layer_futures_ ABSL_GUARDED_BY(mu_);
   // The consumer's data endpoints, populated once `StartPush` serves its pull.
-  std::vector<std::string> remote_data_endpoints_ ABSL_GUARDED_BY(mu_);
+  std::vector<transport::PeerEndpoint> remote_data_endpoints_
+      ABSL_GUARDED_BY(mu_);
   std::vector<int> src_ints_ ABSL_GUARDED_BY(mu_);
   std::vector<int> dst_ints_ ABSL_GUARDED_BY(mu_);
   std::atomic<size_t> remaining_h2h_layers_{0};

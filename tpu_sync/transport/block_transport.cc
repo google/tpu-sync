@@ -65,6 +65,7 @@
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/psp/peregrine_control_service.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
+#include "tpu_sync/transport/peer_endpoint.h"
 
 namespace tpu_raiden {
 namespace transport {
@@ -517,7 +518,7 @@ absl::Status BlockTransport::HandleIncomingPull(
 }
 
 tsl::Future<std::vector<int>> BlockTransport::AsyncPush(
-    const std::vector<std::string>& peers,
+    const std::vector<PeerEndpoint>& peers,
     const std::vector<int>& src_block_ids,
     const std::vector<int>& dst_block_ids, int parallelism,
     MajorOrder major_order, uint64_t uuid, int layer_idx,
@@ -568,8 +569,7 @@ tsl::Future<std::vector<int>> BlockTransport::AsyncPush(
 }
 
 tsl::Future<std::vector<int>> BlockTransport::AsyncPushShards(
-    const std::vector<std::string>& peers,
-    const std::vector<int>& src_block_ids,
+    absl::Span<const PeerEndpoint> peers, const std::vector<int>& src_block_ids,
     const std::vector<int>& dst_block_ids, int parallelism,
     MajorOrder major_order, uint64_t uuid, int layer_idx,
     std::optional<int> wire_layer_idx, absl::Span<const int> shard_ids,
@@ -614,19 +614,29 @@ tsl::Future<std::vector<int>> BlockTransport::AsyncPushShards(
 
   // In multi-NIC setups, `peers` contains all NIC rail endpoints for the
   // destination host. Request chunk resolution is identical across NICs, so
-  // we pass `peers[0]` as the destination peer to build requests.
+  // we pass `peers[0].data` as the destination peer to build requests.
   auto requests = BuildBlockRequests(
-      peers[0], src_block_ids, dst_block_ids, major_order, uuid, layer_idx, P,
-      wire_layer_idx, shard_ids, static_cast<int>(total_streams));
+      peers[0].data, src_block_ids, dst_block_ids, major_order, uuid, layer_idx,
+      P, wire_layer_idx, shard_ids, static_cast<int>(total_streams));
   if (!requests.ok()) {
     on_complete(requests.status());
+    return std::move(future);
+  }
+
+  const lib::TransferOp op = dst_block_ids.empty()
+                                 ? lib::TransferOp::kBlockPush
+                                 : lib::TransferOp::kBlockPushExplicit;
+  absl::StatusOr<std::vector<std::string>> adapter_peers =
+      SelectAdapterPeers(op, peers);
+  if (!adapter_peers.ok()) {
+    on_complete(adapter_peers.status());
     return std::move(future);
   }
 
   // Post reports its own errors through `on_complete`, so the returned status
   // carries no additional information.
   adapter
-      ->Post(peers, *requests, src_block_ids, dst_block_ids,
+      ->Post(*adapter_peers, *requests, src_block_ids, dst_block_ids,
              std::move(on_complete))
       .status()
       .IgnoreError();
@@ -634,7 +644,7 @@ tsl::Future<std::vector<int>> BlockTransport::AsyncPushShards(
 }
 
 absl::StatusOr<std::vector<int>> BlockTransport::SyncPull(
-    const std::vector<std::string>& peers,
+    const std::vector<PeerEndpoint>& peers,
     const std::vector<int>& src_block_ids,
     const std::vector<int>& local_block_ids,
     const std::vector<uint8_t*>& explicit_dst_ptrs, int parallelism,
@@ -650,8 +660,7 @@ absl::StatusOr<std::vector<int>> BlockTransport::SyncPull(
 }
 
 absl::StatusOr<std::vector<int>> BlockTransport::SyncPullInternal(
-    const std::vector<std::string>& peers,
-    const std::vector<int>& src_block_ids,
+    absl::Span<const PeerEndpoint> peers, const std::vector<int>& src_block_ids,
     const std::vector<int>& local_block_ids,
     const std::vector<uint8_t*>& explicit_dst_ptrs, int parallelism,
     MajorOrder major_order, BlockReceivedCallback on_block_received,
@@ -681,6 +690,18 @@ absl::StatusOr<std::vector<int>> BlockTransport::SyncPullInternal(
     return absl::InvalidArgumentError("explicit_dst_ptrs size mismatch");
   }
 
+  int P = parallelism;
+  if (P <= 0) {
+    return absl::InvalidArgumentError("parallelism must be positive");
+  }
+  if (static_cast<int>(local_blocks) < P) P = local_blocks;
+
+  // TODO(swasthi): Support `kBlockPull` over Peregrine.
+  ABSL_ASSIGN_OR_RETURN(lib::TransportAdapter* const adapter,
+                        AdapterForOp(lib::TransferOp::kBlockPull));
+  ABSL_ASSIGN_OR_RETURN(const std::vector<std::string> adapter_peers,
+                        SelectAdapterPeers(lib::TransferOp::kBlockPull, peers));
+
   std::vector<int> allocated_ids;
   if (!local_block_ids.empty()) {
     if (local_block_ids.size() != local_blocks) {
@@ -692,21 +713,11 @@ absl::StatusOr<std::vector<int>> BlockTransport::SyncPullInternal(
                           block_delegate_->AllocateBlocks(local_blocks));
   }
 
-  int P = parallelism;
-  if (P <= 0) {
-    return absl::InvalidArgumentError("parallelism must be positive");
-  }
-  if (static_cast<int>(local_blocks) < P) P = local_blocks;
-
   ABSL_ASSIGN_OR_RETURN(
       const auto requests,
       BuildBlockPullRequests(src_block_ids, allocated_ids, explicit_dst_ptrs,
                              major_order, uuid, P, on_block_received));
-
-  // TODO(swasthi): Support `kBlockPull` over Peregrine.
-  ABSL_ASSIGN_OR_RETURN(lib::TransportAdapter* const adapter,
-                        AdapterForOp(lib::TransferOp::kBlockPull));
-  ABSL_RETURN_IF_ERROR(adapter->Post(peers, requests).status());
+  ABSL_RETURN_IF_ERROR(adapter->Post(adapter_peers, requests).status());
   return allocated_ids;
 }
 
@@ -859,6 +870,27 @@ absl::StatusOr<std::vector<lib::Request>> BlockTransport::BuildBlockRequests(
         }));
   }
   return requests;
+}
+
+absl::StatusOr<std::vector<std::string>> BlockTransport::SelectAdapterPeers(
+    lib::TransferOp op, absl::Span<const PeerEndpoint> peers) const {
+  if (peers.empty()) {
+    return absl::InvalidArgumentError("Peer list cannot be empty");
+  }
+  if (config_.backend_for(op) == TransportBackend::kPeregrine) {
+    if (peers.front().peregrine.empty()) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          "Peer ", peers.front().data,
+          " has no Peregrine control endpoint for op ", static_cast<int>(op)));
+    }
+    return std::vector<std::string>{peers.front().peregrine};
+  }
+  std::vector<std::string> data_peers;
+  data_peers.reserve(peers.size());
+  for (const PeerEndpoint& peer : peers) {
+    data_peers.push_back(peer.data);
+  }
+  return data_peers;
 }
 
 lib::TransportAdapter* BlockTransport::AdapterFor(int numa_node) {

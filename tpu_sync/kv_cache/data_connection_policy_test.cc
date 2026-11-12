@@ -23,6 +23,7 @@
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
+#include "tpu_sync/transport/peer_endpoint.h"
 
 namespace tpu_raiden {
 namespace {
@@ -93,7 +94,7 @@ TEST(DataConnectionPolicyTest, RejectsUnknownValueNamingVariableAndValue) {
 }
 
 TEST(DataConnectionPolicyTest, ReleaseIsANoOpWithoutTransportOrPeers) {
-  const std::vector<std::string> peers = {"127.0.0.1:1"};
+  const std::vector<transport::PeerEndpoint> peers = {"127.0.0.1:1"};
   EXPECT_EQ(ReleaseDataConnectionsAfterSend(nullptr, peers, /*uuid=*/7), 0u);
   EXPECT_EQ(ReleaseDataConnectionsAfterSend(nullptr, {}, /*uuid=*/7), 0u);
 }

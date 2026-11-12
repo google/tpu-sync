@@ -32,6 +32,16 @@ cc_library(
 )
 
 cc_library(
+    name = "peer_endpoint",
+    hdrs = ["peer_endpoint.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+cc_library(
     name = "block_transport_delegate",
     hdrs = ["block_transport_delegate.h"],
     visibility = ["//visibility:public"],
@@ -103,6 +113,7 @@ cc_library(
         ":block_transport_delegate",
         ":block_transport_session",
         ":buffer_push_task",
+        ":peer_endpoint",
         "//tpu_sync/core:tsl_platform_headers",
         "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/telemetry:metrics_backend",
@@ -144,6 +155,7 @@ cc_test(
         ":block_transport_delegate",
         ":block_transport_session",
         ":buffer_push_task",
+        ":peer_endpoint",
         ":transfer_session",
         "//tpu_sync/telemetry:metrics_3p_prometheus_exporter",
         "//tpu_sync/telemetry:metrics_api",

@@ -502,9 +502,10 @@ void AddTransferPairs(const RaidenId& src_unit,
 // Bind ordinals and destination indices to physical ids and emit.
 absl::Status EmitSpanSchedule(
     const DeclaredSpans& declared, const std::vector<RaidenId>& dst_units,
-    const PeersByUnit& dst_peers, const std::vector<int64_t>& dst_ids,
-    const TagPrecheck& precheck, int32_t pool_group, SchedulesByUnit* schedules,
-    int64_t* emitted_chunks, TransferPairs* transfer_pairs_per_sender) {
+    const PeersByUnit& dst_peers, const PeersByUnit& dst_peregrine_endpoints,
+    const std::vector<int64_t>& dst_ids, const TagPrecheck& precheck,
+    int32_t pool_group, SchedulesByUnit* schedules, int64_t* emitted_chunks,
+    TransferPairs* transfer_pairs_per_sender) {
   struct OrderedSpan {
     const PoolByteSpan* span;
     RaidenId unit;
@@ -560,6 +561,10 @@ absl::Status EmitSpanSchedule(
         schedule_entry.count = span.count;
         schedule_entry.layer_idx = 0;
         schedule_entry.pool_group = pool_group;
+        if (!dst_peregrine_endpoints.empty()) {
+          schedule_entry.dst_peregrine_peer =
+              dst_peregrine_endpoints.at(dst_unit_id);
+        }
         (*schedules)[src_unit].push_back(std::move(schedule_entry));
       }
       AddTransferPairs(src_unit, targets, dst_peers, src_block_id, dst_block_id,
@@ -596,6 +601,10 @@ absl::Status EmitSpanSchedule(
           schedule_entry.count = 1;
           schedule_entry.layer_idx = 0;
           schedule_entry.pool_group = pool_group;
+          if (!dst_peregrine_endpoints.empty()) {
+            schedule_entry.dst_peregrine_peer =
+                dst_peregrine_endpoints.at(dst_unit_id);
+          }
           (*schedules)[src_unit].push_back(std::move(schedule_entry));
         }
       }
@@ -1126,13 +1135,23 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
   // entry group.
   absl::btree_map<RaidenId, std::string, RequestBlockRegistry::RaidenIdLess>
       dst_peers;
+  absl::btree_map<RaidenId, std::string, RequestBlockRegistry::RaidenIdLess>
+      dst_peregrine_endpoints;
   {
     absl::btree_set<std::string> unique_peers;
+    bool any_peregrine = false;
     for (const RaidenId& unit : request.dst_units) {
-      const std::string peer = dst_by_unit.at(unit)->shards(0);
+      const auto* dst = dst_by_unit.at(unit);
+      const std::string peer = dst->shards(0);
       unique_peers.insert(peer);
       dst_peers.emplace(unit, peer);
+      const std::string pg_ep = dst->peregrine_endpoints_size() > 0
+                                    ? dst->peregrine_endpoints(0)
+                                    : "";
+      if (!pg_ep.empty()) any_peregrine = true;
+      dst_peregrine_endpoints.emplace(unit, pg_ep);
     }
+    if (!any_peregrine) dst_peregrine_endpoints.clear();
     if (unique_peers.size() != request.dst_units.size()) {
       std::vector<std::string> sorted_peers(unique_peers.begin(),
                                             unique_peers.end());
@@ -1223,10 +1242,10 @@ absl::StatusOr<PoolReshardPlan> BuildPoolReshardPlan(
     if (!coverage_status.ok()) return coverage_status;
 
     TransferPairs transfer_pairs_per_sender;
-    absl::Status emit_status =
-        EmitSpanSchedule(declared, request.dst_units, dst_peers, dst_ids_g,
-                         precheck, static_cast<int32_t>(group_idx), &schedules,
-                         &emitted_chunks, &transfer_pairs_per_sender);
+    absl::Status emit_status = EmitSpanSchedule(
+        declared, request.dst_units, dst_peers, dst_peregrine_endpoints,
+        dst_ids_g, precheck, static_cast<int32_t>(group_idx), &schedules,
+        &emitted_chunks, &transfer_pairs_per_sender);
     if (!emit_status.ok()) return emit_status;
 
     // Computed expected pushes for the receiver.

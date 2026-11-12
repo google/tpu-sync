@@ -71,6 +71,7 @@
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/chunk_serializer.h"
 #include "tpu_sync/transport/lib/psp/psp_syscall_mock.h"  // NOLINT
+#include "tpu_sync/transport/peer_endpoint.h"
 #include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
@@ -1440,8 +1441,8 @@ TEST_P(BlockTransportTest, RoundRobinDistribution) {
   MockDelegate delegate(kSliceSize);
 
   std::vector<std::string> local_ips = {"10.0.0.1", "10.0.0.2"};
-  std::vector<std::string> peers = {"10.0.0.3:1234", "10.0.0.4:1234",
-                                    "10.0.0.5:1234"};
+  std::vector<PeerEndpoint> peers = {"10.0.0.3:1234", "10.0.0.4:1234",
+                                     "10.0.0.5:1234"};
 
   MockBlockTransport transport(&delegate, 0, local_ips);
 
@@ -2416,7 +2417,8 @@ TEST(TransportBackendTest, PeregrineReceiverAllocatedPushIsUnimplemented) {
   BlockTransport sender(&delegate, 0);
 
   EXPECT_THAT(sender
-                  .AsyncPush({"127.0.0.1:1"}, /*src_block_ids=*/{0},
+                  .AsyncPush({PeerEndpoint{"127.0.0.1:1", "127.0.0.1:2"}},
+                             /*src_block_ids=*/{0},
                              /*dst_block_ids=*/{})
                   .Await(),
               StatusIs(absl::StatusCode::kUnimplemented));
@@ -2504,8 +2506,11 @@ TEST(TransportBackendTest, ExplicitPushOverPeregrineIsReceiverResolved) {
   // The Peregrine control endpoint is its own kernel-assigned port.
   ASSERT_GT(receiver.peregrine_local_port(), 0);
   ASSERT_NE(receiver.peregrine_local_port(), receiver.local_port());
-  const std::vector<std::string> peers = {
-      absl::StrCat("127.0.0.1:", receiver.peregrine_local_port())};
+  const std::string peer_data_ep =
+      absl::StrCat("127.0.0.1:", receiver.local_port());
+  const std::vector<PeerEndpoint> peers = {
+      {peer_data_ep,
+       absl::StrCat("127.0.0.1:", receiver.peregrine_local_port())}};
 
   // Layer 1 only: sender block 0 -> receiver block 1 and 1 -> 0, both shards.
   // The sender posts no destination addresses; the receiver resolves each
@@ -2578,13 +2583,17 @@ TEST(TransportBackendTest, AllLayerPushOverPeregrineWithUuidZero) {
   BlockTransport sender(&sender_delegate, 0);
   BlockTransport receiver(&receiver_delegate, 0);
   ASSERT_GT(receiver.peregrine_local_port(), 0);
+  const std::string peer_data_ep =
+      absl::StrCat("127.0.0.1:", receiver.local_port());
 
   // uuid 0 is the staging-push shape (no transfer session); every layer is
   // one Post, joined into a single result.
   EXPECT_THAT(
       sender
           .AsyncPush(
-              {absl::StrCat("127.0.0.1:", receiver.peregrine_local_port())},
+              {PeerEndpoint{
+                  peer_data_ep,
+                  absl::StrCat("127.0.0.1:", receiver.peregrine_local_port())}},
               /*src_block_ids=*/{0, 1}, /*dst_block_ids=*/{1, 0},
               /*parallelism=*/1, MajorOrder::kLayerMajor, /*uuid=*/0,
               /*layer_idx=*/-1)
@@ -2604,6 +2613,38 @@ TEST(TransportBackendTest, AllLayerPushOverPeregrineWithUuidZero) {
           << "layer " << layer << " shard " << shard;
     }
   }
+}
+
+TEST(TransportBackendTest,
+     PeregrinePeerWithEmptyPeregrineEndpointFailsClosedWithFailedPrecondition) {
+  auto cleanup =
+      absl::MakeCleanup([] { unsetenv("TPU_RAIDEN_ENABLE_PEREGRINE"); });
+  setenv("TPU_RAIDEN_ENABLE_PEREGRINE", "6", 1);
+  MockDelegate sender_delegate(/*slice_size=*/64);
+  MockDelegate receiver_delegate(/*slice_size=*/64);
+  BlockTransport sender(&sender_delegate, 0);
+  BlockTransport receiver(&receiver_delegate, 0);
+  const std::string peer_data_ep =
+      absl::StrCat("127.0.0.1:", receiver.local_port());
+
+  EXPECT_THAT(
+      sender
+          .AsyncPush({peer_data_ep}, /*src_block_ids=*/{0},
+                     /*dst_block_ids=*/{0})
+          .Await(),
+      StatusIs(absl::StatusCode::kFailedPrecondition, HasSubstr(peer_data_ep)));
+
+  // Positive control: supplying the Peregrine endpoint on the call succeeds.
+  EXPECT_THAT(
+      sender
+          .AsyncPush(
+              {PeerEndpoint{
+                  peer_data_ep,
+                  absl::StrCat("127.0.0.1:", receiver.peregrine_local_port())}},
+              /*src_block_ids=*/{0},
+              /*dst_block_ids=*/{0})
+          .Await(),
+      IsOkAndHolds(ElementsAre(0)));
 }
 
 TEST(PeregrineRecvCompleteTest, SplitPostsFromOneSenderCompleteLayerOnce) {

@@ -148,6 +148,7 @@ TEST_P(ControlPlaneBackendTest, SendPullRequestWithExplicitConsumerIps) {
   req.uuid = 123456;
   req.ep_idx = 2;
   req.consumer_data_port = 60000;
+  req.consumer_peregrine_port = 60001;
   req.consumer_ips = {"10.0.0.1", "10.0.0.2"};
   req.src_block_ids = {10, 20, 30};
   req.dst_block_ids = {100, 200, 300};

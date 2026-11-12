@@ -45,6 +45,7 @@
 #include "tpu_sync/transport/lib/metrics/transport_metrics_exporter.h"
 #include "tpu_sync/transport/lib/psp/peregrine_control_service.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport.h"
+#include "tpu_sync/transport/peer_endpoint.h"
 
 namespace tpu_raiden {
 namespace transport {
@@ -139,7 +140,7 @@ class BlockTransport final {
   // continuation with `OnReady()`, which runs on the transport thread that
   // completes the push (or inline if the push already failed validation).
   tsl::Future<std::vector<int>> AsyncPush(
-      const std::vector<std::string>& peers,
+      const std::vector<PeerEndpoint>& peers,
       const std::vector<int>& src_block_ids,
       const std::vector<int>& dst_block_ids = {}, int parallelism = 1,
       MajorOrder major_order = MajorOrder::kLayerMajor, uint64_t uuid = 0,
@@ -149,7 +150,7 @@ class BlockTransport final {
   // When explicit_dst_ptrs is supplied it contains one base pointer per
   // (block array, shard), in block-array-major order.
   absl::StatusOr<std::vector<int>> SyncPull(
-      const std::vector<std::string>& peers,
+      const std::vector<PeerEndpoint>& peers,
       const std::vector<int>& src_block_ids,
       const std::vector<int>& local_block_ids = {},
       const std::vector<uint8_t*>& explicit_dst_ptrs = {}, int parallelism = 1,
@@ -227,7 +228,7 @@ class BlockTransport final {
   // number of such calls, so the header declares the stream count over all of
   // them and the receiver completes only once every group has landed.
   tsl::Future<std::vector<int>> AsyncPushShards(
-      const std::vector<std::string>& peers,
+      absl::Span<const PeerEndpoint> peers,
       const std::vector<int>& src_block_ids,
       const std::vector<int>& dst_block_ids, int parallelism,
       MajorOrder major_order, uint64_t uuid, int layer_idx,
@@ -264,6 +265,11 @@ class BlockTransport final {
   // adapter, or the Peregrine adapter when it is running.
   absl::StatusOr<lib::TransportAdapter*> AdapterForOp(lib::TransferOp op);
 
+  // Projects `peers` into the backend-specific address list for `op`: `.data`
+  // for `kSocket`, `{peers.front().peregrine}` for `kPeregrine`.
+  absl::StatusOr<std::vector<std::string>> SelectAdapterPeers(
+      lib::TransferOp op, absl::Span<const PeerEndpoint> peers) const;
+
   // Builds a batch of Requests for block pull transfer.
   absl::StatusOr<std::vector<lib::Request>> BuildBlockPullRequests(
       const std::vector<int>& src_block_ids,
@@ -286,7 +292,7 @@ class BlockTransport final {
   void DeletePullSession(uint64_t session_id);
 
   absl::StatusOr<std::vector<int>> SyncPullInternal(
-      const std::vector<std::string>& peers,
+      absl::Span<const PeerEndpoint> peers,
       const std::vector<int>& src_block_ids,
       const std::vector<int>& local_block_ids,
       const std::vector<uint8_t*>& explicit_dst_ptrs, int parallelism,

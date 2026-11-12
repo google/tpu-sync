@@ -232,6 +232,9 @@ tpu_sync::rpc::StartTransferRequest BuildStartTransferForTarget(
           entry_proto->set_count(entry.count);
           entry_proto->set_layer_idx(entry.layer_idx);
           entry_proto->set_pool_group(entry.pool_group);
+          if (!entry.dst_peregrine_peer.empty()) {
+            entry_proto->set_dst_peregrine_peer(entry.dst_peregrine_peer);
+          }
         }
       };
 

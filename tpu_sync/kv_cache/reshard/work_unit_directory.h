@@ -37,6 +37,7 @@ namespace reshard {
 struct WorkUnitRegistration {
   RaidenId unit;
   std::vector<std::string> shards;
+  std::vector<std::string> peregrine_endpoints;
   std::optional<std::string> control_plane_rpc_address;
   std::optional<std::vector<int64_t>> mesh_shape;
   std::optional<std::vector<int32_t>> layout;
@@ -95,6 +96,7 @@ class WorkUnitDirectory {
  private:
   struct Record {
     std::vector<std::string> shards;
+    std::vector<std::string> peregrine_endpoints;
     // Mirrors worker_rpc_client._endpoints for this unit ("" = absent).
     std::string control_plane_rpc_address;
     std::optional<std::vector<int64_t>> mesh_shape;

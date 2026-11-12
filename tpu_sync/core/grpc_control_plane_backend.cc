@@ -61,6 +61,7 @@ control_plane::proto::PullStreamRequest ToProto(
   proto_req.set_uuid(req.uuid);
   proto_req.set_ep_idx(req.ep_idx);
   proto_req.set_consumer_data_port(req.consumer_data_port);
+  proto_req.set_consumer_peregrine_port(req.consumer_peregrine_port);
   for (const auto& ip : req.consumer_ips) {
     proto_req.add_consumer_ips(ip);
   }
@@ -142,6 +143,7 @@ grpc::Status KVCacheControlPlaneServiceImpl::PullStream(
   spec.uuid = request->uuid();
   spec.ep_idx = request->ep_idx();
   spec.consumer_data_port = request->consumer_data_port();
+  spec.consumer_peregrine_port = request->consumer_peregrine_port();
   spec.consumer_ips.assign(request->consumer_ips().begin(),
                            request->consumer_ips().end());
   spec.src_block_ids.assign(request->src_block_ids().begin(),

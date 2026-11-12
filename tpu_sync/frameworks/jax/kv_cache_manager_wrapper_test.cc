@@ -43,6 +43,7 @@
 #include "tpu_sync/frameworks/jax/kv_cache_manager.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
+#include "tpu_sync/transport/peer_endpoint.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
@@ -97,20 +98,22 @@ class MockSubManager : public KVCacheManagerWithTransfer {
     }
 
     absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>>
-    H2hWrite(std::string peer, const std::vector<int>& src_block_ids,
+    H2hWrite(transport::PeerEndpoint peer,
+             const std::vector<int>& src_block_ids,
              const std::vector<int>& dst_block_ids = {}, uint64_t uuid = 0,
              int layer_idx = -1) override {
       parent_->h2h_write_calls++;
-      parent_->last_h2h_write_peer = std::move(peer);
+      parent_->last_h2h_write_peer = std::move(peer.data);
       parent_->last_h2h_write_src_blocks = src_block_ids;
       parent_->last_h2h_write_dst_blocks = dst_block_ids;
       return std::make_pair(std::vector<int>(), raiden::PjRtCopyFuture());
     }
 
     absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>> H2hRead(
-        std::string peer, const std::vector<int>& src_block_ids) override {
+        transport::PeerEndpoint peer,
+        const std::vector<int>& src_block_ids) override {
       parent_->h2h_read_calls++;
-      parent_->last_h2h_read_peer = std::move(peer);
+      parent_->last_h2h_read_peer = std::move(peer.data);
       parent_->last_h2h_read_src_blocks = src_block_ids;
       return std::make_pair(std::vector<int>(), raiden::PjRtCopyFuture());
     }

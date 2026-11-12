@@ -60,6 +60,7 @@
 #include "tpu_sync/kv_cache/reshard_send_session.h"
 #include "tpu_sync/kv_cache/transfer_receive_session.h"
 #include "tpu_sync/kv_cache/transfer_send_session.h"
+#include "tpu_sync/transport/peer_endpoint.h"
 #include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
@@ -894,14 +895,18 @@ std::vector<RaidenTransferEndpoint> KVCacheManagerWithTransfer::BuildEndpoints(
     int64_t port) const {
   std::vector<::tpu_sync::rpc::PoolHostAddrsProto> layer_host_addrs =
       base_->LayerHostAddrs(/*uuid=*/0);
+  const int peregrine_port = base_->peregrine_local_port();
+  const std::string peregrine_ep =
+      peregrine_port <= 0
+          ? ""
+          : transport::FormatIpPort(base_->local_ip(), peregrine_port);
   std::vector<RaidenTransferEndpoint> eps;
   for (const auto& ip : base_->local_ips()) {
-    std::string endpoint = absl::StrContains(ip, ':')
-                               ? absl::StrCat("[", ip, "]:", port)
-                               : absl::StrCat(ip, ":", port);
+    std::string endpoint = transport::FormatIpPort(ip, port);
     // Shards whose device is NUMA-local to this NIC; every shard when the
     // host has no usable NUMA topology.
-    eps.push_back({endpoint, base_->shards_for_local_ip(ip), layer_host_addrs});
+    eps.push_back({endpoint, base_->shards_for_local_ip(ip), layer_host_addrs,
+                   peregrine_ep});
   }
   return eps;
 }
@@ -1285,20 +1290,24 @@ KVCacheManagerWithTransfer::HandlePullStream(
       }
     }
 
-    std::vector<std::string> remote_data_endpoints;
+    std::string consumer_peregrine_ep;
+    if (req.consumer_peregrine_port > 0 && !peer_ips.empty()) {
+      consumer_peregrine_ep = transport::FormatIpPort(
+          peer_ips.front(), req.consumer_peregrine_port);
+    }
+
+    std::vector<transport::PeerEndpoint> remote_data_endpoints;
+    remote_data_endpoints.reserve(peer_ips.size());
     for (const auto& peer_ip : peer_ips) {
-      if (absl::StrContains(peer_ip, ':')) {
-        remote_data_endpoints.push_back(
-            absl::StrCat("[", peer_ip, "]:", req.consumer_data_port));
-      } else {
-        remote_data_endpoints.push_back(
-            absl::StrCat(peer_ip, ":", req.consumer_data_port));
-      }
+      remote_data_endpoints.push_back(
+          {transport::FormatIpPort(peer_ip, req.consumer_data_port),
+           consumer_peregrine_ep});
     }
 
     VLOG(1) << "HandlePullStream (Hybrid Bridge) successfully acknowledged "
                "consumer. Intercepting and launching StartPush to "
-            << (remote_data_endpoints.empty() ? "" : remote_data_endpoints[0])
+            << (remote_data_endpoints.empty() ? ""
+                                              : remote_data_endpoints[0].data)
             << (remote_data_endpoints.size() > 1 ? " and others" : "");
 
     {
@@ -1479,6 +1488,7 @@ KVCacheManagerWithTransfer::DeadlineFromNow() const {
 void KVCacheManagerWithTransfer::ConfigureDataPortFromKvTransfer() {
   if (base_->num_layers() == 0) {
     local_data_port_ = 0;
+    local_peregrine_port_ = 0;
     return;
   }
   std::optional<int> data_port = base_->local_port();
@@ -1486,6 +1496,7 @@ void KVCacheManagerWithTransfer::ConfigureDataPortFromKvTransfer() {
     throw std::runtime_error("KVCacheManager BlockTransport is not running");
   }
   local_data_port_ = *data_port;
+  local_peregrine_port_ = base_->peregrine_local_port();
 }
 
 }  // namespace tpu_raiden

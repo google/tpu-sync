@@ -47,6 +47,7 @@ struct ScheduleEntry {
   int32_t count = 1;
   int32_t layer_idx = 0;
   int32_t pool_group = 0;
+  std::string dst_peregrine_peer;
 };
 
 // One tag class's slice of the plan (TransferPlan.pool_groups element).

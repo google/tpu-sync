@@ -44,6 +44,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/base/thread_annotations.h"
+#include "absl/cleanup/cleanup.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -1280,6 +1281,92 @@ TEST(ControlHandshakeTest, DISABLED_SickPeerStarvesStagingSlotsForHealthyPeer) {
     (void)sent;
     settled += received.size() + failed.size();
     absl::SleepFor(absl::Milliseconds(20));
+  }
+}
+
+TEST(ControlHandshakeTest,
+     StartReadOverPeregrinePropagatesConsumerPortAndCompletesPush) {
+  auto cleanup =
+      absl::MakeCleanup([] { unsetenv("TPU_RAIDEN_ENABLE_PEREGRINE"); });
+  setenv("TPU_RAIDEN_ENABLE_PEREGRINE", "6", 1);
+
+  static constexpr size_t kLayers = 2;
+  static constexpr size_t kBlockBytes = 128;
+  static constexpr int kBlocks = 4;
+
+  struct HostTransferManager : public KVCacheManagerWithTransfer {
+    explicit HostTransferManager(int control_port)
+        : KVCacheManagerWithTransfer(
+              std::make_unique<kv_cache::KVCacheManagerBase>(
+                  kLayers, /*num_shards=*/1,
+                  std::vector<size_t>(kLayers, kBlockBytes),
+                  /*local_port=*/std::nullopt,
+                  /*host_blocks_to_allocate=*/kBlocks, /*parallelism=*/1),
+              /*node_id=*/0, /*local_control_port=*/control_port,
+              /*max_blocks=*/0, /*num_slots=*/0, /*timeout_s=*/5.0) {}
+  };
+
+  HostTransferManager producer(/*control_port=*/0);
+  HostTransferManager consumer(/*control_port=*/-1);
+
+  ASSERT_GT(consumer.base()->peregrine_local_port(), 0);
+  for (size_t layer = 0; layer < kLayers; ++layer) {
+    for (int block = 0; block < kBlocks; ++block) {
+      std::memset(
+          producer.base()->GetHostPointer(layer, 0) + block * kBlockBytes,
+          static_cast<int>(0x20 + layer * 16 + block), kBlockBytes);
+      std::memset(
+          consumer.base()->GetHostPointer(layer, 0) + block * kBlockBytes, 0,
+          kBlockBytes);
+    }
+  }
+
+  ASSERT_GT(
+      producer.NotifyForRead("pg_pull", /*uuid=*/950, {1, 3},
+                             /*deadline=*/std::nullopt, BlockLocation::kHost),
+      0);
+  consumer.StartRead("pg_pull", /*uuid=*/950,
+                     absl::StrCat("127.0.0.1:", producer.local_control_port()),
+                     /*remote_block_ids=*/{1, 3}, /*local_block_ids=*/{2, 0},
+                     /*parallelism=*/1, /*local_host_block_ids=*/std::nullopt,
+                     /*deadline=*/std::nullopt, BlockLocation::kHost);
+
+  bool consumer_done = false;
+  bool producer_done = false;
+  const absl::Time deadline = absl::Now() + absl::Seconds(10);
+  while ((!consumer_done || !producer_done) && absl::Now() < deadline) {
+    if (!consumer_done) {
+      CompleteReadResult res = consumer.CompleteReadWithDetails();
+      ASSERT_THAT(res.failed, ::testing::IsEmpty());
+      if (!res.received.empty()) {
+        EXPECT_THAT(res.received, ElementsAre("pg_pull"));
+        consumer_done = true;
+      }
+    }
+    if (!producer_done) {
+      CompleteReadResult res = producer.CompleteReadWithDetails();
+      ASSERT_THAT(res.failed, ::testing::IsEmpty());
+      if (!res.sent.empty()) {
+        EXPECT_THAT(res.sent, ElementsAre("pg_pull"));
+        producer_done = true;
+      }
+    }
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  ASSERT_TRUE(consumer_done);
+  ASSERT_TRUE(producer_done);
+
+  for (size_t layer = 0; layer < kLayers; ++layer) {
+    EXPECT_EQ(
+        std::memcmp(consumer.base()->GetHostPointer(layer, 0) + 2 * kBlockBytes,
+                    producer.base()->GetHostPointer(layer, 0) + 1 * kBlockBytes,
+                    kBlockBytes),
+        0);
+    EXPECT_EQ(
+        std::memcmp(consumer.base()->GetHostPointer(layer, 0) + 0 * kBlockBytes,
+                    producer.base()->GetHostPointer(layer, 0) + 3 * kBlockBytes,
+                    kBlockBytes),
+        0);
   }
 }
 

@@ -47,6 +47,10 @@ message PullStreamRequest {
 
   // Consumer host addresses, one per layer. Empty if not reported.
   repeated tpu_sync.rpc.PoolHostAddrsProto layer_host_addrs = 7;
+
+  // Peregrine control port on which the consumer's BlockTransport server is
+  // listening when Peregrine is enabled (0 when disabled).
+  uint32 consumer_peregrine_port = 8;
 }
 
 // Response returned by the producer acknowledging validation of the pull

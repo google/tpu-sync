@@ -37,6 +37,7 @@
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/transport/peer_endpoint.h"
 
 namespace xla {
 class PjRtBuffer;
@@ -206,7 +207,7 @@ class NumaAwareKVCacheManager {
                   const std::vector<int64_t>& copy_sizes_major_dim = {});
 
   absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>> H2hWrite(
-      std::string peer, const std::vector<int>& src_block_ids,
+      transport::PeerEndpoint peer, const std::vector<int>& src_block_ids,
       const std::vector<int>& dst_block_ids = {}, uint64_t uuid = 0,
       int layer_idx = -1);
 
@@ -217,7 +218,7 @@ class NumaAwareKVCacheManager {
       int layer_idx = -1);
 
   absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>> H2hRead(
-      std::string peer, const std::vector<int>& src_block_ids);
+      transport::PeerEndpoint peer, const std::vector<int>& src_block_ids);
 
   absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>> H2hRead(
       const std::vector<RaidenTransferEndpoint>& remote_descriptors,
@@ -514,7 +515,7 @@ class KVCacheManager {
   }
 
   absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>> H2hWrite(
-      std::string peer, const std::vector<int>& src_block_ids,
+      transport::PeerEndpoint peer, const std::vector<int>& src_block_ids,
       const std::vector<int>& dst_block_ids = {}, uint64_t uuid = 0,
       int layer_idx = -1) {
     return numa_manager_->H2hWrite(std::move(peer), src_block_ids,
@@ -531,7 +532,7 @@ class KVCacheManager {
   }
 
   absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>> H2hRead(
-      std::string peer, const std::vector<int>& src_block_ids) {
+      transport::PeerEndpoint peer, const std::vector<int>& src_block_ids) {
     return numa_manager_->H2hRead(std::move(peer), src_block_ids);
   }
 

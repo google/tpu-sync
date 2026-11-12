@@ -117,6 +117,7 @@ void WorkUnitDirectory::RegisterLocked(const WorkUnitRegistration& reg) {
   }
   Record& record = records_[idx];
   record.shards = reg.shards;
+  record.peregrine_endpoints = reg.peregrine_endpoints;
   record.mesh_shape = reg.mesh_shape;
   record.layout = reg.layout;
   record.global_shape = reg.global_shape;
@@ -144,6 +145,9 @@ WorkUnitDirectory::MetadataProtoLocked(const RaidenId& unit) const {
   *reg_req.mutable_unit() = RaidenIdToProto(unit);
   for (const std::string& shard : record.shards) {
     reg_req.add_shards(shard);
+  }
+  for (const std::string& ep : record.peregrine_endpoints) {
+    reg_req.add_peregrine_endpoints(ep);
   }
   reg_req.set_control_plane_rpc_address(record.control_plane_rpc_address);
   reg_req.set_itemsize(record.itemsize.value_or(0));

@@ -15,6 +15,7 @@
 """Host-only tests for the Python pool-admission surface."""
 
 import enum
+import os
 import unittest
 from unittest import mock
 
@@ -179,6 +180,45 @@ class KVCacheManagerHostTest(unittest.TestCase):
     # before the page is validated: page_nbytes=0 would otherwise be rejected.
     with self.assertRaisesRegex(RuntimeError, "no active PJRT client"):
       manager.experimental_map_shared_memory(4096, 4096, page_nbytes=0)
+
+  def test_peregrine_transfer_address_reflects_peregrine_enablement(self):
+    with mock.patch.dict(os.environ, {}, clear=False):
+      os.environ.pop("TPU_RAIDEN_ENABLE_PEREGRINE", None)
+      manager_off = (
+          kv_cache_manager.KVCacheManager.create_host_only_for_testing(
+              num_layers=1,
+              num_shards=1,
+              slice_byte_size=128,
+              node_id=7,
+              local_port=0,
+              host_blocks=2,
+              parallelism=1,
+          )
+      )
+      self.assertEqual(manager_off.peregrine_transfer_address, "")
+      eps_off = manager_off.get_local_endpoints()
+      self.assertGreater(len(eps_off), 0)
+      self.assertEqual(eps_off[0]["peregrine_endpoint"], "")
+
+    with mock.patch.dict(
+        os.environ, {"TPU_RAIDEN_ENABLE_PEREGRINE": "1"}, clear=False
+    ):
+      manager_on = kv_cache_manager.KVCacheManager.create_host_only_for_testing(
+          num_layers=1,
+          num_shards=1,
+          slice_byte_size=128,
+          node_id=8,
+          local_port=0,
+          host_blocks=2,
+          parallelism=1,
+      )
+      self.assertNotEqual(manager_on.peregrine_transfer_address, "")
+      eps_on = manager_on.get_local_endpoints()
+      self.assertGreater(len(eps_on), 0)
+      self.assertEqual(
+          manager_on.peregrine_transfer_address,
+          eps_on[0]["peregrine_endpoint"],
+      )
 
 
 class _FakeDetailsImpl:

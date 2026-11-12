@@ -205,6 +205,7 @@ cc_library(
         "//tpu_sync/core/controller:worker_service_server",
         "//tpu_sync/kv_cache:kv_cache_listener",
         "//tpu_sync/transport:block_transport",
+        "//tpu_sync/transport:peer_endpoint",
     ],
 )
 
@@ -237,6 +238,7 @@ nanobind_extension(
         "//tpu_sync/kv_cache/reshard:reshard_client",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "//tpu_sync/telemetry/python:telemetry_binding",
+        "//tpu_sync/transport:peer_endpoint",
         "//tpu_sync/weight_sync:weight_synchronizer_base",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -266,6 +268,7 @@ nanobind_extension(
         "//tpu_sync/kv_cache:kv_cache_manager_with_transfer",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "//tpu_sync/transport:block_transport",
+        "//tpu_sync/transport:peer_endpoint",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
@@ -445,6 +448,7 @@ cc_library(
         "//tpu_sync/core/controller:worker_service_server",
         "//tpu_sync/kv_cache:kv_cache_listener",
         "//tpu_sync/transport:block_transport",
+        "//tpu_sync/transport:peer_endpoint",
     ],
 )
 

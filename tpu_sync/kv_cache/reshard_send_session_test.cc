@@ -29,6 +29,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/base/thread_annotations.h"
+#include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
@@ -962,6 +963,107 @@ TEST(ReshardSendSessionTest,
   EXPECT_EQ(receiver.uploaded_bytes(1), std::vector<uint8_t>(16, 0x5A));
   EXPECT_NE(receiver.uploaded_host_slot(0), std::nullopt);
   EXPECT_NE(receiver.uploaded_host_slot(1), std::nullopt);
+}
+
+// With op 6 routed over Peregrine, the send session must take the receiver's
+// Peregrine endpoint from the schedule entry (dst_peregrine_peer, paired with
+// dst_peer) and push through it: the bytes land on the receiver.
+TEST(ReshardSendSessionTest, PushesOverPeregrineWithScheduleEntryEndpoint) {
+  // Set before any manager: BlockTransport reads it once in its constructor.
+  auto cleanup =
+      absl::MakeCleanup([] { unsetenv("TPU_RAIDEN_ENABLE_PEREGRINE"); });
+  setenv("TPU_RAIDEN_ENABLE_PEREGRINE", "6", 1);
+  std::vector<kv_cache::PoolSpec> pools = {DensePool("fa")};
+
+  FakeD2hBase sender(/*num_layers=*/1, /*num_shards=*/1,
+                     /*slice_byte_size=*/128, /*local_port=*/std::nullopt,
+                     /*host_blocks_to_allocate=*/std::make_optional(4));
+  sender.set_node_id(0);
+  ABSL_ASSERT_OK(sender.RegisterPools(pools));
+  sender.FillOnCopy(/*pool_idx=*/0, 0xC3);
+
+  RecordingH2dReceiverBase receiver(/*num_layers=*/1);
+  ABSL_ASSERT_OK(receiver.RegisterPools(pools));
+  ASSERT_GT(receiver.transport_server()->peregrine_local_port(), 0);
+  const std::string peer = absl::StrCat(
+      receiver.local_ip(), ":", receiver.transport_server()->local_port());
+  const std::string peregrine_peer =
+      absl::StrCat(receiver.local_ip(), ":",
+                   receiver.transport_server()->peregrine_local_port());
+
+  sender.AttachPlaceholderDeviceHoldForTest();
+  receiver.AttachPlaceholderDeviceHoldForTest();
+  std::unique_ptr<StagingBlockAllocator> send_allocator =
+      CreateStagingBlockAllocator(&sender, /*num_slots=*/0, /*max_blocks=*/0);
+  std::unique_ptr<StagingBlockAllocator> recv_allocator =
+      CreateStagingBlockAllocator(&receiver, /*num_slots=*/0, /*max_blocks=*/0);
+
+  StartTransferRequest plan = ValidPlan(/*uuid=*/1405);
+  auto* entry = (*plan.mutable_shard_push_schedules())[0].mutable_entries(0);
+  entry->set_dst_peer(peer);
+  entry->set_dst_peregrine_peer(peregrine_peer);
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<TransferSession> recv_session,
+      CreateReshardReceiveSession(&receiver, recv_allocator.get(), plan,
+                                  std::vector<int64_t>{0}, deadline));
+  RouteSessionLookups(receiver, recv_session);
+  ABSL_ASSERT_OK(recv_session->Start());
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<TransferSession> send_session,
+      CreateReshardSendSession(&sender, send_allocator.get(),
+                               std::vector<int64_t>{0}, /*parallelism=*/1,
+                               deadline, plan));
+  RouteSessionLookups(sender, send_session);
+
+  ABSL_ASSERT_OK(send_session->Start());
+  ABSL_EXPECT_OK(send_session->AwaitForDone());
+  ABSL_EXPECT_OK(recv_session->AwaitForDone());
+
+  EXPECT_EQ(receiver.uploaded_bytes(0), std::vector<uint8_t>(16, 0xC3));
+  // The socket data port saw no connection: the push went over Peregrine.
+  EXPECT_EQ(sender.transport_server()->IdleConnectionCount(peer), 0u);
+}
+
+// The same plan without dst_peregrine_peer fails closed under op 6 over
+// Peregrine: the send settles with FailedPrecondition naming the data peer
+// instead of silently falling back to the socket backend.
+TEST(ReshardSendSessionTest,
+     PushOverPeregrineWithoutScheduleEntryEndpointFailsClosed) {
+  // Set before any manager: BlockTransport reads it once in its constructor.
+  auto cleanup =
+      absl::MakeCleanup([] { unsetenv("TPU_RAIDEN_ENABLE_PEREGRINE"); });
+  setenv("TPU_RAIDEN_ENABLE_PEREGRINE", "6", 1);
+  FakeD2hBase sender(/*num_layers=*/1, /*num_shards=*/1,
+                     /*slice_byte_size=*/128, /*local_port=*/std::nullopt,
+                     /*host_blocks_to_allocate=*/std::make_optional(4));
+  sender.set_node_id(0);
+  ABSL_ASSERT_OK(sender.RegisterPools({DensePool("fa")}));
+  sender.AttachPlaceholderDeviceHoldForTest();
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateStagingBlockAllocator(&sender, /*num_slots=*/0, /*max_blocks=*/0);
+
+  StartTransferRequest plan = ValidPlan(/*uuid=*/1406);
+  (*plan.mutable_shard_push_schedules())[0].mutable_entries(0)->set_dst_peer(
+      "127.0.0.1:1");
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<TransferSession> session,
+      CreateReshardSendSession(
+          &sender, allocator.get(), std::vector<int64_t>{0},
+          /*parallelism=*/1,
+          std::chrono::steady_clock::now() + std::chrono::seconds(10), plan));
+  RouteSessionLookups(sender, session);
+
+  ABSL_ASSERT_OK(session->Start());
+  ASSERT_TRUE(SettlesWithin(*session, absl::Seconds(10)));
+  EXPECT_THAT(session->AwaitForDone(),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       AllOf(HasSubstr("127.0.0.1:1"),
+                             HasSubstr("no Peregrine control endpoint"))));
 }
 
 // On a full host mirror (no num_staging_layers) every pool stages in its own

@@ -50,6 +50,7 @@
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/transport/block_transport.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
+#include "tpu_sync/transport/peer_endpoint.h"
 #include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
@@ -199,7 +200,7 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // not yet executed by this call; data rests in the peer's staging blocks and
   // the receiver's own machinery must move it to HBM (Phase 2).
   virtual absl::StatusOr<raiden::PjRtCopyFuture> H2dWrite(
-      absl::string_view peer,
+      transport::PeerEndpoint peer,
       const std::vector<int64_t>& src_host_offsets_major_dim,
       const std::vector<int64_t>& dst_host_offsets_major_dim,
       const std::vector<int64_t>& dst_device_offsets_major_dim,
@@ -209,7 +210,7 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // flow-ordered: remote host source -> LOCAL host staging (bridge, explicit;
   // caller-owned, never aliased to the remote id) -> local HBM destination.
   virtual absl::StatusOr<raiden::PjRtCopyFuture> H2dRead(
-      absl::string_view peer,
+      transport::PeerEndpoint peer,
       const std::vector<int64_t>& src_host_offsets_major_dim,
       const std::vector<int64_t>& dst_host_offsets_major_dim,
       const std::vector<int64_t>& dst_device_offsets_major_dim,
@@ -231,7 +232,7 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // flow-ordered: local HBM source -> LOCAL host staging (bridge, explicit;
   // caller-owned, never aliased to the remote id) -> remote host destination.
   virtual absl::StatusOr<raiden::PjRtCopyFuture> D2hWrite(
-      absl::string_view peer,
+      transport::PeerEndpoint peer,
       const std::vector<int64_t>& src_device_offsets_major_dim,
       const std::vector<int64_t>& src_host_offsets_major_dim,
       const std::vector<int64_t>& dst_host_offsets_major_dim,
@@ -252,22 +253,22 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
 
   // Symmetrical H2H writes E2E
   virtual absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>>
-  H2hWrite(const std::vector<std::string>& peers,
+  H2hWrite(const std::vector<transport::PeerEndpoint>& peers,
            const std::vector<int>& src_block_ids,
            const std::vector<int>& dst_block_ids = {}, uint64_t uuid = 0,
            int layer_idx = -1);
 
   virtual absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>>
-  H2hWrite(std::string peer, const std::vector<int>& src_block_ids,
+  H2hWrite(transport::PeerEndpoint peer, const std::vector<int>& src_block_ids,
            const std::vector<int>& dst_block_ids = {}, uint64_t uuid = 0,
            int layer_idx = -1);
 
   virtual absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>>
-  H2hRead(const std::vector<std::string>& peers,
+  H2hRead(const std::vector<transport::PeerEndpoint>& peers,
           const std::vector<int>& src_block_ids);
 
   virtual absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>>
-  H2hRead(std::string peer, const std::vector<int>& src_block_ids);
+  H2hRead(transport::PeerEndpoint peer, const std::vector<int>& src_block_ids);
 
   virtual std::string worker_id() const {
     if (!worker_id_.empty()) return worker_id_;
@@ -323,7 +324,7 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
       int staging_block_id) const;
 
   virtual absl::StatusOr<raiden::PjRtCopyFuture> H2hReadExplicit(
-      std::string peer, const std::vector<int>& src_block_ids,
+      transport::PeerEndpoint peer, const std::vector<int>& src_block_ids,
       const std::vector<int>& local_block_ids,
       const std::vector<uint8_t*>& explicit_dst_ptrs, int parallelism = 1,
       tpu_raiden::transport::MajorOrder major_order =

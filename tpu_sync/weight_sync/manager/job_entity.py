@@ -151,6 +151,7 @@ class JobEntity:
     self.transfer_rank: Optional[int] = None
     self.variables: Optional[list[Any]] = None
     self.computed_phys_mesh: Optional[list[int]] = None
+    self.peregrine_endpoints: list[str] = []
 
     initial_rep = getattr(unit, "job_replica_id", "") or ""
     if shards and initial_rep:
@@ -517,6 +518,7 @@ class JobEntity:
       transfer_rank: Optional[int] = None,
       variables: Optional[list[Any]] = None,
       unit: Optional[RaidenId] = None,
+      peregrine_endpoints: Sequence[str] = (),
   ) -> None:
     """Updates host registration (`unit.job_replica_id`), shards, and endpoints."""
     if unit is not None:
@@ -558,6 +560,7 @@ class JobEntity:
     self.transfer_parallelism = transfer_parallelism
     self.transfer_rank = transfer_rank
     self.variables = variables
+    self.peregrine_endpoints = list(peregrine_endpoints)
     if self._on_update is not None:
       self._on_update(self)
 
@@ -582,6 +585,7 @@ class JobEntity:
     reg_req.mesh_axes.extend(self.mesh_axes or ())
     reg_req.layout.extend(self.layout or ())
     reg_req.global_shape.extend(self.global_shape or ())
+    reg_req.peregrine_endpoints.extend(self.peregrine_endpoints)
     for pool in self.pool_manifest or ():
       reg_req.pools.add().CopyFrom(pool)
     if self.variables is not None:

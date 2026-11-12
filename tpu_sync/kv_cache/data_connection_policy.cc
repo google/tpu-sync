@@ -28,6 +28,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "tpu_sync/transport/block_transport.h"
+#include "tpu_sync/transport/peer_endpoint.h"
 
 namespace tpu_raiden {
 
@@ -52,16 +53,16 @@ absl::StatusOr<DataConnectionReuse> ResolveDataConnectionReuse() {
   return *parsed;
 }
 
-size_t ReleaseDataConnectionsAfterSend(transport::BlockTransport* transport,
-                                       absl::Span<const std::string> peers,
-                                       uint64_t uuid) {
+size_t ReleaseDataConnectionsAfterSend(
+    transport::BlockTransport* transport,
+    absl::Span<const transport::PeerEndpoint> peers, uint64_t uuid) {
   if (transport == nullptr) return 0;
   size_t closed = 0;
-  for (const std::string& peer : peers) {
-    const size_t n = transport->CloseIdleConnections(peer);
+  for (const transport::PeerEndpoint& peer : peers) {
+    const size_t n = transport->CloseIdleConnections(peer.data);
     if (n == 0) continue;
     closed += n;
-    LOG(INFO) << "Released " << n << " idle data connection(s) to " << peer
+    LOG(INFO) << "Released " << n << " idle data connection(s) to " << peer.data
               << " after send uuid=" << uuid
               << " (TPU_RAIDEN_DATA_CONN_REUSE=per_transfer)";
   }

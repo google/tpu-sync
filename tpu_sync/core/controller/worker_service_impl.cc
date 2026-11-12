@@ -40,6 +40,7 @@
 #include "tpu_sync/proto/transfer_program.pb.h"
 #include "tpu_sync/proto/worker_service.pb.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
+#include "tpu_sync/transport/peer_endpoint.h"
 
 namespace tpu_raiden {
 namespace controller {
@@ -278,10 +279,12 @@ grpc::Status WorkerServiceImpl::TransferBuffers(
                                             copy_sizes);
     } else if (transfer.dst_buffers_size() > 0 &&
                !transfer.dst_buffers(0).remote_address().empty()) {
-      std::string dst_peer = transfer.dst_buffers(0).remote_address();
       // Flow order: local device src -> local host staging -> remote host dst.
+      // remote_address is a socket data endpoint only: explicit pushes routed
+      // over Peregrine fail closed in the transport (no Peregrine endpoint).
       future_or = transfer_manager_.D2hWrite(
-          dst_peer, src_offsets, staging_host_offsets, dst_offsets, copy_sizes);
+          transport::PeerEndpoint(transfer.dst_buffers(0).remote_address()),
+          src_offsets, staging_host_offsets, dst_offsets, copy_sizes);
     } else {
       future_or = transfer_manager_.D2h(src_offsets, dst_offsets, copy_sizes);
     }
@@ -294,16 +297,16 @@ grpc::Status WorkerServiceImpl::TransferBuffers(
                                             copy_sizes);
     } else if (transfer.src_buffers_size() > 0 &&
                !transfer.src_buffers(0).remote_address().empty()) {
-      std::string src_peer = transfer.src_buffers(0).remote_address();
       // Flow order: remote host src -> local host staging -> local device dst.
       future_or = transfer_manager_.H2dRead(
-          src_peer, src_offsets, staging_host_offsets, dst_offsets, copy_sizes);
+          transport::PeerEndpoint(transfer.src_buffers(0).remote_address()),
+          src_offsets, staging_host_offsets, dst_offsets, copy_sizes);
     } else if (transfer.dst_buffers_size() > 0 &&
                !transfer.dst_buffers(0).remote_address().empty()) {
-      std::string dst_peer = transfer.dst_buffers(0).remote_address();
       // Flow order: local host src -> remote host staging -> remote device dst.
       future_or = transfer_manager_.H2dWrite(
-          dst_peer, src_offsets, staging_host_offsets, dst_offsets, copy_sizes);
+          transport::PeerEndpoint(transfer.dst_buffers(0).remote_address()),
+          src_offsets, staging_host_offsets, dst_offsets, copy_sizes);
     } else {
       future_or = transfer_manager_.H2d(src_offsets, dst_offsets, copy_sizes);
     }
@@ -316,11 +319,13 @@ grpc::Status WorkerServiceImpl::TransferBuffers(
   } else if (transfer.src_buffers_size() > 0 &&
              !transfer.src_buffers(0).remote_address().empty()) {
     future_or = transfer_manager_.H2hRead(
-        transfer.src_buffers(0).remote_address(), src_offsets, dst_offsets);
+        transport::PeerEndpoint(transfer.src_buffers(0).remote_address()),
+        src_offsets, dst_offsets);
   } else if (transfer.dst_buffers_size() > 0 &&
              !transfer.dst_buffers(0).remote_address().empty()) {
     future_or = transfer_manager_.H2hWrite(
-        transfer.dst_buffers(0).remote_address(), src_offsets, dst_offsets);
+        transport::PeerEndpoint(transfer.dst_buffers(0).remote_address()),
+        src_offsets, dst_offsets);
   } else {
     response->set_success(false);
     response->set_message("Peer address must be provided for H2H transfers");

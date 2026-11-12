@@ -92,6 +92,7 @@ struct ClientPoolSpans {
 struct RegisterWorkUnitArgs {
   RaidenId unit;
   std::vector<std::string> shards;
+  std::vector<std::string> peregrine_endpoints;
   // Python: control_plane_rpc_address if control_plane_rpc_address else ""
   std::string control_plane_rpc_address;
   // Python presence quirks preserved: `if mesh_shape:` — present-but-empty

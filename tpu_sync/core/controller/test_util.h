@@ -47,6 +47,7 @@
 #include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/backends/storage/posix_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
+#include "tpu_sync/transport/peer_endpoint.h"
 
 namespace tpu_raiden {
 namespace test_util_internal {
@@ -91,6 +92,7 @@ struct MockTransferManager {
   int h2h_read_calls = 0;
   int h2h_write_calls = 0;
   std::string last_peer;
+  std::string last_peregrine_peer;
   std::vector<int64_t> last_src_offsets;
   std::vector<int64_t> last_dst_offsets;
   std::vector<int64_t> last_staging_offsets;
@@ -114,12 +116,14 @@ struct MockTransferManager {
   }
 
   absl::StatusOr<raiden::PjRtCopyFuture> D2hWrite(
-      absl::string_view peer, const std::vector<int64_t>& src_device_offsets,
+      transport::PeerEndpoint peer,
+      const std::vector<int64_t>& src_device_offsets,
       const std::vector<int64_t>& src_host_offsets,
       const std::vector<int64_t>& dst_host_offsets,
       const std::vector<int64_t>& copy_sizes) {
     d2h_write_calls++;
-    last_peer = std::string(peer);
+    last_peer = std::move(peer.data);
+    last_peregrine_peer = std::move(peer.peregrine);
     last_src_offsets = src_device_offsets;
     last_staging_offsets = src_host_offsets;
     last_dst_offsets = dst_host_offsets;
@@ -152,12 +156,14 @@ struct MockTransferManager {
   }
 
   absl::StatusOr<raiden::PjRtCopyFuture> H2dWrite(
-      absl::string_view peer, const std::vector<int64_t>& src_host_offsets,
+      transport::PeerEndpoint peer,
+      const std::vector<int64_t>& src_host_offsets,
       const std::vector<int64_t>& dst_host_offsets,
       const std::vector<int64_t>& dst_device_offsets,
       const std::vector<int64_t>& copy_sizes) {
     h2d_write_calls++;
-    last_peer = std::string(peer);
+    last_peer = std::move(peer.data);
+    last_peregrine_peer = std::move(peer.peregrine);
     last_src_offsets = src_host_offsets;
     last_staging_offsets = dst_host_offsets;
     last_dst_offsets = dst_device_offsets;
@@ -166,12 +172,14 @@ struct MockTransferManager {
   }
 
   absl::StatusOr<raiden::PjRtCopyFuture> H2dRead(
-      absl::string_view peer, const std::vector<int64_t>& src_host_offsets,
+      transport::PeerEndpoint peer,
+      const std::vector<int64_t>& src_host_offsets,
       const std::vector<int64_t>& dst_host_offsets,
       const std::vector<int64_t>& dst_device_offsets,
       const std::vector<int64_t>& copy_sizes) {
     h2d_read_calls++;
-    last_peer = std::string(peer);
+    last_peer = std::move(peer.data);
+    last_peregrine_peer = std::move(peer.peregrine);
     last_src_offsets = src_host_offsets;
     last_staging_offsets = dst_host_offsets;
     last_dst_offsets = dst_device_offsets;
@@ -180,23 +188,25 @@ struct MockTransferManager {
   }
 
   absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>> H2hRead(
-      std::string peer, const std::vector<int>& src_block_ids,
+      transport::PeerEndpoint peer, const std::vector<int>& src_block_ids,
       const std::vector<int>& dst_block_ids = {}, uint64_t uuid = 0,
       int layer_idx = -1) {
     h2h_calls++;
     h2h_read_calls++;
-    last_peer = peer;
+    last_peer = std::move(peer.data);
+    last_peregrine_peer = std::move(peer.peregrine);
     last_src_offsets.assign(src_block_ids.begin(), src_block_ids.end());
     last_dst_offsets.assign(dst_block_ids.begin(), dst_block_ids.end());
     return std::make_pair(std::vector<int>{}, raiden::PjRtCopyFuture());
   }
   absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>> H2hWrite(
-      std::string peer, const std::vector<int>& src_block_ids,
+      transport::PeerEndpoint peer, const std::vector<int>& src_block_ids,
       const std::vector<int>& dst_block_ids = {}, uint64_t uuid = 0,
       int layer_idx = -1) {
     h2h_calls++;
     h2h_write_calls++;
-    last_peer = peer;
+    last_peer = std::move(peer.data);
+    last_peregrine_peer = std::move(peer.peregrine);
     last_src_offsets.assign(src_block_ids.begin(), src_block_ids.end());
     last_dst_offsets.assign(dst_block_ids.begin(), dst_block_ids.end());
     return std::make_pair(std::vector<int>{}, raiden::PjRtCopyFuture());

@@ -47,6 +47,7 @@
 #include "tpu_sync/frameworks/torch/weight_synchronizer.h"
 #include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/transport/peer_endpoint.h"
 #include "tpu_sync/kv_cache/kv_cache_store.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/kv_cache/kv_cache_store_wrapper.h"
@@ -345,10 +346,11 @@ NB_MODULE(_tpu_raiden_torch, m) {
           [](KVCacheManager& self, uint64_t uuid, const std::string& peer,
              const std::vector<int>& src_block_ids,
              const std::vector<int>& dst_block_ids, int layer_idx,
-             int parallelism) {
-            absl::Status status =
-                self.PushRegisteredPlan(uuid, peer, src_block_ids,
-                                        dst_block_ids, layer_idx, parallelism);
+             int parallelism, const std::string& peregrine_endpoint) {
+            absl::Status status = self.PushRegisteredPlan(
+                uuid,
+                tpu_raiden::transport::PeerEndpoint(peer, peregrine_endpoint),
+                src_block_ids, dst_block_ids, layer_idx, parallelism);
             if (!status.ok()) {
               throw std::runtime_error(
                   "KVCacheManager push_registered_plan failed: " +
@@ -357,7 +359,8 @@ NB_MODULE(_tpu_raiden_torch, m) {
           },
           nb::arg("uuid"), nb::arg("peer"), nb::arg("src_block_ids"),
           nb::arg("dst_block_ids"), nb::arg("layer_idx") = -1,
-          nb::arg("parallelism") = 1, nb::call_guard<nb::gil_scoped_release>())
+          nb::arg("parallelism") = 1, nb::arg("peregrine_endpoint") = "",
+          nb::call_guard<nb::gil_scoped_release>())
       .def(
           "read_block_bytes",
           [](KVCacheManager& self, size_t layer_idx, int block_id) {
@@ -586,6 +589,7 @@ NB_MODULE(_tpu_raiden_torch, m) {
                nb::dict d;
                d["endpoint"] = ep.endpoint;
                d["shards"] = ep.shards;
+               d["peregrine_endpoint"] = ep.peregrine_endpoint;
                py_eps.append(d);
              }
              return py_eps;
@@ -593,6 +597,8 @@ NB_MODULE(_tpu_raiden_torch, m) {
       .def_prop_ro("listener_port", &KVCacheManager::listener_port)
       .def_prop_ro("is_listener_active", &KVCacheManager::is_listener_active)
       .def_prop_ro("transfer_address", &KVCacheManager::transfer_address)
+      .def_prop_ro("peregrine_transfer_address",
+                   &KVCacheManager::peregrine_transfer_address)
       .def_prop_ro("listener_address", &KVCacheManager::listener_address)
 
       .def("notify_for_read", &KVCacheManager::NotifyForRead, nb::arg("req_id"),
@@ -1325,10 +1331,12 @@ NB_MODULE(_tpu_raiden_torch, m) {
              std::optional<int64_t> page_tokens,
              std::optional<int32_t> transfer_parallelism,
              std::optional<int32_t> transfer_rank, bool has_variables,
-             const std::vector<nb::bytes>& variables) {
+             const std::vector<nb::bytes>& variables,
+             const std::vector<std::string>& peregrine_endpoints) {
             tpu_raiden::kv_cache::reshard::RegisterWorkUnitArgs args;
             args.unit = ::tpu_raiden::kv_cache::reshardpb2::UnitOf(unit);
             args.shards = shards;
+            args.peregrine_endpoints = peregrine_endpoints;
             args.control_plane_rpc_address = control_plane_rpc_address;
             args.mesh_shape = mesh_shape;
             args.layout = layout;

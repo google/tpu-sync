@@ -61,6 +61,7 @@
 #include "tpu_sync/kv_cache/transfer_receive_session.h"
 #include "tpu_sync/kv_cache/transfer_send_session.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
+#include "tpu_sync/transport/peer_endpoint.h"
 #include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
@@ -293,7 +294,7 @@ class TestManager : private TestManagerH2hState,
     }
 
     void H2hWriteDirectAsync(
-        const std::vector<std::string>& peers,
+        const std::vector<transport::PeerEndpoint>& peers,
         const std::vector<int>& src_block_ids,
         const std::vector<int>& dst_block_ids, uint64_t uuid, int layer_idx,
         std::function<void(absl::StatusOr<std::vector<int>>)> on_complete)

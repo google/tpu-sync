@@ -33,19 +33,12 @@
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/transport/block_transport.h"
+#include "tpu_sync/transport/peer_endpoint.h"
 
 namespace nb = nanobind;
 
 namespace tpu_raiden {
 namespace {
-
-std::string FormatAddressWithPort(absl::string_view ip, int port) {
-  if (ip.find(':') != absl::string_view::npos && !ip.empty() &&
-      ip.front() != '[') {
-    return absl::StrCat("[", ip, "]:", port);
-  }
-  return absl::StrCat(ip, ":", port);
-}
 
 // Test/library role configuration of KVCacheManagerWithTransfer; not part of
 // the TPU serving path (scaffolding ledger A.4 classification; exported to
@@ -67,14 +60,21 @@ class HostKVCacheManager : public KVCacheManagerWithTransfer {
   std::string transfer_address() const {
     std::optional<int> port = base_->local_port();
     if (!port.has_value()) return "";
-    return FormatAddressWithPort(base_->local_ip(), *port);
+    return transport::FormatIpPort(base_->local_ip(), *port);
   }
 
-  absl::Status PushRegisteredPlan(uint64_t uuid, const std::string& peer,
+  std::string peregrine_transfer_address() const {
+    const int port = base_->peregrine_local_port();
+    if (port <= 0) return "";
+    return transport::FormatIpPort(base_->local_ip(), port);
+  }
+
+  absl::Status PushRegisteredPlan(uint64_t uuid,
+                                  const transport::PeerEndpoint& peer,
                                   const std::vector<int>& src_block_ids,
                                   const std::vector<int>& dst_block_ids,
                                   int layer_idx, int parallelism) {
-    if (peer.empty()) {
+    if (peer.data.empty()) {
       return absl::InvalidArgumentError("peer must not be empty");
     }
     if (src_block_ids.empty()) {
@@ -223,6 +223,8 @@ NB_MODULE(_tpu_raiden_host, m) {
           },
           nb::arg("block_array_idx"))
       .def_prop_ro("transfer_address", &HostKVCacheManager::transfer_address)
+      .def_prop_ro("peregrine_transfer_address",
+                   &HostKVCacheManager::peregrine_transfer_address)
       .def(
           "map_shared_memory",
           [](HostKVCacheManager& self, uintptr_t mapped_address,
@@ -251,6 +253,7 @@ NB_MODULE(_tpu_raiden_host, m) {
                nb::dict d;
                d["endpoint"] = ep.endpoint;
                d["shards"] = ep.shards;
+               d["peregrine_endpoint"] = ep.peregrine_endpoint;
                py_eps.append(d);
              }
              return py_eps;
@@ -299,15 +302,17 @@ NB_MODULE(_tpu_raiden_host, m) {
           [](HostKVCacheManager& self, uint64_t uuid, const std::string& peer,
              const std::vector<int>& src_block_ids,
              const std::vector<int>& dst_block_ids, int layer_idx,
-             int parallelism) {
+             int parallelism, const std::string& peregrine_endpoint) {
             ThrowIfError(
-                self.PushRegisteredPlan(uuid, peer, src_block_ids,
-                                        dst_block_ids, layer_idx, parallelism),
+                self.PushRegisteredPlan(
+                    uuid, transport::PeerEndpoint(peer, peregrine_endpoint),
+                    src_block_ids, dst_block_ids, layer_idx, parallelism),
                 "KVCacheManager push_registered_plan failed");
           },
           nb::arg("uuid"), nb::arg("peer"), nb::arg("src_block_ids"),
           nb::arg("dst_block_ids"), nb::arg("layer_idx") = -1,
-          nb::arg("parallelism") = 1, nb::call_guard<nb::gil_scoped_release>())
+          nb::arg("parallelism") = 1, nb::arg("peregrine_endpoint") = "",
+          nb::call_guard<nb::gil_scoped_release>())
       .def(
           "read_block_bytes",
           [](HostKVCacheManager& self, size_t layer_idx, int block_id) {

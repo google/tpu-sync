@@ -56,6 +56,7 @@
 #include "tpu_sync/core/utils.h"  // IWYU pragma: keep
 #include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/transport/peer_endpoint.h"
 #ifndef WITHOUT_PYTHON
 #include "tpu_sync/frameworks/jax/utils.h"
 
@@ -570,7 +571,8 @@ NumaAwareKVCacheManager::get_local_data_endpoints() const {
         shards = submanager_to_global_shards_[s];
       }
       for (const auto& sub_ep : sub_eps) {
-        res.push_back({sub_ep.endpoint, shards, sub_ep.layer_host_addrs});
+        res.push_back({sub_ep.endpoint, shards, sub_ep.layer_host_addrs,
+                       sub_ep.peregrine_endpoint});
       }
     }
   }
@@ -588,7 +590,8 @@ NumaAwareKVCacheManager::get_local_endpoints() const {
         shards = submanager_to_global_shards_[s];
       }
       for (const auto& sub_ep : sub_eps) {
-        res.push_back({sub_ep.endpoint, shards, sub_ep.layer_host_addrs});
+        res.push_back({sub_ep.endpoint, shards, sub_ep.layer_host_addrs,
+                       sub_ep.peregrine_endpoint});
       }
     }
   }
@@ -796,7 +799,7 @@ NumaAwareKVCacheManager::D2hAutoAllocate(
 }
 
 absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>>
-NumaAwareKVCacheManager::H2hWrite(std::string peer,
+NumaAwareKVCacheManager::H2hWrite(transport::PeerEndpoint peer,
                                   const std::vector<int>& src_block_ids,
                                   const std::vector<int>& dst_block_ids,
                                   uint64_t uuid, int layer_idx) {
@@ -805,10 +808,10 @@ NumaAwareKVCacheManager::H2hWrite(std::string peer,
   }
   std::string host_prefix;
   int base_port = -1;
-  size_t colon = peer.find_last_of(':');
+  size_t colon = peer.data.find_last_of(':');
   if (colon != std::string::npos) {
-    host_prefix = peer.substr(0, colon + 1);
-    if (!absl::SimpleAtoi(absl::string_view(peer).substr(colon + 1),
+    host_prefix = peer.data.substr(0, colon + 1);
+    if (!absl::SimpleAtoi(absl::string_view(peer.data).substr(colon + 1),
                           &base_port)) {
       base_port = -1;
     }
@@ -817,11 +820,14 @@ NumaAwareKVCacheManager::H2hWrite(std::string peer,
   std::vector<int> all_ids;
   std::vector<raiden::PjRtCopyFuture> sub_copy_futures;
   for (size_t s = 0; s < sub_managers_.size(); ++s) {
-    std::string sub_peer =
-        (base_port >= 0) ? host_prefix + std::to_string(base_port + s) : peer;
+    std::string sub_peer = (base_port >= 0)
+                               ? absl::StrCat(host_prefix, base_port + s)
+                               : peer.data;
     ABSL_ASSIGN_OR_RETURN(
-        auto res, sub_managers_[s]->base()->H2hWrite(
-                      sub_peer, src_block_ids, dst_block_ids, uuid, layer_idx));
+        auto res,
+        sub_managers_[s]->base()->H2hWrite(
+            transport::PeerEndpoint(std::move(sub_peer), peer.peregrine),
+            src_block_ids, dst_block_ids, uuid, layer_idx));
     if (s == 0) {
       all_ids = res.first;
     }
@@ -836,17 +842,17 @@ NumaAwareKVCacheManager::H2hWrite(std::string peer,
 }
 
 absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>>
-NumaAwareKVCacheManager::H2hRead(std::string peer,
+NumaAwareKVCacheManager::H2hRead(transport::PeerEndpoint peer,
                                  const std::vector<int>& src_block_ids) {
   if (sub_managers_.empty()) {
     return std::make_pair(std::vector<int>(), raiden::PjRtCopyFuture());
   }
   std::string host_prefix;
   int base_port = -1;
-  size_t colon = peer.find_last_of(':');
+  size_t colon = peer.data.find_last_of(':');
   if (colon != std::string::npos) {
-    host_prefix = peer.substr(0, colon + 1);
-    if (!absl::SimpleAtoi(absl::string_view(peer).substr(colon + 1),
+    host_prefix = peer.data.substr(0, colon + 1);
+    if (!absl::SimpleAtoi(absl::string_view(peer.data).substr(colon + 1),
                           &base_port)) {
       base_port = -1;
     }
@@ -855,10 +861,14 @@ NumaAwareKVCacheManager::H2hRead(std::string peer,
   std::vector<int> all_ids;
   std::vector<raiden::PjRtCopyFuture> sub_copy_futures;
   for (size_t s = 0; s < sub_managers_.size(); ++s) {
-    std::string sub_peer =
-        (base_port >= 0) ? host_prefix + std::to_string(base_port + s) : peer;
+    std::string sub_peer = (base_port >= 0)
+                               ? absl::StrCat(host_prefix, base_port + s)
+                               : peer.data;
     ABSL_ASSIGN_OR_RETURN(
-        auto res, sub_managers_[s]->base()->H2hRead(sub_peer, src_block_ids));
+        auto res,
+        sub_managers_[s]->base()->H2hRead(
+            transport::PeerEndpoint(std::move(sub_peer), peer.peregrine),
+            src_block_ids));
     if (s == 0) {
       all_ids = res.first;
     }
@@ -900,8 +910,9 @@ NumaAwareKVCacheManager::H2hWrite(
       matched_desc = &remote_descriptors[0];
     }
 
-    std::string matched_ep =
-        matched_desc != nullptr ? matched_desc->endpoint : "";
+    transport::PeerEndpoint matched_ep = matched_desc != nullptr
+                                             ? matched_desc->peer_endpoint()
+                                             : transport::PeerEndpoint{};
     sub_managers_[s]->base()->SetRemoteLayerAddrs(
         uuid, matched_desc != nullptr
                   ? matched_desc->layer_host_addrs
@@ -911,7 +922,7 @@ NumaAwareKVCacheManager::H2hWrite(
     };
 
     ABSL_ASSIGN_OR_RETURN(auto res, sub_managers_[s]->base()->H2hWrite(
-                                        matched_ep, src_block_ids,
+                                        std::move(matched_ep), src_block_ids,
                                         dst_block_ids, uuid, layer_idx));
     if (s == 0) {
       all_ids = res.first;
@@ -938,19 +949,19 @@ NumaAwareKVCacheManager::H2hRead(
 
   for (size_t s = 0; s < sub_managers_.size(); ++s) {
     const auto& sub_shards = submanager_to_global_shards_[s];
-    std::string matched_ep;
+    transport::PeerEndpoint matched_ep;
     for (const auto& desc : remote_descriptors) {
       for (int64_t gsh : sub_shards) {
         if (std::find(desc.shards.begin(), desc.shards.end(), gsh) !=
             desc.shards.end()) {
-          matched_ep = desc.endpoint;
+          matched_ep = desc.peer_endpoint();
           break;
         }
       }
-      if (!matched_ep.empty()) break;
+      if (!matched_ep.data.empty()) break;
     }
-    if (matched_ep.empty() && !remote_descriptors.empty()) {
-      matched_ep = remote_descriptors[0].endpoint;
+    if (matched_ep.data.empty() && !remote_descriptors.empty()) {
+      matched_ep = remote_descriptors[0].peer_endpoint();
     }
 
     ABSL_ASSIGN_OR_RETURN(
@@ -982,19 +993,19 @@ NumaAwareKVCacheManager::H2hReadExplicit(
   for (size_t s = 0; s < sub_managers_.size(); ++s) {
     // Same endpoint matching as the vector H2hRead/H2hWrite/H2dRead above.
     const auto& sub_shards = submanager_to_global_shards_[s];
-    std::string matched_ep;
+    transport::PeerEndpoint matched_ep;
     for (const auto& desc : remote_descriptors) {
       for (int64_t gsh : sub_shards) {
         if (std::find(desc.shards.begin(), desc.shards.end(), gsh) !=
             desc.shards.end()) {
-          matched_ep = desc.endpoint;
+          matched_ep = desc.peer_endpoint();
           break;
         }
       }
-      if (!matched_ep.empty()) break;
+      if (!matched_ep.data.empty()) break;
     }
-    if (matched_ep.empty() && !remote_descriptors.empty()) {
-      matched_ep = remote_descriptors[0].endpoint;
+    if (matched_ep.data.empty() && !remote_descriptors.empty()) {
+      matched_ep = remote_descriptors[0].peer_endpoint();
     }
 
     ABSL_ASSIGN_OR_RETURN(auto fut,
@@ -1024,19 +1035,19 @@ absl::StatusOr<raiden::PjRtCopyFuture> NumaAwareKVCacheManager::H2dRead(
     // sub-manager owns a shard of every block, so the block offsets are
     // identical across sub-managers; only the peer differs.
     const auto& sub_shards = submanager_to_global_shards_[s];
-    std::string matched_ep;
+    transport::PeerEndpoint matched_ep;
     for (const auto& desc : remote_descriptors) {
       for (int64_t gsh : sub_shards) {
         if (std::find(desc.shards.begin(), desc.shards.end(), gsh) !=
             desc.shards.end()) {
-          matched_ep = desc.endpoint;
+          matched_ep = desc.peer_endpoint();
           break;
         }
       }
-      if (!matched_ep.empty()) break;
+      if (!matched_ep.data.empty()) break;
     }
-    if (matched_ep.empty() && !remote_descriptors.empty()) {
-      matched_ep = remote_descriptors[0].endpoint;
+    if (matched_ep.data.empty() && !remote_descriptors.empty()) {
+      matched_ep = remote_descriptors[0].peer_endpoint();
     }
 
     ABSL_ASSIGN_OR_RETURN(auto fut,

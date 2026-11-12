@@ -287,6 +287,7 @@ NB_MODULE(_tpu_raiden_jax, m) {
                nb::dict d;
                d["endpoint"] = ep.endpoint;
                d["shards"] = ep.shards;
+               d["peregrine_endpoint"] = ep.peregrine_endpoint;
                py_eps.append(d);
              }
              return py_eps;

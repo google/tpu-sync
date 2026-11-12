@@ -62,6 +62,7 @@ message RaidenTransferEndpointProto {
   string endpoint = 1;
   repeated int64 shards = 2;
   repeated tpu_sync.rpc.PoolHostAddrsProto layer_host_addrs = 3;
+  string peregrine_endpoint = 4;
 }
 
 // A group of transfer endpoints owned by a single peer worker (a worker may

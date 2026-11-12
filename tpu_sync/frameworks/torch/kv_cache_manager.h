@@ -30,6 +30,7 @@
 #include "csrc/api/tensor_buffer.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/transport/peer_endpoint.h"
 
 namespace tpu_raiden {
 namespace controller {
@@ -82,9 +83,11 @@ class TorchKVCacheManager : public KVCacheManagerWithTransfer {
   bool is_listener_active() const;
 
   std::string transfer_address() const;
+  std::string peregrine_transfer_address() const;
   std::string listener_address() const;
 
-  absl::Status PushRegisteredPlan(uint64_t uuid, const std::string& peer,
+  absl::Status PushRegisteredPlan(uint64_t uuid,
+                                  const transport::PeerEndpoint& peer,
                                   const std::vector<int>& src_block_ids,
                                   const std::vector<int>& dst_block_ids,
                                   int layer_idx = -1, int parallelism = 1);
@@ -213,11 +216,16 @@ class KVCacheManager {
     return torch_manager_->transfer_address();
   }
 
+  std::string peregrine_transfer_address() const {
+    return torch_manager_->peregrine_transfer_address();
+  }
+
   std::string listener_address() const {
     return torch_manager_->listener_address();
   }
 
-  absl::Status PushRegisteredPlan(uint64_t uuid, const std::string& peer,
+  absl::Status PushRegisteredPlan(uint64_t uuid,
+                                  const transport::PeerEndpoint& peer,
                                   const std::vector<int>& src_block_ids,
                                   const std::vector<int>& dst_block_ids,
                                   int layer_idx = -1, int parallelism = 1) {
@@ -391,7 +399,7 @@ class KVCacheManager {
   }
 
   absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>> H2hWrite(
-      const std::vector<std::string>& peers,
+      const std::vector<transport::PeerEndpoint>& peers,
       const std::vector<int>& src_block_ids,
       const std::vector<int>& dst_block_ids = {}, uint64_t uuid = 0,
       int layer_idx = -1) {
@@ -400,7 +408,7 @@ class KVCacheManager {
   }
 
   absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>> H2hWrite(
-      std::string peer, const std::vector<int>& src_block_ids,
+      transport::PeerEndpoint peer, const std::vector<int>& src_block_ids,
       const std::vector<int>& dst_block_ids = {}, uint64_t uuid = 0,
       int layer_idx = -1) {
     return torch_manager_->base()->H2hWrite(std::move(peer), src_block_ids,
@@ -408,13 +416,13 @@ class KVCacheManager {
   }
 
   absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>> H2hRead(
-      const std::vector<std::string>& peers,
+      const std::vector<transport::PeerEndpoint>& peers,
       const std::vector<int>& src_block_ids) {
     return torch_manager_->base()->H2hRead(peers, src_block_ids);
   }
 
   absl::StatusOr<std::pair<std::vector<int>, raiden::PjRtCopyFuture>> H2hRead(
-      std::string peer, const std::vector<int>& src_block_ids) {
+      transport::PeerEndpoint peer, const std::vector<int>& src_block_ids) {
     return torch_manager_->base()->H2hRead(std::move(peer), src_block_ids);
   }
 

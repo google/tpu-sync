@@ -68,6 +68,7 @@
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/logical_block_manager.h"
+#include "tpu_sync/telemetry/exporter_util.h"
 
 ABSL_FLAG(std::string, role, "", "Role: sender or receiver");
 ABSL_FLAG(std::string, control_ip, "127.0.0.1", "Local control IP");
@@ -760,7 +761,8 @@ int main(int argc, char* argv[]) {
       }
       allocated_block_ids.push_back(src_block_ids);
 
-      std::string peer_addr = absl::StrFormat("%s:%d", remote.ip, remote.port);
+      std::string peer_addr =
+          tpu_raiden::telemetry::JoinHostPort(remote.ip, remote.port);
       mapped_peer_addresses.push_back(peer_addr);
       managers.push_back(std::move(manager));
     }

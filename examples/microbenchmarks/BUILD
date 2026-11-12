@@ -24,6 +24,7 @@ cc_binary(
         "//tpu_sync/core:tpu_utils",
         "//tpu_sync/kv_cache:kv_cache_manager_base",
         "//tpu_sync/kv_cache:logical_block_manager",
+        "//tpu_sync/telemetry:exporter_util",
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/flags:parse",
         "@com_google_absl//absl/status",

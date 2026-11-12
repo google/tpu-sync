@@ -18,6 +18,7 @@ import collections
 import threading
 import timeit
 from typing import Any
+from unittest import mock
 
 from absl import logging
 from absl.testing import absltest
@@ -1127,6 +1128,103 @@ class ReshardPlannerTest(absltest.TestCase):
             6: False,
         },
     )
+
+  def _pair_warning_messages(self, warn_mock: mock.MagicMock) -> list[str]:
+    return [
+        call.args[0] % call.args[1:]
+        for call in warn_mock.call_args_list
+        if "peer_control_endpoints" in (call.args[0] if call.args else "")
+    ]
+
+  def test_pair_host_endpoints_cases_and_warning_dedup(self) -> None:
+    """Verifies pairing cases and per-warned_units set warning dedup."""
+    host_proto = raiden_service_pb2.HostEndpointsProto
+    pair_fn = reshard_planner.pair_host_endpoints
+    valid_host = host_proto(
+        control_address="10.0.0.1:9000",
+        shards=["10.0.0.1:8000", "10.0.0.1:8001"],
+    )
+    self.assertEqual(
+        pair_fn(RaidenId("sampler", "0", "weights"), [valid_host]),
+        {"10.0.0.1:8000": "10.0.0.1:9000", "10.0.0.1:8001": "10.0.0.1:9000"},
+    )
+    bad_cases = [
+        ("empty_ctrl", [("", ["10.0.0.2:8000"])], "10.0.0.2:8000"),
+        (
+            "multi_ctrl",
+            [("10.0.0.3:9000,10.0.0.4:9000", ["10.0.0.3:8000"])],
+            "10.0.0.3:9000",
+        ),
+        ("no_hosts", [], "no HostEndpointsProto"),
+        (
+            "multi_hosts",
+            [
+                ("10.0.0.5:9000", ["10.0.0.5:8000"]),
+                ("10.0.0.6:9000", ["10.0.0.6:8000"]),
+            ],
+            "10.0.0.5:9000",
+        ),
+    ]
+    warned_a, warned_b = set(), set()
+    for name, host_specs, expected_token in bad_cases:
+      unit = RaidenId("s", name, "w")
+      hosts = [host_proto(control_address=c, shards=s) for c, s in host_specs]
+      with self.subTest(case=name), mock.patch.object(
+          logging, "warning", wraps=logging.warning
+      ) as warn_mock:
+        for warned, count in ((warned_a, 1), (warned_a, 1), (warned_b, 2)):
+          self.assertEqual(pair_fn(unit, hosts, warned), {})
+          messages = self._pair_warning_messages(warn_mock)
+          self.assertLen(messages, count)
+          self.assertIn(str(unit), messages[-1])
+          self.assertIn(expected_token, messages[-1])
+
+  def test_planner_builds_peer_control_endpoints_from_metadata(self) -> None:
+    """Verifies ReshardPlanner pairs metadata.hosts per destination unit."""
+    src_unit = RaidenId("trainer", "0", "weights")
+    dst_units = [RaidenId("sampler", str(i), "weights") for i in (0, 1)]
+    var_metadata = [
+        controller_types.VariableMetadata(
+            name="w",
+            shape=[128, 128],
+            mesh_shape=[1, 1],
+            layout=[1, 0],
+            item_size=4,
+            layer_idx=0,
+            sharding_spec=["", ""],
+            global_shard_indices=[0] * 8,
+        )
+    ]
+    planner_kwargs = self._build_planner_inputs(
+        src_vars_by_unit={src_unit: var_metadata},
+        dst_vars_by_unit={unit: var_metadata for unit in dst_units},
+        src_phys_mesh=[1, 1],
+        dst_phys_mesh=[1, 1],
+        dst_mesh_axes=["x", "y"],
+    )
+    for meta in planner_kwargs["dst_metadata"]:
+      meta.hosts.add(
+          control_address=meta.control_plane_rpc_address, shards=meta.shards
+      )
+    compute_schedule = (
+        reshard_planner.ReshardPlanner.compute_transfer_schedule_from_metadata
+    )
+    schedule = compute_schedule(**planner_kwargs)
+    self.assertEqual(
+        schedule.peer_control_endpoints,
+        {
+            **{f"10.1.0.1:{8000 + d}": "10.1.0.1:9000" for d in range(8)},
+            **{f"10.1.0.2:{8000 + d}": "10.1.0.2:9000" for d in range(8)},
+        },
+    )
+    for meta in planner_kwargs["dst_metadata"]:
+      meta.ClearField("hosts")
+    with mock.patch.object(
+        logging, "warning", wraps=logging.warning
+    ) as warn_mock:
+      no_hosts = compute_schedule(**planner_kwargs)
+    self.assertEqual(no_hosts.peer_control_endpoints, {})
+    self.assertLen(self._pair_warning_messages(warn_mock), 2)
 
 
 if __name__ == "__main__":

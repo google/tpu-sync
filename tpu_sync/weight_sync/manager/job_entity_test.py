@@ -15,7 +15,9 @@
 """Unit tests for JobEntity host dispatch and request encoding."""
 
 import asyncio
+import dataclasses
 from typing import Any
+from unittest import mock
 
 from absl.testing import absltest
 
@@ -684,6 +686,152 @@ class JobEntityTest(absltest.TestCase):
       )
     finally:
       client.close()
+
+  def _encode_req(
+      self,
+      entity: job_entity.JobEntity,
+      plan: controller_types.TransferPlan,
+      control_address: str = "10.11.0.1:9000",
+      unit: Any = None,
+  ) -> tuple[raiden_service_pb2.ControlRequest, dict[str, str], bytes]:
+    req = raiden_service_pb2.ControlRequest()
+    payload = entity.encode_start_transfer(
+        plan, control_address, unit or self.src_unit
+    )
+    req.ParseFromString(payload)
+    return req, dict(req.start_transfer_request.peer_control_endpoints), payload
+
+  def _make_entity(self, unit: Any, ip_suffix: int) -> job_entity.JobEntity:
+    entity = job_entity.JobEntity(
+        unit=unit,
+        shards=[f"10.11.0.{ip_suffix}:8000"],
+        control_endpoints=[f"10.11.0.{ip_suffix}:9000"],
+        control_pipe=self.pipe_stub,
+    )
+    self.addCleanup(entity.worker_rpc_client.close)
+    return entity
+
+  def _make_ws_plan(self, **overrides: Any) -> controller_types.TransferPlan:
+    return controller_types.TransferPlan(
+        src_units=[self.src_unit],
+        dst_units=[self.dst_unit],
+        plan=None,
+        shard_push_schedules={self.src_unit: {0: [self._make_dummy_entry(0)]}},
+        worker_data_addresses={
+            self.src_unit: ["10.11.0.1:8000"],
+            self.dst_unit: ["10.11.0.3:8000"],
+        },
+        use_block_chunks=True,
+        is_sender=True,
+        is_weight_sync=True,
+        **overrides,
+    )
+
+  def test_encode_start_transfer_peer_control_endpoints_filtering_and_roles(
+      self,
+  ) -> None:
+    """Verifies exact pushed-peer filtering across planned/planless/recv."""
+    src_entity = self._make_entity(self.src_unit, 1)
+    dst_entity = self._make_entity(self.dst_unit, 3)
+
+    def _sched(dst_peer: str, dst_peers: tuple[str, ...] = ()) -> Any:
+      return raiden_service_pb2.ShardPushScheduleProto(
+          entries=[
+              raiden_service_pb2.ShardPushEntryProto(
+                  dst_peer=dst_peer, dst_peers=list(dst_peers), size_bytes=1024
+              )
+          ]
+      )
+
+    full_map = {
+        f"10.11.0.{i}:8000": f"10.11.0.{i}:9000" for i in (3, 4, 5, 77, 99)
+    }
+    planned = self._make_ws_plan(
+        sender_push_schedule_protos={
+            self.src_unit: {
+                0: _sched("10.11.0.3:8000"),
+                1: _sched(
+                    "10.11.0.77:8000", ("10.11.0.4:8000", "10.11.0.5:8000")
+                ),
+            }
+        },
+        peer_control_endpoints=full_map,
+    )
+    req_planned, planned_eps, _ = self._encode_req(src_entity, planned)
+    expected_pushed = {"10.11.0.3:8000", "10.11.0.4:8000", "10.11.0.5:8000"}
+    self.assertEmpty(req_planned.peers)
+    self.assertNotIn("10.11.0.77:8000", planned_eps)
+    self.assertEqual(
+        planned_eps, {peer: full_map[peer] for peer in expected_pushed}
+    )
+
+    recv_plan = dataclasses.replace(
+        planned,
+        shard_push_schedules={},
+        sender_push_schedule_protos={},
+        use_block_chunks=False,
+        is_sender=False,
+        is_weight_sync=False,
+    )
+    _, recv_eps, _ = self._encode_req(
+        dst_entity, recv_plan, "10.11.0.3:9000", self.dst_unit
+    )
+    self.assertEmpty(recv_eps)
+
+    planless = dataclasses.replace(
+        recv_plan,
+        plan={self.src_unit: {0: [(self.dst_unit, 0, [[(0, 1024)]])]}},
+        is_sender=True,
+    )
+    req_planless, planless_eps, _ = self._encode_req(src_entity, planless)
+    self.assertTrue(req_planless.start_transfer_request.is_sender)
+    self.assertEqual(planless_eps, {"10.11.0.3:8000": "10.11.0.3:9000"})
+    self.assertEqual(set(planless_eps), set(req_planless.peers))
+
+  def test_encode_start_transfer_payload_cache_keys_and_template_hit(
+      self,
+  ) -> None:
+    """Verifies cache keys, template hits, and precomputed key skips sort."""
+    entity = self._make_entity(self.src_unit, 1)
+    endpoint_map = {f"10.11.0.{i}:8000": f"10.11.0.{i}:9000" for i in (3, 99)}
+    base = self._make_ws_plan(
+        peer_control_endpoints=endpoint_map,
+        peer_control_endpoints_key=tuple(sorted(endpoint_map.items())),
+        uuid=1,
+        req_id="r1",
+        cached_serialized_payloads={},
+    )
+    with mock.patch.object(
+        entity, "_raiden_id_to_proto", wraps=entity._raiden_id_to_proto
+    ) as proto_mock, mock.patch("builtins.sorted", wraps=sorted) as sorted_mock:
+      _, _, payload = self._encode_req(entity, base)
+      self.assertEqual(sorted_mock.call_count, 1)
+      first_miss_count = proto_mock.call_count
+      self.assertGreater(first_miss_count, 0)
+      self.assertEqual(self._encode_req(entity, base)[2], payload)
+      self._encode_req(entity, dataclasses.replace(base, req_id="r1_steady"))
+      self.assertEqual(proto_mock.call_count, first_miss_count)
+
+      req_template, template_eps, _ = self._encode_req(
+          entity, dataclasses.replace(base, uuid=2, req_id="r2")
+      )
+      self.assertEqual(proto_mock.call_count, first_miss_count)
+      self.assertEqual(sorted_mock.call_count, 4)
+      self.assertEqual(req_template.start_transfer_request.uuid, 2)
+      self.assertEqual(template_eps, {"10.11.0.3:8000": "10.11.0.3:9000"})
+
+      sorted_mock.reset_mock()
+      updated = dataclasses.replace(
+          base,
+          uuid=2,
+          req_id="r2",
+          peer_control_endpoints={"10.11.0.3:8000": "10.11.0.3:9099"},
+          peer_control_endpoints_key=None,
+      )
+      _, updated_eps, _ = self._encode_req(entity, updated)
+      self.assertEqual(sorted_mock.call_count, 2)
+      self.assertGreater(proto_mock.call_count, first_miss_count)
+      self.assertEqual(updated_eps, {"10.11.0.3:8000": "10.11.0.3:9099"})
 
 
 if __name__ == "__main__":

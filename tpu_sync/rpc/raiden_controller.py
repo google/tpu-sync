@@ -63,6 +63,7 @@ WeightSyncWorkerRpcClient = job_entity.WeightSyncWorkerRpcClient
 WorkerRpcClient = job_entity.WorkerRpcClient
 
 ReshardPlanner = reshard_planner.ReshardPlanner
+pair_host_endpoints = reshard_planner.pair_host_endpoints
 _get_global_indices = reshard_planner.get_global_indices
 generate_strided_copy_chunks = reshard_planner.generate_strided_copy_chunks
 generate_strided_copy_chunks_tile_aware = (
@@ -89,6 +90,11 @@ class _HostRecord:
 
   endpoints: tuple[str, ...]
   shards: tuple[str, ...]
+
+  @property
+  def control_address(self) -> str:
+    """Returns endpoints formatted as HostEndpointsProto.control_address."""
+    return ",".join(self.endpoints)
 
 
 class _EntityBroadcastDispatcher:
@@ -200,6 +206,9 @@ class RaidenController:
     # Explicit per-unit registration snapshots for GetMetadataResponse.hosts;
     # guarded by self._lock.
     self._registration_records: dict[RaidenId, _HostRecord] = {}
+    # Units already warned about unpaired/missing control endpoints; guarded by
+    # self._lock.
+    self._warned_unpaired_units: set[RaidenId] = set()
     self._planner = ReshardPlanner()
 
   @property
@@ -662,7 +671,7 @@ class RaidenController:
         self._plan_cache.pop(k, None)
 
   def clear_plan_cache(self) -> None:
-    """Clears all cached transfer schedules."""
+    """Clears all cached transfer schedules, including remote peer endpoints."""
     with self._lock:
       self._plan_cache.clear()
 
@@ -839,6 +848,7 @@ class RaidenController:
         req_id=req_id,
         uuid=uuid,
         pipeline_target_stages=self.broadcast_pipeline_stages,
+        warned_units=self._warned_unpaired_units,
     )
     common.record_histogram(
         "weight_sync_schedule_generation_time_ms",
@@ -1068,6 +1078,8 @@ class RaidenController:
       dst_block_counts: Optional[Sequence[int]] = None,
       skip_tiling: Optional[dict[int, bool]] = None,
       group_size: int = 1,
+      # True freezes remote receivers' peer_control_endpoints across listener
+      # port re-registrations; pass False or call clear_plan_cache() to refresh.
       use_cached_plan: bool = True,
       expected_layer_chunk_counts: Optional[dict[int, int]] = None,
       host_tiling_mode: int = raiden_service_pb2.HOST_TILING_MODE_UNSPECIFIED,
@@ -1159,6 +1171,18 @@ class RaidenController:
 
       rpc_addresses = self.get_entity_rpc_addresses()
       data_addresses = {unit: self._resolve_shards(unit) for unit in dst_units}
+      peer_control_endpoints: dict[str, str] = {}
+      with self._lock:
+        for unit in dst_units:
+          rec = self._valid_registration_record_locked(unit)
+          peer_control_endpoints.update(
+              pair_host_endpoints(
+                  unit,
+                  [rec] if rec is not None else (),
+                  warned_units=self._warned_unpaired_units,
+              )
+          )
+      peer_control_endpoints_key = tuple(sorted(peer_control_endpoints.items()))
 
       plan = TransferPlan(
           src_units=[selected_src],
@@ -1167,9 +1191,12 @@ class RaidenController:
           shard_push_schedules={},
           worker_rpc_addresses=rpc_addresses,
           worker_data_addresses=data_addresses,
+          peer_control_endpoints=peer_control_endpoints,
+          peer_control_endpoints_key=peer_control_endpoints_key,
           uuid=uuid,
           dst_mem_type=dst_mem_type,
           use_block_chunks=False,
+          is_sender=True,
           skip_d2h=skip_d2h,
       )
       with self._lock:
@@ -1358,6 +1385,37 @@ class RaidenController:
           rpc_addresses = dict(cached_schedule.rpc_addresses)
           rpc_addresses.update(self.get_entity_rpc_addresses())
           data_addresses = cached_schedule.data_addresses
+          # `use_cached_plan=True` freezes remote receivers'
+          # `peer_control_endpoints` alongside `rpc_addresses`/`data_addresses`;
+          # a remote receiver that re-registers on a new listener port requires
+          # `use_cached_plan=False` or `clear_plan_cache()`.
+          if not dst_controller_address:
+            with self._lock:
+              peer_control_endpoints = dict(
+                  cached_schedule.peer_control_endpoints
+              )
+              for unit in dst_units:
+                if (
+                    unit in self._registered_shards
+                    or unit in self._registration_records
+                ):
+                  for shard_key in set(data_addresses.get(unit, ())) | set(
+                      self._registered_shards.get(unit, ())
+                  ):
+                    peer_control_endpoints.pop(shard_key, None)
+                  rec = self._valid_registration_record_locked(unit)
+                  peer_control_endpoints.update(
+                      pair_host_endpoints(
+                          unit,
+                          [rec] if rec is not None else (),
+                          warned_units=self._warned_unpaired_units,
+                      )
+                  )
+          else:
+            peer_control_endpoints = cached_schedule.peer_control_endpoints
+          peer_control_endpoints_key = tuple(
+              sorted(peer_control_endpoints.items())
+          )
           dst_unit_counts = cached_schedule.dst_unit_counts
           endpoint_to_shards: dict[Any, set[int]] = {}
           for u in (*src_units, *dst_units):
@@ -1518,6 +1576,8 @@ class RaidenController:
               shard_push_schedules=all_push_schedules,
               worker_rpc_addresses=rpc_addresses,
               worker_data_addresses=data_addresses,
+              peer_control_endpoints=peer_control_endpoints,
+              peer_control_endpoints_key=peer_control_endpoints_key,
               uuid=uuid,
               dst_mem_type=dst_mem_type,
               use_block_chunks=use_block_chunks,

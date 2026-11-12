@@ -1497,6 +1497,10 @@ class BroadcastEngine:
                     if final_plan.worker_data_addresses is not None
                     else {}
                 ),
+                peer_control_endpoints=final_plan.peer_control_endpoints,
+                peer_control_endpoints_key=(
+                    final_plan.peer_control_endpoints_key
+                ),
                 uuid=hop_uuid,
                 dst_mem_type=dst_mem_type,
                 use_block_chunks=True,
@@ -1615,6 +1619,10 @@ class BroadcastEngine:
                   dict(final_plan.worker_data_addresses)
                   if final_plan.worker_data_addresses is not None
                   else {}
+              ),
+              peer_control_endpoints=final_plan.peer_control_endpoints,
+              peer_control_endpoints_key=(
+                  final_plan.peer_control_endpoints_key
               ),
               uuid=hop_uuid,
               dst_mem_type=dst_mem_type,
@@ -1744,6 +1752,8 @@ class BroadcastEngine:
                 if final_plan.worker_data_addresses is not None
                 else {}
             ),
+            peer_control_endpoints=final_plan.peer_control_endpoints,
+            peer_control_endpoints_key=final_plan.peer_control_endpoints_key,
             uuid=hop_uuid,
             dst_mem_type=dst_mem_type,
             use_block_chunks=True,

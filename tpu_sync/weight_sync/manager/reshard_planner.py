@@ -507,6 +507,84 @@ def compute_bandwidth_matched_seed(
   )
 
 
+def pair_host_endpoints(
+    unit: RaidenId,
+    hosts: Sequence[Any],
+    warned_units: Optional[set[RaidenId]] = None,
+) -> dict[str, str]:
+  """Pairs |unit|'s shard data endpoints with its single control endpoint.
+
+  Args:
+    unit: Work unit identifier whose host record is being paired.
+    hosts: Sequence of HostEndpointsProto-like objects with |control_address|
+      and |shards| attributes.
+    warned_units: Optional per-instance set of units already warned about to
+      suppress repeated warnings across calls. Uses a call-local set when None,
+      so separate calls with None will log again.
+
+  Returns:
+    Mapping from shard data endpoint ("ip:port") to its single control-plane
+    listener address ("ip:port"), or {} when no unambiguous 1-to-N pairing
+    exists (logging a warning deduplicated against |warned_units| when provided,
+    or once within the call when None).
+  """
+  warned = warned_units if warned_units is not None else set()
+
+  def _warn_once(fmt: str, *args: Any) -> None:
+    if unit not in warned:
+      warned.add(unit)
+      logging.warning(fmt, *args)
+
+  host_list = list(hosts or ())
+  if not host_list:
+    _warn_once(
+        "Unit %s has no HostEndpointsProto registration record; omitting"
+        " peer_control_endpoints.",
+        unit,
+    )
+    return {}
+  if len(host_list) > 1:
+    control_addresses = [getattr(h, "control_address", "") for h in host_list]
+    shards = []
+    for h in host_list:
+      shards.extend(str(s) for s in getattr(h, "shards", ()) if s)
+    _warn_once(
+        "Unit %s has %d HostEndpointsProto records (control_addresses=%s,"
+        " shards=%s), expected 1; omitting peer_control_endpoints.",
+        unit,
+        len(host_list),
+        control_addresses,
+        shards,
+    )
+    return {}
+
+  host = host_list[0]
+  control_address = str(getattr(host, "control_address", "") or "")
+  endpoints = [ep.strip() for ep in control_address.split(",") if ep.strip()]
+  shards = [str(s) for s in getattr(host, "shards", ()) if s]
+  if not endpoints:
+    _warn_once(
+        "Unit %s has no registered control endpoint (control_address=%r,"
+        " shards=%s); omitting peer_control_endpoints.",
+        unit,
+        control_address,
+        shards,
+    )
+    return {}
+  if len(endpoints) > 1:
+    _warn_once(
+        "Unit %s has %d control endpoints (%s) for shards=%s, cannot tell"
+        " which serves which data endpoint; omitting peer_control_endpoints.",
+        unit,
+        len(endpoints),
+        endpoints,
+        shards,
+    )
+    return {}
+  warned.discard(unit)
+  return {shard: endpoints[0] for shard in shards}
+
+
 class ReshardPlanner:
   """Computes resharding schedules across registered source and destination JobEntities."""
 
@@ -616,6 +694,7 @@ class ReshardPlanner:
       req_id: str = "warmup",
       uuid: Any = "",
       pipeline_target_stages: int = _PIPELINE_TARGET_STAGES,
+      warned_units: Optional[set[RaidenId]] = None,
   ) -> _CachedTransferSchedule:
     """Computes transfer schedule math and returns a _CachedTransferSchedule."""
     if group_size <= 0:
@@ -1599,11 +1678,16 @@ class ReshardPlanner:
 
     # Build rpc_addresses for local source workers
     rpc_addresses = dict(worker_endpoints)
+    warned = warned_units if warned_units is not None else set()
+    dst_unit_set = set(dst_units)
+    dst_meta_by_unit: dict[RaidenId, Any] = {}
     # Merge destination rpc addresses from metadata
     for meta in dst_metadata:
       unit = _raiden_id_from_proto(meta.unit)
       if meta.control_plane_rpc_address:
         rpc_addresses[unit] = meta.control_plane_rpc_address
+      if unit in dst_unit_set:
+        dst_meta_by_unit[unit] = meta
 
     data_addresses = {unit: [] for unit in dst_units}
     for meta in dst_metadata:
@@ -1614,6 +1698,15 @@ class ReshardPlanner:
       with lock:
         if unit in registered_shards:
           data_addresses[unit] = list(registered_shards[unit])
+
+    peer_control_endpoints: dict[str, str] = {}
+    with lock:
+      for unit in dst_units:
+        meta = dst_meta_by_unit.get(unit)
+        hosts = getattr(meta, "hosts", ()) if meta is not None else ()
+        peer_control_endpoints.update(
+            pair_host_endpoints(unit, hosts, warned_units=warned)
+        )
 
     if not shard_push_schedules:
       direct_schedules = {}
@@ -1833,6 +1926,7 @@ class ReshardPlanner:
         direct_dsts=list(direct_dsts),
         rpc_addresses=dict(rpc_addresses),
         data_addresses=data_addresses,
+        peer_control_endpoints=peer_control_endpoints,
         dst_unit_counts=dst_unit_counts,
         dst_endpoint_counts=dst_endpoint_counts,
         dst_endpoint_layer_counts=dst_endpoint_layer_counts,

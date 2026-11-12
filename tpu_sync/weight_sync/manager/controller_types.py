@@ -225,6 +225,9 @@ class _CachedTransferSchedule:
   direct_dsts: list[Any] = dataclasses.field(default_factory=list)
   rpc_addresses: dict[Any, str] = dataclasses.field(default_factory=dict)
   data_addresses: dict[Any, list[str]] = dataclasses.field(default_factory=dict)
+  peer_control_endpoints: dict[str, str] = dataclasses.field(
+      default_factory=dict
+  )
   dst_unit_counts: dict[Any, int] = dataclasses.field(default_factory=dict)
   dst_endpoint_counts: dict[str, int] = dataclasses.field(default_factory=dict)
   dst_endpoint_layer_counts: dict[str, dict[int, int]] = dataclasses.field(
@@ -318,6 +321,14 @@ class TransferPlan:
   worker_data_addresses: dict[RaidenId, list[str]] = dataclasses.field(
       default_factory=dict
   )
+  # Maps peer Data TCP endpoint ("ip:port") to its Peregrine control-plane
+  # listener address ("ip:port"). Treated as immutable once attached to a plan.
+  peer_control_endpoints: dict[str, str] = dataclasses.field(
+      default_factory=dict
+  )
+  # Precomputed sorted-items key for |peer_control_endpoints| built once per
+  # transfer for payload-cache lookup; None falls back to sorting on encode.
+  peer_control_endpoints_key: Optional[tuple[tuple[str, str], ...]] = None
   uuid: int = 0
   dst_mem_type: int = RaidenMemoryType.DRAM
   use_block_chunks: bool = False

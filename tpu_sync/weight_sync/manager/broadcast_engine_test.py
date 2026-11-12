@@ -2374,6 +2374,93 @@ class BroadcastEngineTest(absltest.TestCase):
     for plan in receiver_plans:
       self.assertEqual(plan.expected_block_count, num_layers)
 
+  def test_peer_control_endpoints_passed_by_ref_on_senders_only(
+      self,
+  ) -> None:
+    """Verifies sender plans share endpoints by ref and receivers omit them."""
+    src = RaidenId("trainer", "0", "w")
+    seed = RaidenId("sampler", "0", "w")
+    relay = RaidenId("sampler", "1", "w")
+    endpoint_map = {f"10.0.1.{i}:8000": f"10.0.1.{i}:9000" for i in (0, 1)}
+    endpoint_key = tuple(sorted(endpoint_map.items()))
+    data_addresses = {
+        src: ["10.0.0.1:8000"],
+        seed: ["10.0.1.0:8000"],
+        relay: ["10.0.1.1:8000"],
+    }
+    stage_group = controller_types.StageBroadcastGroup(
+        pool_group=0,
+        layer_group_idx=0,
+        src_units=[src],
+        dst_units=[seed, relay],
+        stage_ordered_vars_by_unit={src: [(0, 10)]},
+        canonical_variable_plans={
+            src: {10: {0: [(0, 0, 0, 512, 0, 0, 512, 512, 1)]}}
+        },
+        canonical_relay_plans={10: {0: [(0, 512, 0)]}},
+        data_addresses=data_addresses,
+    )
+    final_plan = raiden_controller.TransferPlan(
+        src_units=[src],
+        dst_units=[seed, relay],
+        plan=None,
+        worker_data_addresses=data_addresses,
+        peer_control_endpoints=endpoint_map,
+        peer_control_endpoints_key=endpoint_key,
+        uuid=101,
+        is_weight_sync=True,
+    )
+
+    def _run_pipeline(groups, reg_shards, req_id):
+      rpc = RecordingWorkerRpcClient()
+      self.addCleanup(rpc.close)
+      engine = broadcast_engine.BroadcastEngine(rpc)
+      asyncio.run(
+          engine.execute_slice_broadcast_pipeline(
+              groups_list=groups,
+              final_plan=final_plan,
+              n_seed=1,
+              req_id=req_id,
+              dst_mem_type=raiden_controller.RaidenMemoryType.DRAM,
+              registered_shards=reg_shards,
+              pipeline_target_stages=1,
+          )
+      )
+      return rpc.invocations
+
+    stage_invocations = _run_pipeline([stage_group], data_addresses, "req_sbg")
+    self.assertEqual(
+        {t for t, p in stage_invocations if p.is_sender and t in p.src_units},
+        {src, seed},
+    )
+    self.assertTrue(any(not p.is_sender for _, p in stage_invocations))
+    for _, plan in stage_invocations:
+      if plan.is_sender:
+        self.assertIs(plan.peer_control_endpoints, endpoint_map)
+        self.assertIs(plan.peer_control_endpoints_key, endpoint_key)
+      else:
+        self.assertEmpty(plan.peer_control_endpoints)
+        self.assertIsNone(plan.peer_control_endpoints_key)
+
+    slice_group = [(
+        (src, 0, 0, 0, 512, 0, 1, 0, 0),
+        [
+            (seed, "10.0.1.0:8000", 0, 0, 0, 0),
+            (relay, "10.0.1.1:8000", 0, 0, 0, 0),
+        ],
+    )]
+    slice_invocations = _run_pipeline(
+        [slice_group], {u: ["s0"] for u in (src, seed, relay)}, "req_slice"
+    )
+    relay_plans = [
+        p
+        for t, p in slice_invocations
+        if t == seed and p.is_sender and p.dst_units == [relay]
+    ]
+    self.assertLen(relay_plans, 1)
+    self.assertIs(relay_plans[0].peer_control_endpoints, endpoint_map)
+    self.assertIs(relay_plans[0].peer_control_endpoints_key, endpoint_key)
+
 
 if __name__ == "__main__":
   absltest.main()

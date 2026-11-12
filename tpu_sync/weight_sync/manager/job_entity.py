@@ -1052,6 +1052,15 @@ class JobEntity:
     owned_shards_key = (
         tuple(sorted(owned_shards)) if owned_shards is not None else None
     )
+    peer_control_endpoints_map = transfer_plan.peer_control_endpoints
+    if is_sender and peer_control_endpoints_map:
+      peer_control_endpoints_key = transfer_plan.peer_control_endpoints_key
+      if peer_control_endpoints_key is None:
+        peer_control_endpoints_key = tuple(
+            sorted(peer_control_endpoints_map.items())
+        )
+    else:
+      peer_control_endpoints_key = ()
     cache_key = (
         target_id,
         address,
@@ -1068,6 +1077,7 @@ class JobEntity:
         is_ws,
         ep_count,
         include_recv_sched,
+        peer_control_endpoints_key,
     )
     steady_key = (
         target_id,
@@ -1084,6 +1094,7 @@ class JobEntity:
         is_ws,
         ep_count,
         include_recv_sched,
+        peer_control_endpoints_key,
     )
     template_key = (
         "__template__",
@@ -1102,6 +1113,7 @@ class JobEntity:
         int(transfer_plan.parallelism or 0),
         ep_count,
         include_recv_sched,
+        peer_control_endpoints_key,
     )
 
     if payload_cache is not None:
@@ -1369,6 +1381,19 @@ class JobEntity:
         and not start_req.shard_push_schedules
     ):
       return None
+
+    if is_sender and peer_control_endpoints_map:
+      pushed_peers: set[str] = set(peers)
+      for schedule_proto in start_req.shard_push_schedules.values():
+        for entry_proto in schedule_proto.entries:
+          if entry_proto.dst_peers:
+            pushed_peers.update(entry_proto.dst_peers)
+          elif entry_proto.dst_peer:
+            pushed_peers.add(entry_proto.dst_peer)
+      for peer in pushed_peers:
+        ctrl_ep = peer_control_endpoints_map.get(peer)
+        if ctrl_ep:
+          start_req.peer_control_endpoints[peer] = ctrl_ep
 
     start_req.uuid = int(uuid_val or 0)
     start_req.req_id = str(req_id_val or "")

@@ -28,7 +28,8 @@ and `reshard_service_test.cc`
        (`if (claimed_.find(lifecycle_key) != claimed_.end())`), or
      - `request_blocks_[(req_id, unit)]` already exists with a different payload
        (`auto existing = request_blocks_.find(key);`; identical re-registration
-       is an idempotent TTL refresh, `existing->second.expires_at = now + ttl_s_;`).
+       overwrites the row with `registration.expires_at = now + ttl_s_;`,
+       `request_blocks_[key] = std::move(registration);`).
 
   2. **Claim linearization (`RequestBlockRegistry::LookupAndClaim` in
      `tpu_sync/kv_cache/reshard/request_block_registry.cc`):**
@@ -203,7 +204,7 @@ structure RegGen where
   /-- Monotonic flag recording whether `RequestBlockRegistry::RetireLocked`
   has fired to retire the generation. -/
   retired : Bool
-  deriving DecidableEq, Repr
+  deriving DecidableEq, Repr, Hashable
 
 /-- Initial empty state for a `(req_id, uuid)` generation. -/
 def RegGen.init : RegGen :=

@@ -30,7 +30,7 @@ inductive CoordPhase where
   /-- `RunSubPlan` returned a non-OK `absl::Status`
       (`if (!plan_or.ok())`, `return arm_status[i];`, or `for (const absl::Status& status : sender_status)`). -/
   | aborted
-  deriving DecidableEq, Repr
+  deriving DecidableEq, Repr, Hashable
 
 /-- Per-destination-unit receiver state (`KVCacheListener::HandleControlRequest`,
 `KVCacheManagerWithTransfer::PoolReshardRegisterRecv`,
@@ -50,7 +50,7 @@ structure DstUnitState where
   /-- True once all `src_units` have pushed and the session has settled and
       released its staging lease (`ReshardReceiveSession::ReleaseStagingLocked` / `ReshardReceiveSession::ReleaseStaging`). -/
   completed : Bool
-  deriving DecidableEq, Repr
+  deriving DecidableEq, Repr, Hashable
 
 namespace DstUnitState
 
@@ -116,7 +116,7 @@ structure CoordState where
   sendFailed : Bool
   /-- Underlying `RequestBlockRegistry` state for `(args.req_id, args.uuid)`. -/
   reg : RegGen
-  deriving DecidableEq, Repr
+  deriving DecidableEq, Repr, Hashable
 
 /-- Events of the two-stage coordinator + registry composition. -/
 inductive Ev where

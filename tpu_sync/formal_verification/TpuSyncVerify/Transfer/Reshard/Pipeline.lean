@@ -43,10 +43,11 @@ dispatched by its own `ReshardCoordinator::RunSubPlan` call, and lands in its
 own staging leases, so everything below applies to each sub-plan in turn. How
 a worker folds the sub-plans' settlements into the request's single
 `done_sending` / `done_recving` / `failed_recving` entry
-(`KVCacheManagerWithTransfer::RecordPoolReshardTerminalLocked`,
-`SweepSubPlanChainsLocked`) is outside the model; `send.published` and
-`recv.published` are the session's own terminal as `CompleteReadWithDetails`
-hands it to that bookkeeping.
+(`KVCacheManagerWithTransfer::NoteSubPlanRegisteredLocked`,
+`RecordPoolReshardTerminalLocked`, `SweepSubPlanChainsLocked`) is modelled in
+`Reshard/SubPlanChain.lean`; `send.published` and `recv.published` here are the
+session's own terminal as `CompleteReadWithDetails` hands it to that
+bookkeeping.
 
 ## Memories and aliased device pages
 

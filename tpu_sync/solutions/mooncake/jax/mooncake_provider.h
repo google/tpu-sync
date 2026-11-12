@@ -37,6 +37,17 @@
 //     buffers is destroyed. Handles still live at process exit are leaked,
 //     never released.
 //
+// DMA mapping. TENT registers each of its host staging pools with the TPU DMA
+// engine through dma_map, so that copies into and out of the pool run as
+// direct DMA. dma_map maps with the PJRT client of the most recently exported
+// buffers (JAX has one TPU client per process), so it fails until something
+// has been exported, and that JAX backend must be alive when Mooncake maps.
+// Each mapping belongs to the client that made it and must be undone before
+// that backend is destroyed; Mooncake undoes its mappings when its
+// TransferEngine is destroyed. JAX's own atexit handler may destroy the
+// backend, so once interpreter exit begins (MarkProcessExiting), dma_map fails
+// and dma_unmap skips PJRT, leaking the mapping to the exiting process.
+//
 // Alignment. TPU DMA needs both the host pointer and the device offset to be
 // 32-byte aligned; the length may be anything (measured on TPU v6e and v7x).
 // The provider stages copies through misaligned host pointers via an aligned
@@ -87,6 +98,18 @@ struct ProviderTable {
                         const void* host_src, size_t len);
   // Frees the handle. Mooncake calls it exactly once per handle.
   void (*release)(BufferHandle handle);
+
+  // Registers host memory [host, host + len) with the TPU DMA engine
+  // (PjRtClient::DmaMap), so that copies into and out of it run as direct DMA.
+  // TENT maps each host staging pool it allocates: `host` and `len` are
+  // multiples of the page size, and the range overlaps no live mapping. Return
+  // 0 on success and non-zero on failure, after which TENT uses the memory
+  // unmapped, only with slower copies.
+  int (*dma_map)(void* host, size_t len);
+  // Undoes the dma_map that succeeded for the range starting at `host`. TENT
+  // calls it when it releases the pool, after every copy into or out of it has
+  // returned. Return 0 on success and non-zero on failure.
+  int (*dma_unmap)(void* host);
 };
 
 // --- tpu_raiden side --------------------------------------------------------
@@ -102,12 +125,23 @@ struct ExportRequest {
 // its request's buffer reference and caches the buffer's size and NUMA node.
 // The caller owns the returned handles until it passes them to Mooncake.
 // All-or-nothing: returns InvalidArgument, and creates no handle, if any
-// request holds no buffer or has a negative device index.
+// request holds no buffer or has a negative device index. A successful export
+// also makes its buffers' PJRT client the one that dma_map maps with.
 absl::StatusOr<std::vector<BufferHandle>> ExportBuffers(
     std::vector<ExportRequest> requests);
 
 // Number of handles created by ExportBuffers and not yet released.
 int64_t LiveBufferCount();
+
+// Number of host ranges mapped by dma_map and not yet unmapped.
+int64_t LiveDmaMappingCount();
+
+// Declares that interpreter exit has begun, so the PJRT client may be
+// destroyed at any moment: from now on dma_map fails, and dma_unmap forgets
+// the mapping without calling PJRT. When this returns, no PJRT call from either
+// is still running. tpu_sync/solutions/mooncake/jax/mooncake_provider.py
+// registers it with atexit, to run before JAX's own atexit handler.
+void MarkProcessExiting();
 
 }  // namespace raiden::mooncake
 

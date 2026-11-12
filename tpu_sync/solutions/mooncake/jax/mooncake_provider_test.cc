@@ -14,9 +14,14 @@
 
 #include "tpu_sync/solutions/mooncake/jax/mooncake_provider.h"
 
+#include <sys/mman.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -24,6 +29,8 @@
 #include <utility>
 #include <vector>
 
+#include "absl/base/log_severity.h"
+#include "absl/log/scoped_mock_log.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/status_matchers.h"
@@ -40,7 +47,9 @@ namespace raiden::mooncake {
 namespace {
 
 using ::absl_testing::StatusIs;
+using ::testing::_;
 using ::testing::ElementsAreArray;
+using ::testing::HasSubstr;
 using ::testing::NotNull;
 
 constexpr int kDeviceIndex = 3;
@@ -49,6 +58,22 @@ ProviderTable GetTable() {
   ProviderTable table{};
   EXPECT_EQ(mc_tpu_buffer_provider_get(&table), 0);
   return table;
+}
+
+size_t PageSize() { return sysconf(_SC_PAGESIZE); }
+
+// Anonymous host memory, page-aligned like TENT's staging pools.
+struct Munmap {
+  size_t size;
+  void operator()(void* pages) const { munmap(pages, size); }
+};
+using HostPages = std::unique_ptr<void, Munmap>;
+
+// Null if mmap fails.
+HostPages MapHostPages(size_t size) {
+  void* pages = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  return HostPages(pages == MAP_FAILED ? nullptr : pages, Munmap{size});
 }
 
 // Acquires `buffer` as jax_compat.cc does for jax >= 0.11.1: a reference to a
@@ -109,6 +134,8 @@ TEST(MooncakeProviderAbiTest, ServesCompleteTable) {
   EXPECT_THAT(table.copy_to_host, NotNull());
   EXPECT_THAT(table.copy_from_host, NotNull());
   EXPECT_THAT(table.release, NotNull());
+  EXPECT_THAT(table.dma_map, NotNull());
+  EXPECT_THAT(table.dma_unmap, NotNull());
 }
 
 TEST(MooncakeProviderAbiTest, RejectsNullTable) {
@@ -282,6 +309,91 @@ TEST_F(MooncakeProviderTest, ConcurrentCopiesOnOneHandle) {
 
   EXPECT_THAT(failures, ::testing::Each(0));
   table_.release(handle);
+}
+
+// Real mapping needs a TPU (mooncake_provider_test.py covers it). Here the
+// export makes the XLA CPU client the one dma_map maps with, and that client
+// cannot DMA-map.
+TEST_F(MooncakeProviderTest, DmaMapFailsCleanlyWithoutDmaCapableClient) {
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::PjRtBuffer> buffer,
+                          MakeBuffer(64));
+  TF_ASSERT_OK_AND_ASSIGN(BufferHandle handle, Export(buffer.get()));
+  HostPages page = MapHostPages(PageSize());
+  ASSERT_NE(page, nullptr);
+
+  absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);
+  EXPECT_CALL(log, Log(absl::LogSeverity::kError, _,
+                       HasSubstr("cannot DMA-map host memory")));
+  log.StartCapturingLogs();
+  EXPECT_NE(table_.dma_map(page.get(), PageSize()), 0);
+  log.StopCapturingLogs();
+
+  EXPECT_EQ(LiveDmaMappingCount(), 0);
+  EXPECT_NE(table_.dma_unmap(page.get()), 0);  // Nothing was mapped.
+  table_.release(handle);
+}
+
+// The range is checked before the client, so these fail for their range
+// even though no client here could map them.
+TEST_F(MooncakeProviderTest, DmaMapRejectsBadRanges) {
+  const size_t page_size = PageSize();
+  HostPages pages = MapHostPages(2 * page_size);
+  ASSERT_NE(pages, nullptr);
+  char* host = static_cast<char*>(pages.get());
+  // Page-aligned, but a range of two pages from it runs past the end of the
+  // address space.
+  void* const last_page = reinterpret_cast<void*>(
+      std::numeric_limits<uintptr_t>::max() - page_size + 1);
+
+  absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);
+  EXPECT_CALL(log, Log(absl::LogSeverity::kError, _, HasSubstr("page size")))
+      .Times(5);
+  log.StartCapturingLogs();
+  EXPECT_NE(table_.dma_map(nullptr, page_size), 0);
+  EXPECT_NE(table_.dma_map(host, 0), 0);
+  EXPECT_NE(table_.dma_map(host + 64, page_size), 0);
+  EXPECT_NE(table_.dma_map(host, page_size + 64), 0);
+  EXPECT_NE(table_.dma_map(last_page, 2 * page_size), 0);
+  log.StopCapturingLogs();
+
+  EXPECT_EQ(LiveDmaMappingCount(), 0);
+}
+
+TEST_F(MooncakeProviderTest, DmaUnmapRejectsUnknownAddress) {
+  HostPages page = MapHostPages(PageSize());
+  ASSERT_NE(page, nullptr);
+  EXPECT_NE(table_.dma_unmap(page.get()), 0);
+  EXPECT_NE(table_.dma_unmap(nullptr), 0);
+  EXPECT_EQ(LiveDmaMappingCount(), 0);
+}
+
+// The provider's DMA state belongs to the process, so each of these runs in a
+// fresh one: the "threadsafe" style re-executes the test binary.
+class MooncakeProviderDeathTest : public ::testing::Test {
+ protected:
+  void SetUp() override { GTEST_FLAG_SET(death_test_style, "threadsafe"); }
+};
+
+// Exits with 0 if dma_map refuses one page of host memory, and with 1 if not.
+void ExitWithWhetherDmaMapRefuses() {
+  HostPages page = MapHostPages(PageSize());
+  const bool refused =
+      page != nullptr && GetTable().dma_map(page.get(), PageSize()) != 0;
+  std::exit(refused ? 0 : 1);
+}
+
+TEST_F(MooncakeProviderDeathTest, DmaMapFailsBeforeAnyExport) {
+  EXPECT_EXIT(ExitWithWhetherDmaMapRefuses(), ::testing::ExitedWithCode(0),
+              "no buffer has been exported");
+}
+
+TEST_F(MooncakeProviderDeathTest, DmaMapFailsOnceTheProcessIsExiting) {
+  EXPECT_EXIT(
+      {
+        MarkProcessExiting();
+        ExitWithWhetherDmaMapRefuses();
+      },
+      ::testing::ExitedWithCode(0), "the process is exiting");
 }
 
 }  // namespace

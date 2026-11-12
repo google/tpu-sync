@@ -68,4 +68,11 @@ NB_MODULE(_mooncake_provider, m) {
         "pair, in order. All-or-nothing. The caller owns the handles.");
   m.def("live_buffer_count", &raiden::mooncake::LiveBufferCount,
         "Number of exported handles not yet released.");
+  m.def("live_dma_mapping_count", &raiden::mooncake::LiveDmaMappingCount,
+        "Number of host ranges mapped by the table's dma_map and not yet "
+        "unmapped.");
+  m.def("mark_process_exiting", &raiden::mooncake::MarkProcessExiting,
+        "Declares that interpreter exit has begun: from now on dma_map fails "
+        "and dma_unmap skips PJRT, whose client JAX's atexit handler may "
+        "destroy. mooncake_provider registers it with atexit.");
 }

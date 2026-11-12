@@ -28,13 +28,26 @@ and from host memory through the C table that ``library_path()`` exports. The
 contract is Mooncake's ``tent/platform/tpu_buffer_provider.h``, mirrored in
 ``tpu_sync/solutions/mooncake/jax/mooncake_provider.h`` together with the
 lifetime rules.
+
+The table's ``dma_map`` and ``dma_unmap`` let TENT register its host staging
+buffers with the TPU DMA engine, so that the copies through them run as direct
+DMA. They map with the PJRT client of the exported arrays, so export before
+creating the engine, as above, and destroy the engine before clearing JAX's
+backends (``jax.clear_backends()``). At interpreter exit, this module takes care
+of that order.
 """
 
+import atexit
 import os
 
 import jax
 
 from tpu_sync.solutions.mooncake.jax import _mooncake_provider
+
+# Importing jax registered JAX's own atexit handler, which can destroy the PJRT
+# client that dma_map and dma_unmap call. atexit runs handlers in reverse order
+# of registration, so this one runs first and makes them stop calling PJRT.
+atexit.register(_mooncake_provider.mark_process_exiting)
 
 
 def library_path() -> str:

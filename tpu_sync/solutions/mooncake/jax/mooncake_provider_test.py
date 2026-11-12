@@ -21,6 +21,7 @@ on real TPU arrays.
 import concurrent.futures
 import ctypes
 import gc
+import mmap
 import os
 import time
 
@@ -32,52 +33,10 @@ import numpy as np
 
 from tpu_sync.solutions.mooncake.jax import _mooncake_provider
 from tpu_sync.solutions.mooncake.jax import mooncake_provider
+from tpu_sync.solutions.mooncake.jax import mooncake_provider_test_util as test_util
 
-_Handle = ctypes.c_uint64
-
-
-class _ProviderTable(ctypes.Structure):
-  """ctypes mirror of mc_tpu_buffer_provider_t."""
-
-  _fields_ = [
-      ("name", ctypes.c_char_p),
-      ("size", ctypes.CFUNCTYPE(ctypes.c_size_t, _Handle)),
-      ("device_index", ctypes.CFUNCTYPE(ctypes.c_int, _Handle)),
-      ("numa_node", ctypes.CFUNCTYPE(ctypes.c_int, _Handle)),
-      (
-          "copy_to_host",
-          ctypes.CFUNCTYPE(
-              ctypes.c_int,
-              _Handle,
-              ctypes.c_size_t,
-              ctypes.c_void_p,
-              ctypes.c_size_t,
-          ),
-      ),
-      (
-          "copy_from_host",
-          ctypes.CFUNCTYPE(
-              ctypes.c_int,
-              _Handle,
-              ctypes.c_size_t,
-              ctypes.c_void_p,
-              ctypes.c_size_t,
-          ),
-      ),
-      ("release", ctypes.CFUNCTYPE(None, _Handle)),
-  ]
-
-
-def _load_table() -> _ProviderTable:
-  """Fetches the table as Mooncake does: dlopen(), dlsym(), get(&table)."""
-  lib = ctypes.CDLL(mooncake_provider.library_path(), mode=os.RTLD_LOCAL)
-  get = lib.mc_tpu_buffer_provider_get
-  get.argtypes = [ctypes.POINTER(_ProviderTable)]
-  get.restype = ctypes.c_int
-  table = _ProviderTable()
-  if get(ctypes.byref(table)) != 0:
-    raise AssertionError("mc_tpu_buffer_provider_get failed")
-  return table
+# Not in the mmap module.
+_PROT_NONE = 0
 
 
 def _host_buffer(size: int, misalignment: int) -> np.ndarray:
@@ -118,7 +77,7 @@ class MooncakeProviderTest(parameterized.TestCase):
     self.sharding = jax.sharding.NamedSharding(
         self.mesh, jax.sharding.PartitionSpec("x")
     )
-    self.table = _load_table()
+    self.table = test_util.load_table()
 
   def _array(self, shape, dtype, seed=0):
     values = np.random.default_rng(seed).uniform(-100, 100, size=shape)
@@ -278,6 +237,161 @@ class MooncakeProviderTest(parameterized.TestCase):
     self.assertNotEqual(self.table.copy_from_host(handles[0], size, ptr, 1), 0)
     for handle in handles:
       self.table.release(handle)
+
+  def test_dma_map_round_trip(self):
+    # One 4 MiB shard per device: TENT's staging chunk size.
+    shape = (len(self.devices) * 1024, 1024)
+    src = self._array(shape, np.float32, seed=7)
+    dst = jax.device_put(jnp.zeros(shape, np.float32), self.sharding)
+    expected = np.asarray(src)
+    src_handles = mooncake_provider.export_shards(src)
+    dst_handles = mooncake_provider.export_shards(dst)
+    size = self.table.size(src_handles[0])
+    pool = test_util.staging_pool(size)
+    ptr = pool.ctypes.data
+    before = _mooncake_provider.live_dma_mapping_count()
+
+    self.assertEqual(self.table.dma_map(ptr, pool.nbytes), 0)
+    try:
+      self.assertEqual(_mooncake_provider.live_dma_mapping_count(), before + 1)
+      # Every shard goes through the one mapped region, as TENT reuses its
+      # staging chunks.
+      for src_handle, dst_handle in zip(src_handles, dst_handles):
+        self.assertEqual(self.table.size(src_handle), size)
+        self._copy_to_host(src_handle, 0, pool[:size])
+        self._copy_from_host(dst_handle, 0, pool[:size])
+    finally:
+      self.assertEqual(self.table.dma_unmap(ptr), 0)
+    self.assertEqual(_mooncake_provider.live_dma_mapping_count(), before)
+    self.assertNotEqual(self.table.dma_unmap(ptr), 0)
+
+    for handle in src_handles + dst_handles:
+      self.table.release(handle)
+    np.testing.assert_array_equal(np.asarray(dst), expected)
+
+  def test_dma_map_rejects_unaligned_ranges(self):
+    # The export gives the provider a client that can map.
+    handles = mooncake_provider.export_shards(self._array((8, 128), np.float32))
+    page = mmap.PAGESIZE
+    pool = test_util.staging_pool(2 * page)
+    ptr = pool.ctypes.data
+    before = _mooncake_provider.live_dma_mapping_count()
+    for bad_ptr, bad_len in (
+        (None, page),
+        (ptr, 0),
+        (ptr + 64, page),
+        (ptr, page + 64),
+    ):
+      with self.subTest(ptr=bad_ptr, length=bad_len):
+        self.assertNotEqual(self.table.dma_map(bad_ptr, bad_len), 0)
+    self.assertEqual(_mooncake_provider.live_dma_mapping_count(), before)
+
+    # The same memory maps once aligned, so only the ranges were at fault.
+    self.assertEqual(self.table.dma_map(ptr, page), 0)
+    self.assertEqual(self.table.dma_unmap(ptr), 0)
+    for handle in handles:
+      self.table.release(handle)
+
+  def test_dma_map_rejects_overlapping_ranges(self):
+    # libtpu requires mapped ranges not to overlap, so a range that overlaps a
+    # mapped one fails however it overlaps, not only when it starts there.
+    handles = mooncake_provider.export_shards(self._array((8, 128), np.float32))
+    page = mmap.PAGESIZE
+    pool = test_util.staging_pool(4 * page)
+    ptr = pool.ctypes.data
+    before = _mooncake_provider.live_dma_mapping_count()
+    self.assertEqual(self.table.dma_map(ptr + page, 2 * page), 0)  # Pages 1-2.
+    try:
+      for first_page, pages in (
+          (1, 2),  # The same range.
+          (0, 2),  # Over its first page.
+          (2, 2),  # Over its last page.
+          (0, 4),  # Around it.
+          (2, 1),  # Inside it.
+      ):
+        with self.subTest(first_page=first_page, pages=pages):
+          self.assertNotEqual(
+              self.table.dma_map(ptr + first_page * page, pages * page), 0
+          )
+      self.assertEqual(_mooncake_provider.live_dma_mapping_count(), before + 1)
+
+      # The ranges on either side only touch it, so they map.
+      self.assertEqual(self.table.dma_map(ptr, page), 0)
+      self.assertEqual(self.table.dma_map(ptr + 3 * page, page), 0)
+      self.assertEqual(self.table.dma_unmap(ptr), 0)
+      self.assertEqual(self.table.dma_unmap(ptr + 3 * page), 0)
+    finally:
+      self.assertEqual(self.table.dma_unmap(ptr + page), 0)
+    self.assertEqual(_mooncake_provider.live_dma_mapping_count(), before)
+    for handle in handles:
+      self.table.release(handle)
+
+  def test_failed_dma_map_leaves_nothing_mapped(self):
+    # PJRT cannot pin inaccessible pages, so it fails to map them: a failure
+    # past the provider's own checks, which the provider must roll back.
+    handles = mooncake_provider.export_shards(self._array((8, 128), np.float32))
+    size = 4 << 20
+    pages = np.frombuffer(
+        mmap.mmap(
+            -1,
+            size,
+            flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
+            prot=_PROT_NONE,
+        ),
+        np.uint8,
+    )
+    ptr = pages.ctypes.data
+    before = _mooncake_provider.live_dma_mapping_count()
+    rc = self.table.dma_map(ptr, size)
+    if rc == 0:
+      self.table.dma_unmap(ptr)
+    self.assertNotEqual(rc, 0, "PJRT mapped inaccessible pages")
+    self.assertEqual(_mooncake_provider.live_dma_mapping_count(), before)
+
+    # Nothing of the failed map stays behind, in the provider or in PJRT: once
+    # the pages are accessible, the same range maps and unmaps.
+    libc = ctypes.CDLL(None)
+    libc.mprotect.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    rw = mmap.PROT_READ | mmap.PROT_WRITE
+    self.assertEqual(libc.mprotect(ptr, size, rw), 0)
+    ctypes.memset(ptr, 0, size)
+    self.assertEqual(self.table.dma_map(ptr, size), 0)
+    self.assertEqual(self.table.dma_unmap(ptr), 0)
+    for handle in handles:
+      self.table.release(handle)
+
+  def test_concurrent_dma_maps_and_copies(self):
+    # As with several TENT engines in one process: each thread maps pools of
+    # its own and moves a shard through them while the others map, copy and
+    # unmap.
+    shape = (len(self.devices) * 1024, 1024)
+    src = self._array(shape, np.float32, seed=8)
+    dst = jax.device_put(jnp.zeros(shape, np.float32), self.sharding)
+    expected = np.asarray(src)
+    src_handles = mooncake_provider.export_shards(src)
+    dst_handles = mooncake_provider.export_shards(dst)
+    before = _mooncake_provider.live_dma_mapping_count()
+
+    def move(handles):
+      src_handle, dst_handle = handles
+      size = self.table.size(src_handle)
+      for _ in range(2):
+        pool = test_util.staging_pool(size)
+        ptr = pool.ctypes.data
+        self.assertEqual(self.table.dma_map(ptr, pool.nbytes), 0)
+        try:
+          self._copy_to_host(src_handle, 0, pool[:size])
+          self._copy_from_host(dst_handle, 0, pool[:size])
+        finally:
+          self.assertEqual(self.table.dma_unmap(ptr), 0)
+
+    with concurrent.futures.ThreadPoolExecutor(len(src_handles)) as executor:
+      list(executor.map(move, zip(src_handles, dst_handles)))
+
+    self.assertEqual(_mooncake_provider.live_dma_mapping_count(), before)
+    for handle in src_handles + dst_handles:
+      self.table.release(handle)
+    np.testing.assert_array_equal(np.asarray(dst), expected)
 
   def test_handle_keeps_hbm_alive_until_released(self):
     shape = (len(self.devices) * 1024, 2048)  # 8 MiB of float32 per device.

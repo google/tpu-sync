@@ -91,6 +91,13 @@ message VariableMetadataProto {
   repeated int64 global_shard_indices = 8;
 }
 
+// The control endpoint(s) and data endpoints that one registration of a work
+// unit named together.
+message HostEndpointsProto {
+  string control_address = 1;  // As registered; may be comma-joined.
+  repeated string shards = 2;  // Data-plane "ip:port" endpoints.
+}
+
 message RegisterWorkUnitRequest {
   RaidenIdProto unit = 1;
   repeated string shards = 2;
@@ -118,6 +125,11 @@ message RegisterWorkUnitRequest {
   // Deprecated and ignored by the controller. Shard placement must be
   // expressed via VariableMetadataProto.global_shard_indices.
   repeated int64 host_subgrid = 16 [deprecated = true];
+  // Set only in GetMetadataResponse.metadata, and only by the Python
+  // weight-sync controller, for a unit whose current addresses come from one
+  // RegisterWorkUnit call. Empty otherwise. That controller rejects a
+  // registration that sets this field.
+  repeated HostEndpointsProto hosts = 17;
 }
 
 // Defines an explicit 1D linear memory push operation from a local source to a

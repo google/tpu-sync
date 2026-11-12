@@ -229,6 +229,11 @@ class RaidenControllerServer:
           ):
             reg = raiden_req.register_work_unit_request
             unit = _raiden_id_from_proto(reg.unit)
+            if reg.hosts:
+              raise ValueError(
+                  "RegisterWorkUnitRequest.hosts is metadata-only and is not"
+                  f" allowed in registration requests for unit {unit}"
+              )
             shards = list(reg.shards)
             ctrl_addr = (
                 reg.control_plane_rpc_address

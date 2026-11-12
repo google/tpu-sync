@@ -15,6 +15,7 @@
 """High-level RaidenController orchestrating JobEntities and ReshardPlanner."""
 
 import asyncio
+import dataclasses
 import os
 import random
 import threading
@@ -75,6 +76,19 @@ RaidenControllerClientFacade = (
     controller_rpc_service.RaidenControllerClientFacade
 )
 RaidenControllerServer = controller_rpc_service.RaidenControllerServer
+
+
+@dataclasses.dataclass(frozen=True)
+class _HostRecord:
+  """Immutable host registration snapshot for metadata emission.
+
+  Attributes:
+    endpoints: Normalized control-plane endpoints in registration order.
+    shards: Normalized shard identifiers in registration order.
+  """
+
+  endpoints: tuple[str, ...]
+  shards: tuple[str, ...]
 
 
 class _EntityBroadcastDispatcher:
@@ -183,6 +197,9 @@ class RaidenController:
     )
     self._registered_variables: dict[RaidenId, list[Any]] = {}
     self._registered_control_plane_endpoints: dict[RaidenId, list[str]] = {}
+    # Explicit per-unit registration snapshots for GetMetadataResponse.hosts;
+    # guarded by self._lock.
+    self._registration_records: dict[RaidenId, _HostRecord] = {}
     self._planner = ReshardPlanner()
 
   @property
@@ -547,6 +564,10 @@ class RaidenController:
           ent.register_host_endpoint(
               addr, job_replica_id=getattr(unit, "job_replica_id", "")
           )
+        self._registration_records[unit] = _HostRecord(
+            endpoints=tuple(endpoints),
+            shards=tuple(normalized_shards),
+        )
         return
 
       if unit in self._registered_shards:
@@ -579,6 +600,10 @@ class RaidenController:
 
       self._registered_shards[unit] = normalized_shards
       self._registered_control_plane_endpoints[unit] = endpoints
+      self._registration_records[unit] = _HostRecord(
+          endpoints=tuple(endpoints),
+          shards=tuple(normalized_shards),
+      )
       for registry in (
           self._registered_mesh_shapes,
           self._registered_mesh_axes,
@@ -821,6 +846,37 @@ class RaidenController:
     )
     return schedule
 
+  def _valid_registration_record_locked(
+      self, unit: RaidenId
+  ) -> Optional[_HostRecord]:
+    """Returns `unit`'s registration record if still current; else None.
+
+    Requires `self._lock` to be held by the caller. Returns None for any stale
+    snapshot whose shards or control endpoints were overwritten by attach_host
+    or a shared-replica registration.
+
+    Args:
+      unit: Work unit identifier to validate.
+
+    Returns:
+      The matching _HostRecord if current, or None if missing or stale.
+    """
+    rec = self._registration_records.get(unit)
+    if rec is None:
+      return None
+    if (
+        unit not in self._registered_shards
+        or unit not in self._registered_control_plane_endpoints
+    ):
+      return None
+    if (
+        tuple(self._registered_shards[unit]) != rec.shards
+        or tuple(self._registered_control_plane_endpoints[unit])
+        != rec.endpoints
+    ):
+      return None
+    return rec
+
   def _metadata_proto_locked(self, unit: RaidenId) -> Any:
     """Builds an owned registration proto while `_lock` is held."""
     reg_req = raiden_service_pb2.RegisterWorkUnitRequest(
@@ -849,6 +905,11 @@ class RaidenController:
         reg_req.variables.add().CopyFrom(
             _coerce_variable_proto(var, raiden_service_pb2)
         )
+    rec = self._valid_registration_record_locked(unit)
+    if rec is not None:
+      host_proto = reg_req.hosts.add()
+      host_proto.control_address = ",".join(rec.endpoints)
+      host_proto.shards.extend(rec.shards)
     return reg_req
 
   def get_all_metadata(self) -> list[Any]:

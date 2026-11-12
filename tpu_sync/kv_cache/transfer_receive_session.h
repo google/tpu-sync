@@ -41,8 +41,9 @@
 #include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/kv_cache/staging_manager.h"
 #include "tpu_sync/kv_cache/transfer_plan.h"
-#include "tpu_sync/kv_cache/transfer_session.h"
+#include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_sync {
 namespace rpc {

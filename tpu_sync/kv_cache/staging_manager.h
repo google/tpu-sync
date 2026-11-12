@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_TRANSFER_SESSION_H_
-#define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_TRANSFER_SESSION_H_
+#ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_STAGING_MANAGER_H_
+#define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_STAGING_MANAGER_H_
 
 #include <atomic>
 #include <chrono>  // NOLINT(build/c++11)
@@ -25,7 +25,6 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
-#include "tpu_sync/transport/transfer_session.h"  // IWYU pragma: export
 
 namespace tpu_raiden {
 
@@ -76,4 +75,4 @@ class StagingLayerManager {
 
 }  // namespace tpu_raiden
 
-#endif  // THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_TRANSFER_SESSION_H_
+#endif  // THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_STAGING_MANAGER_H_

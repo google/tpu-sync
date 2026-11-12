@@ -54,7 +54,8 @@ ALIASES = {
     "recv.h": "tpu_sync/kv_cache/transfer_receive_session.h",
     "send.cc": "tpu_sync/kv_cache/transfer_send_session.cc",
     "send.h": "tpu_sync/kv_cache/transfer_send_session.h",
-    "session.h": "tpu_sync/kv_cache/transfer_session.h",
+    "staging.cc": "tpu_sync/kv_cache/staging_manager.cc",
+    "staging.h": "tpu_sync/kv_cache/staging_manager.h",
     "mgr.cc": "tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc",
     "mgr.h": "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h",
     "bt.cc": "tpu_sync/transport/block_transport.cc",
@@ -77,16 +78,17 @@ ALIASES = {
     "reg.h": "tpu_sync/kv_cache/reshard/request_block_registry.h",
     "planner.cc": "tpu_sync/kv_cache/reshard/pool_reshard_planner.cc",
     "planner.h": "tpu_sync/kv_cache/reshard/pool_reshard_planner.h",
-    "send_drain_test.cc":
-        "tpu_sync/kv_cache/kv_cache_manager_with_transfer_send_drain_test.cc",
-    "control_test.cc":
-        "tpu_sync/kv_cache/kv_cache_manager_with_transfer_control_test.cc",
-    "pool_reshard_test.cc":
-        "tpu_sync/kv_cache/kv_cache_manager_with_transfer_pool_reshard_test.cc",
-    "reshard_recv_test.cc":
-        "tpu_sync/kv_cache/reshard_receive_session_test.cc",
-    "reshard_send_test.cc":
-        "tpu_sync/kv_cache/reshard_send_session_test.cc",
+    "send_drain_test.cc": (
+        "tpu_sync/kv_cache/kv_cache_manager_with_transfer_send_drain_test.cc"
+    ),
+    "control_test.cc": (
+        "tpu_sync/kv_cache/kv_cache_manager_with_transfer_control_test.cc"
+    ),
+    "pool_reshard_test.cc": (
+        "tpu_sync/kv_cache/kv_cache_manager_with_transfer_pool_reshard_test.cc"
+    ),
+    "reshard_recv_test.cc": "tpu_sync/kv_cache/reshard_receive_session_test.cc",
+    "reshard_send_test.cc": "tpu_sync/kv_cache/reshard_send_session_test.cc",
 }
 
 EXTERNAL = {

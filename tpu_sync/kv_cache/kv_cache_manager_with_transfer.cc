@@ -60,7 +60,7 @@
 #include "tpu_sync/kv_cache/reshard_send_session.h"
 #include "tpu_sync/kv_cache/transfer_receive_session.h"
 #include "tpu_sync/kv_cache/transfer_send_session.h"
-#include "tpu_sync/kv_cache/transfer_session.h"
+#include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
 

@@ -60,7 +60,6 @@
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/transfer_receive_session.h"
 #include "tpu_sync/kv_cache/transfer_send_session.h"
-#include "tpu_sync/kv_cache/transfer_session.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/transport/transfer_session.h"
 

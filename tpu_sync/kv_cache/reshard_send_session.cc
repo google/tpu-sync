@@ -49,11 +49,12 @@
 #include "tpu_sync/kv_cache/data_connection_policy.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
+#include "tpu_sync/kv_cache/staging_manager.h"
 #include "tpu_sync/kv_cache/transfer_plan.h"
-#include "tpu_sync/kv_cache/transfer_session.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/transport/block_transport.h"
 #include "tpu_sync/transport/block_transport_session.h"
+#include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
 

@@ -368,6 +368,37 @@ cc_library(
 # JAX test targets successfully relocated to api/jax/BUILD.
 
 cc_library(
+    name = "staging_manager",
+    srcs = ["staging_manager.cc"],
+    hdrs = ["staging_manager.h"],
+    deps = [
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+    ],
+)
+
+cc_test(
+    name = "staging_manager_test",
+    size = "small",
+    srcs = ["staging_manager_test.cc"],
+    deps = [
+        ":staging_manager",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "kv_cache_manager_with_transfer",
     srcs = [
         "data_connection_policy.cc",
@@ -384,7 +415,6 @@ cc_library(
         "reshard_send_session.h",
         "transfer_receive_session.h",
         "transfer_send_session.h",
-        "transfer_session.h",
     ],
     copts = [
         "-fno-strict-aliasing",
@@ -395,6 +425,7 @@ cc_library(
     deps = [
         ":kv_cache_manager_base",
         ":pool_layout",
+        ":staging_manager",
         ":transfer_plan",
         "//tpu_sync/common:trace",
         "//tpu_sync/core:control_plane_backend",
@@ -610,6 +641,7 @@ cc_test(
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/core:staging_arena",
         "//tpu_sync/transport:block_transport",
+        "//tpu_sync/transport:transfer_session",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",

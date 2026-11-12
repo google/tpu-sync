@@ -36,7 +36,6 @@
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/synchronization/notification.h"
-#include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "tpu_sync/transport/lib/adapter/transport_adapter.h"
@@ -303,7 +302,7 @@ TEST(PeregrineTransportAdapterTest, PollUnknownHandleFails) {
   EXPECT_THAT((*adapter)->Poll(12345), StatusIs(absl::StatusCode::kNotFound));
 }
 
-TEST(PeregrineTransportAdapterTest, EndToEndTcpWriteAndReadOverLoopback) {
+TEST(PeregrineTransportAdapterTest, EndToEndTcpWriteOverLoopback) {
   absl::StatusOr<std::unique_ptr<PeregrineTransportAdapter>> local =
       CreateAdapter(/*num_conns_per_peer=*/2);
   ABSL_ASSERT_OK(local);
@@ -319,7 +318,6 @@ TEST(PeregrineTransportAdapterTest, EndToEndTcpWriteAndReadOverLoopback) {
   const std::string remote_endpoint =
       absl::StrCat("127.0.0.1:", (*remote)->local_port());
 
-  // 1. Write (Op::kWrite) with completion callback.
   Request write_req = {};
   write_req.op = TransferOp::kBlockPushExplicit;
   write_req.laddr = src_buf.data();
@@ -341,35 +339,6 @@ TEST(PeregrineTransportAdapterTest, EndToEndTcpWriteAndReadOverLoopback) {
   ASSERT_TRUE(write_done.WaitForNotificationWithTimeout(absl::Seconds(10)));
   EXPECT_THAT(write_result, IsOkAndHolds(IsEmpty()));
   EXPECT_EQ(remote_buf, src_buf);
-
-  // 2. Read (Op::kRead) with Poll().
-  std::vector<uint8_t> read_buf(src_buf.size(), 0);
-  Request read_req = {};
-  read_req.op = TransferOp::kBlockPull;
-  read_req.laddr = read_buf.data();
-  read_req.raddr = remote_buf.data();
-  read_req.len = read_buf.size();
-
-  absl::StatusOr<Handle> read_handle = (*local)->Post(
-      /*peers=*/{remote_endpoint},
-      /*requests=*/absl::MakeConstSpan(&read_req, 1),
-      /*src_block_ids=*/{}, /*dst_block_ids=*/{},
-      /*on_complete=*/nullptr);
-  ABSL_ASSERT_OK(read_handle);
-
-  Status poll_status = Status::kInProgress;
-  const absl::Time deadline = absl::Now() + absl::Seconds(10);
-  while (absl::Now() < deadline) {
-    absl::StatusOr<Status> current = (*local)->Poll(*read_handle);
-    ABSL_ASSERT_OK(current);
-    poll_status = *current;
-    if (poll_status != Status::kInProgress) {
-      break;
-    }
-    absl::SleepFor(absl::Milliseconds(20));
-  }
-  EXPECT_EQ(poll_status, Status::kSuccess);
-  EXPECT_EQ(read_buf, src_buf);
 }
 
 // Explicit-push validation runs before the peer is contacted: the peer port

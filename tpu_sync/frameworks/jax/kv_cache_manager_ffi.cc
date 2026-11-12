@@ -20,9 +20,13 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
+#include "absl/types/span.h"
 #include "xla/ffi/api/ffi.h"
 #include "xla/stream_executor/platform.h"
 #include "xla/stream_executor/platform_manager.h"
@@ -172,9 +176,17 @@ xla::ffi::Error TriggerRaidenH2dImpl(
   const int32_t* h_copy_sizes =
       reinterpret_cast<const int32_t*>(copy_sizes.untyped_data());
 
-  const uint8_t* h_base =
-      g_kv_cache_managers[shard_idx]->base()->GetHostPointer(
-          static_cast<size_t>(layer_idx), 0);
+  absl::StatusOr<absl::Span<const uint8_t>> host_buffer =
+      std::as_const(*g_kv_cache_managers[shard_idx])
+          .base()
+          ->GetHostBuffer(static_cast<size_t>(layer_idx), 0);
+  if (!host_buffer.ok()) {
+    return xla::ffi::Error(xla::ffi::ErrorCode::kFailedPrecondition,
+                           absl::StrCat("Host buffer unavailable for layer ",
+                                        layer_idx, " on Shard: ", shard_idx,
+                                        ": ", host_buffer.status().message()));
+  }
+  const uint8_t* h_base = host_buffer->data();
 
   LOG(WARNING) << "[TPU Worker FFI] H2D pointers: cache_slice_buf="
                << cache_slice_buf.untyped_data()
@@ -289,9 +301,16 @@ xla::ffi::Error TriggerRaidenD2hImpl(
   const int32_t* h_copy_sizes =
       reinterpret_cast<const int32_t*>(copy_sizes.untyped_data());
 
-  uint8_t* h_base = const_cast<uint8_t*>(
-      g_kv_cache_managers[shard_idx]->base()->GetHostPointer(
-          static_cast<size_t>(layer_idx), 0));
+  absl::StatusOr<absl::Span<uint8_t>> host_buffer =
+      g_kv_cache_managers[shard_idx]->base()->GetHostBuffer(
+          static_cast<size_t>(layer_idx), 0);
+  if (!host_buffer.ok()) {
+    return xla::ffi::Error(xla::ffi::ErrorCode::kFailedPrecondition,
+                           absl::StrCat("Host buffer unavailable for layer ",
+                                        layer_idx, " on Shard: ", shard_idx,
+                                        ": ", host_buffer.status().message()));
+  }
+  uint8_t* h_base = host_buffer->data();
 
   const uint8_t* d_base =
       reinterpret_cast<const uint8_t*>(cache_slice_buf.untyped_data());

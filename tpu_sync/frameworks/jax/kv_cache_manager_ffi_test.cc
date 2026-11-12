@@ -14,14 +14,19 @@
 
 #include "tpu_sync/frameworks/jax/kv_cache_manager_ffi.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <utility>
 #include <vector>
 
+#include "absl/status/statusor.h"
+#include "absl/types/span.h"
 #include "xla/ffi/api/c_api.h"
 #include "xla/ffi/api/ffi.h"
 #include "xla/stream_executor/platform_manager.h"
+#include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/platform/test.h"
 #include "tpu_sync/frameworks/jax/kv_cache_manager_ffi_internal.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
@@ -128,8 +133,9 @@ TEST_F(KVCacheManagerFfiTest, TriggerRaidenH2dAndD2hDMAOrchestration) {
 
   // Populate Host block indices with test data to push
   // Host layer memory block 0 populated with sequence
-  uint8_t* h_base_layer0 = const_cast<uint8_t*>(
-      g_kv_cache_managers[0]->base()->GetHostPointer(0, 0));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> host_layer0,
+                       g_kv_cache_managers[0]->base()->GetHostBuffer(0, 0));
+  uint8_t* h_base_layer0 = host_layer0.data();
   for (size_t j = 0; j < 4096; ++j) {
     h_base_layer0[j] = static_cast<uint8_t>(j % 256);
   }
@@ -198,6 +204,106 @@ TEST_F(KVCacheManagerFfiTest, TriggerRaidenH2dAndD2hDMAOrchestration) {
     ASSERT_EQ(h_block5[j], static_cast<uint8_t>(j % 256))
         << "Mismatch at index " << j << " on host block 5 after D2H";
   }
+}
+
+TEST_F(KVCacheManagerFfiTest, TriggerRaidenH2dLayerWithoutHostBufferFails) {
+  int32_t shard_idx = 0;
+  FfiBufferFixture shard_idx_fixture(XLA_FFI_DataType_S32, &shard_idx, {1});
+  int32_t anchor = 0;
+  FfiBufferFixture anchor_fixture(XLA_FFI_DataType_S32, &anchor, {1});
+  xla::ffi::Error init_err = TriggerRaidenInitImpl(
+      anchor_fixture.AsAnyBuffer(), shard_idx_fixture.AsAnyBuffer(),
+      /*slice_byte_size=*/4096, /*local_port=*/-1, /*parallelism=*/1,
+      /*host_blocks_to_allocate=*/8, /*num_layers=*/2,
+      anchor_fixture.AsAnyBuffer());
+  ASSERT_TRUE(init_err.success()) << init_err.message();
+  // Layer 0 keeps its host buffer; layer 1 loses it.
+  TF_ASSERT_OK_AND_ASSIGN(
+      absl::Span<const uint8_t> host_layer0,
+      std::as_const(*g_kv_cache_managers[0]).base()->GetHostBuffer(0, 0));
+  g_kv_cache_managers[0]->base()->SetExternalHostPointers(
+      {host_layer0.data(), nullptr}, {host_layer0.size(), 0});
+
+  std::vector<uint8_t> cache_slice_data(32768, 0);
+  FfiBufferFixture cache_slice_fixture(XLA_FFI_DataType_U8,
+                                       cache_slice_data.data(), {32768});
+  std::vector<int32_t> src_offsets = {0};
+  std::vector<int32_t> dst_offsets = {2};
+  std::vector<int32_t> copy_sizes = {1};
+  FfiBufferFixture src_offsets_fixture(XLA_FFI_DataType_S32, src_offsets.data(),
+                                       {1});
+  FfiBufferFixture dst_offsets_fixture(XLA_FFI_DataType_S32, dst_offsets.data(),
+                                       {1});
+  FfiBufferFixture copy_sizes_fixture(XLA_FFI_DataType_S32, copy_sizes.data(),
+                                      {1});
+
+  xla::ffi::Error layer0_err = TriggerRaidenH2dImpl(
+      src_offsets_fixture.AsAnyBuffer(), dst_offsets_fixture.AsAnyBuffer(),
+      copy_sizes_fixture.AsAnyBuffer(), shard_idx_fixture.AsAnyBuffer(),
+      cache_slice_fixture.AsAnyBuffer(), /*layer_idx=*/0,
+      cache_slice_fixture.AsAnyBuffer());
+  xla::ffi::Error layer1_err = TriggerRaidenH2dImpl(
+      src_offsets_fixture.AsAnyBuffer(), dst_offsets_fixture.AsAnyBuffer(),
+      copy_sizes_fixture.AsAnyBuffer(), shard_idx_fixture.AsAnyBuffer(),
+      cache_slice_fixture.AsAnyBuffer(), /*layer_idx=*/1,
+      cache_slice_fixture.AsAnyBuffer());
+
+  EXPECT_TRUE(layer0_err.success()) << layer0_err.message();
+  EXPECT_EQ(layer1_err.errc(), xla::ffi::ErrorCode::kFailedPrecondition);
+  EXPECT_THAT(layer1_err.message(),
+              ::testing::HasSubstr("Host buffer unavailable for layer 1 on "
+                                   "Shard: 0: layer 1 shard 0 has no host "
+                                   "buffer"));
+}
+
+TEST_F(KVCacheManagerFfiTest, TriggerRaidenD2hLayerWithoutHostBufferFails) {
+  int32_t shard_idx = 0;
+  FfiBufferFixture shard_idx_fixture(XLA_FFI_DataType_S32, &shard_idx, {1});
+  int32_t anchor = 0;
+  FfiBufferFixture anchor_fixture(XLA_FFI_DataType_S32, &anchor, {1});
+  xla::ffi::Error init_err = TriggerRaidenInitImpl(
+      anchor_fixture.AsAnyBuffer(), shard_idx_fixture.AsAnyBuffer(),
+      /*slice_byte_size=*/4096, /*local_port=*/-1, /*parallelism=*/1,
+      /*host_blocks_to_allocate=*/8, /*num_layers=*/2,
+      anchor_fixture.AsAnyBuffer());
+  ASSERT_TRUE(init_err.success()) << init_err.message();
+  // Layer 0 keeps its host buffer; layer 1 loses it.
+  TF_ASSERT_OK_AND_ASSIGN(
+      absl::Span<const uint8_t> host_layer0,
+      std::as_const(*g_kv_cache_managers[0]).base()->GetHostBuffer(0, 0));
+  g_kv_cache_managers[0]->base()->SetExternalHostPointers(
+      {host_layer0.data(), nullptr}, {host_layer0.size(), 0});
+
+  std::vector<uint8_t> cache_slice_data(32768, 0);
+  FfiBufferFixture cache_slice_fixture(XLA_FFI_DataType_U8,
+                                       cache_slice_data.data(), {32768});
+  std::vector<int32_t> src_offsets = {2};
+  std::vector<int32_t> dst_offsets = {5};
+  std::vector<int32_t> copy_sizes = {1};
+  FfiBufferFixture src_offsets_fixture(XLA_FFI_DataType_S32, src_offsets.data(),
+                                       {1});
+  FfiBufferFixture dst_offsets_fixture(XLA_FFI_DataType_S32, dst_offsets.data(),
+                                       {1});
+  FfiBufferFixture copy_sizes_fixture(XLA_FFI_DataType_S32, copy_sizes.data(),
+                                      {1});
+
+  xla::ffi::Error layer0_err = TriggerRaidenD2hImpl(
+      src_offsets_fixture.AsAnyBuffer(), dst_offsets_fixture.AsAnyBuffer(),
+      copy_sizes_fixture.AsAnyBuffer(), shard_idx_fixture.AsAnyBuffer(),
+      cache_slice_fixture.AsAnyBuffer(), /*layer_idx=*/0,
+      cache_slice_fixture.AsAnyBuffer());
+  xla::ffi::Error layer1_err = TriggerRaidenD2hImpl(
+      src_offsets_fixture.AsAnyBuffer(), dst_offsets_fixture.AsAnyBuffer(),
+      copy_sizes_fixture.AsAnyBuffer(), shard_idx_fixture.AsAnyBuffer(),
+      cache_slice_fixture.AsAnyBuffer(), /*layer_idx=*/1,
+      cache_slice_fixture.AsAnyBuffer());
+
+  EXPECT_TRUE(layer0_err.success()) << layer0_err.message();
+  EXPECT_EQ(layer1_err.errc(), xla::ffi::ErrorCode::kFailedPrecondition);
+  EXPECT_THAT(layer1_err.message(),
+              ::testing::HasSubstr("Host buffer unavailable for layer 1 on "
+                                   "Shard: 0: layer 1 shard 0 has no host "
+                                   "buffer"));
 }
 
 }  // namespace

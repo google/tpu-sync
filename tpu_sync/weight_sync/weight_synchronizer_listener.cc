@@ -33,18 +33,93 @@
 #include "absl/log/log.h"
 #include "absl/log/vlog_is_on.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/ascii.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
+#include "absl/strings/string_view.h"
 #include "tpu_sync/common/control_pipe/control_dispatcher.h"
 #include "tpu_sync/common/control_pipe/control_pipe_server.h"
 #include "tpu_sync/common/control_pipe/control_pipe_types.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
+#include "tpu_sync/rpc/weight_transfer_worker_service.pb.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
 namespace tpu_raiden {
 namespace weight_sync {
+namespace {
+
+constexpr char kStoppingMessage[] = "WeightSynchronizerListener is stopping";
+
+// Validates the expected chunk counts of the receiver-side `start_req` and
+// registers them, with the transfer's tiling settings, so that `engine` can
+// account for the chunks of transfer `start_req.uuid()` as they arrive.
+absl::Status RegisterIncomingTransfer(
+    WeightSynchronizerBase& engine,
+    const ::tpu_sync::rpc::StartTransferRequest& start_req) {
+  const int64_t expected_block_count = start_req.expected_block_count();
+  const uint64_t uuid = start_req.uuid();
+  if (ABSL_PREDICT_FALSE(VLOG_IS_ON(1))) {
+    VLOG(1) << "RAIDEN_DIAG recv arm uuid=" << uuid
+            << " req_id=" << start_req.req_id()
+            << " expected_block_count=" << expected_block_count;
+  }
+  if (expected_block_count <= 0 ||
+      expected_block_count > std::numeric_limits<uint32_t>::max()) {
+    return absl::InvalidArgumentError(
+        "expected_block_count must be positive and fit in 32-bit uint");
+  }
+  const auto& layer_counts_proto = start_req.expected_layer_chunk_counts();
+  // Every received chunk must be attributed to a layer so that each layer
+  // with data fires OnLayerDataReceived before OnDataReceived.
+  int64_t total_layer_chunks = 0;
+  for (const auto& [layer_idx, count] : layer_counts_proto) {
+    if (layer_idx < 0 ||
+        static_cast<size_t>(layer_idx) >= engine.num_layers() || count < 0 ||
+        count > std::numeric_limits<uint32_t>::max()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "expected_layer_chunk_counts maps layer ", layer_idx, " to ", count,
+          " chunks; layers must be in [0, ", engine.num_layers(),
+          ") and counts in [0, ", std::numeric_limits<uint32_t>::max(), "]"));
+    }
+    total_layer_chunks += count;
+  }
+  if (layer_counts_proto.empty() ||
+      total_layer_chunks != expected_block_count) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("expected_layer_chunk_counts must be non-empty and sum to "
+                     "expected_block_count=",
+                     expected_block_count, "; got ", layer_counts_proto.size(),
+                     " layer(s) summing to ", total_layer_chunks));
+  }
+  engine.StoreSkipTiling(uuid, start_req);
+
+  absl::flat_hash_map<size_t, uint32_t> layer_counts;
+  for (const auto& [layer_idx, count] : layer_counts_proto) {
+    layer_counts[static_cast<size_t>(layer_idx)] = static_cast<uint32_t>(count);
+  }
+  ABSL_RETURN_IF_ERROR(engine.RegisterExpectedLayerChunks(uuid, layer_counts));
+  return engine.RegisterExpectedChunks(
+      uuid, static_cast<uint32_t>(expected_block_count));
+}
+
+// Returns FailedPrecondition if `target_incarnation_id` is neither 0 nor
+// `engine`'s incarnation ID, i.e. the `rpc` request was meant for another
+// incarnation of this work unit.
+absl::Status CheckTargetIncarnation(const WeightSynchronizerBase& engine,
+                                    absl::string_view rpc, int64_t uuid,
+                                    int64_t target_incarnation_id) {
+  if (target_incarnation_id == 0 ||
+      target_incarnation_id == engine.incarnation_id()) {
+    return absl::OkStatus();
+  }
+  return absl::FailedPreconditionError(absl::StrCat(
+      rpc, " (uuid=", uuid, ") targets incarnation_id=", target_incarnation_id,
+      ", but this worker's is ", engine.incarnation_id()));
+}
+
+}  // namespace
 
 ControlPipeBackendType WeightSynchronizerListener::ResolveBackendType(
     std::optional<ControlPipeBackendType> backend_type) {
@@ -74,6 +149,24 @@ ControlPipeBackendType WeightSynchronizerListener::ResolveBackendType(
   return ControlPipeBackendType::kGrpc;
 }
 
+template <typename Request, typename Response>
+void WeightSynchronizerListener::RegisterHandler(
+    absl::StatusOr<Response> (WeightSynchronizerListener::*handle)(
+        const Request&),
+    size_t max_payload_bytes) {
+  pipe_server_->dispatcher().RegisterHandler<Request, Response>(
+      [this, handle](const ControlContext& /*ctx*/,
+                     const Request& req) -> absl::StatusOr<Response> {
+        absl::StatusOr<Response> resp = (this->*handle)(req);
+        if (!resp.ok()) {
+          LOG(ERROR) << Request::descriptor()->name()
+                     << " failed: " << resp.status();
+        }
+        return resp;
+      },
+      HandlerOptions<Request>().WithMaxPayloadBytes(max_payload_bytes));
+}
+
 WeightSynchronizerListener::WeightSynchronizerListener(
     WeightSynchronizerBase* engine, int listener_port,
     std::optional<ControlPipeBackendType> backend_type)
@@ -84,26 +177,12 @@ WeightSynchronizerListener::WeightSynchronizerListener(
   cfg.allow_legacy_framing = (cfg.backend_type == ControlPipeBackendType::kTcp);
 
   pipe_server_ = CreateControlPipeServer(cfg);
-  pipe_server_->dispatcher()
-      .RegisterHandler<::tpu_sync::rpc::ControlRequest,
-                       ::tpu_sync::rpc::ControlResponse>(
-          [this](const ControlContext& /*ctx*/,
-                 const ::tpu_sync::rpc::ControlRequest& req)
-              -> absl::StatusOr<::tpu_sync::rpc::ControlResponse> {
-            ::tpu_sync::rpc::ControlResponse resp;
-            if (req.command() ==
-                    ::tpu_sync::rpc::ControlRequest::COMMAND_START_TRANSFER &&
-                stopping_.load()) {
-              resp.set_success(false);
-              resp.set_message("WeightSynchronizerListener is stopping");
-              return resp;
-            }
-            ExecuteControlRequest(engine_, req, &resp,
-                                  [this]() { stopping_.store(true); });
-            return resp;
-          },
-          HandlerOptions<::tpu_sync::rpc::ControlRequest>().WithMaxPayloadBytes(
-              cfg.max_frame_bytes));
+  RegisterHandler(&WeightSynchronizerListener::HandleControlRequest,
+                  cfg.max_frame_bytes);
+  RegisterHandler(&WeightSynchronizerListener::HandlePrepareWeightReceive,
+                  cfg.max_frame_bytes);
+  RegisterHandler(&WeightSynchronizerListener::HandleStartWeightPush,
+                  cfg.max_frame_bytes);
 
   if (pipe_server_->backend_type() == ControlPipeBackendType::kGrpc) {
     CHECK_OK(
@@ -135,6 +214,22 @@ void WeightSynchronizerListener::Shutdown() {
   if (pipe_server_) {
     pipe_server_->Stop();
   }
+}
+
+absl::StatusOr<::tpu_sync::rpc::ControlResponse>
+WeightSynchronizerListener::HandleControlRequest(
+    const ::tpu_sync::rpc::ControlRequest& req) {
+  ::tpu_sync::rpc::ControlResponse resp;
+  if (req.command() ==
+          ::tpu_sync::rpc::ControlRequest::COMMAND_START_TRANSFER &&
+      stopping_.load()) {
+    resp.set_success(false);
+    resp.set_message(kStoppingMessage);
+    return resp;
+  }
+  ExecuteControlRequest(engine_, req, &resp,
+                        [this]() { stopping_.store(true); });
+  return resp;
 }
 
 void WeightSynchronizerListener::ExecuteControlRequest(
@@ -252,63 +347,12 @@ void WeightSynchronizerListener::ExecuteControlRequest(
     } else {
       LOG(INFO) << "C++ Listener received START_TRANSFER (Receiver) - "
                    "registering expected block count";
-      int64_t expected_block_count =
-          req.start_transfer_request().expected_block_count();
-      uint64_t uuid = req.start_transfer_request().uuid();
-      if (ABSL_PREDICT_FALSE(VLOG_IS_ON(1))) {
-        std::string req_id = req.start_transfer_request().req_id();
-        VLOG(1) << "RAIDEN_DIAG recv arm uuid=" << uuid << " req_id=" << req_id
-                << " expected_block_count=" << expected_block_count;
-      }
-      if (expected_block_count <= 0 ||
-          expected_block_count > std::numeric_limits<uint32_t>::max()) {
-        resp->set_success(false);
-        resp->set_message(
-            "expected_block_count must be positive and fit in 32-bit uint");
-        LOG(ERROR) << "Invalid expected_block_count: " << expected_block_count;
-        return;
-      }
-      const auto& layer_counts_proto =
-          req.start_transfer_request().expected_layer_chunk_counts();
-      // Every received chunk must be attributed to a layer so that each layer
-      // with data fires OnLayerDataReceived before OnDataReceived.
-      int64_t total_layer_chunks = 0;
-      for (const auto& entry : layer_counts_proto) {
-        total_layer_chunks += entry.second;
-      }
-      if (layer_counts_proto.empty() ||
-          total_layer_chunks != expected_block_count) {
-        resp->set_success(false);
-        resp->set_message(absl::StrCat(
-            "expected_layer_chunk_counts must be non-empty and sum to "
-            "expected_block_count=",
-            expected_block_count, "; got ", layer_counts_proto.size(),
-            " layer(s) summing to ", total_layer_chunks));
-        LOG(ERROR) << resp->message();
-        return;
-      }
-      engine->StoreSkipTiling(uuid, req.start_transfer_request());
-
-      absl::flat_hash_map<size_t, uint32_t> layer_counts;
-      for (const auto& [layer_idx, count] : layer_counts_proto) {
-        layer_counts[static_cast<size_t>(layer_idx)] =
-            static_cast<uint32_t>(count);
-      }
-      absl::Status layer_status =
-          engine->RegisterExpectedLayerChunks(uuid, layer_counts);
-      if (!layer_status.ok()) {
-        resp->set_success(false);
-        resp->set_message(std::string(layer_status.message()));
-        LOG(ERROR) << "RegisterExpectedLayerChunks failed: " << layer_status;
-        return;
-      }
-
-      absl::Status status = engine->RegisterExpectedChunks(
-          uuid, static_cast<uint32_t>(expected_block_count));
-      if (!status.ok()) {
+      if (absl::Status status =
+              RegisterIncomingTransfer(*engine, req.start_transfer_request());
+          !status.ok()) {
         resp->set_success(false);
         resp->set_message(std::string(status.message()));
-        LOG(ERROR) << "RegisterExpectedChunks failed: " << status;
+        LOG(ERROR) << "START_TRANSFER (Receiver) failed: " << status;
       }
     }
   } else if (req.command() ==
@@ -328,6 +372,82 @@ void WeightSynchronizerListener::ExecuteControlRequest(
     LOG(WARNING) << "C++ Listener received unknown or unspecified "
                     "Protobuf command";
   }
+}
+
+absl::StatusOr<::tpu_sync::rpc::PrepareWeightReceiveResponse>
+WeightSynchronizerListener::HandlePrepareWeightReceive(
+    const ::tpu_sync::rpc::PrepareWeightReceiveRequest& req) {
+  if (stopping_.load()) {
+    return absl::UnavailableError(kStoppingMessage);
+  }
+  LOG(INFO) << "C++ Listener executing PrepareWeightReceive (uuid="
+            << req.uuid() << ", req_id=" << req.req_id() << ")";
+  if (req.uuid() <= 0) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "PrepareWeightReceive requires a positive uuid; got ", req.uuid()));
+  }
+  // TODO(raiden-eng): Commit the version into the staging buffer once the
+  // buffer tracks versions; until then nothing on the worker reads it.
+  if (req.version().epoch() == 0 && req.version().version_id() == 0) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "PrepareWeightReceive (uuid=", req.uuid(), ") carries no version"));
+  }
+  ABSL_RETURN_IF_ERROR(CheckTargetIncarnation(*engine_, "PrepareWeightReceive",
+                                              req.uuid(),
+                                              req.target_incarnation_id()));
+
+  ::tpu_sync::rpc::StartTransferRequest recv;
+  recv.set_is_sender(false);
+  recv.set_uuid(req.uuid());
+  recv.set_expected_block_count(req.expected_block_count());
+  *recv.mutable_expected_layer_chunk_counts() =
+      req.expected_layer_chunk_counts();
+  recv.set_host_tiling_mode(req.host_tiling_mode());
+  *recv.mutable_skip_tiling() = req.skip_tiling();
+  recv.set_req_id(req.req_id());
+  ABSL_RETURN_IF_ERROR(RegisterIncomingTransfer(*engine_, recv));
+  return ::tpu_sync::rpc::PrepareWeightReceiveResponse();
+}
+
+absl::StatusOr<::tpu_sync::rpc::StartWeightPushResponse>
+WeightSynchronizerListener::HandleStartWeightPush(
+    const ::tpu_sync::rpc::StartWeightPushRequest& req) {
+  if (stopping_.load()) {
+    return absl::UnavailableError(kStoppingMessage);
+  }
+  LOG(INFO) << "C++ Listener executing StartWeightPush (uuid=" << req.uuid()
+            << ", req_id=" << req.req_id() << ")";
+  if (req.uuid() <= 0) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "StartWeightPush requires a positive uuid; got ", req.uuid()));
+  }
+  // Without StartTransferRequest.src_units, PushWeightsResharded() cannot
+  // infer the layer of an entry.
+  for (const auto& [shard, schedule] : req.shard_push_schedules()) {
+    for (const ::tpu_sync::rpc::ShardPushEntryProto& entry :
+         schedule.entries()) {
+      if (!entry.has_layer_idx()) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "StartWeightPush (uuid=", req.uuid(),
+            ") has a schedule entry without layer_idx for shard ", shard));
+      }
+    }
+  }
+  ABSL_RETURN_IF_ERROR(CheckTargetIncarnation(
+      *engine_, "StartWeightPush", req.uuid(), req.target_incarnation_id()));
+
+  ::tpu_sync::rpc::StartTransferRequest push;
+  push.set_is_sender(true);
+  push.set_uuid(req.uuid());
+  *push.mutable_shard_push_schedules() = req.shard_push_schedules();
+  push.set_skip_d2h(req.skip_d2h());
+  push.set_host_tiling_mode(req.host_tiling_mode());
+  *push.mutable_skip_tiling() = req.skip_tiling();
+  push.set_parallelism(req.parallelism());
+  push.set_req_id(req.req_id());
+  *push.mutable_peer_control_endpoints() = req.peer_control_endpoints();
+  ABSL_RETURN_IF_ERROR(engine_->PushWeightsResharded(push));
+  return ::tpu_sync::rpc::StartWeightPushResponse();
 }
 
 }  // namespace weight_sync

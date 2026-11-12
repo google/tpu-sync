@@ -157,6 +157,12 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   bool is_listener_active() const;
   virtual std::vector<RaidenTransferEndpoint> get_local_endpoints() const;
 
+  // Identifies this synchronizer among the incarnations of its work unit (see
+  // weight_transfer_common.proto). Derived from the creation time in
+  // microseconds since the Unix epoch, so a restarted worker, created seconds
+  // later, gets a larger ID.
+  int64_t incarnation_id() const { return incarnation_id_; }
+
   ~WeightSynchronizerBase() override;
 
   void SetGlobalShardIndices(std::vector<int64_t> indices) {
@@ -540,6 +546,9 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   // When enabled, automatically schedules asynchronous device transfers (H2D)
   // upon complete host buffer writes.
   bool auto_h2d_ = false;
+
+  // See incarnation_id().
+  const int64_t incarnation_id_ = absl::ToUnixMicros(absl::Now());
 
   // Signals that a received layer's host buffers hold device-layout bytes,
   // i.e. the layer has arrived and, if needed, been tiled in place.

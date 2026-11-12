@@ -19,20 +19,28 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/base/thread_annotations.h"
 #include "absl/flags/flag.h"
+#include "absl/flags/reflection.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
+#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "grpcpp/channel.h"
@@ -47,6 +55,7 @@
 #include "tpu_sync/common/control_pipe/control_pipe_types.h"
 #include "tpu_sync/common/control_pipe/grpc_control_pipe.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
+#include "tpu_sync/rpc/weight_transfer_worker_service.pb.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
 namespace tpu_raiden {
@@ -70,12 +79,19 @@ using ::peregrine::internal::proto::RespMsg;
 using ::testing::AllOf;
 using ::testing::HasSubstr;
 using ::testing::Not;
+using ::testing::Pair;
+using ::testing::UnorderedElementsAre;
+using ::testing::status::IsOkAndHolds;
 using ::testing::status::StatusIs;
 using ::tpu_sync::rpc::ControlRequest;
 using ::tpu_sync::rpc::ControlResponse;
+using ::tpu_sync::rpc::PrepareWeightReceiveRequest;
+using ::tpu_sync::rpc::PrepareWeightReceiveResponse;
 using ::tpu_sync::rpc::ShardPushEntryProto;
 using ::tpu_sync::rpc::ShardPushScheduleProto;
 using ::tpu_sync::rpc::StartTransferRequest;
+using ::tpu_sync::rpc::StartWeightPushRequest;
+using ::tpu_sync::rpc::StartWeightPushResponse;
 
 namespace {
 
@@ -644,6 +660,385 @@ TEST(WeightSynchronizerListenerTest,
                                                     []() {});
   EXPECT_FALSE(resp.success());
   EXPECT_THAT(resp.message(), HasSubstr("summing to 2"));
+}
+
+TEST(WeightSynchronizerListenerTest,
+     ReceiverStartTransferRejectsInvalidLayerChunkCountEntries) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> engine,
+      WeightSynchronizerBase::Create(
+          /*num_layers=*/2, /*num_shards=*/1, /*slice_byte_size=*/128,
+          /*local_port=*/0, /*host_blocks_to_allocate=*/std::nullopt,
+          /*parallelism=*/1, /*listener_port=*/std::nullopt));
+  // Arms transfer `uuid` for 2 chunks with `layer_counts`.
+  auto arm = [&engine](
+                 int64_t uuid,
+                 const std::vector<std::pair<int32_t, int64_t>>& layer_counts) {
+    ControlRequest req;
+    req.set_command(ControlRequest::COMMAND_START_TRANSFER);
+    StartTransferRequest* start_req = req.mutable_start_transfer_request();
+    start_req->set_is_sender(false);
+    start_req->set_uuid(uuid);
+    start_req->set_expected_block_count(2);
+    for (const auto& [layer_idx, count] : layer_counts) {
+      (*start_req->mutable_expected_layer_chunk_counts())[layer_idx] = count;
+    }
+    ControlResponse resp;
+    WeightSynchronizerListener::ExecuteControlRequest(engine.get(), req, &resp,
+                                                      []() {});
+    return resp;
+  };
+
+  // Each of these sums to 2 but has an invalid entry.
+  ControlResponse negative_count = arm(7780, {{0, 3}, {1, -1}});
+  EXPECT_FALSE(negative_count.success());
+  EXPECT_THAT(negative_count.message(), HasSubstr("maps layer 1 to -1 chunks"));
+  ControlResponse unknown_layer = arm(7781, {{0, 1}, {2, 1}});
+  EXPECT_FALSE(unknown_layer.success());
+  EXPECT_THAT(unknown_layer.message(), HasSubstr("maps layer 2 to 1 chunks"));
+  ControlResponse negative_layer = arm(7782, {{-1, 1}, {0, 1}});
+  EXPECT_FALSE(negative_layer.success());
+  EXPECT_THAT(negative_layer.message(), HasSubstr("maps layer -1 to 1 chunks"));
+
+  // A layer without chunks is valid.
+  ControlResponse empty_layer = arm(7783, {{0, 2}, {1, 0}});
+  EXPECT_TRUE(empty_layer.success()) << empty_layer.message();
+}
+
+// The tests of rendezvous weight pushes (weight_transfer_worker_service.proto)
+// below push a 1-layer model from a source with two 8-byte shards to a
+// destination with one 16-byte shard, sending each request to a worker's
+// listener over the control pipe.
+constexpr size_t kSrcShardBytes = 8;
+constexpr int64_t kPushUuid = 4242;
+
+// A CPU-only synchronizer of the model without a listener of its own.
+absl::StatusOr<std::unique_ptr<WeightSynchronizerBase>> CreateShardedCpuEngine(
+    size_t num_shards, size_t shard_bytes) {
+  return WeightSynchronizerBase::Create(
+      /*num_layers=*/1, num_shards, shard_bytes, /*local_port=*/0,
+      /*host_blocks_to_allocate=*/std::nullopt, /*parallelism=*/1,
+      /*listener_port=*/std::nullopt);
+}
+
+// Phase 1 of push `uuid` on a destination that receives `num_chunks` chunks.
+PrepareWeightReceiveRequest MakePrepareRequest(int64_t uuid,
+                                               int64_t num_chunks) {
+  PrepareWeightReceiveRequest req;
+  req.set_uuid(uuid);
+  req.mutable_version()->set_version_id(7);
+  req.set_expected_block_count(num_chunks);
+  (*req.mutable_expected_layer_chunk_counts())[0] = num_chunks;
+  return req;
+}
+
+// Phase 2 of push `uuid` on the source: sends source shards 0 and 1, one chunk
+// each, to the second and first half of the shard of the destination whose
+// data endpoint is `dst_peer`.
+StartWeightPushRequest MakeSwapPushRequest(int64_t uuid,
+                                           const std::string& dst_peer) {
+  StartWeightPushRequest req;
+  req.set_uuid(uuid);
+  for (int shard = 0; shard < 2; ++shard) {
+    ShardPushEntryProto* entry =
+        (*req.mutable_shard_push_schedules())[shard].add_entries();
+    entry->add_dst_peers(dst_peer);
+    entry->set_dst_shard_idx(0);
+    entry->set_src_offset_bytes(0);
+    entry->set_dst_offset_bytes((1 - shard) * kSrcShardBytes);
+    entry->set_size_bytes(kSrcShardBytes);
+    entry->set_layer_idx(0);
+  }
+  return req;
+}
+
+// Sends `req` to `listener` over a control pipe of the listener's backend.
+template <typename Response, typename Request>
+absl::Status CallListener(const WeightSynchronizerListener& listener,
+                          const Request& req) {
+  ControlPipeConfig cfg;
+  cfg.backend_type = listener.backend_type();
+  return CreateControlPipeClient(cfg)
+      ->Call<Request, Response>(
+          absl::StrCat("127.0.0.1:", listener.listener_port()), req,
+          absl::Seconds(10))
+      .status();
+}
+
+absl::Status SendPrepare(const WeightSynchronizerListener& listener,
+                         const PrepareWeightReceiveRequest& req) {
+  return CallListener<PrepareWeightReceiveResponse>(listener, req);
+}
+
+absl::Status SendStartPush(const WeightSynchronizerListener& listener,
+                           const StartWeightPushRequest& req) {
+  return CallListener<StartWeightPushResponse>(listener, req);
+}
+
+// Sets byte `i` of source shard `s` to `s * kSrcShardBytes + i`.
+absl::Status FillSourceShards(WeightSynchronizerBase& src) {
+  for (size_t s = 0; s < 2; ++s) {
+    ABSL_ASSIGN_OR_RETURN(absl::Span<uint8_t> shard, src.GetHostBuffer(0, s));
+    for (size_t i = 0; i < kSrcShardBytes; ++i) {
+      shard[i] = static_cast<uint8_t>(s * kSrcShardBytes + i);
+    }
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<std::vector<uint8_t>> DestinationBytes(
+    WeightSynchronizerBase& dst) {
+  ABSL_ASSIGN_OR_RETURN(absl::Span<const uint8_t> shard,
+                        dst.GetHostBuffer(0, 0));
+  shard = shard.subspan(0, 2 * kSrcShardBytes);
+  return std::vector<uint8_t>(shard.begin(), shard.end());
+}
+
+TEST(WeightSynchronizerListenerTest, RendezvousPushDeliversReshardedSlices) {
+  for (ControlPipeBackendType backend :
+       {ControlPipeBackendType::kGrpc, ControlPipeBackendType::kTcp}) {
+    SCOPED_TRACE(ControlPipeBackendTypeName(backend));
+    TF_ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<WeightSynchronizerBase> src,
+        CreateShardedCpuEngine(/*num_shards=*/2, kSrcShardBytes));
+    TF_ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<WeightSynchronizerBase> dst,
+        CreateShardedCpuEngine(/*num_shards=*/1, 2 * kSrcShardBytes));
+    ASSERT_TRUE(dst->local_port().has_value());
+    ABSL_ASSERT_OK(FillSourceShards(*src));
+    WeightSynchronizerListener src_listener(src.get(), /*listener_port=*/0,
+                                            backend);
+    WeightSynchronizerListener dst_listener(dst.get(), /*listener_port=*/0,
+                                            backend);
+
+    PrepareWeightReceiveRequest prepare =
+        MakePrepareRequest(kPushUuid, /*num_chunks=*/2);
+    prepare.set_target_incarnation_id(dst->incarnation_id());
+    ABSL_ASSERT_OK(SendPrepare(dst_listener, prepare));
+    StartWeightPushRequest push = MakeSwapPushRequest(
+        kPushUuid, absl::StrCat("127.0.0.1:", *dst->local_port()));
+    push.set_target_incarnation_id(src->incarnation_id());
+    ABSL_ASSERT_OK(SendStartPush(src_listener, push));
+
+    // Returns once both chunks registered in phase 1 have arrived.
+    ABSL_ASSERT_OK(dst->WaitForTransferCompletion(kPushUuid));
+    EXPECT_THAT(DestinationBytes(*dst),
+                IsOkAndHolds(std::vector<uint8_t>(
+                    {8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7})));
+  }
+}
+
+TEST(WeightSynchronizerListenerTest,
+     PrepareWeightReceiveRejectsOtherIncarnations) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> dst,
+      CreateShardedCpuEngine(/*num_shards=*/1, 2 * kSrcShardBytes));
+  ASSERT_GT(dst->incarnation_id(), 0);
+  WeightSynchronizerListener listener(dst.get(), /*listener_port=*/0);
+
+  // For example, meant for the worker that this one replaced.
+  PrepareWeightReceiveRequest stale = MakePrepareRequest(kPushUuid, 2);
+  stale.set_target_incarnation_id(dst->incarnation_id() - 1);
+  EXPECT_THAT(SendPrepare(listener, stale),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("incarnation_id")));
+
+  PrepareWeightReceiveRequest current = MakePrepareRequest(kPushUuid + 1, 2);
+  current.set_target_incarnation_id(dst->incarnation_id());
+  ABSL_EXPECT_OK(SendPrepare(listener, current));
+
+  // 0 skips the check.
+  PrepareWeightReceiveRequest unchecked = MakePrepareRequest(kPushUuid + 2, 2);
+  ABSL_EXPECT_OK(SendPrepare(listener, unchecked));
+}
+
+TEST(WeightSynchronizerListenerTest,
+     StartWeightPushRejectsOtherIncarnationsBeforeSending) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> src,
+      CreateShardedCpuEngine(/*num_shards=*/2, kSrcShardBytes));
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> dst,
+      CreateShardedCpuEngine(/*num_shards=*/1, 2 * kSrcShardBytes));
+  ASSERT_TRUE(dst->local_port().has_value());
+  ABSL_ASSERT_OK(FillSourceShards(*src));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> dst_shard, dst->GetHostBuffer(0, 0));
+  std::fill(dst_shard.begin(), dst_shard.end(), 0);
+  WeightSynchronizerListener src_listener(src.get(), /*listener_port=*/0);
+  WeightSynchronizerListener dst_listener(dst.get(), /*listener_port=*/0);
+  ABSL_ASSERT_OK(SendPrepare(dst_listener,
+                             MakePrepareRequest(kPushUuid, /*num_chunks=*/2)));
+  StartWeightPushRequest push = MakeSwapPushRequest(
+      kPushUuid, absl::StrCat("127.0.0.1:", *dst->local_port()));
+
+  push.set_target_incarnation_id(src->incarnation_id() - 1);
+  EXPECT_THAT(SendStartPush(src_listener, push),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("incarnation_id")));
+  EXPECT_THAT(DestinationBytes(*dst),
+              IsOkAndHolds(std::vector<uint8_t>(2 * kSrcShardBytes, 0)));
+
+  // 0 skips the check.
+  push.set_target_incarnation_id(0);
+  ABSL_ASSERT_OK(SendStartPush(src_listener, push));
+  ABSL_ASSERT_OK(dst->WaitForTransferCompletion(kPushUuid));
+  EXPECT_THAT(DestinationBytes(*dst),
+              IsOkAndHolds(std::vector<uint8_t>(
+                  {8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7})));
+}
+
+TEST(WeightSynchronizerListenerTest, RendezvousRequestsRejectInvalidFields) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> engine,
+      CreateShardedCpuEngine(/*num_shards=*/2, kSrcShardBytes));
+  WeightSynchronizerListener listener(engine.get(), /*listener_port=*/0);
+
+  EXPECT_THAT(
+      SendPrepare(listener, MakePrepareRequest(/*uuid=*/0, /*num_chunks=*/2)),
+      StatusIs(absl::StatusCode::kInvalidArgument, HasSubstr("positive uuid")));
+  PrepareWeightReceiveRequest no_version = MakePrepareRequest(kPushUuid, 2);
+  no_version.clear_version();
+  EXPECT_THAT(
+      SendPrepare(listener, no_version),
+      StatusIs(absl::StatusCode::kInvalidArgument, HasSubstr("no version")));
+  PrepareWeightReceiveRequest miscounted = MakePrepareRequest(kPushUuid, 2);
+  (*miscounted.mutable_expected_layer_chunk_counts())[0] = 1;
+  EXPECT_THAT(
+      SendPrepare(listener, miscounted),
+      StatusIs(absl::StatusCode::kInvalidArgument, HasSubstr("summing to 1")));
+  PrepareWeightReceiveRequest unknown_layer = MakePrepareRequest(kPushUuid, 2);
+  unknown_layer.clear_expected_layer_chunk_counts();
+  (*unknown_layer.mutable_expected_layer_chunk_counts())[1] = 2;
+  EXPECT_THAT(SendPrepare(listener, unknown_layer),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("maps layer 1 to 2 chunks")));
+
+  // Rejected before anything is sent to the destination.
+  const std::string dst_peer = "127.0.0.1:1";
+  EXPECT_THAT(
+      SendStartPush(listener, MakeSwapPushRequest(/*uuid=*/0, dst_peer)),
+      StatusIs(absl::StatusCode::kInvalidArgument, HasSubstr("positive uuid")));
+  StartWeightPushRequest no_layer = MakeSwapPushRequest(kPushUuid, dst_peer);
+  (*no_layer.mutable_shard_push_schedules())[1]
+      .mutable_entries(0)
+      ->clear_layer_idx();
+  EXPECT_THAT(
+      SendStartPush(listener, no_layer),
+      StatusIs(absl::StatusCode::kInvalidArgument, HasSubstr("layer_idx")));
+}
+
+TEST(WeightSynchronizerListenerTest, RendezvousRequestsRejectedAfterShutdown) {
+  for (ControlPipeBackendType backend :
+       {ControlPipeBackendType::kGrpc, ControlPipeBackendType::kTcp}) {
+    SCOPED_TRACE(ControlPipeBackendTypeName(backend));
+    TF_ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<WeightSynchronizerBase> engine,
+        CreateShardedCpuEngine(/*num_shards=*/2, kSrcShardBytes));
+    WeightSynchronizerListener listener(engine.get(), /*listener_port=*/0,
+                                        backend);
+    ControlRequest shutdown_req;
+    shutdown_req.set_command(ControlRequest::COMMAND_SHUTDOWN);
+    ControlPipeConfig cfg;
+    cfg.backend_type = backend;
+    TF_ASSERT_OK_AND_ASSIGN(
+        ControlResponse shutdown_resp,
+        (CreateControlPipeClient(cfg)->Call<ControlRequest, ControlResponse>(
+            absl::StrCat("127.0.0.1:", listener.listener_port()), shutdown_req,
+            absl::Seconds(10))));
+    ASSERT_TRUE(shutdown_resp.success()) << shutdown_resp.message();
+
+    EXPECT_THAT(
+        SendPrepare(listener, MakePrepareRequest(kPushUuid, /*num_chunks=*/2)),
+        StatusIs(absl::StatusCode::kUnavailable,
+                 "WeightSynchronizerListener is stopping"));
+    EXPECT_THAT(
+        SendStartPush(listener, MakeSwapPushRequest(kPushUuid, "127.0.0.1:1")),
+        StatusIs(absl::StatusCode::kUnavailable,
+                 "WeightSynchronizerListener is stopping"));
+  }
+}
+
+// Captures the request that StartWeightPush hands to PushWeightsResharded()
+// instead of pushing it.
+class PushCapturingEngine : public WeightSynchronizerBase {
+ public:
+  PushCapturingEngine()
+      : WeightSynchronizerBase(/*num_layers=*/1, /*num_shards=*/2,
+                               /*slice_byte_sizes=*/{kSrcShardBytes},
+                               /*local_port=*/0, /*parallelism=*/1,
+                               /*bind_ip=*/std::nullopt, /*layer_names=*/{},
+                               /*auto_h2d=*/false) {}
+
+  absl::Status Init() {
+    return InitHostBuffers({kSrcShardBytes}, /*listener_port=*/std::nullopt);
+  }
+
+  absl::Status PushWeightsResharded(
+      const StartTransferRequest& request) override {
+    absl::MutexLock lock(mu_);
+    pushed_ = request;
+    return absl::OkStatus();
+  }
+
+  StartTransferRequest pushed() const {
+    absl::MutexLock lock(mu_);
+    return pushed_;
+  }
+
+ private:
+  mutable absl::Mutex mu_;
+  StartTransferRequest pushed_ ABSL_GUARDED_BY(mu_);
+};
+
+TEST(WeightSynchronizerListenerTest, StartWeightPushForwardsItsFieldsToPush) {
+  PushCapturingEngine engine;
+  ABSL_ASSERT_OK(engine.Init());
+  WeightSynchronizerListener listener(&engine, /*listener_port=*/0);
+  StartWeightPushRequest req = MakeSwapPushRequest(kPushUuid, kPeerA);
+  req.set_skip_d2h(true);
+  req.set_host_tiling_mode(tpu_sync::rpc::HOST_TILING_MODE_PRE_TILED);
+  (*req.mutable_skip_tiling())[0] = true;
+  req.set_parallelism(3);
+  req.set_req_id("push-7");
+  (*req.mutable_peer_control_endpoints())[kPeerA] = kEndpoint1;
+
+  ABSL_ASSERT_OK(SendStartPush(listener, req));
+  const StartTransferRequest pushed = engine.pushed();
+  EXPECT_TRUE(pushed.is_sender());
+  EXPECT_EQ(pushed.uuid(), kPushUuid);
+  EXPECT_EQ(pushed.shard_push_schedules().size(), 2);
+  EXPECT_TRUE(pushed.skip_d2h());
+  EXPECT_EQ(pushed.host_tiling_mode(),
+            tpu_sync::rpc::HOST_TILING_MODE_PRE_TILED);
+  EXPECT_THAT(pushed.skip_tiling(), UnorderedElementsAre(Pair(0, true)));
+  EXPECT_EQ(pushed.parallelism(), 3);
+  EXPECT_EQ(pushed.req_id(), "push-7");
+  EXPECT_THAT(pushed.peer_control_endpoints(),
+              UnorderedElementsAre(Pair(kPeerA, kEndpoint1)));
+}
+
+TEST(WeightSynchronizerListenerTest,
+     StartWeightPushNamesDestinationsWithoutPeerControlEndpoints) {
+  absl::FlagSaver flag_saver;
+  absl::SetFlag(&FLAGS_peregrine_enable_psp_tcp, true);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> src,
+      CreateShardedCpuEngine(/*num_shards=*/2, kSrcShardBytes));
+  ASSERT_TRUE(src->psp_tcp_required());
+  // A TCP listener cannot serve PeregrineService, which PSP-TCP requires.
+  WeightSynchronizerListener listener(src.get(), /*listener_port=*/0,
+                                      ControlPipeBackendType::kGrpc);
+  StartWeightPushRequest push = MakeSwapPushRequest(kPushUuid, kPeerA);
+  (*push.mutable_shard_push_schedules())[1].mutable_entries(0)->set_dst_peers(
+      0, kPeerB);
+  (*push.mutable_peer_control_endpoints())[kPeerA] = kEndpoint1;
+
+  // Fails before anything is sent, naming only the destination without an
+  // endpoint.
+  EXPECT_THAT(SendStartPush(listener, push),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       AllOf(HasSubstr("peer_control_endpoints"),
+                             HasSubstr(kPeerB), Not(HasSubstr(kPeerA)))));
 }
 
 ControlPipeConfig GrpcClientConfig() {

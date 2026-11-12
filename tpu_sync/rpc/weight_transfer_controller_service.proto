@@ -27,18 +27,22 @@ option java_outer_classname = "WeightTransferControllerServiceProto";
 //
 // Each request is dispatched over the control pipe by its full protobuf message
 // name (`ControlEnvelope.message_type`); errors are returned in
-// `ControlResponseEnvelope`. When a request names a work unit (or
-// `incarnation_id`) that the controller does not recognize—for example, after a
-// controller restart—the controller returns `NOT_FOUND` so the caller
-// re-registers its work unit before retrying.
+// `ControlResponseEnvelope`:
+//   * `NOT_FOUND`: a work unit named by the request isn't registered, or the
+//     incarnation ID the request carries for it is newer than the one on record
+//     (for example, after a controller or worker restart). The caller
+//     re-registers the unit before retrying.
+//   * `FAILED_PRECONDITION`: the incarnation ID the request carries for a work
+//     unit is older than the one on record, so a newer incarnation of the unit
+//     has replaced the caller. The caller must not re-register in a loop.
+// Error messages name the offending units.
 
 // Publishes that `src_units` hold `version` of `model`.
 //
 // Used both when a producer publishes a newly generated weight version (from
 // which the controller may push `version` into initial receiver units) and when
 // an individual worker reports that it now holds `version` in host staging or
-// device memory after a pull or commit. Returns `NOT_FOUND` if any unit in
-// `src_units` (or `incarnation_id`, when non-zero) is not registered.
+// device memory after a pull or commit.
 message PublishWeightsRequest {
   // Registered work unit(s) holding `version` (all producer units when
   // publishing a newly generated version, or `[unit]` when a single worker
@@ -53,8 +57,8 @@ message PublishWeightsRequest {
   // complete in host staging buffers (eligible to serve peer pulls as a
   // `WeightLocation`), or `MEMORY_TYPE_HBM` when resident in device HBM.
   MemoryType memory_type = 4;
-  // Incarnation ID of the publishing host when a single worker reports its own
-  // buffer (`len(src_units) == 1`); 0 skips the per-host check.
+  // Incarnation ID of the publishing work unit when a single worker reports its
+  // own buffer (`len(src_units) == 1`); 0 skips the per-unit check.
   int64 incarnation_id = 5;
   // Optional transfer UUID when the controller pushes `version` from
   // `src_units` into initial receivers; 0 when no push transfer is needed or to
@@ -81,13 +85,13 @@ message PublishWeightsResponse {
 }
 
 // A registered work unit that holds a weight version in host staging memory and
-// can serve peer pulls for the matching host slot.
+// can serve peer pulls for callers with a matching shard placement and layout.
 message WeightLocation {
   RaidenIdProto unit = 1;
   // Data-plane endpoint ("ip:port") for each local shard of `unit`, indexed
   // 1:1 in local shard order (matching `RegisterWorkUnitRequest.shards`; on a
-  // multi-NIC host, shards on different NUMA nodes carry their respective NIC
-  // endpoints).
+  // multi-NIC machine, shards on different NUMA nodes carry their respective
+  // NIC endpoints).
   repeated string shard_endpoints = 2;
   // Incarnation ID of `unit`, echoed as `target_incarnation_id` in every pull
   // request so a restarted source rejects pulls meant for its predecessor.
@@ -96,14 +100,12 @@ message WeightLocation {
 
 // Queries the latest published weight version for `unit.data_name` and the
 // locations from which `unit` can pull it. Also renews `unit`'s liveness lease.
-// Returns `NOT_FOUND` if `(unit, incarnation_id)` is not registered.
 message GetCurrentWeightVersionRequest {
   // Registered work unit querying the latest version of `unit.data_name` (also
-  // identifies the caller's host slot and layout when selecting compatible
-  // `WeightLocation` sources).
+  // identifies the caller's shard placement and layout when selecting
+  // compatible `WeightLocation` sources).
   RaidenIdProto unit = 1;
-  // Incarnation ID of `unit`. Must be positive and strictly increase across
-  // restarts of the host; callers must not interpret it as a time.
+  // Incarnation ID of `unit` (see `weight_transfer_common.proto`).
   int64 incarnation_id = 2;
 }
 

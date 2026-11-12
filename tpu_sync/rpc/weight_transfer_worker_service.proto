@@ -34,8 +34,8 @@ option java_outer_classname = "WeightTransferWorkerServiceProto";
 //      `PrepareWeightReceiveRequest` verifies `target_incarnation_id`, claims
 //      exclusive write ownership of the destination's staging buffer for
 //      `(uuid, version)` (draining any in-flight pull readers or claimed H2D
-//      copy), registers expected per-layer chunk counts, and returns before any
-//      bytes move.
+//      copy, and dropping the buffer's previous complete version), registers
+//      expected per-layer chunk counts, and returns before any bytes move.
 //   2. Push (`S` parallel RPCs, controller -> each source worker, issued only
 //      after all `D` destinations acknowledge step 1):
 //      `StartWeightPushRequest` verifies `target_incarnation_id`, stages source
@@ -43,6 +43,12 @@ option java_outer_classname = "WeightTransferWorkerServiceProto";
 //      slices over TCP to the armed destinations, and returns once every TCP
 //      batch ACK arrives. Each destination commits `version` into its staging
 //      buffer once its last layer finishes on-arrival tiling.
+//
+// A push that fails midway commits no version, but it rolls back only the
+// staging buffer: on a worker that copies each layer to the device as soon as
+// it arrives (automatic H2D), layers already copied stay on the device.
+// Seed-and-pull receivers therefore copy a version to the device explicitly,
+// only after it commits.
 
 // Phase 1 (controller -> destination worker): arms the destination's staging
 // buffer and chunk accounting for an incoming weight push.
@@ -54,10 +60,10 @@ message PrepareWeightReceiveRequest {
   // destination's staging buffer only once every expected chunk has arrived and
   // been tiled.
   WeightVersion version = 2;
-  // Incarnation ID the controller expects of this destination worker. Rejected
-  // with FAILED_PRECONDITION when non-zero and different from the worker's own
-  // incarnation ID, so a restarted worker rejects commands meant for its
-  // predecessor. 0 skips the check.
+  // Incarnation ID the controller expects of this destination work unit.
+  // Rejected with FAILED_PRECONDITION when non-zero and different from the
+  // worker's own incarnation ID, so a restarted worker rejects commands meant
+  // for its predecessor. 0 skips the check.
   int64 target_incarnation_id = 3;
   // Total push chunks destined for this worker across all layers and shards;
   // must equal the sum of `expected_layer_chunk_counts` values.
@@ -83,12 +89,13 @@ message StartWeightPushRequest {
   // Unique transfer identifier matching `PrepareWeightReceiveRequest.uuid`.
   // Required (> 0).
   int64 uuid = 1;
-  // Incarnation ID the controller expects of this source worker. Rejected with
-  // FAILED_PRECONDITION when non-zero and different from the worker's own
+  // Incarnation ID the controller expects of this source work unit. Rejected
+  // with FAILED_PRECONDITION when non-zero and different from the worker's own
   // incarnation ID (for example, preventing a restarted worker from executing a
   // `skip_d2h` push out of an empty staging buffer). 0 skips the check.
   int64 target_incarnation_id = 2;
-  // Push schedules keyed by local (or global) source shard index.
+  // Push schedules keyed by local (or global) source shard index. Every entry
+  // must set `layer_idx`.
   map<int32, ShardPushScheduleProto> shard_push_schedules = 3;
   // When true, streams directly from existing host staging buffers without a
   // D2H copy.
@@ -102,6 +109,13 @@ message StartWeightPushRequest {
   int32 parallelism = 7;
   // Optional correlation ID for logging and diagnostics.
   string req_id = 8;
+  // Listener endpoint (`control_plane_rpc_address`) of each destination worker
+  // this worker pushes to, keyed by the destination's data endpoint exactly as
+  // the schedule entries name it (`dst_peers`, or `dst_peer` when that is
+  // empty). The worker dials the endpoint for the PSP-TCP key exchange. When
+  // the worker requires PSP-TCP, the push fails with FAILED_PRECONDITION unless
+  // every destination has an entry; otherwise this map is ignored.
+  map<string, string> peer_control_endpoints = 9;
 }
 
 message StartWeightPushResponse {}

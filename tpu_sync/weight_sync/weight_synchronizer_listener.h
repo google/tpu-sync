@@ -16,13 +16,17 @@
 #define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_WEIGHT_SYNC_WEIGHT_SYNCHRONIZER_LISTENER_H_
 
 #include <atomic>
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <optional>
 
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "tpu_sync/common/control_pipe/control_pipe_server.h"
 #include "tpu_sync/common/control_pipe/control_pipe_types.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
+#include "tpu_sync/rpc/weight_transfer_worker_service.pb.h"
 
 namespace tpu_raiden {
 namespace weight_sync {
@@ -31,6 +35,22 @@ class WeightSynchronizerBase;
 
 // Control-Plane Server Daemon that runs natively in C++ to accept management
 // RPC commands (like PushWeights and Shutdown) directly via ControlPipeServer.
+//
+// The listener also serves the two-phase weight push rendezvous of
+// weight_transfer_worker_service.proto, which moves one weight version from S
+// source workers to D destination workers with D + S control RPCs, all sent by
+// the controller to the workers' listeners:
+//   1. A PrepareWeightReceiveRequest to each destination (D RPCs, in
+//      parallel) registers the chunks the destination expects and returns
+//      before any data moves.
+//   2. Once every destination has answered, a StartWeightPushRequest to each
+//      source (S RPCs, in parallel) makes the source stream its scheduled
+//      slices straight to the destinations' data endpoints over TCP. The
+//      source answers once the destinations have acknowledged every slice.
+// A destination's transfer completes once all of its expected chunks have
+// arrived. Apart from the PSP-TCP key exchange, which a source runs with each
+// destination's listener when PSP-TCP is required, workers send each other no
+// control RPCs.
 //
 // On the gRPC backend the listener also serves the engine's PeregrineService
 // (RaidenManagerBase::peregrine_control_service()) on the same port, so one
@@ -95,6 +115,37 @@ class WeightSynchronizerListener final {
       std::function<void()> shutdown_callback = nullptr);
 
  private:
+  // Registers `handle` on the pipe server as the handler of `Request` messages
+  // of up to `max_payload_bytes` bytes, logging the errors it returns.
+  template <typename Request, typename Response>
+  void RegisterHandler(absl::StatusOr<Response> (
+                           WeightSynchronizerListener::*handle)(const Request&),
+                       size_t max_payload_bytes);
+
+  // Rejects COMMAND_START_TRANSFER once the listener is stopping; otherwise
+  // runs ExecuteControlRequest().
+  absl::StatusOr<::tpu_sync::rpc::ControlResponse> HandleControlRequest(
+      const ::tpu_sync::rpc::ControlRequest& req);
+
+  // Step 1 of the rendezvous on a destination worker: registers the incoming
+  // transfer like a receiver COMMAND_START_TRANSFER. Returns Unavailable once
+  // the listener is stopping, FailedPrecondition if a non-zero
+  // `req.target_incarnation_id` is not the engine's incarnation_id(), and
+  // InvalidArgument if `req.uuid` is not positive, `req.version` is unset, or
+  // the chunk counts are invalid. `req.version` is not recorded yet.
+  absl::StatusOr<::tpu_sync::rpc::PrepareWeightReceiveResponse>
+  HandlePrepareWeightReceive(
+      const ::tpu_sync::rpc::PrepareWeightReceiveRequest& req);
+
+  // Step 2 of the rendezvous on a source worker: pushes the scheduled slices
+  // with PushWeightsResharded(). Returns Unavailable once the listener is
+  // stopping, FailedPrecondition if a non-zero `req.target_incarnation_id` is
+  // not the engine's incarnation_id() or, when the engine requires PSP-TCP, if
+  // `req.peer_control_endpoints` lacks a destination, and InvalidArgument if
+  // `req.uuid` is not positive or a schedule entry has no `layer_idx`.
+  absl::StatusOr<::tpu_sync::rpc::StartWeightPushResponse>
+  HandleStartWeightPush(const ::tpu_sync::rpc::StartWeightPushRequest& req);
+
   WeightSynchronizerBase* engine_;
   int listener_port_ = 0;
   std::atomic<bool> stopping_{false};

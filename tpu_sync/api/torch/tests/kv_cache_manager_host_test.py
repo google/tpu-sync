@@ -220,6 +220,53 @@ class KVCacheManagerHostTest(unittest.TestCase):
           eps_on[0]["peregrine_endpoint"],
       )
 
+  def test_read_and_write_block_bytes_roundtrip_and_errors(self):
+    manager = kv_cache_manager.KVCacheManager.create_host_only_for_testing(
+        num_layers=1,
+        num_shards=1,
+        slice_byte_size=128,
+        node_id=7,
+        host_blocks=2,
+        parallelism=1,
+    )
+    payload_0 = b"A" * 128
+    payload_1 = b"B" * 128
+    manager.write_block_bytes(layer_idx=0, block_id=0, payload=payload_0)
+    manager.write_block_bytes(layer_idx=0, block_id=1, payload=payload_1)
+    self.assertEqual(
+        manager.read_block_bytes(layer_idx=0, block_id=0), payload_0
+    )
+    self.assertEqual(
+        manager.read_block_bytes(layer_idx=0, block_id=1), payload_1
+    )
+
+    with self.assertRaisesRegex(RuntimeError, "out of range"):
+      manager.read_block_bytes(layer_idx=1, block_id=0)
+    with self.assertRaisesRegex(RuntimeError, "out of range"):
+      manager.write_block_bytes(layer_idx=1, block_id=0, payload=payload_0)
+
+    with self.assertRaisesRegex(RuntimeError, "exceeds host buffer"):
+      manager.read_block_bytes(layer_idx=0, block_id=2)
+    with self.assertRaisesRegex(RuntimeError, "exceeds host buffer"):
+      manager.write_block_bytes(layer_idx=0, block_id=2, payload=payload_0)
+
+    no_host_manager = (
+        kv_cache_manager.KVCacheManager.create_host_only_for_testing(
+            num_layers=1,
+            num_shards=1,
+            slice_byte_size=128,
+            node_id=7,
+            host_blocks=0,
+            parallelism=1,
+        )
+    )
+    with self.assertRaisesRegex(RuntimeError, "has no host buffer"):
+      no_host_manager.read_block_bytes(layer_idx=0, block_id=0)
+    with self.assertRaisesRegex(RuntimeError, "has no host buffer"):
+      no_host_manager.write_block_bytes(
+          layer_idx=0, block_id=0, payload=payload_0
+      )
+
 
 class _FakeDetailsImpl:
 

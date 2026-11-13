@@ -53,6 +53,8 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "absl/types/span.h"
+#include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/core/control_plane_backend.h"
 #include "tpu_sync/core/grpc_control_plane_backend.h"
 #include "tpu_sync/core/numa_thread_pool.h"
@@ -1311,13 +1313,14 @@ TEST(ControlHandshakeTest,
 
   ASSERT_GT(consumer.base()->peregrine_local_port(), 0);
   for (size_t layer = 0; layer < kLayers; ++layer) {
+    TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> producer_buf,
+                         producer.base()->GetHostBuffer(layer, 0));
+    TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> consumer_buf,
+                         consumer.base()->GetHostBuffer(layer, 0));
     for (int block = 0; block < kBlocks; ++block) {
-      std::memset(
-          producer.base()->GetHostPointer(layer, 0) + block * kBlockBytes,
-          static_cast<int>(0x20 + layer * 16 + block), kBlockBytes);
-      std::memset(
-          consumer.base()->GetHostPointer(layer, 0) + block * kBlockBytes, 0,
-          kBlockBytes);
+      std::memset(producer_buf.data() + block * kBlockBytes,
+                  static_cast<int>(0x20 + layer * 16 + block), kBlockBytes);
+      std::memset(consumer_buf.data() + block * kBlockBytes, 0, kBlockBytes);
     }
   }
 
@@ -1357,16 +1360,16 @@ TEST(ControlHandshakeTest,
   ASSERT_TRUE(producer_done);
 
   for (size_t layer = 0; layer < kLayers; ++layer) {
-    EXPECT_EQ(
-        std::memcmp(consumer.base()->GetHostPointer(layer, 0) + 2 * kBlockBytes,
-                    producer.base()->GetHostPointer(layer, 0) + 1 * kBlockBytes,
-                    kBlockBytes),
-        0);
-    EXPECT_EQ(
-        std::memcmp(consumer.base()->GetHostPointer(layer, 0) + 0 * kBlockBytes,
-                    producer.base()->GetHostPointer(layer, 0) + 3 * kBlockBytes,
-                    kBlockBytes),
-        0);
+    TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> producer_buf,
+                         producer.base()->GetHostBuffer(layer, 0));
+    TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> consumer_buf,
+                         consumer.base()->GetHostBuffer(layer, 0));
+    EXPECT_EQ(std::memcmp(consumer_buf.data() + 2 * kBlockBytes,
+                          producer_buf.data() + 1 * kBlockBytes, kBlockBytes),
+              0);
+    EXPECT_EQ(std::memcmp(consumer_buf.data() + 0 * kBlockBytes,
+                          producer_buf.data() + 3 * kBlockBytes, kBlockBytes),
+              0);
   }
 }
 

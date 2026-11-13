@@ -1202,8 +1202,12 @@ TEST(ActivePlanTest, RegisteredPlanRetainsPeregrineEndpointForExplicitH2hPush) {
       absl::StrCat(receiver.base()->local_ip(), ":",
                    receiver.base()->local_port().value_or(0));
 
-  std::memset(sender.base()->GetHostPointer(0, 0), 0x5A, 128);
-  std::memset(receiver.base()->GetHostPointer(0, 0), 0x00, 128);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> sender_host,
+                       sender.base()->GetHostBuffer(0, 0));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> receiver_host,
+                       receiver.base()->GetHostBuffer(0, 0));
+  std::memset(sender_host.data(), 0x5A, 128);
+  std::memset(receiver_host.data(), 0x00, 128);
 
   StartTransferRequest recv_plan = BlockPlan(8004, {0}, {1}, MEMORY_TYPE_DRAM);
   recv_plan.set_expected_block_count(1);
@@ -1244,13 +1248,12 @@ TEST(ActivePlanTest, RegisteredPlanRetainsPeregrineEndpointForExplicitH2hPush) {
   ABSL_ASSERT_OK(push_res.second.Await());
 
   const absl::Time deadline = absl::Now() + absl::Seconds(10);
-  while (std::memcmp(receiver.base()->GetHostPointer(0, 0) + 128,
-                     sender.base()->GetHostPointer(0, 0), 128) != 0 &&
+  while (std::memcmp(receiver_host.data() + 128, sender_host.data(), 128) !=
+             0 &&
          absl::Now() < deadline) {
     absl::SleepFor(absl::Milliseconds(10));
   }
-  EXPECT_EQ(std::memcmp(receiver.base()->GetHostPointer(0, 0) + 128,
-                        sender.base()->GetHostPointer(0, 0), 128),
+  EXPECT_EQ(std::memcmp(receiver_host.data() + 128, sender_host.data(), 128),
             0);
   ABSL_EXPECT_OK(sender.UnregisterActivePlan(8004));
   ABSL_EXPECT_OK(receiver.UnregisterActivePlan(8004));

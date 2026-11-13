@@ -22,6 +22,10 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/flags/flag.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
+#include "absl/types/span.h"
 #include "grpcpp/client_context.h"
 #include "grpcpp/server.h"
 #include "grpcpp/server_builder.h"
@@ -47,10 +51,13 @@ using ::testing::NotNull;
 
 class FakeRawDelegate : public RawBufferTransportDelegate {
  public:
-  uint8_t* GetHostPointer(size_t buffer_id, size_t shard_idx) override {
-    return nullptr;
+  using RawBufferTransportDelegate::GetHostBuffer;
+
+  absl::StatusOr<absl::Span<const uint8_t>> GetHostBuffer(
+      size_t buffer_id, size_t shard_idx) const override {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "buffer_id ", buffer_id, " shard ", shard_idx, " has no host buffer"));
   }
-  size_t GetHostSize(size_t buffer_id, size_t shard_idx) override { return 0; }
 };
 
 ReqMsg MakeValidReq() {

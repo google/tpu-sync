@@ -49,6 +49,7 @@
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/status_matchers.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
@@ -156,12 +157,16 @@ class RawMockDelegate : public RawBufferTransportDelegate {
     DCHECK(AllZero(buffer_));
   }
 
-  uint8_t* GetHostPointer(size_t buffer_id, size_t shard_idx) override {
-    return buffer_.data();
-  }
+  using RawBufferTransportDelegate::GetHostBuffer;
 
-  size_t GetHostSize(size_t buffer_id, size_t shard_idx) override {
-    return buffer_.size();
+  absl::StatusOr<absl::Span<const uint8_t>> GetHostBuffer(
+      size_t buffer_id, size_t shard_idx) const override {
+    if (buffer_.data() == nullptr) {
+      return absl::FailedPreconditionError(absl::StrCat("buffer_id ", buffer_id,
+                                                        " shard ", shard_idx,
+                                                        " has no host buffer"));
+    }
+    return absl::Span<const uint8_t>(buffer_);
   }
 
   absl::Status OnDataReceived(uint64_t uuid = 0) override {
@@ -871,52 +876,17 @@ TEST(BufferPushTaskTest, DefaultInitializers) {
   EXPECT_EQ(task.src_stride_bytes, 0);
 }
 
-TEST(RawBufferTransportDelegateTest, DefaultGetHostBufferSpansHostMemory) {
-  RawMockDelegate delegate(/*buffer_size=*/256);
-  const RawBufferTransportDelegate& const_delegate = delegate;
-
-  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> buffer,
-                       delegate.GetHostBuffer(kBufferId, kDstShardIdx));
-
-  EXPECT_EQ(buffer.data(), delegate.GetHostPointer(kBufferId, kDstShardIdx));
-  EXPECT_EQ(buffer.size(), 256);
-
-  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> const_buffer,
-                       const_delegate.GetHostBuffer(kBufferId, kDstShardIdx));
-  EXPECT_EQ(const_buffer.data(), buffer.data());
-  EXPECT_EQ(const_buffer.size(), 256);
-  TF_ASSERT_OK_AND_ASSIGN(
-      absl::Span<const uint8_t> direct_const_buffer,
-      std::as_const(delegate).GetHostBuffer(kBufferId, kDstShardIdx));
-  EXPECT_EQ(direct_const_buffer.data(), buffer.data());
-  EXPECT_EQ(direct_const_buffer.size(), 256);
-}
-
-// Delegate without host memory that relies on the default GetHostBuffer().
+// Delegate without host memory.
 class NoHostBufferDelegate : public RawBufferTransportDelegate {
  public:
-  uint8_t* GetHostPointer(size_t buffer_id, size_t shard_idx) override {
-    return nullptr;
+  using RawBufferTransportDelegate::GetHostBuffer;
+
+  absl::StatusOr<absl::Span<const uint8_t>> GetHostBuffer(
+      size_t buffer_id, size_t shard_idx) const override {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "buffer_id ", buffer_id, " shard ", shard_idx, " has no host buffer"));
   }
-  size_t GetHostSize(size_t buffer_id, size_t shard_idx) override { return 0; }
 };
-
-TEST(RawBufferTransportDelegateTest,
-     DefaultGetHostBufferWithoutHostMemoryIsFailedPrecondition) {
-  NoHostBufferDelegate delegate;
-  const RawBufferTransportDelegate& const_delegate = delegate;
-
-  EXPECT_THAT(delegate.GetHostBuffer(/*buffer_id=*/3, /*shard_idx=*/1),
-              ::absl_testing::StatusIs(
-                  absl::StatusCode::kFailedPrecondition,
-                  ::testing::HasSubstr("buffer_id 3 shard 1 has no host "
-                                       "buffer")));
-  EXPECT_THAT(const_delegate.GetHostBuffer(/*buffer_id=*/3, /*shard_idx=*/1),
-              ::absl_testing::StatusIs(
-                  absl::StatusCode::kFailedPrecondition,
-                  ::testing::HasSubstr("buffer_id 3 shard 1 has no host "
-                                       "buffer")));
-}
 
 // The receiver logs the status of a rejected peer request before it closes the
 // connection, so the log carries the InvalidArgument and its cause.

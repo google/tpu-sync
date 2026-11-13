@@ -67,9 +67,9 @@ and adds:
 |---|---|---|
 | `sendMgr` | `TransferSendSession::staging_layer_manager_` | producer `StagingLayerManager(numSendSlots)` |
 | `recvMgr` | `TransferReceiveSession::staging_layer_manager_` | consumer `StagingLayerManager(numRecvSlots)` |
-| `prefillSlots` | `GetHostPointer(0..numSendSlots-1, shard)` on producer | producer's physical host layer buffers |
+| `prefillSlots` | `GetHostBuffer(0..numSendSlots-1, shard)` on producer | producer's physical host layer buffers |
 | `wireB` | payload delivered onto the wire from `prefillSlots[slot]` | layer-indexed wire cells |
-| `decodeSlots` | `GetHostPointer(0..numRecvSlots-1, shard)` on consumer | consumer's physical host layer buffers |
+| `decodeSlots` | `GetHostBuffer(0..numRecvSlots-1, shard)` on consumer | consumer's physical host layer buffers |
 | `decodeHbmB` | decode HBM written from `decodeSlots[slot]` | consumer's `numLayers` HBM layers |
 | `sendLoop` | control pc of `StartPush`'s D2H loop (`SendLoopPhase`) | `.nextIter`, `.acquiring`, `.leasedBeforeD2h`, `.exited` |
 | `recvPhaseL` | per-layer consumer lease state (`RecvLayerPhase`) | `.idle`, `.waiting hadLease`, `.leasedInAcquire`, `.leasedForStream`, `.h2dPending`, `.h2dRunning`, `.h2dRetired`, `.aborted` |

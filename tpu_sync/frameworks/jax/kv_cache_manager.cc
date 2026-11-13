@@ -505,27 +505,6 @@ int64_t NumaAwareKVCacheManager::node_id() const {
   return sub_managers_.empty() ? 0 : sub_managers_[0]->node_id();
 }
 
-uint8_t* NumaAwareKVCacheManager::GetHostPointer(size_t layer_idx,
-                                                 size_t shard_idx) {
-  if (shard_idx >= global_shard_to_submanager_.size()) return nullptr;
-  auto [sub_idx, local_shard] = global_shard_to_submanager_[shard_idx];
-  return sub_managers_[sub_idx]->base()->GetHostPointer(layer_idx, local_shard);
-}
-
-const uint8_t* NumaAwareKVCacheManager::GetHostPointer(size_t layer_idx,
-                                                       size_t shard_idx) const {
-  if (shard_idx >= global_shard_to_submanager_.size()) return nullptr;
-  auto [sub_idx, local_shard] = global_shard_to_submanager_[shard_idx];
-  return sub_managers_[sub_idx]->base()->GetHostPointer(layer_idx, local_shard);
-}
-
-size_t NumaAwareKVCacheManager::GetHostSize(size_t layer_idx,
-                                            size_t shard_idx) {
-  if (shard_idx >= global_shard_to_submanager_.size()) return 0;
-  auto [sub_idx, local_shard] = global_shard_to_submanager_[shard_idx];
-  return sub_managers_[sub_idx]->base()->GetHostSize(layer_idx, local_shard);
-}
-
 absl::StatusOr<absl::Span<const uint8_t>>
 NumaAwareKVCacheManager::GetHostBuffer(size_t layer_idx,
                                        size_t shard_idx) const {

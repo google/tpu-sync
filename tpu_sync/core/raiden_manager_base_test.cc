@@ -129,8 +129,10 @@ TEST(RaidenManagerBaseTest, SetExternalHostPointersWithPinnedAllocator) {
   size_t idx = 0;
   for (size_t l = 0; l < num_layers; ++l) {
     for (size_t sh = 0; sh < num_shards; ++sh) {
-      EXPECT_EQ(manager.GetHostPointer(l, sh), host_ptrs[idx]);
-      EXPECT_EQ(manager.GetHostSize(l, sh), slice_size);
+      TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> host_buffer,
+                           manager.GetHostBuffer(l, sh));
+      EXPECT_EQ(host_buffer.data(), host_ptrs[idx]);
+      EXPECT_EQ(host_buffer.size(), slice_size);
       idx++;
     }
   }

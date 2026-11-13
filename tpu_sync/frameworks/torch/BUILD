@@ -69,6 +69,7 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/types:span",
         "@peregrine//peregrine/src/api/v1:rate_limiter",
         "@torch_tpu//shims/torch:aten_headers",
         "//tpu_sync/core:raiden_transfer_endpoint",
@@ -272,9 +273,11 @@ nanobind_extension(
         "//tpu_sync/transport:block_transport",
         "//tpu_sync/transport:peer_endpoint",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
         "@nanobind",
     ],
 )
@@ -476,6 +479,7 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/types:span",
         "@peregrine//peregrine/src/api/v1:rate_limiter",
         "@torch_tpu//shims/torch:aten_headers",
         "@torch_tpu//shims/torch:torch_headers",
@@ -601,6 +605,28 @@ cc_test(
         "@xla//xla/tsl/platform:statusor",
         "@xla//xla/tsl/platform:test",
         "@xla//xla/tsl/platform:test_main",
+    ],
+)
+
+cc_test(
+    name = "weight_synchronizer_core_test",
+    srcs = ["weight_synchronizer_core_test.cc"],
+    copts = [
+        "-std=c++20",
+        "-fexceptions",
+    ] + _X86_MARCH_COPTS,
+    features = ["-use_header_modules"],
+    deps = [
+        ":weight_synchronizer_torch_mock",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/flags:reflection",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_googletest//:gtest_main",
+        "@torch_tpu//shims/torch",
+        "@torch_tpu//shims/torch:torch_headers",
+        "@xla//xla/tsl/platform:statusor",
     ],
 )
 

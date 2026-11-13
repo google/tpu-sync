@@ -231,11 +231,18 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   absl::Status WaitForExplicitD2h(size_t layer_idx) const
       ABSL_LOCKS_EXCLUDED(explicit_d2h_mu_);
 
-  uint8_t* GetHostPointer(size_t layer_idx, size_t shard_idx) override;
-  size_t GetHostSize(size_t layer_idx, size_t shard_idx) override;
-  const uint8_t* GetHostPointer(size_t layer_idx,
-                                size_t shard_idx) const override;
-  size_t GetHostSize(size_t layer_idx, size_t shard_idx) const override;
+  // Host staging buffer of (|layer_idx|, |shard_idx|), remapping |shard_idx|
+  // via `local_shard_indices_`, then `global_shard_indices_`, falling back to
+  // identity `[0, shards.size())` when `local_shard_indices_` is empty (and
+  // modulo `shards.size()` only when both index lists are empty). Returns
+  // OutOfRange when |layer_idx| has no host layer, that layer has no shards,
+  // |shard_idx| is unmapped when shard index maps are configured, or the
+  // resolved local slot is >= `shards.size()`, and FailedPrecondition
+  // ("has no host buffer") when the resolved shard has no host buffer. An OK
+  // span has a non-null `data()` and may be empty.
+  using RaidenManagerBase::GetHostBuffer;
+  absl::StatusOr<absl::Span<const uint8_t>> GetHostBuffer(
+      size_t layer_idx, size_t shard_idx) const override;
 
   // Returns the tiling scratchpad of `shard_idx`, shared by all layers. The
   // pointer may be reallocated by a later H2D/D2H that needs more space.

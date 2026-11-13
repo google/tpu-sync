@@ -349,51 +349,6 @@ std::vector<int64_t> RaidenManagerBase::shards_for_local_ip(
   return shards.empty() ? all_shards : shards;
 }
 
-// Resolves host memory pointer for a specific layer and shard.
-// In multi-host distributed execution, shard_idx may represent the global shard
-// ID across multiple worker nodes. Modulo indexing (`shard_idx %
-// shards.size()`) ensures clean resolution to the local worker's assigned shard
-// buffers.
-// TODO: It might be clearer if the base manager doesn't have to
-// deal with global shard idx.
-uint8_t* RaidenManagerBase::GetHostPointer(size_t layer_idx, size_t shard_idx) {
-  if (layer_idx >= layers_.size() || layers_[layer_idx].shards.empty()) {
-    return nullptr;
-  }
-  size_t local_idx = shard_idx % layers_[layer_idx].shards.size();
-  return const_cast<uint8_t*>(layers_[layer_idx].shards[local_idx].host_ptr);
-}
-
-// Resolves host memory allocation size in bytes for a specific layer and shard
-// using multi-host modulo indexing.
-size_t RaidenManagerBase::GetHostSize(size_t layer_idx, size_t shard_idx) {
-  if (layer_idx >= layers_.size() || layers_[layer_idx].shards.empty()) {
-    return 0;
-  }
-  size_t local_idx = shard_idx % layers_[layer_idx].shards.size();
-  return layers_[layer_idx].shards[local_idx].host_size;
-}
-
-size_t RaidenManagerBase::GetHostSize(size_t layer_idx,
-                                      size_t shard_idx) const {
-  if (layer_idx >= layers_.size() || layers_[layer_idx].shards.empty()) {
-    return 0;
-  }
-  size_t local_idx = shard_idx % layers_[layer_idx].shards.size();
-  return layers_[layer_idx].shards[local_idx].host_size;
-}
-
-// Const overload resolving host memory pointer for a specific layer and shard
-// using multi-host modulo indexing.
-const uint8_t* RaidenManagerBase::GetHostPointer(size_t layer_idx,
-                                                 size_t shard_idx) const {
-  if (layer_idx >= layers_.size() || layers_[layer_idx].shards.empty()) {
-    return nullptr;
-  }
-  size_t local_idx = shard_idx % layers_[layer_idx].shards.size();
-  return layers_[layer_idx].shards[local_idx].host_ptr;
-}
-
 absl::StatusOr<absl::Span<const uint8_t>> RaidenManagerBase::GetHostBuffer(
     size_t layer_idx, size_t shard_idx) const {
   if (layer_idx >= layers_.size()) {
@@ -406,13 +361,13 @@ absl::StatusOr<absl::Span<const uint8_t>> RaidenManagerBase::GetHostBuffer(
                                               " out of range: layer ",
                                               layer_idx, " has no shards"));
   }
-  // Virtual dispatch keeps subclass shard remapping (WeightSynchronizerBase).
-  const uint8_t* host_ptr = GetHostPointer(layer_idx, shard_idx);
-  if (host_ptr == nullptr) {
+  const size_t local_idx = shard_idx % layers_[layer_idx].shards.size();
+  const ShardBufferInfoBase& shard = layers_[layer_idx].shards[local_idx];
+  if (shard.host_ptr == nullptr) {
     return absl::FailedPreconditionError(absl::StrCat(
         "layer ", layer_idx, " shard ", shard_idx, " has no host buffer"));
   }
-  return absl::Span<const uint8_t>(host_ptr, GetHostSize(layer_idx, shard_idx));
+  return absl::Span<const uint8_t>(shard.host_ptr, shard.host_size);
 }
 
 absl::StatusOr<absl::Span<uint8_t>> RaidenManagerBase::GetHostBuffer(

@@ -837,7 +837,14 @@ NB_MODULE(_tpu_raiden_torch, m) {
               }
               ptr = *host_ptr;
             }
-            size_t size = self.GetHostBufferSize(layer_idx, shard_idx);
+            absl::StatusOr<size_t> host_size =
+                self.GetHostBufferSize(layer_idx, shard_idx);
+            if (!host_size.ok()) {
+              throw std::runtime_error(
+                  absl::StrCat("WeightSynchronizer get_host_buffer failed: ",
+                               host_size.status().message()));
+            }
+            size_t size = *host_size;
             if (size == 0) {
               size = self.slice_byte_size() + 256 * 1024;
             }

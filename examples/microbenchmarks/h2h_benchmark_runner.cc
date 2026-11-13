@@ -63,8 +63,10 @@
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_split.h"
+#include "absl/strings/string_view.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "absl/types/span.h"
 #include "tpu_sync/common/net_util.h"
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
@@ -338,6 +340,22 @@ int connect_to_control_server(const std::string& host, int port) {
   return -1;
 }
 
+// Returns the host staging base pointer for |layer_idx| shard 0, or sets
+// |*ok| = false, logs to stderr, and returns nullptr on error.
+uint8_t* GetLayerHostBaseOrFail(
+    tpu_raiden::kv_cache::KVCacheManagerBase& manager, size_t layer_idx,
+    absl::string_view context, bool* ok) {
+  absl::StatusOr<absl::Span<uint8_t>> host =
+      manager.GetHostBuffer(layer_idx, 0);
+  if (!host.ok()) {
+    std::cerr << "Failed to get host buffer (" << context << ", layer "
+              << layer_idx << "): " << host.status() << std::endl;
+    *ok = false;
+    return nullptr;
+  }
+  return host->data();
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -486,7 +504,9 @@ int main(int argc, char* argv[]) {
 
         // Zero-initialize receiver blocks
         for (size_t l = 0; l < kNumLayers; ++l) {
-          uint8_t* receiver_base = manager->GetHostPointer(l, 0);
+          uint8_t* receiver_base = GetLayerHostBaseOrFail(
+              *manager, l, "receiver init", &alloc_success);
+          if (receiver_base == nullptr) return;
           for (int b = 0; b < num_blocks; ++b) {
             uint8_t* dst_ptr = receiver_base + dst_block_ids[b] * block_size;
             std::memset(dst_ptr, 0, block_size);
@@ -604,7 +624,9 @@ int main(int argc, char* argv[]) {
       const auto& manager = managers[m];
       const auto& dst_block_ids = allocated_block_ids[m];
       for (size_t l = 0; l < kNumLayers; ++l) {
-        uint8_t* receiver_base = manager->GetHostPointer(l, 0);
+        uint8_t* receiver_base =
+            GetLayerHostBaseOrFail(*manager, l, "receiver verify", &success);
+        if (receiver_base == nullptr) break;
         for (int b = 0; b < num_blocks; ++b) {
           uint8_t* dst_ptr = receiver_base + dst_block_ids[b] * block_size;
           for (size_t i = 0; i < block_size; ++i) {
@@ -743,7 +765,9 @@ int main(int argc, char* argv[]) {
 
         // Initialize sender blocks with pattern (unique per manager)
         for (size_t l = 0; l < kNumLayers; ++l) {
-          uint8_t* sender_base = manager->GetHostPointer(l, 0);
+          uint8_t* sender_base = GetLayerHostBaseOrFail(
+              *manager, l, "sender init", &alloc_success);
+          if (sender_base == nullptr) return;
           for (int b = 0; b < num_blocks; ++b) {
             uint8_t* src_ptr = sender_base + src_block_ids[b] * block_size;
             for (size_t i = 0; i < block_size; ++i) {

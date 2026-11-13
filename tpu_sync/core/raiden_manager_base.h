@@ -186,19 +186,11 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
   // would be selected.
   std::vector<int64_t> shards_for_local_ip(absl::string_view ip) const;
 
-  uint8_t* GetHostPointer(size_t layer_idx, size_t shard_idx) override;
-  size_t GetHostSize(size_t layer_idx, size_t shard_idx) override;
-
-  virtual const uint8_t* GetHostPointer(size_t layer_idx,
-                                        size_t shard_idx) const;
-  virtual size_t GetHostSize(size_t layer_idx, size_t shard_idx) const;
-
-  // Host staging buffer of (|layer_idx|, |shard_idx|), resolved through the
-  // const `GetHostPointer()`/`GetHostSize()` so subclass shard remapping
-  // applies. Returns OutOfRange exactly when |layer_idx| has no host layer or
-  // that layer has no shards (a bad index), and FailedPrecondition exactly when
-  // the resolved shard has no host buffer; callers rely on this distinction. An
-  // OK span has a non-null `data()` and may be empty.
+  // Host staging buffer of (|layer_idx|, |shard_idx|). Returns OutOfRange
+  // exactly when |layer_idx| has no host layer or that layer has no shards (a
+  // bad index), and FailedPrecondition exactly when the resolved shard has no
+  // host buffer; callers rely on this distinction. An OK span has a non-null
+  // `data()` and may be empty.
   absl::StatusOr<absl::Span<const uint8_t>> GetHostBuffer(
       size_t layer_idx, size_t shard_idx) const override;
   // Mutable view of the const `GetHostBuffer()`, with the same error contract

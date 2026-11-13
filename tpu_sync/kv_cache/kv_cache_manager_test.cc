@@ -4071,9 +4071,14 @@ TEST(KVCacheManagerTest, D2hWriteAndH2dWriteOverPeregrineOp6Succeed) {
       data_ep,
       absl::StrCat(receiver.local_ip(), ":", receiver.peregrine_local_port()));
 
-  uint8_t* sender_buf = sender.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
-  uint8_t* receiver_buf =
-      receiver.GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0);
+  TF_ASSERT_OK_AND_ASSIGN(
+      absl::Span<uint8_t> sender_span,
+      sender.GetHostBuffer(/*layer_idx=*/0, /*shard_idx=*/0));
+  TF_ASSERT_OK_AND_ASSIGN(
+      absl::Span<uint8_t> receiver_span,
+      receiver.GetHostBuffer(/*layer_idx=*/0, /*shard_idx=*/0));
+  uint8_t* sender_buf = sender_span.data();
+  uint8_t* receiver_buf = receiver_span.data();
   ASSERT_NE(sender_buf, nullptr);
   ASSERT_NE(receiver_buf, nullptr);
 

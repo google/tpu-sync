@@ -327,12 +327,22 @@ class MockDelegate : public BlockTransportDelegate {
     received_size_bytes_ = 0;
   }
 
-  uint8_t* GetHostPointer(size_t layer_idx, size_t shard_idx) override {
-    return buffers_[BufferIndex(layer_idx, shard_idx)].data();
-  }
+  using BlockTransportDelegate::GetHostBuffer;
 
-  size_t GetHostSize(size_t layer_idx, size_t shard_idx) override {
-    return buffers_[BufferIndex(layer_idx, shard_idx)].size();
+  absl::StatusOr<absl::Span<const uint8_t>> GetHostBuffer(
+      size_t layer_idx, size_t shard_idx) const override {
+    if (layer_idx >= num_layers_ || shard_idx >= num_shards_) {
+      return absl::OutOfRangeError(absl::StrCat(
+          "layer_idx ", layer_idx, " shard_idx ", shard_idx,
+          " out of range: ", num_layers_, " layers, ", num_shards_, " shards"));
+    }
+    const std::vector<uint8_t>& buf =
+        buffers_[BufferIndex(layer_idx, shard_idx)];
+    if (buf.data() == nullptr) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          "layer ", layer_idx, " shard ", shard_idx, " has no host buffer"));
+    }
+    return absl::Span<const uint8_t>(buf);
   }
 
   int layer_completion_count() const { return layer_completion_count_.load(); }

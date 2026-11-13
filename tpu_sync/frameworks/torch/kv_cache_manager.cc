@@ -35,6 +35,7 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/types/span.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "tpu_sync/core/buffer_utils.h"
 #include "tpu_sync/core/controller/controller_client.h"
@@ -249,17 +250,17 @@ absl::StatusOr<std::string> TorchKVCacheManager::ReadBlockBytes(
     return absl::InvalidArgumentError("block_id must be non-negative");
   }
   const size_t block_bytes = this->base_->block_bytes(layer_idx);
-  const size_t host_size = base_->GetHostSize(layer_idx, shard_idx);
-  const uint8_t* base = base_->GetHostPointer(layer_idx, shard_idx);
-  if (base == nullptr) {
-    return absl::OutOfRangeError("layer or shard index out of range");
-  }
+  ABSL_ASSIGN_OR_RETURN(
+      absl::Span<const uint8_t> host_buffer,
+      std::as_const(*base_).GetHostBuffer(layer_idx, shard_idx));
+  const size_t host_size = host_buffer.size();
   const size_t block = static_cast<size_t>(block_id);
   if (block_bytes == 0 || block > host_size / block_bytes ||
-      block * block_bytes + block_bytes > host_size) {
+      host_size - block * block_bytes < block_bytes) {
     return absl::OutOfRangeError("block range exceeds host buffer");
   }
-  const char* ptr = reinterpret_cast<const char*>(base + block * block_bytes);
+  const char* ptr =
+      reinterpret_cast<const char*>(host_buffer.data() + block * block_bytes);
   return std::string(ptr, block_bytes);
 }
 
@@ -276,17 +277,16 @@ absl::Status TorchKVCacheManager::WriteBlockBytes(size_t layer_idx,
         absl::StrCat("payload size must equal block size: got ", payload.size(),
                      ", expected ", block_bytes));
   }
-  const size_t host_size = base_->GetHostSize(layer_idx, shard_idx);
-  uint8_t* base = base_->GetHostPointer(layer_idx, shard_idx);
-  if (base == nullptr) {
-    return absl::OutOfRangeError("layer or shard index out of range");
-  }
+  ABSL_ASSIGN_OR_RETURN(absl::Span<uint8_t> host_buffer,
+                        base_->GetHostBuffer(layer_idx, shard_idx));
+  const size_t host_size = host_buffer.size();
   const size_t block = static_cast<size_t>(block_id);
   if (block_bytes == 0 || block > host_size / block_bytes ||
-      block * block_bytes + block_bytes > host_size) {
+      host_size - block * block_bytes < block_bytes) {
     return absl::OutOfRangeError("block range exceeds host buffer");
   }
-  std::memcpy(base + block * block_bytes, payload.data(), block_bytes);
+  std::memcpy(host_buffer.data() + block * block_bytes, payload.data(),
+              block_bytes);
   return absl::OkStatus();
 }
 

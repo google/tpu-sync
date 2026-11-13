@@ -2643,7 +2643,7 @@ TEST_F(WeightSynchronizerTest, PreTiledPushSendsWholeShardAfterTiling) {
   ws_relay->ForgetPushProgress(kUuid);
 }
 
-TEST_F(WeightSynchronizerTest, GetHostPointerAndSizeNonContiguousGlobalShards) {
+TEST_F(WeightSynchronizerTest, GetHostBufferNonContiguousGlobalShards) {
   const size_t num_layers = 2;
   const size_t num_shards = 4;
   const size_t slice_size = 1024;
@@ -2651,6 +2651,18 @@ TEST_F(WeightSynchronizerTest, GetHostPointerAndSizeNonContiguousGlobalShards) {
                           WeightSynchronizerBase::Create(
                               num_layers, num_shards, slice_size,
                               /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+
+  // Assign distinct per-slot byte sizes so wrong-slot or wrong-layer
+  // resolution fails on `.size()` as well as `.data()`.
+  std::vector<const uint8_t*> slot_ptrs;
+  std::vector<size_t> slot_sizes;
+  for (size_t l = 0; l < num_layers; ++l) {
+    for (size_t s = 0; s < num_shards; ++s) {
+      slot_ptrs.push_back(ws->GetHostBufferPtr(l, s));
+      slot_sizes.push_back((l * num_shards + s + 1) * 128);
+    }
+  }
+  ws->SetExternalHostPointers(slot_ptrs, slot_sizes);
 
   // Configure non-contiguous global shards, e.g., NUMA node 0 managing shards
   // {0, 2, 4, 6}
@@ -2680,14 +2692,14 @@ TEST_F(WeightSynchronizerTest, GetHostPointerAndSizeNonContiguousGlobalShards) {
   EXPECT_NE(ptr_shard2, ptr_shard6);
   EXPECT_NE(ptr_shard4, ptr_shard6);
 
-  // Check sizes
-  EXPECT_EQ(shard0_buf.size(), slice_size);
-  EXPECT_EQ(shard2_buf.size(), slice_size);
-  EXPECT_EQ(shard4_buf.size(), slice_size);
-  EXPECT_EQ(shard6_buf.size(), slice_size);
+  // Check distinct per-slot sizes
+  EXPECT_EQ(shard0_buf.size(), 128);
+  EXPECT_EQ(shard2_buf.size(), 256);
+  EXPECT_EQ(shard4_buf.size(), 384);
+  EXPECT_EQ(shard6_buf.size(), 512);
 
   // Const overloads
-  const auto* const_ws = ws.get();
+  const WeightSynchronizerBase* const_ws = ws.get();
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> const_shard0_buf,
                        const_ws->GetHostBuffer(0, 0));
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> const_shard2_buf,
@@ -2700,14 +2712,16 @@ TEST_F(WeightSynchronizerTest, GetHostPointerAndSizeNonContiguousGlobalShards) {
   EXPECT_EQ(const_shard2_buf.data(), ws->GetHostBufferPtr(0, 1));
   EXPECT_EQ(const_shard4_buf.data(), ws->GetHostBufferPtr(0, 2));
   EXPECT_EQ(const_shard6_buf.data(), ws->GetHostBufferPtr(0, 3));
-  EXPECT_EQ(const_shard0_buf.size(), slice_size);
-  EXPECT_EQ(const_shard2_buf.size(), slice_size);
+  EXPECT_EQ(const_shard0_buf.size(), 128);
+  EXPECT_EQ(const_shard2_buf.size(), 256);
+  EXPECT_EQ(const_shard4_buf.size(), 384);
+  EXPECT_EQ(const_shard6_buf.size(), 512);
 
   // Verify memory writes do not collide
-  std::memset(ptr_shard0, 0x11, slice_size);
-  std::memset(ptr_shard2, 0x22, slice_size);
-  std::memset(ptr_shard4, 0x33, slice_size);
-  std::memset(ptr_shard6, 0x44, slice_size);
+  std::memset(ptr_shard0, 0x11, shard0_buf.size());
+  std::memset(ptr_shard2, 0x22, shard2_buf.size());
+  std::memset(ptr_shard4, 0x33, shard4_buf.size());
+  std::memset(ptr_shard6, 0x44, shard6_buf.size());
 
   EXPECT_EQ(ws->GetHostBufferPtr(0, 0)[0], 0x11);
   EXPECT_EQ(ws->GetHostBufferPtr(0, 1)[0], 0x22);
@@ -2715,7 +2729,7 @@ TEST_F(WeightSynchronizerTest, GetHostPointerAndSizeNonContiguousGlobalShards) {
   EXPECT_EQ(ws->GetHostBufferPtr(0, 3)[0], 0x44);
 }
 
-TEST_F(WeightSynchronizerTest, GetHostPointerAndSizeLocalAndGlobalIndices) {
+TEST_F(WeightSynchronizerTest, GetHostBufferLocalAndGlobalIndices) {
   const size_t num_layers = 2;
   const size_t num_shards = 4;
   const size_t slice_size = 1024;
@@ -2723,6 +2737,18 @@ TEST_F(WeightSynchronizerTest, GetHostPointerAndSizeLocalAndGlobalIndices) {
                           WeightSynchronizerBase::Create(
                               num_layers, num_shards, slice_size,
                               /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+
+  // Assign distinct per-slot byte sizes so wrong-slot or wrong-layer
+  // resolution fails on `.size()` as well as `.data()`.
+  std::vector<const uint8_t*> slot_ptrs;
+  std::vector<size_t> slot_sizes;
+  for (size_t l = 0; l < num_layers; ++l) {
+    for (size_t s = 0; s < num_shards; ++s) {
+      slot_ptrs.push_back(ws->GetHostBufferPtr(l, s));
+      slot_sizes.push_back((l * num_shards + s + 1) * 128);
+    }
+  }
+  ws->SetExternalHostPointers(slot_ptrs, slot_sizes);
 
   // Configure non-contiguous global shards, e.g., Host 1 managing global shards
   // {2, 3, 6, 7} with local slots {0, 1, 2, 3}.
@@ -2735,15 +2761,14 @@ TEST_F(WeightSynchronizerTest, GetHostPointerAndSizeLocalAndGlobalIndices) {
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> slot1_buf, ws->GetHostBuffer(0, 1));
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> slot2_buf, ws->GetHostBuffer(0, 2));
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> slot3_buf, ws->GetHostBuffer(0, 3));
-  uint8_t* ptr_slot0 = slot0_buf.data();
-  uint8_t* ptr_slot1 = slot1_buf.data();
-  uint8_t* ptr_slot2 = slot2_buf.data();
-  uint8_t* ptr_slot3 = slot3_buf.data();
-
-  EXPECT_EQ(ptr_slot0, ws->GetHostBufferPtr(0, 0));
-  EXPECT_EQ(ptr_slot1, ws->GetHostBufferPtr(0, 1));
-  EXPECT_EQ(ptr_slot2, ws->GetHostBufferPtr(0, 2));
-  EXPECT_EQ(ptr_slot3, ws->GetHostBufferPtr(0, 3));
+  EXPECT_EQ(slot0_buf.data(), ws->GetHostBufferPtr(0, 0));
+  EXPECT_EQ(slot1_buf.data(), ws->GetHostBufferPtr(0, 1));
+  EXPECT_EQ(slot2_buf.data(), ws->GetHostBufferPtr(0, 2));
+  EXPECT_EQ(slot3_buf.data(), ws->GetHostBufferPtr(0, 3));
+  EXPECT_EQ(slot0_buf.size(), 128);
+  EXPECT_EQ(slot1_buf.size(), 256);
+  EXPECT_EQ(slot2_buf.size(), 384);
+  EXPECT_EQ(slot3_buf.size(), 512);
 
   // Global shard indices not matching local slots (e.g. 6 and 7) should still
   // map to their corresponding internal slots (slots 2 and 3).
@@ -2751,21 +2776,25 @@ TEST_F(WeightSynchronizerTest, GetHostPointerAndSizeLocalAndGlobalIndices) {
                        ws->GetHostBuffer(0, 6));
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> global7_buf,
                        ws->GetHostBuffer(0, 7));
-  uint8_t* ptr_global6 = global6_buf.data();
-  uint8_t* ptr_global7 = global7_buf.data();
-  EXPECT_EQ(ptr_global6, ws->GetHostBufferPtr(0, 2));
-  EXPECT_EQ(ptr_global7, ws->GetHostBufferPtr(0, 3));
+  EXPECT_EQ(global6_buf.data(), ws->GetHostBufferPtr(0, 2));
+  EXPECT_EQ(global7_buf.data(), ws->GetHostBufferPtr(0, 3));
+  EXPECT_EQ(global6_buf.size(), 384);
+  EXPECT_EQ(global7_buf.size(), 512);
 
   // Const overloads
-  const auto* const_ws = ws.get();
+  const WeightSynchronizerBase* const_ws = ws.get();
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> const_slot2_buf,
                        const_ws->GetHostBuffer(0, 2));
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> const_slot3_buf,
                        const_ws->GetHostBuffer(0, 3));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> const_global6_buf,
+                       const_ws->GetHostBuffer(1, 6));
   EXPECT_EQ(const_slot2_buf.data(), ws->GetHostBufferPtr(0, 2));
   EXPECT_EQ(const_slot3_buf.data(), ws->GetHostBufferPtr(0, 3));
-  EXPECT_EQ(const_slot2_buf.size(), slice_size);
-  EXPECT_EQ(const_slot3_buf.size(), slice_size);
+  EXPECT_EQ(const_global6_buf.data(), ws->GetHostBufferPtr(1, 2));
+  EXPECT_EQ(const_slot2_buf.size(), 384);
+  EXPECT_EQ(const_slot3_buf.size(), 512);
+  EXPECT_EQ(const_global6_buf.size(), 896);
 }
 
 TEST_F(WeightSynchronizerTest, GetHostBufferMapsGlobalShardIndices) {
@@ -2776,17 +2805,26 @@ TEST_F(WeightSynchronizerTest, GetHostBufferMapsGlobalShardIndices) {
                        WeightSynchronizerBase::Create(
                            num_layers, num_shards, slice_size,
                            /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  std::vector<const uint8_t*> slot_ptrs;
+  std::vector<size_t> slot_sizes;
+  for (size_t l = 0; l < num_layers; ++l) {
+    for (size_t s = 0; s < num_shards; ++s) {
+      slot_ptrs.push_back(ws->GetHostBufferPtr(l, s));
+      slot_sizes.push_back((l * num_shards + s + 1) * 128);
+    }
+  }
+  ws->SetExternalHostPointers(slot_ptrs, slot_sizes);
   ws->SetGlobalShardIndices({0, 2, 4, 6});
   const WeightSynchronizerBase& const_ws = *ws;
 
   // Global shard 6 is local slot 3 (modulo 4 would give slot 2).
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> buffer, ws->GetHostBuffer(1, 6));
   EXPECT_EQ(buffer.data(), ws->GetHostBufferPtr(1, 3));
-  EXPECT_EQ(buffer.size(), slice_size);
+  EXPECT_EQ(buffer.size(), 1024);
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> const_buffer,
                        const_ws.GetHostBuffer(1, 2));
   EXPECT_EQ(const_buffer.data(), ws->GetHostBufferPtr(1, 1));
-  EXPECT_EQ(const_buffer.size(), slice_size);
+  EXPECT_EQ(const_buffer.size(), 768);
 }
 
 TEST_F(WeightSynchronizerTest, GetHostBufferMapsLocalShardIndices) {
@@ -2797,17 +2835,21 @@ TEST_F(WeightSynchronizerTest, GetHostBufferMapsLocalShardIndices) {
                        WeightSynchronizerBase::Create(
                            num_layers, num_shards, slice_size,
                            /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  ws->SetExternalHostPointers(
+      {ws->GetHostBufferPtr(0, 0), ws->GetHostBufferPtr(0, 1),
+       ws->GetHostBufferPtr(0, 2), ws->GetHostBufferPtr(0, 3)},
+      {128, 256, 384, 512});
   ws->SetLocalShardIndices({3, 2, 1, 0});
   const WeightSynchronizerBase& const_ws = *ws;
 
   // Shard 3 is listed at local slot 0 (modulo 4 would give slot 3).
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> buffer, ws->GetHostBuffer(0, 3));
   EXPECT_EQ(buffer.data(), ws->GetHostBufferPtr(0, 0));
-  EXPECT_EQ(buffer.size(), slice_size);
+  EXPECT_EQ(buffer.size(), 128);
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> const_buffer,
                        const_ws.GetHostBuffer(0, 0));
   EXPECT_EQ(const_buffer.data(), ws->GetHostBufferPtr(0, 3));
-  EXPECT_EQ(const_buffer.size(), slice_size);
+  EXPECT_EQ(const_buffer.size(), 512);
 }
 
 TEST_F(WeightSynchronizerTest, GetHostBufferLayerOutOfRange) {
@@ -2848,6 +2890,172 @@ TEST_F(WeightSynchronizerTest, GetHostBufferMissingBufferIsFailedPrecondition) {
                   ::testing::HasSubstr("layer 0 shard 4 has no host buffer")));
   EXPECT_THAT(const_ws.GetHostBuffer(0, 4),
               ::absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition));
+}
+
+TEST_F(WeightSynchronizerTest,
+       GetHostBufferGlobalShardIndexOutOfBoundsLocalSlot) {
+  const size_t num_layers = 1;
+  const size_t num_shards = 4;
+  const size_t slice_size = 1024;
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws,
+                       WeightSynchronizerBase::Create(
+                           num_layers, num_shards, slice_size,
+                           /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  ws->SetGlobalShardIndices({0, 1, 2, 3, 4, 5, 6, 7});
+  const WeightSynchronizerBase& const_ws = *ws;
+
+  ABSL_EXPECT_OK(ws->GetHostBuffer(0, 3));
+  EXPECT_THAT(ws->GetHostBuffer(0, 7),
+              ::absl_testing::StatusIs(
+                  absl::StatusCode::kOutOfRange,
+                  ::testing::AllOf(::testing::HasSubstr("local slot 7"),
+                                   ::testing::HasSubstr("4 local shards"))));
+  EXPECT_THAT(const_ws.GetHostBuffer(0, 7),
+              ::absl_testing::StatusIs(
+                  absl::StatusCode::kOutOfRange,
+                  ::testing::AllOf(::testing::HasSubstr("local slot 7"),
+                                   ::testing::HasSubstr("4 local shards"))));
+}
+
+TEST_F(WeightSynchronizerTest,
+       GetHostBufferLocalShardIndexOutOfBoundsLocalSlot) {
+  const size_t num_layers = 1;
+  const size_t num_shards = 4;
+  const size_t slice_size = 1024;
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws,
+                       WeightSynchronizerBase::Create(
+                           num_layers, num_shards, slice_size,
+                           /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  ws->SetLocalShardIndices({0, 1, 2, 3, 4, 5, 6, 7});
+  const WeightSynchronizerBase& const_ws = *ws;
+
+  ABSL_EXPECT_OK(ws->GetHostBuffer(0, 3));
+  EXPECT_THAT(ws->GetHostBuffer(0, 7),
+              ::absl_testing::StatusIs(
+                  absl::StatusCode::kOutOfRange,
+                  ::testing::AllOf(::testing::HasSubstr("local slot 7"),
+                                   ::testing::HasSubstr("4 local shards"))));
+  EXPECT_THAT(const_ws.GetHostBuffer(0, 7),
+              ::absl_testing::StatusIs(
+                  absl::StatusCode::kOutOfRange,
+                  ::testing::AllOf(::testing::HasSubstr("local slot 7"),
+                                   ::testing::HasSubstr("4 local shards"))));
+}
+
+TEST_F(WeightSynchronizerTest,
+       GetHostBufferEmptyLocalIndicesIdentityAndUnownedFailClosed) {
+  const size_t num_layers = 1;
+  const size_t num_shards = 2;
+  const size_t slice_size = 1024;
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws,
+                       WeightSynchronizerBase::Create(
+                           num_layers, num_shards, slice_size,
+                           /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  const uint8_t* ptr0 = ws->GetHostBufferPtr(0, 0);
+  const uint8_t* ptr1 = ws->GetHostBufferPtr(0, 1);
+  ws->SetExternalHostPointers({ptr0, ptr1}, {128, 256});
+  ws->SetGlobalShardIndices({4, 6});
+  const WeightSynchronizerBase& const_ws = *ws;
+
+  // Empty local_shard_indices_ preserves identity [0, 2) alongside {4, 6}.
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> local0, ws->GetHostBuffer(0, 0));
+  EXPECT_EQ(local0.data(), ptr0);
+  EXPECT_EQ(local0.size(), 128);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> local1, ws->GetHostBuffer(0, 1));
+  EXPECT_EQ(local1.data(), ptr1);
+  EXPECT_EQ(local1.size(), 256);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> global4, ws->GetHostBuffer(0, 4));
+  EXPECT_EQ(global4.data(), ptr0);
+  EXPECT_EQ(global4.size(), 128);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> global6,
+                       const_ws.GetHostBuffer(0, 6));
+  EXPECT_EQ(global6.data(), ptr1);
+  EXPECT_EQ(global6.size(), 256);
+
+  // Unowned shards outside [0, 2) and {4, 6} fail closed instead of wrapping.
+  for (size_t unowned : {size_t{2}, size_t{5}, size_t{1} << 32, SIZE_MAX}) {
+    EXPECT_THAT(ws->GetHostBuffer(0, unowned),
+                ::absl_testing::StatusIs(absl::StatusCode::kOutOfRange,
+                                         ::testing::HasSubstr("not mapped")));
+  }
+}
+
+TEST_F(WeightSynchronizerTest,
+       GetHostBufferExplicitLocalIndicesFailClosedOnUnowned) {
+  const size_t num_layers = 1;
+  const size_t num_shards = 2;
+  const size_t slice_size = 1024;
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws,
+                       WeightSynchronizerBase::Create(
+                           num_layers, num_shards, slice_size,
+                           /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  const uint8_t* ptr0 = ws->GetHostBufferPtr(0, 0);
+  const uint8_t* ptr1 = ws->GetHostBufferPtr(0, 1);
+  ws->SetExternalHostPointers({ptr0, ptr1}, {128, 256});
+  ws->SetLocalShardIndices({2, 3});
+
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> local2, ws->GetHostBuffer(0, 2));
+  EXPECT_EQ(local2.data(), ptr0);
+  EXPECT_EQ(local2.size(), 128);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> local3, ws->GetHostBuffer(0, 3));
+  EXPECT_EQ(local3.data(), ptr1);
+  EXPECT_EQ(local3.size(), 256);
+
+  for (size_t unowned : {size_t{0}, size_t{1}, size_t{5}}) {
+    EXPECT_THAT(ws->GetHostBuffer(0, unowned),
+                ::absl_testing::StatusIs(absl::StatusCode::kOutOfRange,
+                                         ::testing::HasSubstr("not mapped")));
+  }
+
+  ws->SetGlobalShardIndices({4, 6});
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> global4, ws->GetHostBuffer(0, 4));
+  EXPECT_EQ(global4.data(), ptr0);
+  EXPECT_EQ(global4.size(), 128);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> global6, ws->GetHostBuffer(0, 6));
+  EXPECT_EQ(global6.data(), ptr1);
+  EXPECT_EQ(global6.size(), 256);
+  for (size_t unowned : {size_t{0}, size_t{1}, size_t{5}}) {
+    EXPECT_THAT(ws->GetHostBuffer(0, unowned),
+                ::absl_testing::StatusIs(absl::StatusCode::kOutOfRange,
+                                         ::testing::HasSubstr("not mapped")));
+  }
+}
+
+TEST_F(WeightSynchronizerTest,
+       GetHostBufferRejectsNegativeAndTruncatedShardIndices) {
+  const size_t num_layers = 1;
+  const size_t num_shards = 2;
+  const size_t slice_size = 1024;
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws,
+                       WeightSynchronizerBase::Create(
+                           num_layers, num_shards, slice_size,
+                           /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  const uint8_t* ptr0 = ws->GetHostBufferPtr(0, 0);
+  const uint8_t* ptr1 = ws->GetHostBufferPtr(0, 1);
+  ws->SetExternalHostPointers({ptr0, ptr1}, {128, 256});
+
+  ws->SetLocalShardIndices({0, -1});
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> local0, ws->GetHostBuffer(0, 0));
+  EXPECT_EQ(local0.data(), ptr0);
+  EXPECT_EQ(local0.size(), 128);
+  EXPECT_THAT(ws->GetHostBuffer(0, size_t{1} << 32),
+              ::absl_testing::StatusIs(absl::StatusCode::kOutOfRange,
+                                       ::testing::HasSubstr("not mapped")));
+  EXPECT_THAT(ws->GetHostBuffer(0, SIZE_MAX),
+              ::absl_testing::StatusIs(absl::StatusCode::kOutOfRange,
+                                       ::testing::HasSubstr("not mapped")));
+
+  ws->SetLocalShardIndices({});
+  ws->SetGlobalShardIndices({0, -1});
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> global0, ws->GetHostBuffer(0, 0));
+  EXPECT_EQ(global0.data(), ptr0);
+  EXPECT_EQ(global0.size(), 128);
+  EXPECT_THAT(ws->GetHostBuffer(0, size_t{1} << 32),
+              ::absl_testing::StatusIs(absl::StatusCode::kOutOfRange,
+                                       ::testing::HasSubstr("not mapped")));
+  EXPECT_THAT(ws->GetHostBuffer(0, SIZE_MAX),
+              ::absl_testing::StatusIs(absl::StatusCode::kOutOfRange,
+                                       ::testing::HasSubstr("not mapped")));
 }
 
 TEST_F(WeightSynchronizerTest,

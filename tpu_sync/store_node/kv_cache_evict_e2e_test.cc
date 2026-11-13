@@ -29,6 +29,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "absl/types/span.h"
 #include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/core/controller/controller_client.h"
@@ -129,8 +130,9 @@ class EvictE2ETest : public ::testing::Test {
   static void FillBlock(KVCacheManagerWithTransfer& manager, int block_id,
                         int hash_idx) {
     for (size_t array = 0; array < kNumBlockArrays; ++array) {
-      uint8_t* base = manager.base()->GetHostPointer(array, /*shard_idx=*/0);
-      ASSERT_NE(base, nullptr);
+      TF_ASSERT_OK_AND_ASSIGN(
+          absl::Span<uint8_t> base,
+          manager.base()->GetHostBuffer(array, /*shard_idx=*/0));
       for (size_t b = 0; b < kArrayBytes; ++b) {
         base[block_id * kArrayBytes + b] = PatternByte(hash_idx, array, b);
       }
@@ -142,9 +144,9 @@ class EvictE2ETest : public ::testing::Test {
   static void ExpectBlockBytes(KVCacheManagerWithTransfer& manager,
                                int block_id, int hash_idx) {
     for (size_t array = 0; array < kNumBlockArrays; ++array) {
-      const uint8_t* base =
-          manager.base()->GetHostPointer(array, /*shard_idx=*/0);
-      ASSERT_NE(base, nullptr);
+      TF_ASSERT_OK_AND_ASSIGN(
+          absl::Span<const uint8_t> base,
+          manager.base()->GetHostBuffer(array, /*shard_idx=*/0));
       for (size_t b = 0; b < kArrayBytes; ++b) {
         ASSERT_EQ(base[block_id * kArrayBytes + b],
                   PatternByte(hash_idx, array, b))
@@ -216,9 +218,10 @@ TEST_F(EvictE2ETest, SweepDemotesToTheStoreNodeAndReadsBack) {
     }
     if (!resident) {
       for (size_t array = 0; array < kNumBlockArrays; ++array) {
-        std::memset(
-            src.manager->base()->GetHostPointer(array, 0) + blk * kArrayBytes,
-            0xEE, kArrayBytes);
+        TF_ASSERT_OK_AND_ASSIGN(
+            absl::Span<uint8_t> base,
+            src.manager->base()->GetHostBuffer(array, /*shard_idx=*/0));
+        std::memset(base.data() + blk * kArrayBytes, 0xEE, kArrayBytes);
       }
     }
   }

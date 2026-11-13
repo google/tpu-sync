@@ -28,6 +28,7 @@
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
@@ -96,12 +97,22 @@ class MockSessionDelegate : public BlockTransportDelegate {
   size_t shard_factor() const override { return 1; }
   int64_t node_id() const override { return 0; }
 
-  uint8_t* GetHostPointer(size_t layer_idx, size_t shard_idx) override {
-    return buffers_[layer_idx * num_shards_ + shard_idx].data();
-  }
+  using BlockTransportDelegate::GetHostBuffer;
 
-  size_t GetHostSize(size_t layer_idx, size_t shard_idx) override {
-    return buffers_[layer_idx * num_shards_ + shard_idx].size();
+  absl::StatusOr<absl::Span<const uint8_t>> GetHostBuffer(
+      size_t layer_idx, size_t shard_idx) const override {
+    if (layer_idx >= num_layers_ || shard_idx >= num_shards_) {
+      return absl::OutOfRangeError(absl::StrCat(
+          "layer_idx ", layer_idx, " shard_idx ", shard_idx,
+          " out of range: ", num_layers_, " layers, ", num_shards_, " shards"));
+    }
+    const std::vector<uint8_t>& buf =
+        buffers_[layer_idx * num_shards_ + shard_idx];
+    if (buf.data() == nullptr) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          "layer ", layer_idx, " shard ", shard_idx, " has no host buffer"));
+    }
+    return absl::Span<const uint8_t>(buf);
   }
 
   int GetRemoteReadBlockId(int base_remote_id, int chunk_k) override {

@@ -62,7 +62,7 @@ struct PoolPushProgressSpec {
 // (chunk headers, shard masks) keeps addressing shards by `local_index`.
 struct ShardInfo {
   // Position of the shard within this delegate, i.e. the `shard_idx` passed to
-  // GetHostPointer() and carried in chunk headers.
+  // GetHostBuffer() and carried in chunk headers.
   int local_index = 0;
   // Index of the shard in the full sharding of the tensor across every
   // manager and host (e.g. its mesh position), or -1 when unknown. Not

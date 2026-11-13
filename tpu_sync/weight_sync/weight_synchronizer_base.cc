@@ -2832,127 +2832,67 @@ void WeightSynchronizerBase::ForgetPushProgress(uint64_t uuid) {
   }
 }
 
-uint8_t* WeightSynchronizerBase::GetHostPointer(size_t layer_idx,
-                                                size_t shard_idx) {
-  if (layer_idx >= layers_.size() || layers_[layer_idx].shards.empty()) {
-    return nullptr;
+absl::StatusOr<absl::Span<const uint8_t>> WeightSynchronizerBase::GetHostBuffer(
+    size_t layer_idx, size_t shard_idx) const {
+  if (layer_idx >= layers_.size()) {
+    return absl::OutOfRangeError(absl::StrCat("layer_idx ", layer_idx,
+                                              " out of range: ", layers_.size(),
+                                              " host layers"));
   }
-  size_t local_idx = shard_idx % layers_[layer_idx].shards.size();
-  if (!local_shard_indices_.empty()) {
-    auto it =
-        std::find(local_shard_indices_.begin(), local_shard_indices_.end(),
-                  static_cast<int>(shard_idx));
-    if (it != local_shard_indices_.end()) {
-      local_idx = std::distance(local_shard_indices_.begin(), it);
-    } else if (!global_shard_indices_.empty()) {
-      auto git =
-          std::find(global_shard_indices_.begin(), global_shard_indices_.end(),
-                    static_cast<int64_t>(shard_idx));
-      if (git != global_shard_indices_.end()) {
-        local_idx = std::distance(global_shard_indices_.begin(), git);
+  if (layers_[layer_idx].shards.empty()) {
+    return absl::OutOfRangeError(absl::StrCat("shard_idx ", shard_idx,
+                                              " out of range: layer ",
+                                              layer_idx, " has no shards"));
+  }
+  std::optional<size_t> local_idx;
+  if (local_shard_indices_.empty() && global_shard_indices_.empty()) {
+    local_idx = shard_idx % layers_[layer_idx].shards.size();
+  } else {
+    if (!local_shard_indices_.empty()) {
+      auto it = std::find_if(
+          local_shard_indices_.begin(), local_shard_indices_.end(),
+          [shard_idx](int idx) { return std::cmp_equal(idx, shard_idx); });
+      if (it != local_shard_indices_.end()) {
+        local_idx = static_cast<size_t>(
+            std::distance(local_shard_indices_.begin(), it));
       }
     }
-  } else if (!global_shard_indices_.empty()) {
-    auto it =
-        std::find(global_shard_indices_.begin(), global_shard_indices_.end(),
-                  static_cast<int64_t>(shard_idx));
-    if (it != global_shard_indices_.end()) {
-      local_idx = std::distance(global_shard_indices_.begin(), it);
-    }
-  }
-  return const_cast<uint8_t*>(layers_[layer_idx].shards[local_idx].host_ptr);
-}
-
-size_t WeightSynchronizerBase::GetHostSize(size_t layer_idx, size_t shard_idx) {
-  if (layer_idx >= layers_.size() || layers_[layer_idx].shards.empty()) {
-    return 0;
-  }
-  size_t local_idx = shard_idx % layers_[layer_idx].shards.size();
-  if (!local_shard_indices_.empty()) {
-    auto it =
-        std::find(local_shard_indices_.begin(), local_shard_indices_.end(),
-                  static_cast<int>(shard_idx));
-    if (it != local_shard_indices_.end()) {
-      local_idx = std::distance(local_shard_indices_.begin(), it);
-    } else if (!global_shard_indices_.empty()) {
-      auto git =
-          std::find(global_shard_indices_.begin(), global_shard_indices_.end(),
-                    static_cast<int64_t>(shard_idx));
+    if (!local_idx.has_value() && !global_shard_indices_.empty()) {
+      auto git = std::find_if(
+          global_shard_indices_.begin(), global_shard_indices_.end(),
+          [shard_idx](int64_t idx) { return std::cmp_equal(idx, shard_idx); });
       if (git != global_shard_indices_.end()) {
-        local_idx = std::distance(global_shard_indices_.begin(), git);
+        local_idx = static_cast<size_t>(
+            std::distance(global_shard_indices_.begin(), git));
       }
     }
-  } else if (!global_shard_indices_.empty()) {
-    auto it =
-        std::find(global_shard_indices_.begin(), global_shard_indices_.end(),
-                  static_cast<int64_t>(shard_idx));
-    if (it != global_shard_indices_.end()) {
-      local_idx = std::distance(global_shard_indices_.begin(), it);
+    // Match ResolveShardPushSchedules: an empty local_shard_indices_ denotes
+    // the identity mapping [0, shards.size()), checked after
+    // global_shard_indices_ so global entries take precedence over overlapping
+    // local slots (e.g., global {0, 2, 4, 6} maps 2 -> slot 1).
+    if (!local_idx.has_value() && local_shard_indices_.empty() &&
+        shard_idx < layers_[layer_idx].shards.size()) {
+      local_idx = shard_idx;
+    }
+    if (!local_idx.has_value()) {
+      return absl::OutOfRangeError(absl::StrCat(
+          "shard_idx ", shard_idx,
+          " is not mapped to any local or global shard index on layer ",
+          layer_idx));
     }
   }
-  return layers_[layer_idx].shards[local_idx].host_size;
-}
-
-const uint8_t* WeightSynchronizerBase::GetHostPointer(size_t layer_idx,
-                                                      size_t shard_idx) const {
-  if (layer_idx >= layers_.size() || layers_[layer_idx].shards.empty()) {
-    return nullptr;
+  if (*local_idx >= layers_[layer_idx].shards.size()) {
+    return absl::OutOfRangeError(
+        absl::StrCat("shard_idx ", shard_idx, " maps to local slot ",
+                     *local_idx, " which is out of range for layer ", layer_idx,
+                     " (", layers_[layer_idx].shards.size(), " local shards)"));
   }
-  size_t local_idx = shard_idx % layers_[layer_idx].shards.size();
-  if (!local_shard_indices_.empty()) {
-    auto it =
-        std::find(local_shard_indices_.begin(), local_shard_indices_.end(),
-                  static_cast<int>(shard_idx));
-    if (it != local_shard_indices_.end()) {
-      local_idx = std::distance(local_shard_indices_.begin(), it);
-    } else if (!global_shard_indices_.empty()) {
-      auto git =
-          std::find(global_shard_indices_.begin(), global_shard_indices_.end(),
-                    static_cast<int64_t>(shard_idx));
-      if (git != global_shard_indices_.end()) {
-        local_idx = std::distance(global_shard_indices_.begin(), git);
-      }
-    }
-  } else if (!global_shard_indices_.empty()) {
-    auto it =
-        std::find(global_shard_indices_.begin(), global_shard_indices_.end(),
-                  static_cast<int64_t>(shard_idx));
-    if (it != global_shard_indices_.end()) {
-      local_idx = std::distance(global_shard_indices_.begin(), it);
-    }
+  const ShardBufferInfoBase& shard = layers_[layer_idx].shards[*local_idx];
+  if (shard.host_ptr == nullptr) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "layer ", layer_idx, " shard ", shard_idx, " has no host buffer"));
   }
-  return layers_[layer_idx].shards[local_idx].host_ptr;
-}
-
-size_t WeightSynchronizerBase::GetHostSize(size_t layer_idx,
-                                           size_t shard_idx) const {
-  if (layer_idx >= layers_.size() || layers_[layer_idx].shards.empty()) {
-    return 0;
-  }
-  size_t local_idx = shard_idx % layers_[layer_idx].shards.size();
-  if (!local_shard_indices_.empty()) {
-    auto it =
-        std::find(local_shard_indices_.begin(), local_shard_indices_.end(),
-                  static_cast<int>(shard_idx));
-    if (it != local_shard_indices_.end()) {
-      local_idx = std::distance(local_shard_indices_.begin(), it);
-    } else if (!global_shard_indices_.empty()) {
-      auto git =
-          std::find(global_shard_indices_.begin(), global_shard_indices_.end(),
-                    static_cast<int64_t>(shard_idx));
-      if (git != global_shard_indices_.end()) {
-        local_idx = std::distance(global_shard_indices_.begin(), git);
-      }
-    }
-  } else if (!global_shard_indices_.empty()) {
-    auto it =
-        std::find(global_shard_indices_.begin(), global_shard_indices_.end(),
-                  static_cast<int64_t>(shard_idx));
-    if (it != global_shard_indices_.end()) {
-      local_idx = std::distance(global_shard_indices_.begin(), it);
-    }
-  }
-  return layers_[layer_idx].shards[local_idx].host_size;
+  return absl::Span<const uint8_t>(shard.host_ptr, shard.host_size);
 }
 
 void WeightSynchronizerBase::SetTestOnlyRateLimiters(

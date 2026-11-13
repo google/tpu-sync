@@ -48,8 +48,10 @@ namespace tpu_raiden {
 namespace kv_cache {
 namespace {
 
+using ::absl_testing::IsOkAndHolds;
 using ::absl_testing::StatusIs;
 using ::testing::HasSubstr;
+using ::testing::SizeIs;
 
 class StagingTestManager : public KVCacheManagerBase {
  public:
@@ -1018,10 +1020,12 @@ TEST(PoolStagingTest, FullHostMirrorKeepsHeterogeneousStorageSizes) {
        DensePool("hidden", /*storage_index=*/1, /*base_offset=*/0, kLargeStride,
                  kNumBlocks, /*staging_blocks_per_request=*/0)},
       /*staging_leases=*/0));
-  EXPECT_EQ(full_mirror.GetHostSize(0, 0),
-            static_cast<size_t>(kSmallStride * kNumBlocks));
-  EXPECT_EQ(full_mirror.GetHostSize(1, 0),
-            static_cast<size_t>(kLargeStride * kNumBlocks));
+  EXPECT_THAT(
+      full_mirror.GetHostBuffer(0, 0),
+      IsOkAndHolds(SizeIs(static_cast<size_t>(kSmallStride * kNumBlocks))));
+  EXPECT_THAT(
+      full_mirror.GetHostBuffer(1, 0),
+      IsOkAndHolds(SizeIs(static_cast<size_t>(kLargeStride * kNumBlocks))));
 
   StagingTestManager bounded_layers(/*num_layers=*/2, /*num_shards=*/1,
                                     /*slice_byte_size=*/kSmallStride,
@@ -1036,8 +1040,9 @@ TEST(PoolStagingTest, FullHostMirrorKeepsHeterogeneousStorageSizes) {
        DensePool("hidden", /*storage_index=*/1, /*base_offset=*/0, kLargeStride,
                  kNumBlocks, /*staging_blocks_per_request=*/0)},
       /*staging_leases=*/0));
-  EXPECT_EQ(bounded_layers.GetHostSize(0, 0),
-            static_cast<size_t>(kLargeStride * kNumBlocks));
+  EXPECT_THAT(
+      bounded_layers.GetHostBuffer(0, 0),
+      IsOkAndHolds(SizeIs(static_cast<size_t>(kLargeStride * kNumBlocks))));
 }
 
 }  // namespace

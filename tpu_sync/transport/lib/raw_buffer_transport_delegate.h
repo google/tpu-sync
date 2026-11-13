@@ -18,10 +18,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <utility>
 
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
-#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "grpcpp/channel.h"
@@ -34,40 +35,23 @@ class RawBufferTransportDelegate {
  public:
   virtual ~RawBufferTransportDelegate() = default;
 
-  // Authoritative physical Host / pinned HBM base starting pointer.
-  // The buffer_id parameter allows multidimensional indexing across
-  // layers/buffers.
-  virtual uint8_t* GetHostPointer(size_t buffer_id, size_t shard_idx) = 0;
-
-  // Authoritative total byte capacity of the target shard staging buffer.
-  virtual size_t GetHostSize(size_t buffer_id, size_t shard_idx) = 0;
-
   // Host staging buffer of (|buffer_id|, |shard_idx|). Returns
   // FailedPrecondition exactly when the target has no host buffer, and
-  // OutOfRange exactly when |buffer_id| or |shard_idx| is out of range; callers
+  // OutOfRange when |buffer_id| or |shard_idx| is out of range; callers
   // rely on this distinction. An OK span has a non-null `data()` and may be
-  // empty. This default cannot tell the two cases apart, because
-  // `GetHostPointer()` returns nullptr for both, so it reports every nullptr
-  // as FailedPrecondition; overrides must distinguish them.
+  // empty.
+  virtual absl::StatusOr<absl::Span<const uint8_t>> GetHostBuffer(
+      size_t buffer_id, size_t shard_idx) const = 0;
+
+  // Mutable view of the const `GetHostBuffer()`, with the same error contract.
   virtual absl::StatusOr<absl::Span<uint8_t>> GetHostBuffer(size_t buffer_id,
                                                             size_t shard_idx) {
-    uint8_t* host_ptr = GetHostPointer(buffer_id, shard_idx);
-    if (host_ptr == nullptr) {
-      return absl::FailedPreconditionError(absl::StrCat("buffer_id ", buffer_id,
-                                                        " shard ", shard_idx,
-                                                        " has no host buffer"));
-    }
-    return absl::Span<uint8_t>(host_ptr, GetHostSize(buffer_id, shard_idx));
-  }
-  // Const view of (|buffer_id|, |shard_idx|) with the same error contract. The
-  // default delegates to mutable `GetHostBuffer(|buffer_id|, |shard_idx|)`
-  // because `GetHostPointer()`/`GetHostSize()` are non-const on legacy
-  // delegates.
-  virtual absl::StatusOr<absl::Span<const uint8_t>> GetHostBuffer(
-      size_t buffer_id, size_t shard_idx) const {
-    // `GetHostPointer()`/`GetHostSize()` are non-const on legacy delegates.
-    return const_cast<RawBufferTransportDelegate*>(this)->GetHostBuffer(
-        buffer_id, shard_idx);
+    ABSL_ASSIGN_OR_RETURN(
+        absl::Span<const uint8_t> host_buffer,
+        std::as_const(*this).GetHostBuffer(buffer_id, shard_idx));
+    // The span views delegate-owned mutable staging memory.
+    return absl::Span<uint8_t>(const_cast<uint8_t*>(host_buffer.data()),
+                               host_buffer.size());
   }
 
   // Notification triggered upon verified data chunk arrival for a specific

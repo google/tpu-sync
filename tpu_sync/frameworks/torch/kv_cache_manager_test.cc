@@ -868,6 +868,73 @@ TEST_F(KVCacheManagerTorchTest, ObjectTransferWithoutDeviceBuffersIsReported) {
       << d2h.message();
 }
 
+TEST_F(KVCacheManagerTorchTest, ReadAndWriteBlockBytesRoundtripAndErrors) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      xla::PjRtMemorySpace * memory_space,
+      client_->addressable_devices()[0]->default_memory_space());
+  std::vector<float> data(8 * 256, 0.0f);
+  TF_ASSERT_OK_AND_ASSIGN(auto pjrt_buffer,
+                       client_->BufferFromHostBuffer(
+                           data.data(), xla::F32, {8, 256},
+                           /*byte_strides=*/std::nullopt,
+                           xla::PjRtClient::HostBufferSemantics::
+                               kImmutableUntilTransferCompletes,
+                           /*on_done_with_host_buffer=*/nullptr, memory_space,
+                           /*device_layout=*/nullptr));
+  at::Tensor tensor = at::zeros({8, 256}, at::kFloat);
+  RegisterMockTensor(tensor, pjrt_buffer.get());
+  std::vector<std::vector<at::Tensor>> device_tensors = {{tensor}};
+
+  constexpr int kHostBlocks = 4;
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<KVCacheManager> manager,
+      KVCacheManager::Create(device_tensors, /*local_port=*/std::nullopt,
+                             /*host_blocks_to_allocate=*/kHostBlocks));
+  const size_t block_bytes = manager->block_bytes(/*block_array_idx=*/0);
+  ASSERT_EQ(block_bytes, 256 * sizeof(float));
+
+  const std::string payload_0(block_bytes, 'A');
+  const std::string payload_2(block_bytes, 'C');
+  ABSL_EXPECT_OK(
+      manager->WriteBlockBytes(/*layer_idx=*/0, /*block_id=*/0, payload_0));
+  ABSL_EXPECT_OK(
+      manager->WriteBlockBytes(/*layer_idx=*/0, /*block_id=*/2, payload_2));
+  EXPECT_THAT(manager->ReadBlockBytes(/*layer_idx=*/0, /*block_id=*/0),
+              ::absl_testing::IsOkAndHolds(payload_0));
+  EXPECT_THAT(manager->ReadBlockBytes(/*layer_idx=*/0, /*block_id=*/2),
+              ::absl_testing::IsOkAndHolds(payload_2));
+
+  // Out-of-range layer.
+  EXPECT_THAT(manager->ReadBlockBytes(/*layer_idx=*/1, /*block_id=*/0),
+              ::absl_testing::StatusIs(absl::StatusCode::kOutOfRange));
+  EXPECT_THAT(
+      manager->WriteBlockBytes(/*layer_idx=*/1, /*block_id=*/0, payload_0),
+      ::absl_testing::StatusIs(absl::StatusCode::kOutOfRange));
+
+  // Out-of-range block.
+  EXPECT_THAT(
+      manager->ReadBlockBytes(/*layer_idx=*/0, /*block_id=*/kHostBlocks),
+      ::absl_testing::StatusIs(absl::StatusCode::kOutOfRange));
+  EXPECT_THAT(manager->WriteBlockBytes(/*layer_idx=*/0,
+                                       /*block_id=*/kHostBlocks, payload_0),
+              ::absl_testing::StatusIs(absl::StatusCode::kOutOfRange));
+
+  // Missing host buffer (0 host blocks allocated).
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<KVCacheManager> no_host_manager,
+      KVCacheManager::Create(device_tensors, /*local_port=*/std::nullopt,
+                             /*host_blocks_to_allocate=*/0));
+  EXPECT_THAT(
+      no_host_manager->ReadBlockBytes(/*layer_idx=*/0, /*block_id=*/0),
+      ::absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition,
+                               ::testing::HasSubstr("has no host buffer")));
+  EXPECT_THAT(
+      no_host_manager->WriteBlockBytes(/*layer_idx=*/0, /*block_id=*/0,
+                                       payload_0),
+      ::absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition,
+                               ::testing::HasSubstr("has no host buffer")));
+}
+
 }  // namespace
 }  // namespace torch
 }  // namespace tpu_raiden

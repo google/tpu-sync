@@ -122,12 +122,20 @@ TEST(RaidenManagerBaseHostBufferTest, LayerPastHostLayersIsOutOfRange) {
       {storage.data(), storage.data(), storage.data(), storage.data()},
       {storage.size(), storage.size(), storage.size(), storage.size()});
   const RaidenManagerBase& const_manager = manager;
+  transport::BlockTransportDelegate& delegate = manager;
+  const transport::BlockTransportDelegate& const_delegate = manager;
 
   ABSL_EXPECT_OK(manager.GetHostBuffer(1, 0));
   EXPECT_THAT(manager.GetHostBuffer(2, 0),
               StatusIs(absl::StatusCode::kOutOfRange,
                        HasSubstr("layer_idx 2 out of range: 2 host layers")));
   EXPECT_THAT(const_manager.GetHostBuffer(2, 0),
+              StatusIs(absl::StatusCode::kOutOfRange,
+                       HasSubstr("layer_idx 2 out of range: 2 host layers")));
+  EXPECT_THAT(delegate.GetHostBuffer(2, 0),
+              StatusIs(absl::StatusCode::kOutOfRange,
+                       HasSubstr("layer_idx 2 out of range: 2 host layers")));
+  EXPECT_THAT(const_delegate.GetHostBuffer(2, 0),
               StatusIs(absl::StatusCode::kOutOfRange,
                        HasSubstr("layer_idx 2 out of range: 2 host layers")));
 }
@@ -138,9 +146,24 @@ TEST(RaidenManagerBaseHostBufferTest, LayerWithNoShardsIsOutOfRange) {
   manager.SetExternalHostPointers({storage.data(), storage.data()},
                                   {storage.size(), storage.size()});
   manager.ClearLayerShards(1);
+  const RaidenManagerBase& const_manager = manager;
+  transport::BlockTransportDelegate& delegate = manager;
+  const transport::BlockTransportDelegate& const_delegate = manager;
 
   ABSL_EXPECT_OK(manager.GetHostBuffer(0, 1));
   EXPECT_THAT(manager.GetHostBuffer(1, 1),
+              StatusIs(absl::StatusCode::kOutOfRange,
+                       HasSubstr("shard_idx 1 out of range: layer 1 has no "
+                                 "shards")));
+  EXPECT_THAT(const_manager.GetHostBuffer(1, 1),
+              StatusIs(absl::StatusCode::kOutOfRange,
+                       HasSubstr("shard_idx 1 out of range: layer 1 has no "
+                                 "shards")));
+  EXPECT_THAT(delegate.GetHostBuffer(1, 1),
+              StatusIs(absl::StatusCode::kOutOfRange,
+                       HasSubstr("shard_idx 1 out of range: layer 1 has no "
+                                 "shards")));
+  EXPECT_THAT(const_delegate.GetHostBuffer(1, 1),
               StatusIs(absl::StatusCode::kOutOfRange,
                        HasSubstr("shard_idx 1 out of range: layer 1 has no "
                                  "shards")));
@@ -153,12 +176,20 @@ TEST(RaidenManagerBaseHostBufferTest, NullHostPointerIsFailedPrecondition) {
   manager.SetExternalHostPointers({nullptr, storage.data()},
                                   {storage.size(), storage.size()});
   const RaidenManagerBase& const_manager = manager;
+  transport::BlockTransportDelegate& delegate = manager;
+  const transport::BlockTransportDelegate& const_delegate = manager;
 
   ABSL_EXPECT_OK(manager.GetHostBuffer(0, 1));
   EXPECT_THAT(manager.GetHostBuffer(0, 0),
               StatusIs(absl::StatusCode::kFailedPrecondition,
                        HasSubstr("layer 0 shard 0 has no host buffer")));
   EXPECT_THAT(const_manager.GetHostBuffer(0, 0),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("layer 0 shard 0 has no host buffer")));
+  EXPECT_THAT(delegate.GetHostBuffer(0, 0),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("layer 0 shard 0 has no host buffer")));
+  EXPECT_THAT(const_delegate.GetHostBuffer(0, 0),
               StatusIs(absl::StatusCode::kFailedPrecondition,
                        HasSubstr("layer 0 shard 0 has no host buffer")));
 }

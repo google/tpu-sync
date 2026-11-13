@@ -31,6 +31,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/types/span.h"
 #include "peregrine/src/api/v1/rate_limiter.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
@@ -252,9 +253,12 @@ const uint8_t* WeightSynchronizer::GetHostBufferPtr(size_t layer_idx,
   return base_->GetHostBufferPtr(layer_idx, shard_idx);
 }
 
-size_t WeightSynchronizer::GetHostBufferSize(size_t layer_idx,
-                                             size_t shard_idx) const {
-  return base_->GetHostSize(layer_idx, shard_idx);
+absl::StatusOr<size_t> WeightSynchronizer::GetHostBufferSize(
+    size_t layer_idx, size_t shard_idx) const {
+  ABSL_ASSIGN_OR_RETURN(
+      absl::Span<const uint8_t> host_buffer,
+      std::as_const(*base_).GetHostBuffer(layer_idx, shard_idx));
+  return host_buffer.size();
 }
 
 std::optional<int> WeightSynchronizer::local_port() const {

@@ -121,6 +121,7 @@ NB_MODULE(_tpu_raiden_jax, m) {
   nb::class_<tpu_raiden::kv_cache::BackendConfig>(m, "BackendConfig")
       .def(nb::init<>())
       .def_rw("type", &tpu_raiden::kv_cache::BackendConfig::type)
+      .def_rw("plugin_path", &tpu_raiden::kv_cache::BackendConfig::plugin_path)
       .def_rw("parallelism", &tpu_raiden::kv_cache::BackendConfig::parallelism)
       .def("set_property", &tpu_raiden::kv_cache::BackendConfig::SetProperty)
       .def("get_property", &tpu_raiden::kv_cache::BackendConfig::GetProperty,

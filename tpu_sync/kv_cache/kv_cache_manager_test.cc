@@ -4106,6 +4106,181 @@ TEST(KVCacheManagerTest, D2hWriteAndH2dWriteOverPeregrineOp6Succeed) {
                               /*dst_device=*/{0}, /*copy_sizes=*/{1}),
               StatusIs(absl::StatusCode::kFailedPrecondition));
 }
+
+class CapturingSliceKVBackend : public backends::KVBackend {
+ public:
+  CapturingSliceKVBackend() : backends::KVBackend({}) {}
+  std::string name() const override { return "capturing"; }
+
+  void WriteAsync(const backends::BlockKey& /*key*/,
+                  absl::Span<const backends::HostBufferDescriptor> slices,
+                  size_t /*total_bytes*/,
+                  std::function<void(absl::Status)> callback) override {
+    absl::MutexLock lock(mu_);
+    captured_slices_.assign(slices.begin(), slices.end());
+    if (callback) callback(absl::OkStatus());
+  }
+
+  void ReadAsync(const backends::BlockKey& /*key*/,
+                 absl::Span<const backends::HostBufferDescriptor> slices,
+                 size_t /*total_bytes*/,
+                 std::function<void(absl::Status)> callback) override {
+    absl::MutexLock lock(mu_);
+    captured_slices_.assign(slices.begin(), slices.end());
+    if (callback) callback(absl::OkStatus());
+  }
+
+  void BatchExistsAsync(absl::Span<const backends::BlockKey> keys,
+                        std::function<void(std::vector<absl::StatusOr<bool>>)>
+                            callback) override {
+    if (callback) {
+      callback(std::vector<absl::StatusOr<bool>>(keys.size(), true));
+    }
+  }
+
+  std::vector<backends::HostBufferDescriptor> captured_slices() const {
+    absl::MutexLock lock(mu_);
+    return captured_slices_;
+  }
+
+ private:
+  mutable absl::Mutex mu_;
+  std::vector<backends::HostBufferDescriptor> captured_slices_
+      ABSL_GUARDED_BY(mu_);
+};
+
+TEST(KVCacheManagerTest, ResolveBlockSlicesPropagatesShmFdAndOffset) {
+  int next_region_idx = 0;
+  HostBufferAllocator fake_shm_allocator =
+      [&](size_t size_bytes, const xla::PjRtDevice* /*device*/)
+      -> absl::StatusOr<HostBufferAllocation> {
+    auto buf = std::make_shared<std::vector<uint8_t>>(size_bytes, 0);
+    HostBufferAllocation alloc;
+    alloc.ptr = buf->data();
+    alloc.size = size_bytes;
+    alloc.fd = 77;
+    alloc.fd_offset = 4096 + static_cast<int64_t>(next_region_idx++) * 8192;
+    alloc.owner = buf;
+    return alloc;
+  };
+
+  // 2 layers, 1 shard, 128 bytes per block, 4 host blocks.
+  KVCacheManagerBase manager(
+      /*num_layers=*/2, /*num_shards=*/1,
+      /*slice_byte_size=*/128, /*local_port=*/std::nullopt,
+      /*host_blocks_to_allocate=*/4, /*parallelism=*/1, fake_shm_allocator);
+
+  EXPECT_EQ(manager.GetHostFd(0, 0), 77);
+  EXPECT_EQ(manager.GetHostFdOffset(0, 0), 4096);
+  EXPECT_EQ(manager.GetHostFd(1, 0), 77);
+  EXPECT_EQ(manager.GetHostFdOffset(1, 0), 4096 + 8192);
+
+  auto backend = std::make_shared<CapturingSliceKVBackend>();
+  // Staging block 2 sits at offset 2 * 128 = 256 within each layer's region.
+  TF_ASSERT_OK_AND_ASSIGN(
+      raiden::PjRtCopyFuture read_fut,
+      manager.H2dReadFromBackend({backend}, {{.block_hash = "b0"}},
+                                 /*staging_block_ids=*/{2},
+                                 /*dst_block_ids=*/{2}));
+  // Manager has no device buffers so H2D fails after ReadAsync finishes,
+  // after `backend` has already captured the resolved HostBufferDescriptors.
+  (void)read_fut.Await();
+
+  const std::vector<backends::HostBufferDescriptor> slices =
+      backend->captured_slices();
+  ASSERT_EQ(slices.size(), 2);
+  EXPECT_EQ(slices[0].fd, 77);
+  EXPECT_EQ(slices[0].offset, 4096 + 2 * 128);
+  EXPECT_EQ(slices[0].size, 128);
+  EXPECT_EQ(slices[1].fd, 77);
+  EXPECT_EQ(slices[1].offset, 4096 + 8192 + 2 * 128);
+  EXPECT_EQ(slices[1].size, 128);
+
+  // Replacing host buffers with external pointers clears stale shm metadata.
+  std::vector<uint8_t> ext0(4 * 128, 0);
+  std::vector<uint8_t> ext1(4 * 128, 0);
+  manager.SetExternalHostPointers({ext0.data(), ext1.data()},
+                                  {ext0.size(), ext1.size()});
+  EXPECT_EQ(manager.GetHostFd(0, 0), -1);
+  EXPECT_EQ(manager.GetHostFdOffset(0, 0), 0);
+  EXPECT_EQ(manager.GetHostFd(1, 0), -1);
+  EXPECT_EQ(manager.GetHostFdOffset(1, 0), 0);
+}
+
+class AllocatorTestKVCacheManager : public KVCacheManagerBase {
+ public:
+  AllocatorTestKVCacheManager(size_t num_layers, size_t num_shards,
+                              size_t slice_byte_size, int host_blocks,
+                              HostBufferAllocator host_allocator)
+      : KVCacheManagerBase(num_layers, num_shards, slice_byte_size,
+                           /*local_port=*/std::nullopt, host_blocks,
+                           /*parallelism=*/1, std::move(host_allocator)) {
+    buffer_holds_.resize(num_layers);
+    for (size_t l = 0; l < num_layers; ++l) {
+      buffer_holds_[l].holds.resize(num_shards);
+    }
+  }
+
+  void SetDeviceAndPhysicalSize(size_t layer_idx, const xla::PjRtDevice* device,
+                                size_t physical_size) {
+    buffer_holds_[layer_idx].physical_size = physical_size;
+    major_dim_size_ = 1;
+    for (auto& shard : layers_[layer_idx].shards) {
+      shard.device = device;
+      shard.device_size = physical_size;
+    }
+  }
+};
+
+TEST(KVCacheManagerTest, EnsureHostMirrorCoversUpdatesShmFdAndForwardsDevice) {
+  int call_idx = 0;
+  const xla::PjRtDevice* last_device = nullptr;
+  const auto* fake_device = reinterpret_cast<const xla::PjRtDevice*>(0x1234);
+
+  HostBufferAllocator fake_shm_allocator = [&](size_t size_bytes,
+                                               const xla::PjRtDevice* device)
+      -> absl::StatusOr<HostBufferAllocation> {
+    last_device = device;
+    auto buf = std::make_shared<std::vector<uint8_t>>(size_bytes, 0);
+    HostBufferAllocation alloc;
+    alloc.ptr = buf->data();
+    alloc.size = size_bytes;
+    alloc.fd = 50 + call_idx;
+    alloc.fd_offset = 4096 + static_cast<int64_t>(call_idx) * 16384;
+    alloc.owner = buf;
+    ++call_idx;
+    return alloc;
+  };
+
+  // Initial host mirror holds 2 blocks (256 B); RegisterPools grows it to 8.
+  AllocatorTestKVCacheManager manager(
+      /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+      /*host_blocks=*/2, fake_shm_allocator);
+  EXPECT_EQ(manager.GetHostFd(0, 0), 50);
+  EXPECT_EQ(manager.GetHostFdOffset(0, 0), 4096);
+
+  manager.SetDeviceAndPhysicalSize(/*layer_idx=*/0, fake_device, 8 * 128);
+  ABSL_ASSERT_OK(manager.RegisterPools({DensePool("kind_a", 0, 0, 128, 8)}));
+  EXPECT_EQ(last_device, fake_device);
+  EXPECT_EQ(manager.GetHostFd(0, 0), 51);
+  EXPECT_EQ(manager.GetHostFdOffset(0, 0), 4096 + 16384);
+
+  auto backend = std::make_shared<CapturingSliceKVBackend>();
+  TF_ASSERT_OK_AND_ASSIGN(
+      raiden::PjRtCopyFuture read_fut,
+      manager.H2dReadFromBackend({backend}, {{.block_hash = "b5"}},
+                                 /*staging_block_ids=*/{5},
+                                 /*dst_block_ids=*/{5}));
+  (void)read_fut.Await();
+
+  const std::vector<backends::HostBufferDescriptor> slices =
+      backend->captured_slices();
+  ASSERT_EQ(slices.size(), 1);
+  EXPECT_EQ(slices[0].fd, 51);
+  EXPECT_EQ(slices[0].offset, 4096 + 16384 + 5 * 128);
+  EXPECT_EQ(slices[0].size, 128);
+}
+
 }  // namespace
 }  // namespace kv_cache
 }  // namespace tpu_raiden

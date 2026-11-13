@@ -84,6 +84,11 @@ struct StoreMonitorConfig {
 
 struct BackendConfig {
   std::string type;
+  // Optional filesystem path to a dynamically loaded
+  // `RaidenStorageOutofTreePluginV1` shared library (`.so`). When empty,
+  // `PluginRegistry` falls back to `RAIDEN_STORAGE_PLUGIN_PATH_<TYPE>` or
+  // `RAIDEN_STORAGE_PLUGIN_DIR`.
+  std::string plugin_path;
   size_t capacity = 0;
   std::string global_registry_address;
   // Serving topology this backend instance participates in.
@@ -157,9 +162,15 @@ class KVCacheStoreBackendFactory {
       std::function<absl::StatusOr<std::shared_ptr<KVCacheStoreBackend>>(
           const BackendConfig& config,
           controller::RaidenController* controller)>;
+  using PluginLoader = std::function<absl::Status(
+      absl::string_view type_name, absl::string_view plugin_path)>;
 
   // Access the singleton instance of the factory registry.
   static KVCacheStoreBackendFactory& Instance();
+
+  // Registers a fallback loader invoked when `CreateBackend` encounters an
+  // unregistered backend type.
+  void SetPluginLoader(PluginLoader loader);
 
   // Registers a creator function for the given type_name.
   // Returns Status::AlreadyExists if type_name is already registered.
@@ -204,6 +215,7 @@ class KVCacheStoreBackendFactory {
   mutable absl::Mutex mutex_;
   absl::flat_hash_map<std::string, BackendCreator> creators_
       ABSL_GUARDED_BY(mutex_);
+  PluginLoader plugin_loader_ ABSL_GUARDED_BY(mutex_);
 };
 
 namespace internal {

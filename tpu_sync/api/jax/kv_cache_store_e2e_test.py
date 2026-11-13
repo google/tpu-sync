@@ -98,6 +98,21 @@ def _node_binary_path():
   )
 
 
+def _mock_plugin_so_path():
+  this_dir = os.path.dirname(os.path.abspath(__file__))
+  return os.path.abspath(
+      os.path.join(
+          this_dir,
+          "..",
+          "..",
+          "kv_cache",
+          "backends",
+          "plugin",
+          "libmock_storage_plugin.so",
+      )
+  )
+
+
 def start_servers():
   global _registry_process
   global _registry_port
@@ -825,6 +840,138 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
         f"======================================================================\n",
         flush=True,
     )
+
+  def test_secondary_storage_plugin_e2e_offload_recall(self):
+    """Verifies end-to-end offload and recall via dynamic C ABI storage plugin."""
+    tpu_sharding = self.setup_shardings()
+    num_blocks = 2
+    shape = (num_blocks, 128, 8, 8, 128)
+    host_data = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
+    tpu_cache = jax.device_put(jnp.array(host_data), tpu_sharding)
+    jax.block_until_ready(tpu_cache)
+    expected_ref = host_data
+
+    block_elements = 128 * 8 * 8 * 128
+    shard_size_bytes = (block_elements * 4) // self.num_devices
+    temp_dir = tempfile.mkdtemp()
+    plugin_so = _mock_plugin_so_path()
+    try:
+      cfg = kv_cache_store._impl.BackendConfig()
+      cfg.type = "mock_plugin"
+      cfg.plugin_path = plugin_so
+      cfg.parallelism.tp_rank = 0
+      cfg.parallelism.tp_size = 1
+      cfg.set_property("root_dir", temp_dir)
+      cfg.set_property("prefix", "jax_plugin_e2e")
+
+      tag1 = f"plug1_{uuid.uuid4().hex[:8]}"
+      controller_port1 = _pick_unused_port()
+      rid1 = kv_cache_store.RaidenId(tag1, "0", "cache_1", 0)
+      store1 = kv_cache_store.KVCacheStore(
+          capacity=num_blocks,
+          raiden_id=rid1,
+          num_shards=self.num_devices,
+          shard_size_bytes=shard_size_bytes,
+          store_server_ip="localhost",
+          raiden_controller_port=controller_port1,
+          secondary_backend_configs=[cfg],
+      )
+      manager1 = kv_cache_manager.KVCacheManager(
+          kv_caches=[tpu_cache],
+          local_control_port=0,
+          max_blocks=num_blocks,
+          num_slots=2,
+          unsafe_skip_buffer_lock=self.skip_lock,
+          raiden_worker_port=0,
+          raiden_controller_address=f"localhost:{controller_port1}",
+          worker_id="worker_0",
+          backend_configs=[cfg],
+      )
+
+      hashes = [b"plug_hash_0", b"plug_hash_1"]
+      try:
+        slices = [
+            kv_cache_store.RaidenBlockId(
+                rid1,
+                host_block_id=-1,
+                device_block_id=0,
+                status=kv_cache_store.BlockStatus.HBM,
+            ),
+            kv_cache_store.RaidenBlockId(
+                rid1,
+                host_block_id=-1,
+                device_block_id=1,
+                status=kv_cache_store.BlockStatus.HBM,
+            ),
+        ]
+        self.assertTrue(store1.insert(hashes, slices, on_host=False))
+        self.assertTrue(store1.save(hashes))
+
+        while True:
+          save_done, save_failed, _, save_existing, save_unregistered = (
+              store1.poll_save_status()
+          )
+          if save_failed:
+            raise RuntimeError(f"Plugin Async Save failed: {save_failed}")
+          self.assertEmpty(save_existing)
+          self.assertEmpty(save_unregistered)
+          if save_done:
+            break
+          time.sleep(0.01)
+
+        manager1.h2d([2, 2], [0, 1]).wait()
+        self.assertEqual(float(jax.jit(jnp.sum)(tpu_cache)), 0.0)
+      finally:
+        del manager1, store1
+
+      tag2 = f"plug2_{uuid.uuid4().hex[:8]}"
+      controller_port2 = _pick_unused_port()
+      rid2 = kv_cache_store.RaidenId(tag2, "0", "cache_2", 0)
+      store2 = kv_cache_store.KVCacheStore(
+          capacity=num_blocks,
+          raiden_id=rid2,
+          num_shards=self.num_devices,
+          shard_size_bytes=shard_size_bytes,
+          store_server_ip="localhost",
+          raiden_controller_port=controller_port2,
+          secondary_backend_configs=[cfg],
+      )
+      manager2 = kv_cache_manager.KVCacheManager(
+          kv_caches=[tpu_cache],
+          local_control_port=0,
+          max_blocks=num_blocks,
+          num_slots=2,
+          unsafe_skip_buffer_lock=self.skip_lock,
+          raiden_worker_port=0,
+          raiden_controller_address=f"localhost:{controller_port2}",
+          worker_id="worker_0",
+          backend_configs=[cfg],
+      )
+      try:
+        storage_lookup = store2.lookup(hashes, pin_found=False)
+        self.assertLen(storage_lookup, 2)
+        for _, b in storage_lookup:
+          self.assertEqual(b.status, kv_cache_store.BlockStatus.SHARED_STORAGE)
+
+        storage_slices = [s for _, s in storage_lookup]
+        self.assertTrue(store2.read_remote(hashes, storage_slices, [0, 1]))
+        while True:
+          load_done, load_failed, _ = store2.poll_load_status()
+          if load_failed:
+            raise RuntimeError(f"Plugin Async Load failed: {load_failed}")
+          if load_done:
+            break
+          time.sleep(0.01)
+
+        recalled_tpu_cache = jax.jit(lambda x: x)(tpu_cache)
+        jax.block_until_ready(recalled_tpu_cache)
+        np.testing.assert_array_equal(
+            np.asarray(recalled_tpu_cache), expected_ref
+        )
+      finally:
+        del manager2, store2
+    finally:
+      shutil.rmtree(temp_dir, ignore_errors=True)
 
   # ---------------------------------------------------------------------------
   # Helpers for the multi-source (load / read_remote) tests. Completion waits

@@ -71,9 +71,9 @@ from absl.testing import absltest
 import jax
 import numpy as np
 
+from tpu_sync.solutions.mooncake import mooncake_provider_test_util as test_util
 from tpu_sync.solutions.mooncake.jax import _mooncake_provider
 from tpu_sync.solutions.mooncake.jax import mooncake_provider
-from tpu_sync.solutions.mooncake.jax import mooncake_provider_test_util as test_util
 
 # pylint: enable=g-import-not-at-top,g-bad-import-order,wrong-import-position
 
@@ -83,7 +83,7 @@ class MooncakeProviderExitTest(absltest.TestCase):
   def test_mapping_left_for_interpreter_exit(self):
     # Otherwise the handler would run before JAX's, not after it.
     self.assertFalse(_JAX_WAS_IMPORTED_FIRST)
-    table = test_util.load_table()
+    table = test_util.load_table(mooncake_provider.library_path())
     device = jax.local_devices(backend="tpu")[0]
     array = jax.device_put(np.zeros((8, 128), np.float32), device)
     # The export only gives the provider a client to map with. No array or

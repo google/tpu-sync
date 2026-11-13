@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "tpu_sync/solutions/mooncake/jax/mooncake_provider.h"
+#include "tpu_sync/solutions/mooncake/mooncake_provider.h"
 
 #include <unistd.h>
 
@@ -435,11 +435,10 @@ int64_t LiveDmaMappingCount() { return ProcessDmaMappings().count(); }
 
 void MarkProcessExiting() { ProcessDmaMappings().MarkProcessExiting(); }
 
-}  // namespace raiden::mooncake
-
-extern "C" int mc_tpu_buffer_provider_get(
-    raiden::mooncake::ProviderTable* out) {
+int GetProviderTable(ProviderTable* out) {
   if (out == nullptr) return 1;
-  *out = raiden::mooncake::kProviderTable;
+  *out = kProviderTable;
   return 0;
 }
+
+}  // namespace raiden::mooncake

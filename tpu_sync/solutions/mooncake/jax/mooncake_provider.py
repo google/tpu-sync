@@ -26,8 +26,8 @@ default and uses it to turn the shards of a jax.Array into provider handles:
 Mooncake then copies byte ranges of each shard's on-device representation to
 and from host memory through the C table that ``library_path()`` exports. The
 contract is Mooncake's ``tent/platform/tpu_buffer_provider.h``, mirrored in
-``tpu_sync/solutions/mooncake/jax/mooncake_provider.h`` together with the
-lifetime rules.
+``tpu_sync/solutions/mooncake/mooncake_provider.h`` together with the lifetime
+rules.
 
 The table's ``dma_map`` and ``dma_unmap`` let TENT register its host staging
 buffers with the TPU DMA engine, so that the copies through them run as direct

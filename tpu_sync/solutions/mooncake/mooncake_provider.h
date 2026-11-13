@@ -15,9 +15,10 @@
 // tpu_raiden's TPU buffer provider for Mooncake TENT.
 //
 // Mooncake stages TPU data through host DRAM. Its adapter cannot reach JAX
-// device buffers itself, so it dlopen()s this library, fetches a C function
-// table (ProviderTable below) through mc_tpu_buffer_provider_get(), and asks
-// it to copy byte ranges between a buffer and host memory. The Python side
+// device buffers itself, so it dlopen()s the extension that exported them,
+// fetches a C function table (ProviderTable below) through
+// mc_tpu_buffer_provider_get(), and asks it to copy byte ranges between a
+// buffer and host memory. The Python side
 // (tpu_sync/solutions/mooncake/jax/mooncake_provider.py) turns the shards of a
 // jax.Array into the handles that table operates on.
 //
@@ -58,8 +59,8 @@
 // accepting what writes cannot. Callers must transfer ranges that start at a
 // multiple of 32 bytes.
 
-#ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_SOLUTIONS_MOONCAKE_JAX_MOONCAKE_PROVIDER_H_
-#define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_SOLUTIONS_MOONCAKE_JAX_MOONCAKE_PROVIDER_H_
+#ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_SOLUTIONS_MOONCAKE_MOONCAKE_PROVIDER_H_
+#define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_SOLUTIONS_MOONCAKE_MOONCAKE_PROVIDER_H_
 
 #include <cstddef>
 #include <cstdint>
@@ -143,11 +144,19 @@ int64_t LiveDmaMappingCount();
 // registers it with atexit, to run before JAX's own atexit handler.
 void MarkProcessExiting();
 
+// Writes the table to `*out` and returns 0, or returns non-zero if `out` is
+// null. mc_tpu_buffer_provider_get() returns this.
+int GetProviderTable(ProviderTable* out);
+
 }  // namespace raiden::mooncake
 
-// The entry point Mooncake looks up by this exact name. Writes the table to
-// `*out` and returns 0, or returns non-zero if `out` is null.
+// The entry point Mooncake looks up by this exact name, in the shared object
+// of the extension that exported the handles. Each such extension defines it
+// in its own sources, as `return raiden::mooncake::GetProviderTable(out);`.
+// Defined in a dependency, it could be missing from that shared object:
+// google3 links an extension's dependencies into the Python binary, and
+// -Wl,--exclude-libs,ALL hides their symbols.
 extern "C" __attribute__((visibility("default"))) int
 mc_tpu_buffer_provider_get(raiden::mooncake::ProviderTable* out);
 
-#endif  // THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_SOLUTIONS_MOONCAKE_JAX_MOONCAKE_PROVIDER_H_
+#endif  // THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_SOLUTIONS_MOONCAKE_MOONCAKE_PROVIDER_H_

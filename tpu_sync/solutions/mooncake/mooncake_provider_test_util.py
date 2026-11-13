@@ -12,16 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The Mooncake provider's C table as Mooncake sees it, for the TPU tests."""
+"""The Mooncake provider's C table as Mooncake sees it, for the TPU tests.
 
-from collections.abc import Callable
+Shared by the JAX and torch providers' tests, so it takes the library to load
+instead of importing either provider.
+"""
+
 import ctypes
 import mmap
 import os
 
 import numpy as np
-
-from tpu_sync.solutions.mooncake.jax import mooncake_provider
 
 Handle = ctypes.c_uint64
 
@@ -63,23 +64,21 @@ class ProviderTable(ctypes.Structure):
   ]
 
 
-def provider_get() -> Callable[..., int]:
-  """Looks up mc_tpu_buffer_provider_get as Mooncake does: dlopen(), dlsym().
+def load_table(library_path: str) -> ProviderTable:
+  """Fetches the table as Mooncake does: dlopen(), dlsym(), then the call.
+
+  Args:
+    library_path: The library that the provider's library_path() returns.
 
   Returns:
-    The entry point, called as `get(ctypes.byref(table))`.
+    The table that mc_tpu_buffer_provider_get filled in.
   """
-  lib = ctypes.CDLL(mooncake_provider.library_path(), mode=os.RTLD_LOCAL)
+  lib = ctypes.CDLL(library_path, mode=os.RTLD_LOCAL)
   get = lib.mc_tpu_buffer_provider_get
   get.argtypes = [ctypes.POINTER(ProviderTable)]
   get.restype = ctypes.c_int
-  return get
-
-
-def load_table() -> ProviderTable:
-  """Fetches the table as Mooncake does."""
   table = ProviderTable()
-  if provider_get()(ctypes.byref(table)) != 0:
+  if get(ctypes.byref(table)) != 0:
     raise AssertionError("mc_tpu_buffer_provider_get failed")
   return table
 

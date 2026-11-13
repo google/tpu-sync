@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Python half of the Mooncake TPU buffer provider. It is linked into the same
-// shared object as mooncake_provider.cc, so the handles Python exports here
-// and the C table that Mooncake dlopen()s from this file share one image.
+// The JAX half of the Mooncake TPU buffer provider, the _mooncake_provider
+// extension. Mooncake dlopen()s this extension (the path library_path() in
+// tpu_sync/solutions/mooncake/jax/mooncake_provider.py returns) and calls the
+// mc_tpu_buffer_provider_get defined here, which serves the table of the same
+// provider core that exports the handles below.
 
 #include <Python.h>
 
@@ -29,7 +31,7 @@
 #include <nanobind/stl/pair.h>  // IWYU pragma: keep
 #include <nanobind/stl/vector.h>  // IWYU pragma: keep
 #include "tpu_sync/frameworks/jax/jax_compat.h"
-#include "tpu_sync/solutions/mooncake/jax/mooncake_provider.h"
+#include "tpu_sync/solutions/mooncake/mooncake_provider.h"
 
 namespace nb = nanobind;
 
@@ -60,6 +62,12 @@ std::vector<uint64_t> ExportShardBuffers(
 
 }  // namespace
 }  // namespace raiden::mooncake
+
+// Defined here, in the extension's own sources; see mooncake_provider.h.
+extern "C" int mc_tpu_buffer_provider_get(
+    raiden::mooncake::ProviderTable* out) {
+  return raiden::mooncake::GetProviderTable(out);
+}
 
 NB_MODULE(_mooncake_provider, m) {
   m.def("export_buffers", &raiden::mooncake::ExportShardBuffers,

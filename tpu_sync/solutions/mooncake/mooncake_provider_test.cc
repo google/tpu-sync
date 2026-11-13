@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "tpu_sync/solutions/mooncake/jax/mooncake_provider.h"
+#include "tpu_sync/solutions/mooncake/mooncake_provider.h"
 
 #include <sys/mman.h>
 #include <unistd.h>
@@ -56,7 +56,7 @@ constexpr int kDeviceIndex = 3;
 
 ProviderTable GetTable() {
   ProviderTable table{};
-  EXPECT_EQ(mc_tpu_buffer_provider_get(&table), 0);
+  EXPECT_EQ(GetProviderTable(&table), 0);
   return table;
 }
 
@@ -126,7 +126,7 @@ class MooncakeProviderTest : public ::testing::Test {
 
 TEST(MooncakeProviderAbiTest, ServesCompleteTable) {
   ProviderTable table{};
-  ASSERT_EQ(mc_tpu_buffer_provider_get(&table), 0);
+  ASSERT_EQ(GetProviderTable(&table), 0);
   EXPECT_STREQ(table.name, "tpu-sync");
   EXPECT_THAT(table.size, NotNull());
   EXPECT_THAT(table.device_index, NotNull());
@@ -139,7 +139,7 @@ TEST(MooncakeProviderAbiTest, ServesCompleteTable) {
 }
 
 TEST(MooncakeProviderAbiTest, RejectsNullTable) {
-  EXPECT_NE(mc_tpu_buffer_provider_get(nullptr), 0);
+  EXPECT_NE(GetProviderTable(nullptr), 0);
 }
 
 TEST_F(MooncakeProviderTest, InvalidHandleFailsEverywhere) {

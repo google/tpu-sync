@@ -31,9 +31,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from tpu_sync.solutions.mooncake import mooncake_provider_test_util as test_util
 from tpu_sync.solutions.mooncake.jax import _mooncake_provider
 from tpu_sync.solutions.mooncake.jax import mooncake_provider
-from tpu_sync.solutions.mooncake.jax import mooncake_provider_test_util as test_util
 
 # Not in the mmap module.
 _PROT_NONE = 0
@@ -77,7 +77,7 @@ class MooncakeProviderTest(parameterized.TestCase):
     self.sharding = jax.sharding.NamedSharding(
         self.mesh, jax.sharding.PartitionSpec("x")
     )
-    self.table = test_util.load_table()
+    self.table = test_util.load_table(mooncake_provider.library_path())
 
   def _array(self, shape, dtype, seed=0):
     values = np.random.default_rng(seed).uniform(-100, 100, size=shape)

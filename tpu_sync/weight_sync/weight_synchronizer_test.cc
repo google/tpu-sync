@@ -2713,6 +2713,20 @@ TEST_F(WeightSynchronizerTest, GetHostPointerAndSizeNonContiguousGlobalShards) {
   EXPECT_EQ(ws->GetHostBufferPtr(0, 1)[0], 0x22);
   EXPECT_EQ(ws->GetHostBufferPtr(0, 2)[0], 0x33);
   EXPECT_EQ(ws->GetHostBufferPtr(0, 3)[0], 0x44);
+
+  for (size_t i = 0; i < num_shards; ++i) {
+    ws->staging_arena()[0].shards[i].host_fd = static_cast<int>(10 + i);
+    ws->staging_arena()[0].shards[i].host_fd_offset =
+        static_cast<int64_t>((i + 1) * 4096);
+  }
+  EXPECT_EQ(const_ws->GetHostFd(0, 0), 10);
+  EXPECT_EQ(const_ws->GetHostFd(0, 2), 11);
+  EXPECT_EQ(const_ws->GetHostFd(0, 4), 12);
+  EXPECT_EQ(const_ws->GetHostFd(0, 6), 13);
+  EXPECT_EQ(const_ws->GetHostFdOffset(0, 0), 4096);
+  EXPECT_EQ(const_ws->GetHostFdOffset(0, 2), 2 * 4096);
+  EXPECT_EQ(const_ws->GetHostFdOffset(0, 4), 3 * 4096);
+  EXPECT_EQ(const_ws->GetHostFdOffset(0, 6), 4 * 4096);
 }
 
 TEST_F(WeightSynchronizerTest, GetHostPointerAndSizeLocalAndGlobalIndices) {

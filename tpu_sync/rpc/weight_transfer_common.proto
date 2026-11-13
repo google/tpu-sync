@@ -19,16 +19,16 @@ package tpu_sync.rpc;
 option java_multiple_files = true;
 option java_outer_classname = "WeightTransferCommonProto";
 
-// Types and conventions shared by `weight_transfer_worker_service.proto` and
-// `weight_transfer_controller_service.proto`.
+// Types and conventions used by `weight_transfer_worker_service.proto`.
 //
 // Incarnation IDs: an `incarnation_id` identifies one live worker (weight
 // synchronizer) of a registered `RaidenIdProto` work unit, for example one
 // host's worker in 1-process-per-host JAX or one rank's worker in
 // 1-process-per-device PyTorch. It must be positive and strictly increase
 // across restarts of that work unit, and callers must not interpret it as a
-// timestamp. A worker sends the same incarnation ID in every request it makes,
-// and the controller compares it with the one it has on record for the unit.
+// timestamp. Requests to a worker name the incarnation they are meant for in
+// `target_incarnation_id`, so a restarted worker rejects requests meant for
+// its predecessor.
 
 // Version of a model's weights, ordered lexicographically by
 // `(epoch, version_id)`. An unset message, or one with both fields 0, means

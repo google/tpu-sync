@@ -100,27 +100,6 @@ py_proto_library(
     deps = [":weight_transfer_worker_service_proto"],
 )
 
-proto_library(
-    name = "weight_transfer_controller_service_proto",
-    srcs = ["weight_transfer_controller_service.proto"],
-    deps = [
-        ":raiden_service_proto",
-        ":weight_transfer_common_proto",
-    ],
-)
-
-cc_proto_library(
-    name = "weight_transfer_controller_service_cc_proto",
-    visibility = ["//visibility:public"],
-    deps = [":weight_transfer_controller_service_proto"],
-)
-
-py_proto_library(
-    name = "weight_transfer_controller_service_py_pb2",
-    visibility = ["//visibility:public"],
-    deps = [":weight_transfer_controller_service_proto"],
-)
-
 cc_proto_library(
     name = "coordination_cc_proto",
     deps = [":coordination_proto"],

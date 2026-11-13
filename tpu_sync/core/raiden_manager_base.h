@@ -192,6 +192,8 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
   virtual const uint8_t* GetHostPointer(size_t layer_idx,
                                         size_t shard_idx) const;
   virtual size_t GetHostSize(size_t layer_idx, size_t shard_idx) const;
+  virtual int GetHostFd(size_t layer_idx, size_t shard_idx) const;
+  virtual int64_t GetHostFdOffset(size_t layer_idx, size_t shard_idx) const;
 
   // Host staging buffer of (|layer_idx|, |shard_idx|), resolved through the
   // const `GetHostPointer()`/`GetHostSize()` so subclass shard remapping

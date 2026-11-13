@@ -326,6 +326,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":host_meminfo",
+        ":kv_backend_factory",
         ":kv_cache_store_backend_factory",
         ":logical_block_manager",
         ":pool_layout",
@@ -934,6 +935,43 @@ cc_library(
         "@xla//xla/tsl/concurrency:future",
     ],
     alwayslink = 1,
+)
+
+cc_library(
+    name = "kv_backend_factory",
+    srcs = ["kv_backend_factory.cc"],
+    hdrs = ["kv_backend_factory.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":kv_cache_store_backend_factory",
+        "//tpu_sync/kv_cache/backends:backend",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/base:no_destructor",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/synchronization",
+    ],
+    alwayslink = 1,
+)
+
+cc_test(
+    name = "kv_backend_factory_test",
+    srcs = ["kv_backend_factory_test.cc"],
+    deps = [
+        ":kv_backend_factory",
+        ":kv_cache_store_backend_factory",
+        "//tpu_sync/kv_cache/backends:backend",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+        "@xla//xla/tsl/platform:statusor",
+    ],
 )
 
 cc_library(

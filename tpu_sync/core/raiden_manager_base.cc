@@ -425,6 +425,23 @@ absl::StatusOr<absl::Span<uint8_t>> RaidenManagerBase::GetHostBuffer(
                              host_buffer.size());
 }
 
+int RaidenManagerBase::GetHostFd(size_t layer_idx, size_t shard_idx) const {
+  if (layer_idx >= layers_.size() || layers_[layer_idx].shards.empty()) {
+    return -1;
+  }
+  size_t local_idx = shard_idx % layers_[layer_idx].shards.size();
+  return layers_[layer_idx].shards[local_idx].host_fd;
+}
+
+int64_t RaidenManagerBase::GetHostFdOffset(size_t layer_idx,
+                                           size_t shard_idx) const {
+  if (layer_idx >= layers_.size() || layers_[layer_idx].shards.empty()) {
+    return 0;
+  }
+  size_t local_idx = shard_idx % layers_[layer_idx].shards.size();
+  return layers_[layer_idx].shards[local_idx].host_fd_offset;
+}
+
 void RaidenManagerBase::SetExternalHostPointers(
     const std::vector<const uint8_t*>& host_ptrs,
     const std::vector<size_t>& host_sizes) {
@@ -434,6 +451,8 @@ void RaidenManagerBase::SetExternalHostPointers(
       if (idx < host_ptrs.size() && idx < host_sizes.size()) {
         layers_[l].shards[sh].host_ptr = host_ptrs[idx];
         layers_[l].shards[sh].host_size = host_sizes[idx];
+        layers_[l].shards[sh].host_fd = -1;
+        layers_[l].shards[sh].host_fd_offset = 0;
         idx++;
       }
     }

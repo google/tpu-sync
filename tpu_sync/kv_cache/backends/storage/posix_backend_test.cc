@@ -60,6 +60,7 @@
 #include "tpu_sync/core/controller/raiden_controller.h"
 #include "tpu_sync/core/controller/worker_registry.h"
 #include "tpu_sync/kv_cache/backends/backend.h"
+#include "tpu_sync/kv_cache/kv_backend_factory.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/proto/worker_service.pb.h"
@@ -3115,6 +3116,23 @@ TEST_F(MetadataCacheTest, PropagatesCustomDpRankViaConstructorAndFactory) {
                        factory_store->Lookup({"missing_block"}));
   EXPECT_TRUE(result.empty());
 }
+
+TEST(PosixKVBackendFactoryTest, CreatesWorkerBackendViaKVBackendFactory) {
+  const std::string root_dir =
+      absl::StrCat(::testing::TempDir(), "/posix_kv_factory_test");
+  BackendConfig cfg;
+  cfg.type = std::string(kPosixBackendName);
+  cfg.SetProperty("root_dir", root_dir);
+  cfg.SetProperty("model_name", "test_model");
+  cfg.SetProperty("tp_size", "1");
+  cfg.SetProperty("tp_rank", "0");
+
+  TF_ASSERT_OK_AND_ASSIGN(std::shared_ptr<KVBackend> backend,
+                       KVBackendFactory::Instance().CreateBackend(cfg));
+  ASSERT_NE(backend, nullptr);
+  EXPECT_EQ(backend->name(), kPosixBackendName);
+}
+
 }  // namespace
 }  // namespace storage
 }  // namespace backends

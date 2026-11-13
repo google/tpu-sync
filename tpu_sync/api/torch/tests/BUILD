@@ -160,6 +160,7 @@ py_test(
     timeout = "long",
     srcs = ["kv_cache_store_mpmd_e2e_test.py"],
     data = [
+        "//tpu_sync/kv_cache/backends/plugin:libmock_storage_plugin.so",
         "//tpu_sync/kv_cache/global_registry:global_registry_server",
     ],
     tags = [

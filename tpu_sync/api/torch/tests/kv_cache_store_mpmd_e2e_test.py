@@ -62,6 +62,12 @@ _STORAGE_DIRECT_IO = flags.DEFINE_boolean(
     False,
     "Whether to enable Direct I/O (O_DIRECT) in POSIX secondary storage.",
 )
+_STORAGE_PLUGIN_MODE = flags.DEFINE_boolean(
+    "storage_plugin_mode",
+    False,
+    "secondary_storage and storage_eviction modes: use the C ABI mock storage"
+    " plugin instead of the POSIX backend.",
+)
 _STORAGE_PHASE = flags.DEFINE_string(
     "storage_phase",
     "both",
@@ -182,6 +188,22 @@ def worker_launch_cmd() -> list[str]:
 
 _registry_process = None
 _registry_port = None
+
+
+def _mock_plugin_so_path() -> str:
+  this_dir = os.path.dirname(os.path.abspath(__file__))
+  return os.path.abspath(
+      os.path.join(
+          this_dir,
+          "..",
+          "..",
+          "..",
+          "kv_cache",
+          "backends",
+          "plugin",
+          "libmock_storage_plugin.so",
+      )
+  )
 
 
 def start_servers():
@@ -890,17 +912,25 @@ def _worker_secondary_storage_main(argv):
 
   try:
     cfg = kv_cache_store._impl.BackendConfig()
-    cfg.type = "posix"
-    cfg.parallelism.tp_rank = rank
-    cfg.parallelism.tp_size = world_size
-    cfg.set_property("root_dir", storage_root)
-    cfg.set_property("model_name", "test_model_mpmd")
-    if _STORAGE_DIRECT_IO.value:
-      cfg.set_property("direct_io", "true")
-      print(
-          f"[MPMD Storage][Rank {rank}] Enabled direct_io in BackendConfig.",
-          flush=True,
-      )
+    if _STORAGE_PLUGIN_MODE.value:
+      cfg.type = "mock_plugin"
+      cfg.plugin_path = _mock_plugin_so_path()
+      cfg.parallelism.tp_rank = rank
+      cfg.parallelism.tp_size = world_size
+      cfg.set_property("root_dir", storage_root)
+      cfg.set_property("prefix", "torch_mpmd_plugin")
+    else:
+      cfg.type = "posix"
+      cfg.parallelism.tp_rank = rank
+      cfg.parallelism.tp_size = world_size
+      cfg.set_property("root_dir", storage_root)
+      cfg.set_property("model_name", "test_model_mpmd")
+      if _STORAGE_DIRECT_IO.value:
+        cfg.set_property("direct_io", "true")
+        print(
+            f"[MPMD Storage][Rank {rank}] Enabled direct_io in BackendConfig.",
+            flush=True,
+        )
 
     device = torch.device("tpu")
     num_blocks = 4
@@ -1049,63 +1079,64 @@ def _worker_secondary_storage_main(argv):
 
       dist.barrier()
 
-      # Each rank writes one file per hash, at exactly
-      #   {storage_root}/test_model_mpmd/tp{world_size}_r{rank}/{l1}/{l2}/{hash}.bin
-      # and nothing else may exist under storage_root.
-      paths_by_rank = {
-          r: [
-              _expected_shard_path(
-                  storage_root, "test_model_mpmd", h, [("tp", world_size, r)]
-              )
-              for h in hashes
-          ]
-          for r in range(world_size)
-      }
-      all_paths = []
-      for paths in paths_by_rank.values():
-        all_paths.extend(paths)
-      _assert_exact_shard_files(storage_root, all_paths, f"Rank {rank}")
-      bin_files = paths_by_rank[rank]
-      print(
-          f"[MPMD Storage][Step 6/11][Write Phase][Rank {rank}] Discovered"
-          f" {len(bin_files)} on-disk shard files:"
-          f" {[os.path.basename(f) for f in bin_files]} (paths: {bin_files})",
-          flush=True,
-      )
-      assert len(bin_files) == len(hashes), (
-          f"Rank {rank}: expected {len(hashes)} disk files, found"
-          f" {len(bin_files)}: {bin_files}"
-      )
-      file_by_name = {os.path.basename(f): f for f in bin_files}
-      for i, h in enumerate(hashes):
-        expected_filename = f"{h.hex()}.bin"
-        assert (
-            expected_filename in file_by_name
-        ), f"Rank {rank}: missing file {expected_filename} in {file_by_name}"
-        fpath = file_by_name[expected_filename]
-        fsize = os.path.getsize(fpath)
-        assert fsize == shard_size_bytes, (
-            f"Rank {rank}: file {expected_filename} size {fsize} != expected"
-            f" {shard_size_bytes}"
-        )
-        with open(fpath, "rb") as f:
-          disk_bytes = f.read()
-        disk_block_data = np.frombuffer(disk_bytes, dtype=np.float32).reshape(
-            shape[1:]
-        )
-        np.testing.assert_array_equal(disk_block_data, host_data[i])
+      if not _STORAGE_PLUGIN_MODE.value:
+        # Each rank writes one file per hash, at exactly
+        #   {storage_root}/test_model_mpmd/tp{world_size}_r{rank}/{l1}/{l2}/{hash}.bin
+        # and nothing else may exist under storage_root.
+        paths_by_rank = {
+            r: [
+                _expected_shard_path(
+                    storage_root, "test_model_mpmd", h, [("tp", world_size, r)]
+                )
+                for h in hashes
+            ]
+            for r in range(world_size)
+        }
+        all_paths = []
+        for paths in paths_by_rank.values():
+          all_paths.extend(paths)
+        _assert_exact_shard_files(storage_root, all_paths, f"Rank {rank}")
+        bin_files = paths_by_rank[rank]
         print(
-            f"  [Rank {rank} Verified File] {expected_filename} ({fsize} B):"
-            f" bit-for-bit matched host_data[{i}]",
+            f"[MPMD Storage][Step 6/11][Write Phase][Rank {rank}] Discovered"
+            f" {len(bin_files)} on-disk shard files:"
+            f" {[os.path.basename(f) for f in bin_files]} (paths: {bin_files})",
             flush=True,
         )
+        assert len(bin_files) == len(hashes), (
+            f"Rank {rank}: expected {len(hashes)} disk files, found"
+            f" {len(bin_files)}: {bin_files}"
+        )
+        file_by_name = {os.path.basename(f): f for f in bin_files}
+        for i, h in enumerate(hashes):
+          expected_filename = f"{h.hex()}.bin"
+          assert (
+              expected_filename in file_by_name
+          ), f"Rank {rank}: missing file {expected_filename} in {file_by_name}"
+          fpath = file_by_name[expected_filename]
+          fsize = os.path.getsize(fpath)
+          assert fsize == shard_size_bytes, (
+              f"Rank {rank}: file {expected_filename} size {fsize} != expected"
+              f" {shard_size_bytes}"
+          )
+          with open(fpath, "rb") as f:
+            disk_bytes = f.read()
+          disk_block_data = np.frombuffer(disk_bytes, dtype=np.float32).reshape(
+              shape[1:]
+          )
+          np.testing.assert_array_equal(disk_block_data, host_data[i])
+          print(
+              f"  [Rank {rank} Verified File] {expected_filename} ({fsize} B):"
+              f" bit-for-bit matched host_data[{i}]",
+              flush=True,
+          )
 
-      print(
-          f"[MPMD Storage][Step 6/11][Write Phase][Rank {rank}] Bit-for-bit"
-          f" disk files verified in tp{world_size}_r{rank} ({len(bin_files)}"
-          " files).",
-          flush=True,
-      )
+        print(
+            f"[MPMD Storage][Step 6/11][Write Phase][Rank {rank}] Bit-for-bit"
+            f" disk files verified in tp{world_size}_r{rank} ({len(bin_files)}"
+            " files).",
+            flush=True,
+        )
 
       dist.barrier()
 
@@ -1803,7 +1834,7 @@ def _worker_three_source_main(argv):
 # by --storage_metadata_cache. With the cache off, lookup probes storage and
 # sees an eviction at once; with a stale cache it keeps reporting evicted
 # blocks until a failed recall drops their entries. A truncated file still
-# passes faccessat(F_OK) in both modes (4a/8) until its failed recall drops
+# passes the existence probe in both modes (4a/8) until its failed recall drops
 # the cache entry and the corrupt files are removed (4b/8).
 _EVICTION_LOOKUP_PREFIX = {
     False: {
@@ -1869,12 +1900,17 @@ def _wait_for_failed(
 
 
 def _worker_storage_eviction_main(argv):
-  """4-rank MPMD: shard files evicted or truncated in POSIX storage.
+  """4-rank MPMD: shard files evicted or truncated in shared storage.
 
   Simulates Lustre evicting or truncating KV files out of band (no Raiden
   involvement) and checks that Raiden turns missing/corrupt files into lookup
   misses or failed recalls without leaking host staging blocks or admitting bad
   data into HBM/DRAM.
+
+  The backend is POSIX. With --storage_plugin_mode it is the C ABI mock storage
+  plugin, which also keeps one file per shard under root_dir, so the same
+  steps apply. The plugin backend has no existence cache, so it runs with the
+  "no cache" expectations only.
 
   Write phase (writer group): saves ev_0..ev_3 to storage; every TP rank
   writes one shard file per block (16 files).
@@ -1893,8 +1929,9 @@ def _worker_storage_eviction_main(argv):
                        also fails. Both modes: lookup -> [ev_0, ev_1, ev_2]
                        (ev_3's stale cache entry is dropped; ev_0 is re-probed).
     4. Truncated file: rank 0 truncates its shard of ev_2 to half size.
-                       4a: lookup still -> [ev_0, ev_1, ev_2] (faccessat F_OK).
-                       read_remote([ev_2]) hits unexpected EOF -> FAILED and
+                       4a: lookup still -> [ev_0, ev_1, ev_2] (the probe only
+                       checks that the file exists).
+                       read_remote([ev_2]) finds too few bytes -> FAILED and
                        drops ev_2's cache entry. All ranks remove ev_2;
                        4b: lookup -> [ev_0, ev_1] in both modes.
     5. Evict shard:    only the last TP rank deletes its shard of ev_1, so the
@@ -1929,24 +1966,31 @@ def _worker_storage_eviction_main(argv):
   storage_root = _STORAGE_ROOT.value
   phase = _STORAGE_PHASE.value
   metadata_cache = _STORAGE_METADATA_CACHE.value
+  plugin_mode = _STORAGE_PLUGIN_MODE.value
   model_name = "test_model_mpmd_eviction"
   status = kv_cache_store.BlockStatus
 
   _init_worker_process_group(tag, rank, world_size, FLAGS.master_port, phase)
   try:
     cfg = kv_cache_store._impl.BackendConfig()
-    cfg.type = "posix"
     cfg.parallelism.tp_rank = rank
     cfg.parallelism.tp_size = world_size
     cfg.set_property("root_dir", storage_root)
-    cfg.set_property("model_name", model_name)
-    if _STORAGE_DIRECT_IO.value:
-      cfg.set_property("direct_io", "true")
-    if metadata_cache:
-      # Unbounded and never expiring: an entry is only dropped by a failed
-      # recall, which is exactly the path under test.
-      cfg.set_property("metadata_cache_max_entries", "-1")
-      cfg.set_property("metadata_cache_ttl_secs", "-1")
+    if plugin_mode:
+      assert not metadata_cache, "the plugin backend has no existence cache"
+      cfg.type = "mock_plugin"
+      cfg.plugin_path = _mock_plugin_so_path()
+      cfg.set_property("prefix", model_name)
+    else:
+      cfg.type = "posix"
+      cfg.set_property("model_name", model_name)
+      if _STORAGE_DIRECT_IO.value:
+        cfg.set_property("direct_io", "true")
+      if metadata_cache:
+        # Unbounded and never expiring: an entry is only dropped by a failed
+        # recall, which is exactly the path under test.
+        cfg.set_property("metadata_cache_max_entries", "-1")
+        cfg.set_property("metadata_cache_ttl_secs", "-1")
 
     device = torch.device("tpu")
     num_blocks = 4
@@ -1961,6 +2005,11 @@ def _worker_storage_eviction_main(argv):
     ev0, ev1, ev2, ev3 = hashes
 
     def shard_path(key, tp_rank):
+      if plugin_mode:
+        # The mock plugin names a shard file after the block hash and the
+        # (pp, pcp, tp) ranks. It prints -1 for an axis that is not declared.
+        name = f"{key.hex()}_pp_-1_pcp_-1_tp_{tp_rank}.bin"
+        return os.path.join(storage_root, model_name, name)
       return _expected_shard_path(
           storage_root, model_name, key, [("tp", world_size, tp_rank)]
       )
@@ -2001,9 +2050,16 @@ def _worker_storage_eviction_main(argv):
         secs = _wait_for_all(store_w.poll_save_status, hashes, "storage save")
         _log(tag, "W", rank, f"Saved in {secs:.3f}s.")
       dist.barrier()
-      _verify_and_print_shard_files(
-          tag, "W", storage_root, model_name, world_size, rank, hashes
-      )
+      if plugin_mode:
+        # Every TP rank wrote exactly one file per block, and nothing else.
+        expected_files = []
+        for tp_rank in range(world_size):
+          expected_files.extend(shard_path(h, tp_rank) for h in hashes)
+        _assert_exact_shard_files(storage_root, expected_files, f"Rank {rank}")
+      else:
+        _verify_and_print_shard_files(
+            tag, "W", storage_root, model_name, world_size, rank, hashes
+        )
       del manager_w, store_w, tpu_cache
       dist.barrier()
       if phase == "write":
@@ -2989,6 +3045,11 @@ class KVCacheStoreMpmdE2ETest(parameterized.TestCase):
   ):
     self._drive_secondary_storage("secondary_storage", direct_io, [])
 
+  def test_mpmd_4rank_e2e_plugin_secondary_storage_offload_recall(self):
+    self._drive_secondary_storage(
+        "secondary_storage", False, ["--storage_plugin_mode=true"]
+    )
+
   @parameterized.named_parameters(("buffered", False), ("direct_io", True))
   def test_mpmd_4rank_e2e_gdn_hybrid_mock_offload_recall(self, direct_io: bool):
     """4 TP=1 replicas with a hybrid attention + GDN layout share storage."""
@@ -3012,6 +3073,14 @@ class KVCacheStoreMpmdE2ETest(parameterized.TestCase):
         "storage_eviction",
         direct_io,
         [f"--storage_metadata_cache={metadata_cache}"],
+    )
+
+  def test_mpmd_4rank_e2e_plugin_storage_eviction(self):
+    """The storage eviction steps against the C ABI mock storage plugin."""
+    self._drive_secondary_storage(
+        "storage_eviction",
+        False,
+        ["--storage_metadata_cache=False", "--storage_plugin_mode=true"],
     )
 
   def _drive_secondary_storage(self, worker_mode, direct_io, extra_flags):

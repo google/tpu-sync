@@ -127,7 +127,12 @@ for arg in "$@"; do
   fi
 done
 if [[ ${#TARGETS[@]} -eq 0 ]]; then
-  TARGETS=("//..." "-//tpu_sync/frameworks/torch/..." "-//tpu_sync/api/torch/...")
+  TARGETS=(
+    "//..."
+    "-//tpu_sync/frameworks/torch/..."
+    "-//tpu_sync/api/torch/..."
+    "-//tpu_sync/solutions/mooncake/torch/..."
+  )
   ARGS+=("--build_tests_only")
 fi
 for target in "${TARGETS[@]}"; do

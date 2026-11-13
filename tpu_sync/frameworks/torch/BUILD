@@ -237,6 +237,8 @@ nanobind_extension(
         "//tpu_sync/kv_cache/backends:backend",
         "//tpu_sync/kv_cache/reshard:reshard_client",
         "//tpu_sync/rpc:raiden_service_cc_proto",
+        "//tpu_sync/solutions/mooncake:mooncake_provider",
+        "//tpu_sync/solutions/mooncake/torch:mooncake_provider_bindings",
         "//tpu_sync/telemetry/python:telemetry_binding",
         "//tpu_sync/transport:peer_endpoint",
         "//tpu_sync/weight_sync:weight_synchronizer_base",

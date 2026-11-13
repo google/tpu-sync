@@ -94,8 +94,10 @@ class BounceBuffer {
 // threads may copy through the same buffer at once.
 class ProviderBuffer {
  public:
-  ProviderBuffer(RaidenBufferHandle buffer, int device_index)
-      : buffer_(std::move(buffer)),
+  ProviderBuffer(RaidenBufferHandle buffer, int device_index,
+                 std::shared_ptr<void> keep_alive)
+      : keep_alive_(std::move(keep_alive)),
+        buffer_(std::move(buffer)),
         size_(buffer_.GetOnDeviceSizeInBytes()),
         device_index_(device_index),
         numa_node_(tpu_raiden::GetPjRtDeviceNumaNode(buffer_.device)) {
@@ -172,6 +174,9 @@ class ProviderBuffer {
     return absl::OkStatus();
   }
 
+  // Destroyed after `buffer_`, whose PjRtBuffer pointer it keeps valid for a
+  // torch tensor (see UnpackTorchTensor).
+  const std::shared_ptr<void> keep_alive_;
   const RaidenBufferHandle buffer_;
   const size_t size_;
   const int device_index_;
@@ -260,8 +265,8 @@ class DmaMappings {
     xla::PjRtClient* const client = it->second.client;
     // Forgotten even if PJRT fails: Mooncake frees the memory either way.
     mappings_.erase(it);
-    // JAX may already have destroyed the client, and the exiting process
-    // takes the mapping with it.
+    // The framework may already have destroyed the client, and the exiting
+    // process takes the mapping with it.
     if (process_exiting_) return absl::OkStatus();
     return PjRtClientDmaUnmap(client, host);
   }
@@ -413,7 +418,8 @@ absl::StatusOr<std::vector<BufferHandle>> ExportBuffers(
       client = request.buffer.device->client();
     }
     buffers.push_back(std::make_unique<ProviderBuffer>(
-        std::move(request.buffer), request.device_index));
+        std::move(request.buffer), request.device_index,
+        std::move(request.keep_alive)));
   }
   // Reserved first so that nothing can throw once ownership is handed out.
   std::vector<BufferHandle> handles;
@@ -421,8 +427,8 @@ absl::StatusOr<std::vector<BufferHandle>> ExportBuffers(
   for (std::unique_ptr<ProviderBuffer>& buffer : buffers) {
     handles.push_back(reinterpret_cast<uintptr_t>(buffer.release()));
   }
-  // JAX has one TPU client per process, so dma_map simply maps with the client
-  // of the latest export.
+  // JAX and TorchTPU each have one TPU client per process, so dma_map simply
+  // maps with the client of the latest export.
   if (client != nullptr) ProcessDmaMappings().SetClient(client);
   return handles;
 }

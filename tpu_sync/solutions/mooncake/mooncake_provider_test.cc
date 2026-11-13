@@ -240,6 +240,36 @@ TEST_F(MooncakeProviderTest, ReleaseFreesTheHandle) {
   EXPECT_EQ(LiveBufferCount(), before);
 }
 
+TEST_F(MooncakeProviderTest, HandleHoldsKeepAliveUntilReleased) {
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::PjRtBuffer> buffer,
+                          MakeBuffer(64));
+  TF_ASSERT_OK_AND_ASSIGN(RaidenBufferHandle raw_alias,
+                          AcquireRawAlias(buffer.get()));
+  auto keep_alive = std::make_shared<int>(0);
+  const std::weak_ptr<int> watched = keep_alive;
+  std::vector<ExportRequest> requests;
+  requests.push_back(
+      {std::move(raw_alias), kDeviceIndex, std::move(keep_alive)});
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<BufferHandle> handles,
+                          ExportBuffers(std::move(requests)));
+  ASSERT_EQ(handles.size(), 1);
+
+  EXPECT_FALSE(watched.expired());
+  table_.release(handles.front());
+  EXPECT_TRUE(watched.expired());
+}
+
+TEST_F(MooncakeProviderTest, FailedExportReleasesKeepAlive) {
+  auto keep_alive = std::make_shared<int>(0);
+  const std::weak_ptr<int> watched = keep_alive;
+  std::vector<ExportRequest> requests;
+  requests.push_back(
+      {RaidenBufferHandle(), kDeviceIndex, std::move(keep_alive)});
+  EXPECT_THAT(ExportBuffers(std::move(requests)),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_TRUE(watched.expired());
+}
+
 TEST_F(MooncakeProviderTest, HandleKeepsDeviceMemoryAliveAfterBufferIsGone) {
   constexpr size_t kSize = 4096;
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::PjRtBuffer> buffer,

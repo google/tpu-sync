@@ -106,6 +106,9 @@ TORCH_DEPS = [
     "//tpu_sync/api/torch:raw_transfer",
     # Fault/latency injection shim; submodule of _tpu_raiden_torch (no extra .so).
     "//tpu_sync/api/torch:fault_injection",
+    # TPU buffer provider for Mooncake TENT; submodule of _tpu_raiden_torch (no
+    # extra .so).
+    "//tpu_sync/solutions/mooncake/torch:mooncake_provider",
     "//tpu_sync/api/torch:reshard_client",
     "//tpu_sync/api/torch:reshard_store",
     "//tpu_sync/api/torch:weight_synchronizer_torch_py",

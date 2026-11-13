@@ -53,6 +53,8 @@
 #include "tpu_sync/kv_cache/kv_cache_store_wrapper.h"
 #include "tpu_sync/kv_cache/reshard/reshard_client.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
+#include "tpu_sync/solutions/mooncake/mooncake_provider.h"
+#include "tpu_sync/solutions/mooncake/torch/mooncake_provider_bindings.h"
 #include "tpu_sync/telemetry/python/telemetry_binding.h"
 
 namespace nb = nanobind;
@@ -188,6 +190,15 @@ struct ClientHandle {
 }  // namespace tpu_raiden
 
 using ::tpu_raiden::kv_cache::ToStdStringVector;
+
+// Mooncake dlopen()s this extension to serve the handles that its
+// mooncake_provider submodule exports, so the entry point is defined here, in
+// the extension's own sources; see
+// tpu_sync/solutions/mooncake/mooncake_provider.h.
+extern "C" int mc_tpu_buffer_provider_get(
+    raiden::mooncake::ProviderTable* out) {
+  return raiden::mooncake::GetProviderTable(out);
+}
 
 NB_MODULE(_tpu_raiden_torch, m) {
   // =========================================================================
@@ -1540,4 +1551,10 @@ NB_MODULE(_tpu_raiden_torch, m) {
   nb::module_ fault_injection = m.def_submodule(
       "fault_injection", "Fault and latency injection control for raiden.");
   tpu_raiden::BindFaultInjection(fault_injection);
+
+  // TPU buffer provider for Mooncake TENT. Mounted here, like raw_transfer, so
+  // the wheel needs no second torch-linked .so.
+  nb::module_ mooncake_provider = m.def_submodule(
+      "mooncake_provider", "TPU buffer provider for Mooncake TENT.");
+  ::raiden::mooncake::BindMooncakeProvider(mooncake_provider);
 }

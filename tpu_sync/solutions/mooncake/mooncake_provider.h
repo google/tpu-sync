@@ -14,40 +14,50 @@
 
 // tpu_raiden's TPU buffer provider for Mooncake TENT.
 //
-// Mooncake stages TPU data through host DRAM. Its adapter cannot reach JAX
-// device buffers itself, so it dlopen()s the extension that exported them,
-// fetches a C function table (ProviderTable below) through
+// Mooncake stages TPU data through host DRAM. Its adapter cannot reach a
+// framework's device buffers itself, so it dlopen()s the extension that
+// exported them, fetches a C function table (ProviderTable below) through
 // mc_tpu_buffer_provider_get(), and asks it to copy byte ranges between a
-// buffer and host memory. The Python side
-// (tpu_sync/solutions/mooncake/jax/mooncake_provider.py) turns the shards of a
-// jax.Array into the handles that table operates on.
+// buffer and host memory. A Python module per framework turns its arrays into
+// the handles that table operates on:
+// tpu_sync/solutions/mooncake/jax/mooncake_provider.py the shards of a
+// jax.Array, tpu_sync/solutions/mooncake/torch/mooncake_provider.py torch
+// tensors.
 //
-// Lifetime. A handle owns one strong reference to the shard's PJRT raw buffer,
-// and the raw buffer owns the device allocation. While the handle is live the
-// HBM therefore stays allocated and every copy is memory-safe, even if Python
-// drops or deletes the array. The handle holds no reference to the Python
-// object and no PJRT usage hold, so releasing it never touches the GIL and
-// never blocks JAX. The cost is that nothing orders the copies with JAX:
-//   * The caller must keep JAX from writing the buffer while Mooncake copies
+// Lifetime. A handle owns one strong reference to its buffer's PJRT raw
+// buffer, which owns the device allocation, and its export request's
+// keep_alive: for a torch tensor, TorchTPU's buffer, which also keeps
+// TorchTPU's PJRT client alive. While the handle is live the HBM therefore
+// stays allocated and every copy is memory-safe, even if Python drops or
+// deletes the array. The handle holds no reference to a Python object and no
+// PJRT usage hold, so releasing it never touches the GIL and never blocks the
+// framework. The cost is that nothing orders the copies with the framework:
+//   * The caller must keep the framework from writing the buffer while
+//     Mooncake copies out of it, and from using it while Mooncake copies into
 //     it, as for KVCacheManager's `unsafe_skip_buffer_lock`.
-//   * Donating an exported array is unsupported: XLA may reuse the
+//   * Donating an exported jax.Array is unsupported: XLA may reuse the
 //     allocation for the donated computation's output and race the copies.
+//   * TorchTPU applies some in-place ops in a torch tensor's buffer, where the
+//     handle sees their results, and for others moves the tensor to a new
+//     buffer, which the handle does not see
+//     (tpu_sync/solutions/mooncake/torch/mooncake_provider.py).
 //   * After the array is deleted, copies still reach the original
-//     allocation, which JAX no longer sees.
-//   * Handles must be released before the JAX backend that owns their
+//     allocation, which the framework no longer sees.
+//   * Handles must be released before the PJRT client that owns their
 //     buffers is destroyed. Handles still live at process exit are leaked,
 //     never released.
 //
 // DMA mapping. TENT registers each of its host staging pools with the TPU DMA
 // engine through dma_map, so that copies into and out of the pool run as
 // direct DMA. dma_map maps with the PJRT client of the most recently exported
-// buffers (JAX has one TPU client per process), so it fails until something
-// has been exported, and that JAX backend must be alive when Mooncake maps.
-// Each mapping belongs to the client that made it and must be undone before
-// that backend is destroyed; Mooncake undoes its mappings when its
-// TransferEngine is destroyed. JAX's own atexit handler may destroy the
-// backend, so once interpreter exit begins (MarkProcessExiting), dma_map fails
-// and dma_unmap skips PJRT, leaking the mapping to the exiting process.
+// buffers (JAX and TorchTPU each have one TPU client per process), so it fails
+// until something has been exported, and that client must be alive when
+// Mooncake maps. Each mapping belongs to the client that made it and must be
+// undone before that client is destroyed; Mooncake undoes its mappings when
+// its TransferEngine is destroyed. The framework's own atexit handler may
+// destroy the client, so once interpreter exit begins (MarkProcessExiting),
+// dma_map fails and dma_unmap skips PJRT, leaking the mapping to the exiting
+// process.
 //
 // Alignment. TPU DMA needs both the host pointer and the device offset to be
 // 32-byte aligned; the length may be anything (measured on TPU v6e and v7x).
@@ -64,6 +74,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "absl/status/statusor.h"
@@ -115,19 +126,21 @@ struct ProviderTable {
 
 // --- tpu_raiden side --------------------------------------------------------
 
-// One device buffer to export, and the device ordinal its handle reports as
-// `device_index` (TENT's "tpu:N").
+// One device buffer to export, the device ordinal its handle reports as
+// `device_index` (TENT's "tpu:N"), and anything else that must stay alive while
+// the handle uses the buffer, such as the framework object that owns it.
 struct ExportRequest {
   RaidenBufferHandle buffer;
   int device_index;
+  std::shared_ptr<void> keep_alive;
 };
 
 // Turns each request into a provider handle, in order. Each handle takes over
-// its request's buffer reference and caches the buffer's size and NUMA node.
-// The caller owns the returned handles until it passes them to Mooncake.
-// All-or-nothing: returns InvalidArgument, and creates no handle, if any
-// request holds no buffer or has a negative device index. A successful export
-// also makes its buffers' PJRT client the one that dma_map maps with.
+// its request's buffer reference and keep_alive, and caches the buffer's size
+// and NUMA node. The caller owns the returned handles until it passes them to
+// Mooncake. All-or-nothing: returns InvalidArgument, and creates no handle, if
+// any request holds no buffer or has a negative device index. A successful
+// export also makes its buffers' PJRT client the one that dma_map maps with.
 absl::StatusOr<std::vector<BufferHandle>> ExportBuffers(
     std::vector<ExportRequest> requests);
 
@@ -140,8 +153,8 @@ int64_t LiveDmaMappingCount();
 // Declares that interpreter exit has begun, so the PJRT client may be
 // destroyed at any moment: from now on dma_map fails, and dma_unmap forgets
 // the mapping without calling PJRT. When this returns, no PJRT call from either
-// is still running. tpu_sync/solutions/mooncake/jax/mooncake_provider.py
-// registers it with atexit, to run before JAX's own atexit handler.
+// is still running. Each framework's Python module registers it with atexit,
+// to run before the framework's own atexit handler.
 void MarkProcessExiting();
 
 // Writes the table to `*out` and returns 0, or returns non-zero if `out` is

@@ -28,7 +28,7 @@ pip install tpu-sync-jax
 # from the torch_tpu registry — see "The torch_tpu ABI pin" below for how the
 # compatible torch_tpu version is recorded per release.
 pip install --pre torch_tpu \
-  --index-url "https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
+  --index-url "https://us-python.pkg.dev/ml-oss-artifacts-published/torch-tpu-virtual-registry/simple/"
 pip install tpu-sync-torch
 ```
 

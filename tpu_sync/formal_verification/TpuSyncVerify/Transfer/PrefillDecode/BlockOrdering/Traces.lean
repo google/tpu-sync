@@ -123,7 +123,7 @@ theorem trace_custom_host_block_transfer :
   decide
 
 /-- **Trace 8 (`def test_non_contiguous_blocks` in
-`tpu_sync/api/jax/kv_cache_manager_transfer_test.py` and
+`tpu_sync/api/jax/tests/kv_cache_manager_transfer_test.py` and
 `tpu_sync/api/torch/tests/kv_cache_manager_transfer_test.py`):**
 2 layers completing out of order; `registered = [0, 2]`, `remote = [0, 2]`,
 `local = [0, 1]` out of `3` blocks. For both layers `l ∈ {0, 1}`,
@@ -136,7 +136,7 @@ theorem trace_non_contiguous_blocks :
   decide
 
 /-- **Trace 9 (`def test_host_reordering` in
-`tpu_sync/api/jax/kv_cache_manager_transfer_test.py` and
+`tpu_sync/api/jax/tests/kv_cache_manager_transfer_test.py` and
 `tpu_sync/api/torch/tests/kv_cache_manager_transfer_test.py`):**
 2 layers completing out of order; `registered = [0, 1]`, `remote = [1, 0]`
 (reversed), `local = [0, 1]`. Both layers deliver `[.kv l 1, .kv l 0]` in
@@ -150,7 +150,7 @@ theorem trace_host_reordering :
 
 /-- The 10-block non-contiguous reversed transfer configuration from
 `def test_large_complex_non_contiguous_and_reorder` in
-`tpu_sync/api/jax/kv_cache_manager_transfer_test.py` and
+`tpu_sync/api/jax/tests/kv_cache_manager_transfer_test.py` and
 `tpu_sync/api/torch/tests/kv_cache_manager_transfer_test.py`. -/
 def largeComplexRegistered : List Nat := [0, 2, 3, 5, 6, 7, 9, 11, 12, 14]
 def largeComplexRemote : List Nat := largeComplexRegistered.reverse
@@ -158,7 +158,7 @@ def largeComplexLocal : List Nat := List.range 10
 def largeComplexHost : List Nat := List.range 10
 
 /-- **Trace 10 (`def test_large_complex_non_contiguous_and_reorder` in
-`tpu_sync/api/jax/kv_cache_manager_transfer_test.py` and
+`tpu_sync/api/jax/tests/kv_cache_manager_transfer_test.py` and
 `tpu_sync/api/torch/tests/kv_cache_manager_transfer_test.py`):**
 16 blocks per layer, 2 layers completing out of order; `registered = [0, 2, 3, 5, 6, 7, 9, 11, 12, 14]`,
 `remote = reversed(registered)`, `local = [0..9]`.

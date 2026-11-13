@@ -56,6 +56,7 @@ def _registry_binary_path():
           this_dir,
           "..",
           "..",
+          "..",
           "kv_cache",
           "global_registry",
           "global_registry_server",
@@ -182,8 +183,6 @@ class KVCacheStoreTest(absltest.TestCase):
     self.assertTrue(controller.insert(hashes, slices, True))
     controller.release(hashes)
 
-
-
   def test_insert_rejects_remote_slices(self):
     # The LRU cache holds LOCAL blocks only; a REMOTE slice names a block on
     # another node. The whole batch is refused before anything is touched, so
@@ -219,12 +218,8 @@ class KVCacheStoreTest(absltest.TestCase):
       )
       rid = kv_cache_store.RaidenId("inference_server", "0", "kv_cache", 0)
       slices = [
-          kv_cache_store.RaidenBlockId(
-              rid, 1, kv_cache_store.BlockStatus.HOST
-          ),
-          kv_cache_store.RaidenBlockId(
-              rid, 2, kv_cache_store.BlockStatus.HOST
-          ),
+          kv_cache_store.RaidenBlockId(rid, 1, kv_cache_store.BlockStatus.HOST),
+          kv_cache_store.RaidenBlockId(rid, 2, kv_cache_store.BlockStatus.HOST),
       ]
       self.assertTrue(store.insert([b"h1", b"h2"], slices, True))
       store.release([b"h1", b"h2"])  # resident but unpinned
@@ -512,7 +507,6 @@ class KVCacheStoreTest(absltest.TestCase):
         controller.poll_load_status(), ([], [b"hash_1"], [b"hash_2"])
     )
     mock_impl.poll_load_status.assert_called_once()
-
 
   def test_e2e_load(self):
     """Tests end-to-end load (H2D) on CPU."""
@@ -1008,9 +1002,7 @@ class KVCacheStoreTest(absltest.TestCase):
     # hashes are content-addressed, so the peer having them is exactly the
     # post-condition the caller wanted, and no bytes move.
     self.assertTrue(src.save(hashes, dst_id))
-    done, failed, pending, existing, unregistered = (
-        src.poll_save_status()
-    )
+    done, failed, pending, existing, unregistered = src.poll_save_status()
     self.assertCountEqual(done, hashes)
     self.assertEmpty(failed)
     self.assertEmpty(pending)
@@ -1052,9 +1044,7 @@ class KVCacheStoreTest(absltest.TestCase):
 
     self.assertLen(src.lookup(hashes), len(hashes))
     self.assertTrue(src.save(hashes, dst_id))
-    done, failed, pending, existing, unregistered = (
-        src.poll_save_status()
-    )
+    done, failed, pending, existing, unregistered = src.poll_save_status()
     self.assertEmpty(done)
     self.assertCountEqual(failed, hashes)
     self.assertEmpty(pending)
@@ -1170,9 +1160,7 @@ class KVCacheStoreLoadWithSlicesTest(absltest.TestCase):
     ]
     # Two hashes, one slice, two destinations: the store must not guess which
     # hash the single slice belongs to.
-    self.assertFalse(
-        store.load([b"h1", b"h2"], [0, 1], slices=slices)
-    )
+    self.assertFalse(store.load([b"h1", b"h2"], [0, 1], slices=slices))
 
   def test_rejects_device_block_ids_count_mismatch(self):
     store = self._make_store()

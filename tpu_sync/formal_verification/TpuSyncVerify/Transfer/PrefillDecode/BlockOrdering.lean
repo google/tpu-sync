@@ -45,9 +45,9 @@ import TpuSyncVerify.Transfer.PrefillDecode.BlockOrdering.Traces
 | `tpu_sync/kv_cache/kv_cache_manager_with_transfer_test.cc` | `KVCacheManagerWithTransferTest.LocalOrchestratedTransfer` | `:111-290` |
 | `tpu_sync/kv_cache/kv_cache_manager_with_transfer_test.cc` | `KVCacheManagerWithTransferTest.LocalOrchestratedTransferToCustomHostBlock` | `:324-438` |
 | `tpu_sync/kv_cache/kv_cache_manager_with_transfer_test.cc` | `KVCacheManagerWithTransferTest.LocalOrchestratedTransferToCustomHostBlock` (`// Host Block 5 should still be 0` .. `EXPECT_EQ(host_block_5_float[i], 0.0f);`) | `:434-436` |
-| `tpu_sync/api/jax/kv_cache_manager_transfer_test.py` | `test_non_contiguous_blocks` | `:187-271` |
-| `tpu_sync/api/jax/kv_cache_manager_transfer_test.py` | `test_host_reordering` | `:274-356` |
-| `tpu_sync/api/jax/kv_cache_manager_transfer_test.py` | `test_large_complex_non_contiguous_and_reorder` | `:359-448` |
+| `tpu_sync/api/jax/tests/kv_cache_manager_transfer_test.py` | `test_non_contiguous_blocks` | `:187-271` |
+| `tpu_sync/api/jax/tests/kv_cache_manager_transfer_test.py` | `test_host_reordering` | `:274-356` |
+| `tpu_sync/api/jax/tests/kv_cache_manager_transfer_test.py` | `test_large_complex_non_contiguous_and_reorder` | `:359-448` |
 | `tpu_sync/api/torch/tests/kv_cache_manager_transfer_test.py` | `test_non_contiguous_blocks` | `:176-206` |
 | `tpu_sync/api/torch/tests/kv_cache_manager_transfer_test.py` | `test_host_reordering` | `:209-237` |
 | `tpu_sync/api/torch/tests/kv_cache_manager_transfer_test.py` | `test_large_complex_non_contiguous_and_reorder` | `:240-282` |

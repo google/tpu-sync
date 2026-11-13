@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-load("@rules_python//python:defs.bzl", "py_library", "py_test")
+load("@rules_python//python:defs.bzl", "py_library")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -36,48 +36,6 @@ py_library(
     ],
 )
 
-py_test(
-    name = "kv_cache_store_test",
-    srcs = ["kv_cache_store_test.py"],
-    data = [
-        "//tpu_sync/kv_cache/global_registry:global_registry_server",
-    ],
-    tags = [
-        "manual",
-    ],
-    deps = [
-        ":kv_cache_store",
-        ":kv_cache_manager_jax_py",
-        "//pyglib:resources",
-        "@com_google_absl_py//absl/testing:absltest",
-        "@jax//jax",
-        "@jax//jax/experimental:mesh_utils",
-        "@pypi//numpy",
-        # buildcleaner: keep
-        "//tpu_sync/frameworks/jax:_raw_transfer",
-    ],
-)
-
-# For remote execution on Forge, use the _gf or _gl targets below.
-py_test(
-    name = "kv_cache_store_recovery_e2e_test",
-    srcs = ["kv_cache_store_recovery_e2e_test.py"],
-    tags = [
-        "manual",
-    ],
-    deps = [
-        ":kv_cache_store",
-        ":kv_cache_manager_jax_py",
-        "@com_google_absl_py//absl/flags",
-        "@com_google_absl_py//absl/testing:absltest",
-        "@com_google_absl_py//absl:app",
-        "@jax//jax",
-        "@pypi//numpy",
-        # buildcleaner: keep
-        "//tpu_sync/frameworks/jax:_raw_transfer",
-    ],
-)
-
 py_library(
     name = "weight_synchronizer_jax_py",
     srcs = [
@@ -90,20 +48,6 @@ py_library(
         "//tpu_sync/frameworks/jax:_tpu_raiden_jax",
         "//tpu_sync/frameworks/jax:jax_test_utils",
         "@jax//jax",
-    ],
-)
-
-py_test(
-    name = "weight_synchronizer_test",
-    srcs = ["weight_synchronizer_test.py"],
-    tags = [],
-    deps = [
-        ":weight_synchronizer_jax_py",
-        "//tpu_sync/common/control_pipe:control_pipe_client",
-        "//tpu_sync/rpc:raiden_service_py_pb2",
-        "@com_google_absl_py//absl/testing:absltest",
-        "@jax//jax",
-        "@pypi//numpy",
     ],
 )
 

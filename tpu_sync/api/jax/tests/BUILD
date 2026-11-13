@@ -1,0 +1,73 @@
+# Copyright 2026 Google LLC.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+load("@rules_python//python:defs.bzl", "py_test")
+
+package(default_visibility = ["//visibility:public"])
+
+py_test(
+    name = "kv_cache_store_test",
+    srcs = ["kv_cache_store_test.py"],
+    data = [
+        "//tpu_sync/kv_cache/global_registry:global_registry_server",
+    ],
+    tags = [
+        "manual",
+    ],
+    deps = [
+        "//pyglib:resources",
+        "@com_google_absl_py//absl/testing:absltest",
+        "@jax//jax",
+        "@jax//jax/experimental:mesh_utils",
+        "@pypi//numpy",
+        "//tpu_sync/api/jax:kv_cache_manager_jax_py",
+        "//tpu_sync/api/jax:kv_cache_store",
+        # buildcleaner: keep
+        "//tpu_sync/frameworks/jax:_raw_transfer",
+    ],
+)
+
+# For remote execution on Forge, use the _gf or _gl targets below.
+py_test(
+    name = "kv_cache_store_recovery_e2e_test",
+    srcs = ["kv_cache_store_recovery_e2e_test.py"],
+    tags = [
+        "manual",
+    ],
+    deps = [
+        "@com_google_absl_py//absl:app",
+        "@com_google_absl_py//absl/flags",
+        "@com_google_absl_py//absl/testing:absltest",
+        "@jax//jax",
+        "@pypi//numpy",
+        "//tpu_sync/api/jax:kv_cache_manager_jax_py",
+        "//tpu_sync/api/jax:kv_cache_store",
+        # buildcleaner: keep
+        "//tpu_sync/frameworks/jax:_raw_transfer",
+    ],
+)
+
+py_test(
+    name = "weight_synchronizer_test",
+    srcs = ["weight_synchronizer_test.py"],
+    tags = [],
+    deps = [
+        "//tpu_sync/api/jax:weight_synchronizer_jax_py",
+        "//tpu_sync/common/control_pipe:control_pipe_client",
+        "//tpu_sync/rpc:raiden_service_py_pb2",
+        "@com_google_absl_py//absl/testing:absltest",
+        "@jax//jax",
+        "@pypi//numpy",
+    ],
+)

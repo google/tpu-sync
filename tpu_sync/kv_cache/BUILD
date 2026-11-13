@@ -366,7 +366,7 @@ cc_library(
     alwayslink = 1,
 )
 
-# JAX test targets successfully relocated to api/jax/BUILD.
+# JAX test targets successfully relocated to api/jax/tests/BUILD.
 
 cc_library(
     name = "staging_manager",

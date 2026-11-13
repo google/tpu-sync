@@ -14,7 +14,7 @@
 
 """E2E test for the PyTorch KVCacheStore crash recovery from shared memory.
 
-The torch twin of tpu_raiden/api/jax/kv_cache_store_recovery_e2e_test.py.
+The torch twin of tpu_sync/api/jax/tests/kv_cache_store_recovery_e2e_test.py.
 Simulates an engine crash and restart on one host:
 
   Phase A (subprocess): builds a KVCacheStore (with a raiden controller) and a

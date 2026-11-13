@@ -78,6 +78,7 @@ def _registry_binary_path():
           this_dir,
           "..",
           "..",
+          "..",
           "kv_cache",
           "global_registry",
           "global_registry_server",
@@ -90,6 +91,7 @@ def _node_binary_path():
   return os.path.abspath(
       os.path.join(
           this_dir,
+          "..",
           "..",
           "..",
           "store_node",
@@ -425,11 +427,11 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
     mode_str = "direct_io" if direct_io else "buffered"
     print(
         "\n======================================================================\n[JAX"
-        f" E2E Storage] STARTING 4-CHIP SECONDARY STORAGE E2E TEST (mode={mode_str})\n  Total TPU"
-        f" Chips: {self.num_devices} | Devices: {self.devices}\n  Logical"
-        f" Shape: {shape} ({num_blocks} blocks)\n  Bytes/block: {block_bytes} B"
-        f" ({block_bytes / (1024 * 1024):.1f} MiB) | Total bytes: {total_bytes}"
-        f" B ({total_bytes / (1024 * 1024):.1f}"
+        " E2E Storage] STARTING 4-CHIP SECONDARY STORAGE E2E TEST"
+        f" (mode={mode_str})\n  Total TPU Chips: {self.num_devices} | Devices:"
+        f" {self.devices}\n  Logical Shape: {shape} ({num_blocks} blocks)\n "
+        f" Bytes/block: {block_bytes} B ({block_bytes / (1024 * 1024):.1f} MiB)"
+        f" | Total bytes: {total_bytes} B ({total_bytes / (1024 * 1024):.1f}"
         " MiB)\n======================================================================\n[JAX"
         " E2E Storage][Step 1/11] Generating reference cache data and placing"
         f" across {self.num_devices} TPU chips...",
@@ -842,11 +844,11 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
     got = [s.status for _, s in lookup_result]
     for i, want in enumerate(expected_statuses):
       allowed = want if isinstance(want, tuple) else (want,)
-      self.assertIn(got[i], allowed,
-                    f"block {hashes[i]!r}: statuses={got}")
+      self.assertIn(got[i], allowed, f"block {hashes[i]!r}: statuses={got}")
 
-  def _await_lookup_statuses(self, store, hashes, expected_statuses,
-                             timeout_s=120.0, **lookup_kwargs):
+  def _await_lookup_statuses(
+      self, store, hashes, expected_statuses, timeout_s=120.0, **lookup_kwargs
+  ):
     """Polls lookup() until it returns exactly expected_statuses.
 
     Replaces fixed sleeps where visibility is eventually consistent (global
@@ -865,8 +867,9 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
 
   def _make_storage_dir(self, prefix):
     if _SECONDARY_STORAGE_ROOT.value:
-      temp_dir = os.path.join(_SECONDARY_STORAGE_ROOT.value,
-                              f"{prefix}_{uuid.uuid4().hex[:8]}")
+      temp_dir = os.path.join(
+          _SECONDARY_STORAGE_ROOT.value, f"{prefix}_{uuid.uuid4().hex[:8]}"
+      )
       os.makedirs(temp_dir, exist_ok=True)
       return temp_dir, True
     return tempfile.mkdtemp(), False
@@ -905,7 +908,8 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
       1. Seed storage:  writer saves 3src_s0 to POSIX storage.
       2. Stage remote:  peer A saves 3src_r0 to its host RAM (published).
       3. Stage local:   consumer B saves 3src_h0 (host RAM + storage).
-      4. Lookup:        B sees exactly [HOST_AND_HBM, REMOTE(A), SHARED_STORAGE].
+      4. Lookup:        B sees exactly [HOST_AND_HBM, REMOTE(A),
+      SHARED_STORAGE].
       5. Load:          load([h0]) -> HBM 1, read_remote([r0, s0]) ->
                         HBM [2, 3]; all done.
       6. Verify:        HBM 1..3 bit-exact; s0 now HOST_AND_HBM in B's host
@@ -923,13 +927,16 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
 
     temp_dir, is_custom_root = self._make_storage_dir("jax_three_source")
     cfg = self._posix_cfg(temp_dir, model_name)
-    print(f"[{tag}] {self.num_devices} chips, shape={shape}, storage={temp_dir}",
-          flush=True)
+    print(
+        f"[{tag}] {self.num_devices} chips, shape={shape}, storage={temp_dir}",
+        flush=True,
+    )
     try:
       # ---- Phase 1/6: seed storage with 3src_s0. ----
       port_s = _pick_unused_port()
-      rid_s = kv_cache_store.RaidenId(f"writer3s_{uuid.uuid4().hex[:8]}", "0",
-                                      "cache_s", 0)
+      rid_s = kv_cache_store.RaidenId(
+          f"writer3s_{uuid.uuid4().hex[:8]}", "0", "cache_s", 0
+      )
       store_s = kv_cache_store.KVCacheStore(
           capacity=1,
           raiden_id=rid_s,
@@ -953,10 +960,12 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
           backend_configs=[cfg],
       )
       try:
-        print(f"[{tag}][Phase 1/6] Saving {s0!r} -> SHARED_STORAGE.",
-              flush=True)
-        self.assertTrue(store_s.insert([s0], self._hbm_slices(rid_s, 1),
-                                       on_host=False))
+        print(
+            f"[{tag}][Phase 1/6] Saving {s0!r} -> SHARED_STORAGE.", flush=True
+        )
+        self.assertTrue(
+            store_s.insert([s0], self._hbm_slices(rid_s, 1), on_host=False)
+        )
         self.assertTrue(store_s.save([s0]))
         self._await_terminal(store_s.poll_save_status, 1, "storage save")
       finally:
@@ -964,8 +973,9 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
 
       # ---- Phase 2/6: peer A stages 3src_r0 in its host RAM. ----
       port_a = _pick_unused_port()
-      rid_a = kv_cache_store.RaidenId(f"job3s_a_{uuid.uuid4().hex[:8]}", "0",
-                                      "cache_a", 0)
+      rid_a = kv_cache_store.RaidenId(
+          f"job3s_a_{uuid.uuid4().hex[:8]}", "0", "cache_a", 0
+      )
       store_a = kv_cache_store.KVCacheStore(
           capacity=2,
           global_registry_address=f"localhost:{_registry_port}",
@@ -988,10 +998,14 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
           worker_id="worker_a",
           node_id=0,
       )
-      print(f"[{tag}][Phase 2/6] Peer A saving {r0!r} -> HOST (published to"
-            " global registry).", flush=True)
-      self.assertTrue(store_a.insert([r0], self._hbm_slices(rid_a, 1),
-                                     on_host=False))
+      print(
+          f"[{tag}][Phase 2/6] Peer A saving {r0!r} -> HOST (published to"
+          " global registry).",
+          flush=True,
+      )
+      self.assertTrue(
+          store_a.insert([r0], self._hbm_slices(rid_a, 1), on_host=False)
+      )
       self.assertTrue(store_a.save([r0]))
       self._await_terminal(store_a.poll_save_status, 1, "peer A save")
 
@@ -1001,8 +1015,9 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
       # B's HBM: block 0 holds h0's data; blocks 1-3 are zero and serve as the
       # Load() targets, so any DMA that slipped through would show up there.
       port_b = _pick_unused_port()
-      rid_b = kv_cache_store.RaidenId(f"job3s_b_{uuid.uuid4().hex[:8]}", "0",
-                                      "cache_b", 0)
+      rid_b = kv_cache_store.RaidenId(
+          f"job3s_b_{uuid.uuid4().hex[:8]}", "0", "cache_b", 0
+      )
       store_b = kv_cache_store.KVCacheStore(
           capacity=num_blocks,
           global_registry_address=f"localhost:{_registry_port}",
@@ -1030,10 +1045,14 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
           backend_configs=[cfg],
       )
       try:
-        print(f"[{tag}][Phase 3/6] Consumer B saving {h0!r} -> HOST (local) + "
-              "SHARED_STORAGE.", flush=True)
-        self.assertTrue(store_b.insert([h0], self._hbm_slices(rid_b, 1),
-                                       on_host=False))
+        print(
+            f"[{tag}][Phase 3/6] Consumer B saving {h0!r} -> HOST (local) + "
+            "SHARED_STORAGE.",
+            flush=True,
+        )
+        self.assertTrue(
+            store_b.insert([h0], self._hbm_slices(rid_b, 1), on_host=False)
+        )
         self.assertTrue(store_b.save([h0]))
         self._await_terminal(store_b.poll_save_status, 1, "consumer B save")
 
@@ -1041,38 +1060,56 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
         hashes = [h0, r0, s0]
         expected = [status.HOST_AND_HBM, status.REMOTE, status.SHARED_STORAGE]
         # Wait (unpinned) for registry visibility, then take the pin once.
-        self._await_lookup_statuses(store_b, hashes, expected,
-                                    enable_global=True, pin_found=False)
+        self._await_lookup_statuses(
+            store_b, hashes, expected, enable_global=True, pin_found=False
+        )
         lookup = store_b.lookup(hashes, enable_global=True, pin_found=True)
         self._assert_block_statuses(lookup, hashes, expected)
         self.assertEqual(lookup[1][1].raiden_id, rid_a)
         for h, b in lookup:
-          print(f"  [B Lookup] hash={h!r} status={b.status.name}"
-                f" raiden_id={b.raiden_id}", flush=True)
+          print(
+              f"  [B Lookup] hash={h!r} status={b.status.name}"
+              f" raiden_id={b.raiden_id}",
+              flush=True,
+          )
         slice_of = {h: s for h, s in lookup}
-        print(f"[{tag}][Phase 4/6] Lookup: [HOST, REMOTE(peer A),"
-              " SHARED_STORAGE] resolved in one call.", flush=True)
+        print(
+            f"[{tag}][Phase 4/6] Lookup: [HOST, REMOTE(peer A),"
+            " SHARED_STORAGE] resolved in one call.",
+            flush=True,
+        )
 
         # ---- Phase 5/6: load() local, one read_remote() for the rest. ----
         self.assertTrue(store_b.load([h0], [1], slices=[slice_of[h0]]))
-        print(f"[{tag}][Phase 5/6] load([{h0!r}]) -> HBM 1 launched"
-              " (local host DRAM, consumes lookup pin).", flush=True)
+        print(
+            f"[{tag}][Phase 5/6] load([{h0!r}]) -> HBM 1 launched"
+            " (local host DRAM, consumes lookup pin).",
+            flush=True,
+        )
         self.assertTrue(
-            store_b.read_remote([r0, s0], [slice_of[r0], slice_of[s0]], [2, 3]))
-        print(f"[{tag}][Phase 5/6] read_remote([{r0!r}, {s0!r}]) -> HBM [2, 3]"
-              " launched (peer A DRAM + secondary storage, no pin).",
-              flush=True)
+            store_b.read_remote([r0, s0], [slice_of[r0], slice_of[s0]], [2, 3])
+        )
+        print(
+            f"[{tag}][Phase 5/6] read_remote([{r0!r}, {s0!r}]) -> HBM [2, 3]"
+            " launched (peer A DRAM + secondary storage, no pin).",
+            flush=True,
+        )
         self._await_terminal(store_b.poll_load_status, 3, "three-source load")
-        print(f"[{tag}][Phase 5/6] poll_load_status: all 3 blocks done.",
-              flush=True)
+        print(
+            f"[{tag}][Phase 5/6] poll_load_status: all 3 blocks done.",
+            flush=True,
+        )
 
         # ---- Phase 6/6: bytes and local records. ----
         after = np.asarray(jax.jit(lambda x: x)(tpu_cache_b))
         np.testing.assert_array_equal(after[1], host_data[0])
         np.testing.assert_array_equal(after[2], host_data[1])
         np.testing.assert_array_equal(after[3], host_data[2])
-        print(f"[{tag}][Phase 6/6] HBM blocks [1, 2, 3] bit-exact"
-              " (HOST, REMOTE, SHARED_STORAGE sources).", flush=True)
+        print(
+            f"[{tag}][Phase 6/6] HBM blocks [1, 2, 3] bit-exact"
+            " (HOST, REMOTE, SHARED_STORAGE sources).",
+            flush=True,
+        )
 
         # The storage recall published s0 into B's host cache; the peer read
         # recorded nothing locally.
@@ -1081,8 +1118,11 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
         self.assertEqual(local[0][1].raiden_id, rid_b)
         r0_local = store_b.lookup([r0], enable_global=False, pin_found=False)
         self.assertEmpty(r0_local, f"{r0!r} must not be recorded locally")
-        print(f"[{tag}][Phase 6/6] {s0!r} published HOST_AND_HBM under B;"
-              f" {r0!r} not recorded locally.", flush=True)
+        print(
+            f"[{tag}][Phase 6/6] {s0!r} published HOST_AND_HBM under B;"
+            f" {r0!r} not recorded locally.",
+            flush=True,
+        )
       finally:
         del manager_b, store_b, tpu_cache_b
         del manager_a, store_a, tpu_cache_a
@@ -1348,7 +1388,9 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
     """
     return np.asarray(jax.jit(lambda x: x * 1.0)(arr))
 
-  def _run_remote_read_to_hbm_test(self, enable_multi_numa: bool, use_slices: bool = False):
+  def _run_remote_read_to_hbm_test(
+      self, enable_multi_numa: bool, use_slices: bool = False
+  ):
     """Job A saves; Job B pulls straight into scattered device blocks.
 
     Covers, on real TPU and byte-exactly: save (D2H) on the producer, then
@@ -1574,9 +1616,7 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
     """
     deadline = time.time() + timeout_s
     while time.time() < deadline:
-      done, failed, pending, existing, unregistered = (
-          store.poll_save_status()
-      )
+      done, failed, pending, existing, unregistered = store.poll_save_status()
       if done or failed:
         return done, failed, existing, unregistered
       if not pending:
@@ -2280,7 +2320,8 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
           with open("/tmp/raiden_store_node.log", "r") as f:
             log_content = f.read()
           self.fail(
-              f"store node exited prematurely with code {node_process.returncode}:\n{log_content}"
+              "store node exited prematurely with code"
+              f" {node_process.returncode}:\n{log_content}"
           )
         if os.path.exists("/tmp/raiden_store_node.log"):
           with open("/tmp/raiden_store_node.log", "r") as f:

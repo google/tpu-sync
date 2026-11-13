@@ -893,7 +893,7 @@ absl::Status RawBufferTransport::PullBuffer(
 }
 
 std::string RawBufferTransport::SourceIpForPeer(absl::string_view peer) const {
-  if (!IsSourceBindEnabled()) return "";
+  if (!require_psp_tcp_ && !IsSourceBindEnabled()) return "";
   std::vector<std::string> routable;
   for (const std::string& local_ip : local_ips_) {
     const absl::StatusOr<bool> routes = SourceIpRoutesToPeer(local_ip, peer);

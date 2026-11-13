@@ -39,6 +39,7 @@
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/kv_cache/backends/backend.h"
+#include "tpu_sync/kv_cache/backends/storage/storage_lookup_helper.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/kv_cache/lru_cache.h"
 
@@ -327,16 +328,9 @@ class PosixKVCacheStoreBackend : public KVCacheStoreBackend {
     absl::Time last_used;
   };
 
-  // Returns the storage keys ("shard keys") that must all exist for ONE block,
-  // `block_hash`, to be available: one key per (pp_rank, pcp_rank, tp_rank)
-  // worker, mapper()->shards_per_block() keys in total, pp_rank-major, then
-  // pcp_rank.
-  absl::StatusOr<std::vector<BlockKey>> MapShardKeys(
-      const std::string& block_hash) const;
-
   // Indexing: i = position of the block in the Lookup request
   // (block_hashes[i]); j = position of the shard key within
-  // MapShardKeys(block_hashes[i]).
+  // StorageLookupHelper::ExpandShardKeys(mapper, block_hashes[i]).
   // Returns fresh[i][j] = true iff shard_keys[i][j] has a fresh cache entry.
   // Expired entries are erased and reported as absent.
   std::vector<std::vector<bool>> CachedFresh(
@@ -346,12 +340,6 @@ class PosixKVCacheStoreBackend : public KVCacheStoreBackend {
   // its original timestamp.
   void CacheInsert(absl::Span<const BlockKey* const> keys);
 
-  // Synchronously probes storage for `keys`. Returns one entry per key; a
-  // short or failed answer is reported as absent from that point on.
-  std::vector<bool> ProbeExists(absl::Span<const BlockKey> keys);
-
-  RaidenBlockId MakeSharedStorageBlock() const;
-
   std::shared_ptr<KVBackend> storage_backend_;
   PosixKVBackend* posix_backend_ = nullptr;
   std::string name_ = std::string(kPosixBackendName);
@@ -359,6 +347,7 @@ class PosixKVCacheStoreBackend : public KVCacheStoreBackend {
   size_t lookup_batch_size_ = 32;
   const MetadataCacheOptions cache_options_;
   const std::string dp_rank_ = "0";
+  const StorageLookupHelper lookup_helper_;
 
   // Never held across storage I/O or key mapping.
   mutable absl::Mutex cache_mu_;

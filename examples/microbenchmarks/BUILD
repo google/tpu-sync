@@ -21,6 +21,7 @@ cc_binary(
     name = "h2h_benchmark_runner",
     srcs = ["h2h_benchmark_runner.cc"],
     deps = [
+        "//tpu_sync/common:net_util",
         "//tpu_sync/core:tpu_utils",
         "//tpu_sync/kv_cache:kv_cache_manager_base",
         "//tpu_sync/kv_cache:logical_block_manager",

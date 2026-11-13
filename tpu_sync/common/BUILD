@@ -70,6 +70,27 @@ cc_test(
 )
 
 cc_library(
+    name = "net_util",
+    srcs = ["net_util.cc"],
+    hdrs = ["net_util.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_test(
+    name = "net_util_test",
+    srcs = ["net_util_test.cc"],
+    deps = [
+        ":net_util",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "detached_thread_group",
     srcs = ["detached_thread_group.cc"],
     hdrs = ["detached_thread_group.h"],

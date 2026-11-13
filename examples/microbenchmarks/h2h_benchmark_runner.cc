@@ -65,6 +65,7 @@
 #include "absl/strings/str_split.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "tpu_sync/common/net_util.h"
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/logical_block_manager.h"
@@ -760,7 +761,8 @@ int main(int argc, char* argv[]) {
       }
       allocated_block_ids.push_back(src_block_ids);
 
-      std::string peer_addr = absl::StrFormat("%s:%d", remote.ip, remote.port);
+      std::string peer_addr =
+          tpu_raiden::FormatHostPort(remote.ip, remote.port);
       mapped_peer_addresses.push_back(peer_addr);
       managers.push_back(std::move(manager));
     }

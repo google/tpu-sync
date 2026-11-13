@@ -74,8 +74,8 @@
 #include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/kv_cache/backends/backend.h"
-#include "tpu_sync/kv_cache/backends/storage/posix_backend.h"
 #include "tpu_sync/kv_cache/host_meminfo.h"
+#include "tpu_sync/kv_cache/kv_backend_factory.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/kv_cache/logical_block_manager.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
@@ -3789,32 +3789,25 @@ bool KVCacheManagerBase::InitializeSingleSecondaryBackend(
                << "): declares no parallelism axis";
   }
   BackendConfig resolved = config;
+  resolved.type = canonical_name;
   ApplyParallelismToProperties(config.parallelism, &resolved);
-  absl::StatusOr<backends::storage::PosixBackendOptions> options =
-      backends::storage::PosixBackendOptions::FromProperties(
-          resolved.properties);
-  if (!options.ok()) {
+  absl::StatusOr<std::shared_ptr<backends::KVBackend>> backend_or =
+      KVBackendFactory::Instance().CreateBackend(resolved);
+  if (!backend_or.ok()) {
+    if (absl::IsNotFound(backend_or.status())) {
+      LOG(FATAL) << "[Worker] unsupported secondary backend type '"
+                 << config.type << "' (received topology: " << received << ")";
+    }
     LOG(FATAL) << "[Worker] invalid " << config.type
                << " backend config (received topology: " << received
-               << "): " << options.status().message();
-  }
-  std::shared_ptr<backends::KVBackend> backend;
-  if (canonical_name == backends::storage::kPosixBackendName) {
-    backend = std::make_shared<backends::storage::PosixKVBackend>(
-        canonical_name, resolved.properties);
-  } else {
-    LOG(FATAL) << "[Worker] unsupported secondary backend type '" << config.type
-               << "' (received topology: " << received << ")";
+               << "): " << backend_or.status().message();
   }
   {
     absl::MutexLock lock(backends_mu_);
-    backends_[canonical_name] = std::move(backend);
+    backends_[canonical_name] = *std::move(backend_or);
   }
   LOG(INFO) << "[Worker] Initialized secondary backend " << canonical_name
-            << " with topology " << received << "; shard directory "
-            << options->root_dir << "/"
-            << backends::storage::SanitizeModelName(options->model_name) << "/"
-            << backends::storage::FormatTopologyDir(config.parallelism) << "/";
+            << " with topology " << received;
   return true;
 }
 

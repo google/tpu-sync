@@ -237,6 +237,8 @@ absl::Status WeightSynchronizerBase::InitDeviceBuffers(
             if (alloc.ok()) {
               shard_info.host_ptr = (*alloc).ptr;
               shard_info.host_size = alloc_size;
+              shard_info.host_fd = (*alloc).fd;
+              shard_info.host_fd_offset = (*alloc).fd_offset;
               shard_info.host_owner = (*alloc).owner;
             }
           }
@@ -2832,11 +2834,8 @@ void WeightSynchronizerBase::ForgetPushProgress(uint64_t uuid) {
   }
 }
 
-uint8_t* WeightSynchronizerBase::GetHostPointer(size_t layer_idx,
-                                                size_t shard_idx) {
-  if (layer_idx >= layers_.size() || layers_[layer_idx].shards.empty()) {
-    return nullptr;
-  }
+size_t WeightSynchronizerBase::ResolveLocalShardIndex(size_t layer_idx,
+                                                      size_t shard_idx) const {
   size_t local_idx = shard_idx % layers_[layer_idx].shards.size();
   if (!local_shard_indices_.empty()) {
     auto it =
@@ -2860,37 +2859,17 @@ uint8_t* WeightSynchronizerBase::GetHostPointer(size_t layer_idx,
       local_idx = std::distance(global_shard_indices_.begin(), it);
     }
   }
-  return const_cast<uint8_t*>(layers_[layer_idx].shards[local_idx].host_ptr);
+  return local_idx;
+}
+
+uint8_t* WeightSynchronizerBase::GetHostPointer(size_t layer_idx,
+                                                size_t shard_idx) {
+  return const_cast<uint8_t*>(
+      std::as_const(*this).GetHostPointer(layer_idx, shard_idx));
 }
 
 size_t WeightSynchronizerBase::GetHostSize(size_t layer_idx, size_t shard_idx) {
-  if (layer_idx >= layers_.size() || layers_[layer_idx].shards.empty()) {
-    return 0;
-  }
-  size_t local_idx = shard_idx % layers_[layer_idx].shards.size();
-  if (!local_shard_indices_.empty()) {
-    auto it =
-        std::find(local_shard_indices_.begin(), local_shard_indices_.end(),
-                  static_cast<int>(shard_idx));
-    if (it != local_shard_indices_.end()) {
-      local_idx = std::distance(local_shard_indices_.begin(), it);
-    } else if (!global_shard_indices_.empty()) {
-      auto git =
-          std::find(global_shard_indices_.begin(), global_shard_indices_.end(),
-                    static_cast<int64_t>(shard_idx));
-      if (git != global_shard_indices_.end()) {
-        local_idx = std::distance(global_shard_indices_.begin(), git);
-      }
-    }
-  } else if (!global_shard_indices_.empty()) {
-    auto it =
-        std::find(global_shard_indices_.begin(), global_shard_indices_.end(),
-                  static_cast<int64_t>(shard_idx));
-    if (it != global_shard_indices_.end()) {
-      local_idx = std::distance(global_shard_indices_.begin(), it);
-    }
-  }
-  return layers_[layer_idx].shards[local_idx].host_size;
+  return std::as_const(*this).GetHostSize(layer_idx, shard_idx);
 }
 
 const uint8_t* WeightSynchronizerBase::GetHostPointer(size_t layer_idx,
@@ -2898,30 +2877,9 @@ const uint8_t* WeightSynchronizerBase::GetHostPointer(size_t layer_idx,
   if (layer_idx >= layers_.size() || layers_[layer_idx].shards.empty()) {
     return nullptr;
   }
-  size_t local_idx = shard_idx % layers_[layer_idx].shards.size();
-  if (!local_shard_indices_.empty()) {
-    auto it =
-        std::find(local_shard_indices_.begin(), local_shard_indices_.end(),
-                  static_cast<int>(shard_idx));
-    if (it != local_shard_indices_.end()) {
-      local_idx = std::distance(local_shard_indices_.begin(), it);
-    } else if (!global_shard_indices_.empty()) {
-      auto git =
-          std::find(global_shard_indices_.begin(), global_shard_indices_.end(),
-                    static_cast<int64_t>(shard_idx));
-      if (git != global_shard_indices_.end()) {
-        local_idx = std::distance(global_shard_indices_.begin(), git);
-      }
-    }
-  } else if (!global_shard_indices_.empty()) {
-    auto it =
-        std::find(global_shard_indices_.begin(), global_shard_indices_.end(),
-                  static_cast<int64_t>(shard_idx));
-    if (it != global_shard_indices_.end()) {
-      local_idx = std::distance(global_shard_indices_.begin(), it);
-    }
-  }
-  return layers_[layer_idx].shards[local_idx].host_ptr;
+  return layers_[layer_idx]
+      .shards[ResolveLocalShardIndex(layer_idx, shard_idx)]
+      .host_ptr;
 }
 
 size_t WeightSynchronizerBase::GetHostSize(size_t layer_idx,
@@ -2929,30 +2887,29 @@ size_t WeightSynchronizerBase::GetHostSize(size_t layer_idx,
   if (layer_idx >= layers_.size() || layers_[layer_idx].shards.empty()) {
     return 0;
   }
-  size_t local_idx = shard_idx % layers_[layer_idx].shards.size();
-  if (!local_shard_indices_.empty()) {
-    auto it =
-        std::find(local_shard_indices_.begin(), local_shard_indices_.end(),
-                  static_cast<int>(shard_idx));
-    if (it != local_shard_indices_.end()) {
-      local_idx = std::distance(local_shard_indices_.begin(), it);
-    } else if (!global_shard_indices_.empty()) {
-      auto git =
-          std::find(global_shard_indices_.begin(), global_shard_indices_.end(),
-                    static_cast<int64_t>(shard_idx));
-      if (git != global_shard_indices_.end()) {
-        local_idx = std::distance(global_shard_indices_.begin(), git);
-      }
-    }
-  } else if (!global_shard_indices_.empty()) {
-    auto it =
-        std::find(global_shard_indices_.begin(), global_shard_indices_.end(),
-                  static_cast<int64_t>(shard_idx));
-    if (it != global_shard_indices_.end()) {
-      local_idx = std::distance(global_shard_indices_.begin(), it);
-    }
+  return layers_[layer_idx]
+      .shards[ResolveLocalShardIndex(layer_idx, shard_idx)]
+      .host_size;
+}
+
+int WeightSynchronizerBase::GetHostFd(size_t layer_idx,
+                                      size_t shard_idx) const {
+  if (layer_idx >= layers_.size() || layers_[layer_idx].shards.empty()) {
+    return -1;
   }
-  return layers_[layer_idx].shards[local_idx].host_size;
+  return layers_[layer_idx]
+      .shards[ResolveLocalShardIndex(layer_idx, shard_idx)]
+      .host_fd;
+}
+
+int64_t WeightSynchronizerBase::GetHostFdOffset(size_t layer_idx,
+                                                size_t shard_idx) const {
+  if (layer_idx >= layers_.size() || layers_[layer_idx].shards.empty()) {
+    return 0;
+  }
+  return layers_[layer_idx]
+      .shards[ResolveLocalShardIndex(layer_idx, shard_idx)]
+      .host_fd_offset;
 }
 
 void WeightSynchronizerBase::SetTestOnlyRateLimiters(

@@ -611,7 +611,14 @@ SharedMemoryHostMemoryAllocator::AllocateRegion(size_t size_bytes) {
   if (segment->payload_cursor > segment->header->total_payload_bytes) {
     segment->header->total_payload_bytes = segment->payload_cursor;
   }
-  segment->regions.push_back(PayloadRegion{ptr, aligned_size, false});
+  segment->regions.push_back(PayloadRegion{
+      .ptr = ptr,
+      .size_bytes = aligned_size,
+      .dma_mapped = false,
+      .fd = segment->fd,
+      .fd_offset = static_cast<int64_t>(region_offset),
+      .shm_name = segment_name,
+  });
   return &segment->regions.back();
 }
 
@@ -626,11 +633,15 @@ absl::StatusOr<HostBufferAllocation> SharedMemoryHostMemoryAllocator::Allocate(
 
   auto region_or = AllocateRegion(size_bytes);
   if (!region_or.ok()) return region_or.status();
+  PayloadRegion* region = *region_or;
 
   HostBufferAllocation alloc;
-  alloc.ptr = static_cast<uint8_t*>((*region_or)->ptr);
+  alloc.ptr = static_cast<uint8_t*>(region->ptr);
   alloc.size = size_bytes;
-  alloc.owner = std::shared_ptr<void>((*region_or)->ptr, [](void*) {});
+  alloc.fd = region->fd;
+  alloc.fd_offset = region->fd_offset;
+  alloc.shm_name = region->shm_name;
+  alloc.owner = std::shared_ptr<void>(region->ptr, [](void*) {});
   return alloc;
 }
 
@@ -662,6 +673,9 @@ SharedMemoryHostMemoryAllocator::AllocateDmaMapped(size_t size_bytes) {
   HostBufferAllocation alloc;
   alloc.ptr = static_cast<uint8_t*>(region->ptr);
   alloc.size = size_bytes;
+  alloc.fd = region->fd;
+  alloc.fd_offset = region->fd_offset;
+  alloc.shm_name = region->shm_name;
   alloc.owner = std::shared_ptr<void>(region->ptr, [](void*) {});
   return alloc;
 }

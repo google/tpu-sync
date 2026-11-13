@@ -61,12 +61,12 @@ struct BlockKey {
 struct HostBufferDescriptor {
   void* ptr = nullptr;  // Host virtual address
   size_t size = 0;      // Slice size in bytes
-  // `fd` and `offset` are optional and reserved for future direct/splice I/O:
-  // they let a backend hand the kernel a file-backed source/sink instead of a
-  // user buffer. No caller populates them today (callers pass fd=-1,
-  // offset=0), so this path is unexercised.
-  int fd = -1;         // Optional file descriptor (direct/splice I/O)
-  int64_t offset = 0;  // Optional byte offset within fd
+  // When `fd >= 0`, `fd` is a borrowed `/dev/shm` descriptor owned by the host
+  // memory allocator and `offset` is this slice's byte offset within it. Both
+  // remain valid while the manager's host buffers live (`dup` to retain
+  // longer).
+  int fd = -1;
+  int64_t offset = 0;
 };
 
 class BlockKeyMapper;
@@ -111,6 +111,14 @@ class KVBackend : public std::enable_shared_from_this<KVBackend> {
 
   // Returns the canonical backend name (e.g. "posix", "lustre").
   virtual std::string name() const = 0;
+
+  // Optional hook invoked once when the worker's host staging memory regions
+  // are attached to this backend, allowing plugins to pre-register `/dev/shm`
+  // arenas.
+  virtual absl::Status OnHostMemoryInitialized(
+      absl::Span<const HostBufferDescriptor> shard_regions) {
+    return absl::OkStatus();
+  }
 
   // Asynchronously writes a sequence of host DRAM buffer slices into the target
   // key. Works uniformly for a single slice (passed as `{slice}`) or

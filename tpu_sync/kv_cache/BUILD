@@ -148,6 +148,7 @@ cc_library(
         ":kv_cache_store",
         ":kv_cache_store_backend_factory",
         "//tpu_sync/common:raiden_id",
+        "//tpu_sync/kv_cache/backends/plugin:plugin_registry",
         "//tpu_sync/kv_cache/backends/storage:posix_backend",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
@@ -326,6 +327,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":host_meminfo",
+        ":kv_backend_factory",
         ":kv_cache_store_backend_factory",
         ":logical_block_manager",
         ":pool_layout",
@@ -338,6 +340,7 @@ cc_library(
         "//tpu_sync/core:tpu_utils",
         "//tpu_sync/core:xla_raw_transfer_headers",
         "//tpu_sync/kv_cache/backends:backend",
+        "//tpu_sync/kv_cache/backends/plugin:plugin_registry",
         "//tpu_sync/kv_cache/backends/storage:posix_backend",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "//tpu_sync/telemetry:metrics_api",
@@ -937,6 +940,43 @@ cc_library(
 )
 
 cc_library(
+    name = "kv_backend_factory",
+    srcs = ["kv_backend_factory.cc"],
+    hdrs = ["kv_backend_factory.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":kv_cache_store_backend_factory",
+        "//tpu_sync/kv_cache/backends:backend",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/base:no_destructor",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/synchronization",
+    ],
+    alwayslink = 1,
+)
+
+cc_test(
+    name = "kv_backend_factory_test",
+    srcs = ["kv_backend_factory_test.cc"],
+    deps = [
+        ":kv_backend_factory",
+        ":kv_cache_store_backend_factory",
+        "//tpu_sync/kv_cache/backends:backend",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+        "@xla//xla/tsl/platform:statusor",
+    ],
+)
+
+cc_library(
     name = "kv_cache_store_backend_factory",
     srcs = ["kv_cache_store_backend_factory.cc"],
     hdrs = ["kv_cache_store_backend_factory.h"],
@@ -1115,6 +1155,7 @@ cc_library(
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/core/controller:raiden_controller",
         "//tpu_sync/kv_cache/backends:backend",
+        "//tpu_sync/kv_cache/backends/plugin:plugin_registry",
         "//tpu_sync/kv_cache/backends/storage:posix_backend",
         "//tpu_sync/kv_cache/global_registry:global_registry_client_cc",
         "//tpu_sync/kv_cache/reshard:reshard_service",

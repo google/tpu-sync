@@ -207,6 +207,11 @@ KVCacheStoreBackendFactory::KVCacheStoreBackendFactory() {
 
 void KVCacheStoreBackendFactory::RegisterBuiltInBackends() {}
 
+void KVCacheStoreBackendFactory::SetPluginLoader(PluginLoader loader) {
+  absl::MutexLock lock(mutex_);
+  plugin_loader_ = std::move(loader);
+}
+
 absl::Status KVCacheStoreBackendFactory::RegisterBackend(
     absl::string_view type_name, BackendCreator creator) {
   absl::MutexLock lock(mutex_);
@@ -224,15 +229,37 @@ KVCacheStoreBackendFactory::CreateBackend(
     const BackendConfig& config,
     controller::RaidenController* controller) const {
   BackendCreator creator;
+  PluginLoader loader;
   {
     absl::MutexLock lock(mutex_);
     auto it = creators_.find(config.type);
-    if (it == creators_.end()) {
-      return absl::NotFoundError(absl::StrCat(
-          "Unknown backend type '", config.type,
-          "'. Ensure it is registered in KVCacheStoreBackendFactory."));
+    if (it != creators_.end()) {
+      creator = it->second;
+    } else {
+      loader = plugin_loader_;
     }
-    creator = it->second;
+  }
+  if (!creator && loader) {
+    const std::string effective_plugin_path =
+        !config.plugin_path.empty() ? config.plugin_path
+                                    : config.GetProperty("plugin_path");
+    absl::Status load_status = loader(config.type, effective_plugin_path);
+    if (!load_status.ok()) {
+      if (!absl::IsNotFound(load_status) || !effective_plugin_path.empty()) {
+        return load_status;
+      }
+    } else {
+      absl::MutexLock lock(mutex_);
+      auto it = creators_.find(config.type);
+      if (it != creators_.end()) {
+        creator = it->second;
+      }
+    }
+  }
+  if (!creator) {
+    return absl::NotFoundError(absl::StrCat(
+        "Unknown backend type '", config.type,
+        "'. Ensure it is registered in KVCacheStoreBackendFactory."));
   }
   // Execute creator OUTSIDE the lock to ensure thread safety and avoid
   // deadlock during recursive instantiation of sub-backends.

@@ -48,9 +48,9 @@ import TpuSyncVerify.Transfer.PrefillDecode.BlockOrdering.Traces
 | `tpu_sync/api/jax/kv_cache_manager_transfer_test.py` | `test_non_contiguous_blocks` | `:187-271` |
 | `tpu_sync/api/jax/kv_cache_manager_transfer_test.py` | `test_host_reordering` | `:274-356` |
 | `tpu_sync/api/jax/kv_cache_manager_transfer_test.py` | `test_large_complex_non_contiguous_and_reorder` | `:359-448` |
-| `tpu_sync/api/torch/kv_cache_manager_transfer_test.py` | `test_non_contiguous_blocks` | `:176-206` |
-| `tpu_sync/api/torch/kv_cache_manager_transfer_test.py` | `test_host_reordering` | `:209-237` |
-| `tpu_sync/api/torch/kv_cache_manager_transfer_test.py` | `test_large_complex_non_contiguous_and_reorder` | `:240-282` |
+| `tpu_sync/api/torch/tests/kv_cache_manager_transfer_test.py` | `test_non_contiguous_blocks` | `:176-206` |
+| `tpu_sync/api/torch/tests/kv_cache_manager_transfer_test.py` | `test_host_reordering` | `:209-237` |
+| `tpu_sync/api/torch/tests/kv_cache_manager_transfer_test.py` | `test_large_complex_non_contiguous_and_reorder` | `:240-282` |
 <!-- source-map:end -->
 
 Stage 4 (spatial block refinement) of the prefill-to-decode model: refines

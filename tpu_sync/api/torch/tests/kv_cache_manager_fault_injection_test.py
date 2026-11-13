@@ -217,7 +217,7 @@ class KVCacheManagerFaultInjectionTest(absltest.TestCase):
     self.assertEqual(
         outcome,
         "done",
-        f"transfer failed after reset_faults(); a stale rule at "
+        "transfer failed after reset_faults(); a stale rule at "
         f"{_PULL_REQUEST_HOOK} is still live in the transfer path",
     )
     for idx, t in enumerate(dst_caches):

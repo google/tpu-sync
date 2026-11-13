@@ -270,9 +270,7 @@ class PollStatsWithDetailsTest(unittest.TestCase):
     manager = object.__new__(kv_cache_manager.KVCacheManager)
     manager._impl = _FakeDetailsImpl()  # pylint: disable=protected-access
 
-    self.assertEqual(
-        manager.poll_stats(), (["sent"], ["received"], ["failed"])
-    )
+    self.assertEqual(manager.poll_stats(), (["sent"], ["received"], ["failed"]))
 
   def test_failed_transfer_says_why(self):
     manager = object.__new__(kv_cache_manager.KVCacheManager)

@@ -167,6 +167,7 @@ def prepare_tpu_environment(world_size: int) -> None:
   # addresses, got 8").
   os.environ["TORCH_TPU_TOPOLOGY"] = get_tpu_topology(world_size)
 
+
 def worker_launch_cmd() -> list[str]:
   """The command prefix that re-enters this file as a worker rank.
 
@@ -177,6 +178,7 @@ def worker_launch_cmd() -> list[str]:
   if os.access(sys.argv[0], os.X_OK):
     return [sys.argv[0]]
   return [sys.executable, os.path.abspath(__file__)]
+
 
 _registry_process = None
 _registry_port = None
@@ -196,6 +198,7 @@ def start_servers():
     registry_binary = os.path.abspath(
         os.path.join(
             this_dir,
+            "..",
             "..",
             "..",
             "kv_cache",
@@ -1353,8 +1356,9 @@ def _wait_for_workers(procs, timeout_s=_THREE_SOURCE_WORKER_TIMEOUT_S):
   return failures
 
 
-def _wait_for_all(poll_fn, expected_hashes, what,
-                  timeout_s=_THREE_SOURCE_WAIT_TIMEOUT_S):
+def _wait_for_all(
+    poll_fn, expected_hashes, what, timeout_s=_THREE_SOURCE_WAIT_TIMEOUT_S
+):
   """Blocks until every hash in expected_hashes is reported done by poll_fn.
 
   Args:
@@ -1390,13 +1394,18 @@ def _assert_statuses(lookup_result, hashes, expected_statuses):
   got_hashes = [h for h, _ in lookup_result]
   got_statuses = [s.status for _, s in lookup_result]
   assert got_hashes == list(hashes), f"lookup hashes {got_hashes} != {hashes}"
-  assert got_statuses == list(expected_statuses), (
-      f"lookup statuses {got_statuses} != {list(expected_statuses)}"
-  )
+  assert got_statuses == list(
+      expected_statuses
+  ), f"lookup statuses {got_statuses} != {list(expected_statuses)}"
 
 
-def _wait_for_lookup(store, hashes, expected_statuses,
-                     timeout_s=_THREE_SOURCE_WAIT_TIMEOUT_S, **lookup_kwargs):
+def _wait_for_lookup(
+    store,
+    hashes,
+    expected_statuses,
+    timeout_s=_THREE_SOURCE_WAIT_TIMEOUT_S,
+    **lookup_kwargs,
+):
   """Polls store.lookup() until it returns exactly expected_statuses.
 
   Used where visibility is eventually consistent (global registry publication),
@@ -1436,8 +1445,10 @@ def _verify_and_print_shard_files(
       f"{len(bin_files)} on-disk shard files (exact paths verified):",
   )
   for f in bin_files:
-    print(f"  [Shard File][Rank {rank}] {f}"
-          f" ({os.path.getsize(f)} bytes)", flush=True)
+    print(
+        f"  [Shard File][Rank {rank}] {f} ({os.path.getsize(f)} bytes)",
+        flush=True,
+    )
 
 
 def _init_worker_process_group(tag, rank, world_size, master_port, phase):
@@ -1549,7 +1560,11 @@ def _worker_three_source_main(argv):
         rank * 1000.0
     )
     shard_size_bytes = 128 * 8 * 8 * 128 * 4
-    h0, r0, s0 = b"hash_mpmd_3src_h0", b"hash_mpmd_3src_r0", b"hash_mpmd_3src_s0"
+    h0, r0, s0 = (
+        b"hash_mpmd_3src_h0",
+        b"hash_mpmd_3src_r0",
+        b"hash_mpmd_3src_s0",
+    )
 
     if phase in ("write", "both"):
       # ---- Phase 1/6: seed storage with s0 (data = host_data[2]). ----
@@ -1660,8 +1675,12 @@ def _worker_three_source_main(argv):
 
       # ---- Phase 2/6: peer A stages r0 in its host RAM. ----
       if rank == 0:
-        _log(tag, "2/6", rank,
-             f"Peer A saving {r0!r} -> HOST (published to global registry).")
+        _log(
+            tag,
+            "2/6",
+            rank,
+            f"Peer A saving {r0!r} -> HOST (published to global registry).",
+        )
         assert store_a.save([r0]), "peer A save failed"
         _wait_for_all(store_a.poll_save_status, [r0], "peer A save")
       dist.barrier()
@@ -1670,8 +1689,12 @@ def _worker_three_source_main(argv):
       # save writes h0 to B's host RAM and to POSIX storage; lookup still
       # reports HOST_AND_HBM because the host tier is checked first. ----
       if rank == 0:
-        _log(tag, "3/6", rank,
-             f"Consumer B saving {h0!r} -> HOST (local) + SHARED_STORAGE.")
+        _log(
+            tag,
+            "3/6",
+            rank,
+            f"Consumer B saving {h0!r} -> HOST (local) + SHARED_STORAGE.",
+        )
         assert store_b.save([h0]), "consumer B save failed"
         _wait_for_all(store_b.poll_save_status, [h0], "consumer B save")
       dist.barrier()
@@ -1681,36 +1704,57 @@ def _worker_three_source_main(argv):
         hashes = [h0, r0, s0]
         expected = [status.HOST_AND_HBM, status.REMOTE, status.SHARED_STORAGE]
         # Wait (unpinned) for registry visibility, then take the pin once.
-        _wait_for_lookup(store_b, hashes, expected,
-                         enable_global=True, pin_found=False)
+        _wait_for_lookup(
+            store_b, hashes, expected, enable_global=True, pin_found=False
+        )
         lookup = store_b.lookup(hashes, enable_global=True, pin_found=True)
         _assert_statuses(lookup, hashes, expected)
-        assert lookup[1][1].raiden_id == rid_a, (
-            f"r0 owner {lookup[1][1].raiden_id} != peer A"
-        )
+        assert (
+            lookup[1][1].raiden_id == rid_a
+        ), f"r0 owner {lookup[1][1].raiden_id} != peer A"
         for h, b in lookup:
-          print(f"  [B Lookup] hash={h!r} status={b.status.name}"
-                f" raiden_id={b.raiden_id}", flush=True)
+          print(
+              f"  [B Lookup] hash={h!r} status={b.status.name}"
+              f" raiden_id={b.raiden_id}",
+              flush=True,
+          )
         slice_of = {h: b for h, b in lookup}
-        _log(tag, "4/6", rank,
-             "Lookup: [HOST_AND_HBM, REMOTE(peer A), SHARED_STORAGE] resolved"
-             " in one call.")
+        _log(
+            tag,
+            "4/6",
+            rank,
+            "Lookup: [HOST_AND_HBM, REMOTE(peer A), SHARED_STORAGE] resolved"
+            " in one call.",
+        )
 
         # ---- Phase 5/6: load() local, one read_remote() for the rest. ----
         assert store_b.load([h0], [1], slices=[slice_of[h0]]), "load failed"
-        _log(tag, "5/6", rank,
-             f"load([{h0!r}]) -> HBM 1 launched (local host DRAM, consumes"
-             " lookup pin).")
+        _log(
+            tag,
+            "5/6",
+            rank,
+            f"load([{h0!r}]) -> HBM 1 launched (local host DRAM, consumes"
+            " lookup pin).",
+        )
         assert store_b.read_remote(
             [r0, s0], [slice_of[r0], slice_of[s0]], [2, 3]
         ), "read_remote failed"
-        _log(tag, "5/6", rank,
-             f"read_remote([{r0!r}, {s0!r}]) -> HBM [2, 3] launched (peer A"
-             " DRAM + secondary storage, no pin).")
-        secs = _wait_for_all(store_b.poll_load_status, hashes,
-                             "three-source load")
-        _log(tag, "5/6", rank,
-             f"poll_load_status: all 3 blocks done in {secs:.3f}s.")
+        _log(
+            tag,
+            "5/6",
+            rank,
+            f"read_remote([{r0!r}, {s0!r}]) -> HBM [2, 3] launched (peer A"
+            " DRAM + secondary storage, no pin).",
+        )
+        secs = _wait_for_all(
+            store_b.poll_load_status, hashes, "three-source load"
+        )
+        _log(
+            tag,
+            "5/6",
+            rank,
+            f"poll_load_status: all 3 blocks done in {secs:.3f}s.",
+        )
       dist.barrier()
 
       # ---- Phase 6/6: bytes on every rank, local records on rank 0. ----
@@ -1719,23 +1763,31 @@ def _worker_three_source_main(argv):
       np.testing.assert_array_equal(after[1], host_data[0])
       np.testing.assert_array_equal(after[2], host_data[1])
       np.testing.assert_array_equal(after[3], host_data[2])
-      _log(tag, "6/6", rank,
-           "HBM blocks [1, 2, 3] bit-exact (HOST, REMOTE, SHARED_STORAGE"
-           " sources).")
+      _log(
+          tag,
+          "6/6",
+          rank,
+          "HBM blocks [1, 2, 3] bit-exact (HOST, REMOTE, SHARED_STORAGE"
+          " sources).",
+      )
       dist.barrier()
       if rank == 0:
         # The storage recall published s0 into B's host cache; the peer read
         # recorded nothing locally.
         local = store_b.lookup([s0], enable_global=False, pin_found=False)
         _assert_statuses(local, [s0], [status.HOST_AND_HBM])
-        assert local[0][1].raiden_id == rid_b, (
-            f"s0 owner {local[0][1].raiden_id} != consumer B"
-        )
+        assert (
+            local[0][1].raiden_id == rid_b
+        ), f"s0 owner {local[0][1].raiden_id} != consumer B"
         r0_local = store_b.lookup([r0], enable_global=False, pin_found=False)
         assert not r0_local, f"{r0!r} must not be recorded locally: {r0_local}"
-        _log(tag, "6/6", rank,
-             f"{s0!r} published HOST_AND_HBM under B; {r0!r} not recorded"
-             " locally.")
+        _log(
+            tag,
+            "6/6",
+            rank,
+            f"{s0!r} published HOST_AND_HBM under B; {r0!r} not recorded"
+            " locally.",
+        )
       del manager_b, store_b, manager_a, store_a
       dist.barrier()
   finally:
@@ -2299,9 +2351,9 @@ def _check_file(path, blocks, block, who, *, block_bytes):
   """
   data = np.fromfile(path, dtype=np.uint8)
   want = np.concatenate([b[block] for b in blocks])
-  assert data.size == want.size, (
-      f"{who} block {block}: file {data.size} B != {want.size} B"
-  )
+  assert (
+      data.size == want.size
+  ), f"{who} block {block}: file {data.size} B != {want.size} B"
   bad = np.flatnonzero(data != want)
   assert bad.size == 0, (
       f"{who} block {block}: {bad.size} bad bytes, first at buffer"
@@ -2643,6 +2695,7 @@ def _worker_gdn_hybrid_mock_main(argv):
       assert store.save(keys), "store.save failed"
       _wait_for_all(store.poll_save_status, keys, "save")
       dist.barrier()
+
       # W4. After the barrier every replica has saved, so tp1_r0 holds
       #     exactly world_size x 10 files, one per key of every replica, and
       #     nothing else.
@@ -2676,15 +2729,15 @@ def _worker_gdn_hybrid_mock_main(argv):
       src = (rank + 1) % world_size  # recall another replica's blocks
       img = np.full((_GDN_NUM_BLOCKS, _GDN_BLOCK_BYTES), _SENTINEL, np.uint8)
       buffers = [
-          _blocks_to_device_buffer(img, device)
-          for _ in range(_GDN_NUM_BUFFERS)
+          _blocks_to_device_buffer(img, device) for _ in range(_GDN_NUM_BUFFERS)
       ]
       _tpu_sync()
       _, store, manager = make_replica(buffers, "r")
       # R2. All 10 of replica src's keys must be found in SHARED_STORAGE.
       keys = _gdn_keys(src, _GDN_SRC_PAGES)
       found = _wait_for_lookup(
-          store, keys,
+          store,
+          keys,
           [kv_cache_store.BlockStatus.SHARED_STORAGE] * len(keys),
           pin_found=False,
       )
@@ -2706,9 +2759,14 @@ def _worker_gdn_hybrid_mock_main(argv):
       #     2, 3, 4, 5, 6, 7, 8, 9, 10, 11 byte for byte (the R3 pairs), and
       #     reader page 1 (blocks 2, 3), page 2 (blocks 4, 5) and page 6
       #     (blocks 12, 13), which were not recall targets, are still 0xA5.
-      _check_recalled(buffers, _gdn_blocks(src), dict(zip(dst_ids, src_ids)),
-                      f"replica {rank}", block_bytes=_GDN_BLOCK_BYTES,
-                      num_blocks=_GDN_NUM_BLOCKS)
+      _check_recalled(
+          buffers,
+          _gdn_blocks(src),
+          dict(zip(dst_ids, src_ids)),
+          f"replica {rank}",
+          block_bytes=_GDN_BLOCK_BYTES,
+          num_blocks=_GDN_NUM_BLOCKS,
+      )
       _log(tag, phase, rank, f"PASS: replica {src}'s blocks bit-exact.")
     dist.barrier()
     del manager, store
@@ -3003,19 +3061,23 @@ class KVCacheStoreMpmdE2ETest(parameterized.TestCase):
       for rank in range(world_size):
         env = os.environ.copy()
         env["GLOG_alsologtostderr"] = "1"
-        cmd = worker_launch_cmd() + [
-            "--run_worker",
-            "--alsologtostderr",
-            f"--worker_mode={worker_mode}",
-            "--storage_phase=write",
-            f"--storage_root={temp_dir}",
-            f"--storage_direct_io={direct_io}",
-            f"--rank={rank}",
-            f"--world_size={world_size}",
-            f"--master_port={master_port_w}",
-            f"--controller_port={controller_port_w}",
-            f"--registry_port={_registry_port}",
-        ] + list(extra_flags)
+        cmd = (
+            worker_launch_cmd()
+            + [
+                "--run_worker",
+                "--alsologtostderr",
+                f"--worker_mode={worker_mode}",
+                "--storage_phase=write",
+                f"--storage_root={temp_dir}",
+                f"--storage_direct_io={direct_io}",
+                f"--rank={rank}",
+                f"--world_size={world_size}",
+                f"--master_port={master_port_w}",
+                f"--controller_port={controller_port_w}",
+                f"--registry_port={_registry_port}",
+            ]
+            + list(extra_flags)
+        )
         p = subprocess.Popen(cmd, env=env)
         print(
             f"[MPMD Driver] Spawning Writer worker rank {rank}/{world_size}"
@@ -3055,19 +3117,23 @@ class KVCacheStoreMpmdE2ETest(parameterized.TestCase):
       for rank in range(world_size):
         env = os.environ.copy()
         env["GLOG_alsologtostderr"] = "1"
-        cmd = worker_launch_cmd() + [
-            "--run_worker",
-            "--alsologtostderr",
-            f"--worker_mode={worker_mode}",
-            "--storage_phase=read",
-            f"--storage_root={temp_dir}",
-            f"--storage_direct_io={direct_io}",
-            f"--rank={rank}",
-            f"--world_size={world_size}",
-            f"--master_port={master_port_r}",
-            f"--controller_port={controller_port_r}",
-            f"--registry_port={_registry_port}",
-        ] + list(extra_flags)
+        cmd = (
+            worker_launch_cmd()
+            + [
+                "--run_worker",
+                "--alsologtostderr",
+                f"--worker_mode={worker_mode}",
+                "--storage_phase=read",
+                f"--storage_root={temp_dir}",
+                f"--storage_direct_io={direct_io}",
+                f"--rank={rank}",
+                f"--world_size={world_size}",
+                f"--master_port={master_port_r}",
+                f"--controller_port={controller_port_r}",
+                f"--registry_port={_registry_port}",
+            ]
+            + list(extra_flags)
+        )
         p = subprocess.Popen(cmd, env=env)
         print(
             f"[MPMD Driver] Spawning Reader worker rank {rank}/{world_size}"
@@ -3172,7 +3238,7 @@ class KVCacheStoreMpmdE2ETest(parameterized.TestCase):
         ]
         p = subprocess.Popen(cmd, env=env)
         print(
-            f"[MPMD Driver] Spawning three_source worker rank"
+            "[MPMD Driver] Spawning three_source worker rank"
             f" {rank}/{world_size} (PID={p.pid})...",
             flush=True,
         )

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-load("@rules_python//python:defs.bzl", "py_library", "py_test")
+load("@rules_python//python:defs.bzl", "py_library")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -86,15 +86,6 @@ py_library(
     ],
 )
 
-py_test(
-    name = "kv_cache_manager_host_test",
-    srcs = ["kv_cache_manager_host_test.py"],
-    deps = [
-        ":kv_cache_manager_host_py",
-        ":pool_layout",
-    ],
-)
-
 py_library(
     name = "weight_synchronizer_torch_py",
     srcs = ["weight_synchronizer.py"],
@@ -146,160 +137,5 @@ py_library(
         ":torch_tpu_common_loader",
         "//tpu_sync/api:common",
         "//tpu_sync/frameworks/torch:_tpu_raiden_torch",
-    ],
-)
-
-py_test(
-    name = "reshard_store_test",
-    srcs = ["reshard_store_test.py"],
-    tags = ["nobuilder"],
-    deps = [
-        ":reshard_client",
-        ":reshard_store",
-        "@com_google_absl_py//absl/testing:absltest",
-    ],
-)
-
-py_test(
-    name = "kv_cache_store_test",
-    srcs = ["kv_cache_store_test.py"],
-    data = [
-        "//tpu_sync/kv_cache/global_registry:global_registry_server",
-    ],
-    deps = [
-        ":kv_cache_store",
-        "//pyglib:resources",
-        "@com_google_absl_py//absl/testing:absltest",
-    ],
-)
-
-py_test(
-    name = "weight_synchronizer_test",
-    srcs = ["weight_synchronizer_test.py"],
-    tags = [
-        "cpu:8",
-        "requires-accel-hbm",
-        "requires-ghostlite:8",
-        "requires-net:external",
-    ],
-    deps = [
-        ":weight_synchronizer_torch_py",
-        "//tpu_sync/common/control_pipe:control_pipe_client",
-        "//tpu_sync/rpc:raiden_controller",
-        "//tpu_sync/rpc:raiden_service_py_pb2",
-        "@com_google_absl_py//absl/logging",
-        "@com_google_absl_py//absl/testing:absltest",
-        "@com_google_absl_py//absl/testing:parameterized",
-        "@torch_tpu//shims/torch:pytorch",
-        "@torch_tpu//src/torch_tpu",
-    ],
-)
-
-# Base accelerator test requiring physical TPU devices via torch_tpu.
-# Tagged "manual" because generic CPU Forge runners lack TPU hardware.
-# For remote execution on Forge, use the _gf (TPU v4) or _gl (TPU v5e) targets below.
-py_test(
-    name = "kv_cache_store_recovery_e2e_test",
-    srcs = ["kv_cache_store_recovery_e2e_test.py"],
-    tags = [
-        "manual",
-        "notap",
-    ],
-    deps = [
-        ":kv_cache_manager_torch_py",
-        ":kv_cache_store",
-        "@com_google_absl_py//absl:app",
-        "@com_google_absl_py//absl/flags",
-        "@com_google_absl_py//absl/testing:absltest",
-        "@pypi//numpy",
-        "@torch_tpu//shims/torch:pytorch",
-        "@torch_tpu//src/torch_tpu",
-    ],
-)
-
-py_test(
-    name = "kv_cache_manager_transfer_test",
-    srcs = ["kv_cache_manager_transfer_test.py"],
-    tags = [
-        "cpu:8",
-        "requires-accel-hbm",
-        "requires-ghostlite:8",
-        "requires-net:external",
-    ],
-    deps = [
-        ":kv_cache_manager_torch_py",
-        "@com_google_absl_py//absl/testing:absltest",
-        "@com_google_absl_py//absl/testing:parameterized",
-        "@torch_tpu//shims/torch:pytorch",
-        "@torch_tpu//src/torch_tpu",
-    ],
-)
-
-# Note: blaze shares one FaultInjector across extensions, so only
-# test_wrapper_resolves_to_torch_extension guards the wheel's wiring bug.
-py_test(
-    name = "kv_cache_manager_fault_injection_test",
-    srcs = ["kv_cache_manager_fault_injection_test.py"],
-    tags = [
-        "cpu:8",
-        "notap",
-        "requires-accel-hbm",
-        "requires-ghostlite:8",
-        "requires-net:external",
-    ],
-    deps = [
-        ":fault_injection",
-        ":kv_cache_manager_torch_py",
-        "@com_google_absl_py//absl/testing:absltest",
-        "@torch_tpu//shims/torch:pytorch",
-        "@torch_tpu//src/torch_tpu",
-    ],
-)
-
-py_test(
-    name = "kv_cache_store_e2e_test",
-    timeout = "long",
-    srcs = ["kv_cache_store_e2e_test.py"],
-    data = [
-        "//tpu_sync/kv_cache/global_registry:global_registry_server",
-    ],
-    tags = [
-        "manual",
-        "notap",
-    ],
-    deps = [
-        ":kv_cache_manager_torch_py",
-        ":kv_cache_store",
-        "//pyglib:resources",
-        "@com_google_absl_py//absl/testing:absltest",
-        "@com_google_absl_py//absl/testing:parameterized",
-        "@pypi//numpy",
-        "@torch_tpu//shims/torch:pytorch",
-        "@torch_tpu//src/torch_tpu",
-    ],
-)
-
-py_test(
-    name = "kv_cache_store_mpmd_e2e_test",
-    timeout = "long",
-    srcs = ["kv_cache_store_mpmd_e2e_test.py"],
-    data = [
-        "//tpu_sync/kv_cache/global_registry:global_registry_server",
-    ],
-    tags = [
-        "manual",
-        "notap",
-    ],
-    deps = [
-        ":kv_cache_manager_torch_py",
-        ":kv_cache_store",
-        "//pyglib:resources",
-        "@com_google_absl_py//absl:app",
-        "@com_google_absl_py//absl/flags",
-        "@com_google_absl_py//absl/testing:absltest",
-        "@com_google_absl_py//absl/testing:parameterized",
-        "@pypi//numpy",
-        "@torch_tpu//shims/torch:pytorch",
-        "@torch_tpu//src/torch_tpu",
     ],
 )

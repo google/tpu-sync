@@ -42,6 +42,7 @@ def _registry_binary_path():
           this_dir,
           "..",
           "..",
+          "..",
           "kv_cache",
           "global_registry",
           "global_registry_server",
@@ -150,9 +151,7 @@ class KVCacheStoreTest(absltest.TestCase):
     # 1. Insert. Re-inserting hashes that are already present succeeds:
     # insert pins what is there and inserts what is not.
     self.assertTrue(controller.insert(hashes, slices, True))
-    self.assertTrue(
-        controller.insert(hashes, slices, True)
-    )  # Already exists
+    self.assertTrue(controller.insert(hashes, slices, True))  # Already exists
     # Two inserts granted two pins each; hand them all back -- these cases
     # only need the blocks resident.
     controller.release(hashes)
@@ -332,12 +331,8 @@ class KVCacheStoreTest(absltest.TestCase):
       )
       rid = kv_cache_store.RaidenId("inference_server", "0", "kv_cache", 0)
       slices = [
-          kv_cache_store.RaidenBlockId(
-              rid, 1, kv_cache_store.BlockStatus.HOST
-          ),
-          kv_cache_store.RaidenBlockId(
-              rid, 2, kv_cache_store.BlockStatus.HOST
-          ),
+          kv_cache_store.RaidenBlockId(rid, 1, kv_cache_store.BlockStatus.HOST),
+          kv_cache_store.RaidenBlockId(rid, 2, kv_cache_store.BlockStatus.HOST),
       ]
       self.assertTrue(store.insert([b"h1", b"h2"], slices, True))
       store.release([b"h1", b"h2"])  # resident but unpinned
@@ -540,9 +535,7 @@ class KVCacheStoreTest(absltest.TestCase):
     # hashes are content-addressed, so the peer having them is exactly the
     # post-condition the caller wanted, and no bytes move.
     self.assertTrue(src.save(hashes, dst_id))
-    done, failed, pending, existing, unregistered = (
-        src.poll_save_status()
-    )
+    done, failed, pending, existing, unregistered = src.poll_save_status()
     self.assertCountEqual(done, hashes)
     self.assertEmpty(failed)
     self.assertEmpty(pending)
@@ -584,9 +577,7 @@ class KVCacheStoreTest(absltest.TestCase):
 
     self.assertLen(src.lookup(hashes), len(hashes))
     self.assertTrue(src.save(hashes, dst_id))
-    done, failed, pending, existing, unregistered = (
-        src.poll_save_status()
-    )
+    done, failed, pending, existing, unregistered = src.poll_save_status()
     self.assertEmpty(done)
     self.assertCountEqual(failed, hashes)
     self.assertEmpty(pending)

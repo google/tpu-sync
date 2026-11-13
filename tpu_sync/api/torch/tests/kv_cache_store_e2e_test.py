@@ -67,6 +67,7 @@ def _registry_binary_path():
           this_dir,
           "..",
           "..",
+          "..",
           "kv_cache",
           "global_registry",
           "global_registry_server",
@@ -79,6 +80,7 @@ def _node_binary_path():
   return os.path.abspath(
       os.path.join(
           this_dir,
+          "..",
           "..",
           "..",
           "store_node",
@@ -158,8 +160,13 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
   def setUp(self):
     super().setUp()
     self.device = torch.device("tpu")
-    assert self.device.type == "tpu", f"Expected real PyTorch TPU device, got {self.device}"
-    print(f"=== [DEVICE VERIFIED] Using real PyTorch TPU device: {self.device} ===")
+    assert (
+        self.device.type == "tpu"
+    ), f"Expected real PyTorch TPU device, got {self.device}"
+    print(
+        "=== [DEVICE VERIFIED] Using real PyTorch TPU device:"
+        f" {self.device} ==="
+    )
 
     self.num_devices = 1  # E2E tests for PyTorch currently use single device logic for kv caches
     self.num_layers = 1
@@ -494,9 +501,7 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
 
       # 4. Job B calls Lookup (enable_global=True)
       time.sleep(0.5)
-      lookup_res_b = store_b.lookup(
-          hashes, enable_global=True, pin_found=False
-      )
+      lookup_res_b = store_b.lookup(hashes, enable_global=True, pin_found=False)
       self.assertLen(lookup_res_b, 2)
 
       # Verify REMOTE status and owner job_a
@@ -1044,7 +1049,8 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
           with open("/tmp/raiden_store_node.log", "r") as f:
             log_content = f.read()
           self.fail(
-              f"store node exited prematurely with code {node_process.returncode}:\n{log_content}"
+              "store node exited prematurely with code"
+              f" {node_process.returncode}:\n{log_content}"
           )
         if os.path.exists("/tmp/raiden_store_node.log"):
           with open("/tmp/raiden_store_node.log", "r") as f:

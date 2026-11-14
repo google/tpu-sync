@@ -35,8 +35,10 @@ namespace {
 
 using ::absl_testing::IsOkAndHolds;
 using ::absl_testing::StatusIs;
+using ::testing::SizeIs;
 
-TEST(WeightSynchronizerTest, GetHostBufferSizeReportsMissingBufferAndBadLayer) {
+TEST(WeightSynchronizerTest,
+     GetHostBufferWithLocalIndexReportsMissingBufferAndBadIndices) {
   absl::FlagSaver flag_saver;
   // With no scratchpad, a zero-byte layer gets no host buffer (null pointer).
   absl::SetFlag(&FLAGS_raiden_weight_sync_host_buffer_scratchpad_size, 0);
@@ -48,11 +50,21 @@ TEST(WeightSynchronizerTest, GetHostBufferSizeReportsMissingBufferAndBadLayer) {
           kNumLayers, /*num_shards=*/1,
           std::vector<size_t>{kSliceByteSize, /*no host buffer=*/0}));
 
-  EXPECT_THAT(ws->GetHostBufferSize(/*layer_idx=*/0, /*shard_idx=*/0),
-              IsOkAndHolds(kSliceByteSize));
-  EXPECT_THAT(ws->GetHostBufferSize(/*layer_idx=*/1, /*shard_idx=*/0),
+  EXPECT_THAT(ws->GetHostBufferWithLocalIndex(/*layer_idx=*/0,
+                                              /*local_shard_idx=*/0)
+                  .Await(),
+              IsOkAndHolds(SizeIs(kSliceByteSize)));
+  EXPECT_THAT(ws->GetHostBufferWithLocalIndex(/*layer_idx=*/1,
+                                              /*local_shard_idx=*/0)
+                  .Await(),
               StatusIs(absl::StatusCode::kFailedPrecondition));
-  EXPECT_THAT(ws->GetHostBufferSize(/*layer_idx=*/kNumLayers, /*shard_idx=*/0),
+  EXPECT_THAT(ws->GetHostBufferWithLocalIndex(/*layer_idx=*/kNumLayers,
+                                              /*local_shard_idx=*/0)
+                  .Await(),
+              StatusIs(absl::StatusCode::kOutOfRange));
+  EXPECT_THAT(ws->GetHostBufferWithLocalIndex(/*layer_idx=*/0,
+                                              /*local_shard_idx=*/1)
+                  .Await(),
               StatusIs(absl::StatusCode::kOutOfRange));
 }
 

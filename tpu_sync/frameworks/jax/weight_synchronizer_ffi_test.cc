@@ -189,10 +189,14 @@ TEST_F(WeightSynchronizerFfiTest, TriggerMultiH2DSucceeds) {
   // 2. Populate Host Staging Buffers with dummy data
   // Layer 0: [0, 1, 2, ... 255]
   // Layer 1: [256, 257, ... 511]
-  uint8_t* host_ptr_0 = const_cast<uint8_t*>(ws->GetHostBufferPtr(0, 0));
-  uint8_t* host_ptr_1 = const_cast<uint8_t*>(ws->GetHostBufferPtr(1, 0));
-  ASSERT_NE(host_ptr_0, nullptr);
-  ASSERT_NE(host_ptr_1, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> host_buf_0,
+                       ws->GetHostBufferWithLocalIndex(0, 0).Await());
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> host_buf_1,
+                       ws->GetHostBufferWithLocalIndex(1, 0).Await());
+  ASSERT_GE(host_buf_0.size(), 1024);
+  ASSERT_GE(host_buf_1.size(), 1024);
+  uint8_t* host_ptr_0 = host_buf_0.data();
+  uint8_t* host_ptr_1 = host_buf_1.data();
 
   std::vector<int32_t> src_data_0(256);
   std::vector<int32_t> src_data_1(256);
@@ -295,11 +299,13 @@ TEST_F(WeightSynchronizerFfiTest, MultiShardGetLocalSlotAndGlobalShardIndices) {
 
   // Staging buffer pointers for shard 8 (slot 0) and shard 9 (slot 1) must be
   // distinct
-  const uint8_t* ptr8 = ws8->GetHostBufferPtr(0, 0);
-  const uint8_t* ptr9 = ws9->GetHostBufferPtr(0, 1);
-  ASSERT_NE(ptr8, nullptr);
-  ASSERT_NE(ptr9, nullptr);
-  EXPECT_NE(ptr8, ptr9);
+  TF_ASSERT_OK_AND_ASSIGN(
+      absl::Span<const uint8_t> buf8,
+      std::as_const(*ws8).GetHostBufferWithLocalIndex(0, 0).Await());
+  TF_ASSERT_OK_AND_ASSIGN(
+      absl::Span<const uint8_t> buf9,
+      std::as_const(*ws9).GetHostBufferWithLocalIndex(0, 1).Await());
+  EXPECT_NE(buf8.data(), buf9.data());
 }
 
 TEST_F(WeightSynchronizerFfiTest, MultiNumaFourShardsInitAndD2hTest) {
@@ -374,9 +380,12 @@ TEST_F(WeightSynchronizerFfiTest, MultiNumaFourShardsInitAndD2hTest) {
   // Verify that D2H wrote the exact shard data into the corresponding host slot
   for (int s = 0; s < kNumShards; ++s) {
     for (int l = 0; l < kNumLayers; ++l) {
-      const uint8_t* host_ptr = ws->GetHostBufferPtr(l, s);
-      ASSERT_NE(host_ptr, nullptr);
-      const int32_t* host_data = reinterpret_cast<const int32_t*>(host_ptr);
+      TF_ASSERT_OK_AND_ASSIGN(
+          absl::Span<const uint8_t> host_buf,
+          std::as_const(*ws).GetHostBufferWithLocalIndex(l, s).Await());
+      ASSERT_GE(host_buf.size(), kSliceElements * sizeof(int32_t));
+      const int32_t* host_data =
+          reinterpret_cast<const int32_t*>(host_buf.data());
       for (int i = 0; i < kSliceElements; ++i) {
         EXPECT_EQ(host_data[i], shard_layer_data[s][l][i])
             << "Mismatch at shard " << (kBaseShard + s) << " (slot " << s
@@ -516,9 +525,12 @@ TEST_F(WeightSynchronizerFfiTest,
   // Verify host buffer data in ws_0 (shards 0..3)
   for (int s = 0; s < 4; ++s) {
     for (int l = 0; l < kNumLayers; ++l) {
-      const uint8_t* host_ptr = ws_0->GetHostBufferPtr(l, s);
-      ASSERT_NE(host_ptr, nullptr);
-      const int32_t* host_data = reinterpret_cast<const int32_t*>(host_ptr);
+      TF_ASSERT_OK_AND_ASSIGN(
+          absl::Span<const uint8_t> host_buf,
+          std::as_const(*ws_0).GetHostBufferWithLocalIndex(l, s).Await());
+      ASSERT_GE(host_buf.size(), kSliceElements * sizeof(int32_t));
+      const int32_t* host_data =
+          reinterpret_cast<const int32_t*>(host_buf.data());
       for (int i = 0; i < kSliceElements; ++i) {
         EXPECT_EQ(host_data[i], shard_layer_data[s][l][i])
             << "Mismatch in ws_0 at shard " << s << ", layer " << l
@@ -531,9 +543,12 @@ TEST_F(WeightSynchronizerFfiTest,
   for (int s = 4; s < 8; ++s) {
     int slot = s - 4;
     for (int l = 0; l < kNumLayers; ++l) {
-      const uint8_t* host_ptr = ws_1->GetHostBufferPtr(l, slot);
-      ASSERT_NE(host_ptr, nullptr);
-      const int32_t* host_data = reinterpret_cast<const int32_t*>(host_ptr);
+      TF_ASSERT_OK_AND_ASSIGN(
+          absl::Span<const uint8_t> host_buf,
+          std::as_const(*ws_1).GetHostBufferWithLocalIndex(l, slot).Await());
+      ASSERT_GE(host_buf.size(), kSliceElements * sizeof(int32_t));
+      const int32_t* host_data =
+          reinterpret_cast<const int32_t*>(host_buf.data());
       for (int i = 0; i < kSliceElements; ++i) {
         EXPECT_EQ(host_data[i], shard_layer_data[s][l][i])
             << "Mismatch in ws_1 at shard " << s << " (slot " << slot
@@ -686,9 +701,13 @@ TEST_F(WeightSynchronizerFfiTest, NonContiguousShardsInitAndD2hTest) {
   for (const auto& a : assignments) {
     WeightSynchronizerBase* ws = (a.host_idx == 0) ? ws_0 : ws_1;
     for (int l = 0; l < kNumLayers; ++l) {
-      const uint8_t* host_ptr = ws->GetHostBufferPtr(l, a.local_slot);
-      ASSERT_NE(host_ptr, nullptr);
-      const int32_t* host_data = reinterpret_cast<const int32_t*>(host_ptr);
+      TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> host_buf,
+                           std::as_const(*ws)
+                               .GetHostBufferWithLocalIndex(l, a.local_slot)
+                               .Await());
+      ASSERT_GE(host_buf.size(), kSliceElements * sizeof(int32_t));
+      const int32_t* host_data =
+          reinterpret_cast<const int32_t*>(host_buf.data());
       for (int i = 0; i < kSliceElements; ++i) {
         EXPECT_EQ(host_data[i], shard_layer_data[a.global_shard][l][i])
             << "Mismatch at shard " << a.global_shard << " (slot "
@@ -835,9 +854,13 @@ TEST_F(WeightSynchronizerFfiTest, TorusPermutedDeviceIdsInitAndD2hTest) {
   for (const auto& a : assignments) {
     WeightSynchronizerBase* ws = (a.host_idx == 0) ? ws_0 : ws_1;
     for (int l = 0; l < kNumLayers; ++l) {
-      const uint8_t* host_ptr = ws->GetHostBufferPtr(l, a.local_slot);
-      ASSERT_NE(host_ptr, nullptr);
-      const int32_t* host_data = reinterpret_cast<const int32_t*>(host_ptr);
+      TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> host_buf,
+                           std::as_const(*ws)
+                               .GetHostBufferWithLocalIndex(l, a.local_slot)
+                               .Await());
+      ASSERT_GE(host_buf.size(), kSliceElements * sizeof(int32_t));
+      const int32_t* host_data =
+          reinterpret_cast<const int32_t*>(host_buf.data());
       for (int i = 0; i < kSliceElements; ++i) {
         EXPECT_EQ(host_data[i], device_layer_data[a.device_id][l][i])
             << "Mismatch at device " << a.device_id << " (slot " << a.local_slot

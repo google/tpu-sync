@@ -2658,7 +2658,10 @@ TEST_F(WeightSynchronizerTest, GetHostBufferNonContiguousGlobalShards) {
   std::vector<size_t> slot_sizes;
   for (size_t l = 0; l < num_layers; ++l) {
     for (size_t s = 0; s < num_shards; ++s) {
-      slot_ptrs.push_back(ws->GetHostBufferPtr(l, s));
+      TF_ASSERT_OK_AND_ASSIGN(
+          absl::Span<const uint8_t> slot_buf,
+          std::as_const(*ws).GetHostBufferWithLocalIndex(l, s).Await());
+      slot_ptrs.push_back(slot_buf.data());
       slot_sizes.push_back((l * num_shards + s + 1) * 128);
     }
   }
@@ -2679,10 +2682,19 @@ TEST_F(WeightSynchronizerTest, GetHostBufferNonContiguousGlobalShards) {
   uint8_t* ptr_shard4 = shard4_buf.data();
   uint8_t* ptr_shard6 = shard6_buf.data();
 
-  EXPECT_EQ(ptr_shard0, ws->GetHostBufferPtr(0, 0));
-  EXPECT_EQ(ptr_shard2, ws->GetHostBufferPtr(0, 1));
-  EXPECT_EQ(ptr_shard4, ws->GetHostBufferPtr(0, 2));
-  EXPECT_EQ(ptr_shard6, ws->GetHostBufferPtr(0, 3));
+  const WeightSynchronizerBase* const_ws = ws.get();
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> local0,
+                       const_ws->GetHostBufferWithLocalIndex(0, 0).Await());
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> local1,
+                       const_ws->GetHostBufferWithLocalIndex(0, 1).Await());
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> local2,
+                       const_ws->GetHostBufferWithLocalIndex(0, 2).Await());
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> local3,
+                       const_ws->GetHostBufferWithLocalIndex(0, 3).Await());
+  EXPECT_EQ(ptr_shard0, local0.data());
+  EXPECT_EQ(ptr_shard2, local1.data());
+  EXPECT_EQ(ptr_shard4, local2.data());
+  EXPECT_EQ(ptr_shard6, local3.data());
 
   // Ensure all 4 resolved pointers are distinct
   EXPECT_NE(ptr_shard0, ptr_shard2);
@@ -2699,7 +2711,6 @@ TEST_F(WeightSynchronizerTest, GetHostBufferNonContiguousGlobalShards) {
   EXPECT_EQ(shard6_buf.size(), 512);
 
   // Const overloads
-  const WeightSynchronizerBase* const_ws = ws.get();
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> const_shard0_buf,
                        const_ws->GetHostBuffer(0, 0));
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> const_shard2_buf,
@@ -2708,10 +2719,10 @@ TEST_F(WeightSynchronizerTest, GetHostBufferNonContiguousGlobalShards) {
                        const_ws->GetHostBuffer(0, 4));
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> const_shard6_buf,
                        const_ws->GetHostBuffer(0, 6));
-  EXPECT_EQ(const_shard0_buf.data(), ws->GetHostBufferPtr(0, 0));
-  EXPECT_EQ(const_shard2_buf.data(), ws->GetHostBufferPtr(0, 1));
-  EXPECT_EQ(const_shard4_buf.data(), ws->GetHostBufferPtr(0, 2));
-  EXPECT_EQ(const_shard6_buf.data(), ws->GetHostBufferPtr(0, 3));
+  EXPECT_EQ(const_shard0_buf.data(), local0.data());
+  EXPECT_EQ(const_shard2_buf.data(), local1.data());
+  EXPECT_EQ(const_shard4_buf.data(), local2.data());
+  EXPECT_EQ(const_shard6_buf.data(), local3.data());
   EXPECT_EQ(const_shard0_buf.size(), 128);
   EXPECT_EQ(const_shard2_buf.size(), 256);
   EXPECT_EQ(const_shard4_buf.size(), 384);
@@ -2723,10 +2734,10 @@ TEST_F(WeightSynchronizerTest, GetHostBufferNonContiguousGlobalShards) {
   std::memset(ptr_shard4, 0x33, shard4_buf.size());
   std::memset(ptr_shard6, 0x44, shard6_buf.size());
 
-  EXPECT_EQ(ws->GetHostBufferPtr(0, 0)[0], 0x11);
-  EXPECT_EQ(ws->GetHostBufferPtr(0, 1)[0], 0x22);
-  EXPECT_EQ(ws->GetHostBufferPtr(0, 2)[0], 0x33);
-  EXPECT_EQ(ws->GetHostBufferPtr(0, 3)[0], 0x44);
+  EXPECT_EQ(local0[0], 0x11);
+  EXPECT_EQ(local1[0], 0x22);
+  EXPECT_EQ(local2[0], 0x33);
+  EXPECT_EQ(local3[0], 0x44);
 }
 
 TEST_F(WeightSynchronizerTest, GetHostBufferLocalAndGlobalIndices) {
@@ -2744,7 +2755,10 @@ TEST_F(WeightSynchronizerTest, GetHostBufferLocalAndGlobalIndices) {
   std::vector<size_t> slot_sizes;
   for (size_t l = 0; l < num_layers; ++l) {
     for (size_t s = 0; s < num_shards; ++s) {
-      slot_ptrs.push_back(ws->GetHostBufferPtr(l, s));
+      TF_ASSERT_OK_AND_ASSIGN(
+          absl::Span<const uint8_t> slot_buf,
+          std::as_const(*ws).GetHostBufferWithLocalIndex(l, s).Await());
+      slot_ptrs.push_back(slot_buf.data());
       slot_sizes.push_back((l * num_shards + s + 1) * 128);
     }
   }
@@ -2761,10 +2775,21 @@ TEST_F(WeightSynchronizerTest, GetHostBufferLocalAndGlobalIndices) {
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> slot1_buf, ws->GetHostBuffer(0, 1));
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> slot2_buf, ws->GetHostBuffer(0, 2));
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> slot3_buf, ws->GetHostBuffer(0, 3));
-  EXPECT_EQ(slot0_buf.data(), ws->GetHostBufferPtr(0, 0));
-  EXPECT_EQ(slot1_buf.data(), ws->GetHostBufferPtr(0, 1));
-  EXPECT_EQ(slot2_buf.data(), ws->GetHostBufferPtr(0, 2));
-  EXPECT_EQ(slot3_buf.data(), ws->GetHostBufferPtr(0, 3));
+  const WeightSynchronizerBase* const_ws = ws.get();
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> raw0,
+                       const_ws->GetHostBufferWithLocalIndex(0, 0).Await());
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> raw1,
+                       const_ws->GetHostBufferWithLocalIndex(0, 1).Await());
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> raw2,
+                       const_ws->GetHostBufferWithLocalIndex(0, 2).Await());
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> raw3,
+                       const_ws->GetHostBufferWithLocalIndex(0, 3).Await());
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> raw1_2,
+                       const_ws->GetHostBufferWithLocalIndex(1, 2).Await());
+  EXPECT_EQ(slot0_buf.data(), raw0.data());
+  EXPECT_EQ(slot1_buf.data(), raw1.data());
+  EXPECT_EQ(slot2_buf.data(), raw2.data());
+  EXPECT_EQ(slot3_buf.data(), raw3.data());
   EXPECT_EQ(slot0_buf.size(), 128);
   EXPECT_EQ(slot1_buf.size(), 256);
   EXPECT_EQ(slot2_buf.size(), 384);
@@ -2776,22 +2801,21 @@ TEST_F(WeightSynchronizerTest, GetHostBufferLocalAndGlobalIndices) {
                        ws->GetHostBuffer(0, 6));
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> global7_buf,
                        ws->GetHostBuffer(0, 7));
-  EXPECT_EQ(global6_buf.data(), ws->GetHostBufferPtr(0, 2));
-  EXPECT_EQ(global7_buf.data(), ws->GetHostBufferPtr(0, 3));
+  EXPECT_EQ(global6_buf.data(), raw2.data());
+  EXPECT_EQ(global7_buf.data(), raw3.data());
   EXPECT_EQ(global6_buf.size(), 384);
   EXPECT_EQ(global7_buf.size(), 512);
 
   // Const overloads
-  const WeightSynchronizerBase* const_ws = ws.get();
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> const_slot2_buf,
                        const_ws->GetHostBuffer(0, 2));
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> const_slot3_buf,
                        const_ws->GetHostBuffer(0, 3));
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> const_global6_buf,
                        const_ws->GetHostBuffer(1, 6));
-  EXPECT_EQ(const_slot2_buf.data(), ws->GetHostBufferPtr(0, 2));
-  EXPECT_EQ(const_slot3_buf.data(), ws->GetHostBufferPtr(0, 3));
-  EXPECT_EQ(const_global6_buf.data(), ws->GetHostBufferPtr(1, 2));
+  EXPECT_EQ(const_slot2_buf.data(), raw2.data());
+  EXPECT_EQ(const_slot3_buf.data(), raw3.data());
+  EXPECT_EQ(const_global6_buf.data(), raw1_2.data());
   EXPECT_EQ(const_slot2_buf.size(), 384);
   EXPECT_EQ(const_slot3_buf.size(), 512);
   EXPECT_EQ(const_global6_buf.size(), 896);
@@ -2809,7 +2833,10 @@ TEST_F(WeightSynchronizerTest, GetHostBufferMapsGlobalShardIndices) {
   std::vector<size_t> slot_sizes;
   for (size_t l = 0; l < num_layers; ++l) {
     for (size_t s = 0; s < num_shards; ++s) {
-      slot_ptrs.push_back(ws->GetHostBufferPtr(l, s));
+      TF_ASSERT_OK_AND_ASSIGN(
+          absl::Span<const uint8_t> slot_buf,
+          std::as_const(*ws).GetHostBufferWithLocalIndex(l, s).Await());
+      slot_ptrs.push_back(slot_buf.data());
       slot_sizes.push_back((l * num_shards + s + 1) * 128);
     }
   }
@@ -2819,11 +2846,15 @@ TEST_F(WeightSynchronizerTest, GetHostBufferMapsGlobalShardIndices) {
 
   // Global shard 6 is local slot 3 (modulo 4 would give slot 2).
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> buffer, ws->GetHostBuffer(1, 6));
-  EXPECT_EQ(buffer.data(), ws->GetHostBufferPtr(1, 3));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> local_slot3,
+                       const_ws.GetHostBufferWithLocalIndex(1, 3).Await());
+  EXPECT_EQ(buffer.data(), local_slot3.data());
   EXPECT_EQ(buffer.size(), 1024);
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> const_buffer,
                        const_ws.GetHostBuffer(1, 2));
-  EXPECT_EQ(const_buffer.data(), ws->GetHostBufferPtr(1, 1));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> local_slot1,
+                       const_ws.GetHostBufferWithLocalIndex(1, 1).Await());
+  EXPECT_EQ(const_buffer.data(), local_slot1.data());
   EXPECT_EQ(const_buffer.size(), 768);
 }
 
@@ -2835,21 +2866,39 @@ TEST_F(WeightSynchronizerTest, GetHostBufferMapsLocalShardIndices) {
                        WeightSynchronizerBase::Create(
                            num_layers, num_shards, slice_size,
                            /*local_port=*/0, /*host_blocks_to_allocate=*/1));
+  const WeightSynchronizerBase& const_ws = *ws;
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> local0,
+                       const_ws.GetHostBufferWithLocalIndex(0, 0).Await());
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> local1,
+                       const_ws.GetHostBufferWithLocalIndex(0, 1).Await());
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> local2,
+                       const_ws.GetHostBufferWithLocalIndex(0, 2).Await());
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> local3,
+                       const_ws.GetHostBufferWithLocalIndex(0, 3).Await());
   ws->SetExternalHostPointers(
-      {ws->GetHostBufferPtr(0, 0), ws->GetHostBufferPtr(0, 1),
-       ws->GetHostBufferPtr(0, 2), ws->GetHostBufferPtr(0, 3)},
+      {local0.data(), local1.data(), local2.data(), local3.data()},
       {128, 256, 384, 512});
   ws->SetLocalShardIndices({3, 2, 1, 0});
-  const WeightSynchronizerBase& const_ws = *ws;
 
   // Shard 3 is listed at local slot 0 (modulo 4 would give slot 3).
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> buffer, ws->GetHostBuffer(0, 3));
-  EXPECT_EQ(buffer.data(), ws->GetHostBufferPtr(0, 0));
+  EXPECT_EQ(buffer.data(), local0.data());
   EXPECT_EQ(buffer.size(), 128);
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> const_buffer,
                        const_ws.GetHostBuffer(0, 0));
-  EXPECT_EQ(const_buffer.data(), ws->GetHostBufferPtr(0, 3));
+  EXPECT_EQ(const_buffer.data(), local3.data());
   EXPECT_EQ(const_buffer.size(), 512);
+
+  // GetHostBufferWithLocalIndex ignores
+  // SetLocalShardIndices/SetGlobalShardIndices.
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> direct0,
+                       const_ws.GetHostBufferWithLocalIndex(0, 0).Await());
+  EXPECT_EQ(direct0.data(), local0.data());
+  EXPECT_EQ(direct0.size(), 128);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> direct3,
+                       ws->GetHostBufferWithLocalIndex(0, 3).Await());
+  EXPECT_EQ(direct3.data(), local3.data());
+  EXPECT_EQ(direct3.size(), 512);
 }
 
 TEST_F(WeightSynchronizerTest, GetHostBufferLayerOutOfRange) {
@@ -2878,10 +2927,12 @@ TEST_F(WeightSynchronizerTest, GetHostBufferMissingBufferIsFailedPrecondition) {
                            num_layers, num_shards, slice_size,
                            /*local_port=*/0, /*host_blocks_to_allocate=*/1));
   ws->SetGlobalShardIndices({4, 6});
-  // Local slot 0 (global shard 4) loses its host buffer; slot 1 keeps its own.
-  ws->SetExternalHostPointers({nullptr, ws->GetHostBufferPtr(0, 1)},
-                              {slice_size, slice_size});
   const WeightSynchronizerBase& const_ws = *ws;
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> local1,
+                       const_ws.GetHostBufferWithLocalIndex(0, 1).Await());
+  // Local slot 0 (global shard 4) loses its host buffer; slot 1 keeps its own.
+  ws->SetExternalHostPointers({nullptr, local1.data()},
+                              {slice_size, slice_size});
 
   ABSL_EXPECT_OK(ws->GetHostBuffer(0, 6));
   EXPECT_THAT(ws->GetHostBuffer(0, 4),
@@ -2890,6 +2941,12 @@ TEST_F(WeightSynchronizerTest, GetHostBufferMissingBufferIsFailedPrecondition) {
                   ::testing::HasSubstr("layer 0 shard 4 has no host buffer")));
   EXPECT_THAT(const_ws.GetHostBuffer(0, 4),
               ::absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition));
+  EXPECT_THAT(ws->GetHostBufferWithLocalIndex(0, 0).Await(),
+              ::absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition));
+  EXPECT_THAT(const_ws.GetHostBufferWithLocalIndex(0, 0).Await(),
+              ::absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition));
+  EXPECT_THAT(const_ws.GetHostBufferWithLocalIndex(0, 2).Await(),
+              ::absl_testing::StatusIs(absl::StatusCode::kOutOfRange));
 }
 
 TEST_F(WeightSynchronizerTest,
@@ -2951,11 +3008,15 @@ TEST_F(WeightSynchronizerTest,
                        WeightSynchronizerBase::Create(
                            num_layers, num_shards, slice_size,
                            /*local_port=*/0, /*host_blocks_to_allocate=*/1));
-  const uint8_t* ptr0 = ws->GetHostBufferPtr(0, 0);
-  const uint8_t* ptr1 = ws->GetHostBufferPtr(0, 1);
+  const WeightSynchronizerBase& const_ws = *ws;
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> buf0,
+                       const_ws.GetHostBufferWithLocalIndex(0, 0).Await());
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> buf1,
+                       const_ws.GetHostBufferWithLocalIndex(0, 1).Await());
+  const uint8_t* ptr0 = buf0.data();
+  const uint8_t* ptr1 = buf1.data();
   ws->SetExternalHostPointers({ptr0, ptr1}, {128, 256});
   ws->SetGlobalShardIndices({4, 6});
-  const WeightSynchronizerBase& const_ws = *ws;
 
   // Empty local_shard_indices_ preserves identity [0, 2) alongside {4, 6}.
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> local0, ws->GetHostBuffer(0, 0));
@@ -2989,8 +3050,14 @@ TEST_F(WeightSynchronizerTest,
                        WeightSynchronizerBase::Create(
                            num_layers, num_shards, slice_size,
                            /*local_port=*/0, /*host_blocks_to_allocate=*/1));
-  const uint8_t* ptr0 = ws->GetHostBufferPtr(0, 0);
-  const uint8_t* ptr1 = ws->GetHostBufferPtr(0, 1);
+  TF_ASSERT_OK_AND_ASSIGN(
+      absl::Span<const uint8_t> buf0,
+      std::as_const(*ws).GetHostBufferWithLocalIndex(0, 0).Await());
+  TF_ASSERT_OK_AND_ASSIGN(
+      absl::Span<const uint8_t> buf1,
+      std::as_const(*ws).GetHostBufferWithLocalIndex(0, 1).Await());
+  const uint8_t* ptr0 = buf0.data();
+  const uint8_t* ptr1 = buf1.data();
   ws->SetExternalHostPointers({ptr0, ptr1}, {128, 256});
   ws->SetLocalShardIndices({2, 3});
 
@@ -3030,8 +3097,14 @@ TEST_F(WeightSynchronizerTest,
                        WeightSynchronizerBase::Create(
                            num_layers, num_shards, slice_size,
                            /*local_port=*/0, /*host_blocks_to_allocate=*/1));
-  const uint8_t* ptr0 = ws->GetHostBufferPtr(0, 0);
-  const uint8_t* ptr1 = ws->GetHostBufferPtr(0, 1);
+  TF_ASSERT_OK_AND_ASSIGN(
+      absl::Span<const uint8_t> buf0,
+      std::as_const(*ws).GetHostBufferWithLocalIndex(0, 0).Await());
+  TF_ASSERT_OK_AND_ASSIGN(
+      absl::Span<const uint8_t> buf1,
+      std::as_const(*ws).GetHostBufferWithLocalIndex(0, 1).Await());
+  const uint8_t* ptr0 = buf0.data();
+  const uint8_t* ptr1 = buf1.data();
   ws->SetExternalHostPointers({ptr0, ptr1}, {128, 256});
 
   ws->SetLocalShardIndices({0, -1});
@@ -3119,10 +3192,12 @@ TEST_F(WeightSynchronizerTest,
   ASSERT_OK(ws_dest->WaitForTransferCompletion(request.uuid()));
 
   for (size_t s = 0; s < num_shards; ++s) {
-    const uint8_t* dst_ptr = ws_dest->GetHostBufferPtr(0, s);
-    ASSERT_NE(dst_ptr, nullptr);
+    TF_ASSERT_OK_AND_ASSIGN(
+        absl::Span<const uint8_t> dst_buf,
+        std::as_const(*ws_dest).GetHostBufferWithLocalIndex(0, s).Await());
+    ASSERT_EQ(dst_buf.size(), slice_byte_size);
     for (size_t b = 0; b < slice_byte_size; ++b) {
-      EXPECT_EQ(dst_ptr[b], fill_bytes[s])
+      EXPECT_EQ(dst_buf[b], fill_bytes[s])
           << "Mismatch at slot " << s << " byte " << b;
     }
   }
@@ -3186,10 +3261,12 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedLocalShardIndicesFallback) {
   ASSERT_OK(ws_dest->WaitForTransferCompletion(request.uuid()));
 
   for (size_t s = 0; s < num_shards; ++s) {
-    const uint8_t* dst_ptr = ws_dest->GetHostBufferPtr(0, s);
-    ASSERT_NE(dst_ptr, nullptr);
+    TF_ASSERT_OK_AND_ASSIGN(
+        absl::Span<const uint8_t> dst_buf,
+        std::as_const(*ws_dest).GetHostBufferWithLocalIndex(0, s).Await());
+    ASSERT_EQ(dst_buf.size(), slice_byte_size);
     for (size_t b = 0; b < slice_byte_size; ++b) {
-      EXPECT_EQ(dst_ptr[b], fill_bytes[s])
+      EXPECT_EQ(dst_buf[b], fill_bytes[s])
           << "Mismatch at slot " << s << " byte " << b;
     }
   }
@@ -3245,8 +3322,10 @@ TEST_F(WeightSynchronizerTest,
   ASSERT_OK(ws_source->PushWeightsResharded(request));
   ASSERT_OK(ws_dest->WaitForTransferCompletion(request.uuid()));
 
-  const uint8_t* out = ws_dest->GetHostBufferPtr(0, 0);
-  ASSERT_NE(out, nullptr);
+  TF_ASSERT_OK_AND_ASSIGN(
+      absl::Span<const uint8_t> out,
+      std::as_const(*ws_dest).GetHostBufferWithLocalIndex(0, 0).Await());
+  ASSERT_EQ(out.size(), slice_byte_size);
   for (size_t b = 0; b < slice_byte_size; ++b) {
     EXPECT_EQ(out[b], 0x5A) << "Mismatch at byte " << b;
   }
@@ -3284,12 +3363,14 @@ TEST_F(WeightSynchronizerTest,
 
   const uint8_t fill_bytes[4] = {0x11, 0x22, 0x33, 0x44};
   for (size_t s = 0; s < num_shards; ++s) {
-    uint8_t* src_ptr = const_cast<uint8_t*>(ws_source->GetHostBufferPtr(0, s));
-    uint8_t* dst_ptr = const_cast<uint8_t*>(ws_dest->GetHostBufferPtr(0, s));
-    ASSERT_NE(src_ptr, nullptr);
-    ASSERT_NE(dst_ptr, nullptr);
-    std::memset(src_ptr, fill_bytes[s], slice_byte_size);
-    std::memset(dst_ptr, 0x00, slice_byte_size);
+    TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> src_buf,
+                         ws_source->GetHostBufferWithLocalIndex(0, s).Await());
+    TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> dst_buf,
+                         ws_dest->GetHostBufferWithLocalIndex(0, s).Await());
+    ASSERT_EQ(src_buf.size(), slice_byte_size);
+    ASSERT_EQ(dst_buf.size(), slice_byte_size);
+    std::memset(src_buf.data(), fill_bytes[s], slice_byte_size);
+    std::memset(dst_buf.data(), 0x00, slice_byte_size);
   }
 
   tpu_sync::rpc::StartTransferRequest request;
@@ -3314,10 +3395,12 @@ TEST_F(WeightSynchronizerTest,
   ASSERT_OK(ws_dest->WaitForTransferCompletion(request.uuid()));
 
   for (size_t s = 0; s < num_shards; ++s) {
-    const uint8_t* dst_ptr = ws_dest->GetHostBufferPtr(0, s);
-    ASSERT_NE(dst_ptr, nullptr);
+    TF_ASSERT_OK_AND_ASSIGN(
+        absl::Span<const uint8_t> dst_buf,
+        std::as_const(*ws_dest).GetHostBufferWithLocalIndex(0, s).Await());
+    ASSERT_EQ(dst_buf.size(), slice_byte_size);
     for (size_t b = 0; b < slice_byte_size; ++b) {
-      EXPECT_EQ(dst_ptr[b], fill_bytes[s])
+      EXPECT_EQ(dst_buf[b], fill_bytes[s])
           << "Mismatch at slot " << s << " byte " << b;
     }
   }
@@ -3352,12 +3435,14 @@ TEST_F(WeightSynchronizerTest,
 
   const uint8_t fill_bytes[4] = {0xAA, 0xBB, 0xCC, 0xDD};
   for (size_t s = 0; s < num_shards; ++s) {
-    uint8_t* src_ptr = const_cast<uint8_t*>(ws_source->GetHostBufferPtr(0, s));
-    uint8_t* dst_ptr = const_cast<uint8_t*>(ws_dest->GetHostBufferPtr(0, s));
-    ASSERT_NE(src_ptr, nullptr);
-    ASSERT_NE(dst_ptr, nullptr);
-    std::memset(src_ptr, fill_bytes[s], slice_byte_size);
-    std::memset(dst_ptr, 0x00, slice_byte_size);
+    TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> src_buf,
+                         ws_source->GetHostBufferWithLocalIndex(0, s).Await());
+    TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> dst_buf,
+                         ws_dest->GetHostBufferWithLocalIndex(0, s).Await());
+    ASSERT_EQ(src_buf.size(), slice_byte_size);
+    ASSERT_EQ(dst_buf.size(), slice_byte_size);
+    std::memset(src_buf.data(), fill_bytes[s], slice_byte_size);
+    std::memset(dst_buf.data(), 0x00, slice_byte_size);
   }
 
   tpu_sync::rpc::StartTransferRequest request;
@@ -3384,10 +3469,12 @@ TEST_F(WeightSynchronizerTest,
   ASSERT_OK(ws_dest->WaitForTransferCompletion(request.uuid()));
 
   for (size_t s = 0; s < num_shards; ++s) {
-    const uint8_t* dst_ptr = ws_dest->GetHostBufferPtr(0, s);
-    ASSERT_NE(dst_ptr, nullptr);
+    TF_ASSERT_OK_AND_ASSIGN(
+        absl::Span<const uint8_t> dst_buf,
+        std::as_const(*ws_dest).GetHostBufferWithLocalIndex(0, s).Await());
+    ASSERT_EQ(dst_buf.size(), slice_byte_size);
     for (size_t b = 0; b < slice_byte_size; ++b) {
-      EXPECT_EQ(dst_ptr[b], fill_bytes[s])
+      EXPECT_EQ(dst_buf[b], fill_bytes[s])
           << "Mismatch at slot " << s << " byte " << b;
     }
   }
@@ -3443,13 +3530,15 @@ TEST_F(WeightSynchronizerTest,
 
   for (int step = 0; step < 2; ++step) {
     for (size_t s = 0; s < num_shards; ++s) {
-      uint8_t* src_ptr =
-          const_cast<uint8_t*>(ws_source->GetHostBufferPtr(0, s));
-      uint8_t* dst_ptr = const_cast<uint8_t*>(ws_dest->GetHostBufferPtr(0, s));
-      ASSERT_NE(src_ptr, nullptr);
-      ASSERT_NE(dst_ptr, nullptr);
-      std::memset(src_ptr, step_patterns[step][s], slice_byte_size);
-      std::memset(dst_ptr, 0x00, slice_byte_size);
+      TF_ASSERT_OK_AND_ASSIGN(
+          absl::Span<uint8_t> src_buf,
+          ws_source->GetHostBufferWithLocalIndex(0, s).Await());
+      TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> dst_buf,
+                           ws_dest->GetHostBufferWithLocalIndex(0, s).Await());
+      ASSERT_EQ(src_buf.size(), slice_byte_size);
+      ASSERT_EQ(dst_buf.size(), slice_byte_size);
+      std::memset(src_buf.data(), step_patterns[step][s], slice_byte_size);
+      std::memset(dst_buf.data(), 0x00, slice_byte_size);
     }
 
     request.set_uuid(step_uuids[step]);
@@ -3459,10 +3548,12 @@ TEST_F(WeightSynchronizerTest,
     ASSERT_OK(ws_dest->WaitForTransferCompletion(request.uuid()));
 
     for (size_t s = 0; s < num_shards; ++s) {
-      const uint8_t* dst_ptr = ws_dest->GetHostBufferPtr(0, s);
-      ASSERT_NE(dst_ptr, nullptr);
+      TF_ASSERT_OK_AND_ASSIGN(
+          absl::Span<const uint8_t> dst_buf,
+          std::as_const(*ws_dest).GetHostBufferWithLocalIndex(0, s).Await());
+      ASSERT_EQ(dst_buf.size(), slice_byte_size);
       for (size_t b = 0; b < slice_byte_size; ++b) {
-        EXPECT_EQ(dst_ptr[b], step_patterns[step][s])
+        EXPECT_EQ(dst_buf[b], step_patterns[step][s])
             << "Step " << step << " mismatch at slot " << s << " byte " << b;
       }
     }
@@ -4376,8 +4467,12 @@ void ExpectErr(const absl::Status& s, absl::StatusCode code,
 
 std::vector<uint8_t> ReadHostLayerBytes(const WeightSynchronizerBase& ws,
                                         size_t layer_idx, size_t bytes) {
-  const uint8_t* ptr = ws.GetHostBufferPtr(layer_idx, 0);
-  return std::vector<uint8_t>(ptr, ptr + bytes);
+  absl::StatusOr<absl::Span<const uint8_t>> buf =
+      ws.GetHostBufferWithLocalIndex(layer_idx, 0).Await();
+  EXPECT_TRUE(buf.ok()) << buf.status();
+  if (!buf.ok()) return {};
+  return std::vector<uint8_t>(buf->data(),
+                              buf->data() + std::min(bytes, buf->size()));
 }
 
 std::future<absl::Status> PushAsync(WeightSynchronizerBase& ws,
@@ -4461,25 +4556,30 @@ TEST_F(WeightSynchronizerTest,
   constexpr absl::string_view kErr = "simulated_d2h_dma_failure_layer_1";
   g1.promise.Set(absl::UnavailableError(kErr));
   ExpectErr(d2h_future.Await(), absl::StatusCode::kUnavailable, {kErr});
-  ABSL_EXPECT_OK(source->WaitForExplicitD2h(0));
-  TF_ASSERT_OK_AND_ASSIGN(const uint8_t* ptr0,
-                       source->WaitAndGetHostBufferPtr(0, 0));
-  EXPECT_EQ(ptr0, source->GetHostBufferPtr(0, 0));
-  ExpectErr(source->WaitForExplicitD2h(1), absl::StatusCode::kUnavailable,
-            {kErr});
-  ExpectErr(source->WaitAndGetHostBufferPtr(1, 0).status(),
+  TF_ASSERT_OK_AND_ASSIGN(
+      absl::Span<const uint8_t> buf0,
+      std::as_const(*source).GetHostBufferWithLocalIndex(0, 0).Await());
+  EXPECT_EQ(buf0.size(), kBytes);
+  EXPECT_EQ(buf0.front(), 0x33);
+  ExpectErr(
+      std::as_const(*source).GetHostBufferWithLocalIndex(1, 0).Await().status(),
+      absl::StatusCode::kUnavailable, {kErr});
+  ExpectErr(source->GetHostBufferWithLocalIndex(1, 0).Await().status(),
             absl::StatusCode::kUnavailable, {kErr});
-  ExpectErr(source->WaitAndGetHostBufferPtr(2, 0).status(),
-            absl::StatusCode::kOutOfRange, {"layer_idx=2", "num_layers=2"});
+  ExpectErr(
+      std::as_const(*source).GetHostBufferWithLocalIndex(2, 0).Await().status(),
+      absl::StatusCode::kOutOfRange, {"layer_idx=2", "num_layers=2"});
   ExpectErr(source->H2d().status(), absl::StatusCode::kUnavailable, {kErr});
   ExpectErr(source->PushWeightsResharded(
                 MakeSimplePushRequest(92002, true, *dest, kNumLayers, kBytes)),
             absl::StatusCode::kUnavailable, {kErr});
 
-  // Positive recovery: a clean D2h() restores WaitAndGetHostBufferPtr/H2d/push.
+  // Positive recovery: a clean D2h() restores
+  // GetHostBufferWithLocalIndex/H2d/push.
   TF_ASSERT_OK_AND_ASSIGN(auto recovery_d2h, source->D2h());
   ABSL_ASSERT_OK(recovery_d2h.Await());
-  ABSL_EXPECT_OK(source->WaitAndGetHostBufferPtr(1, 0));
+  ABSL_EXPECT_OK(
+      std::as_const(*source).GetHostBufferWithLocalIndex(1, 0).Await());
   TF_ASSERT_OK_AND_ASSIGN(auto recovery_h2d, source->H2d());
   ABSL_ASSERT_OK(recovery_h2d.Await());
   ABSL_ASSERT_OK(dest->RegisterExpectedChunks(92003, 2));
@@ -4583,24 +4683,18 @@ TEST_F(WeightSynchronizerTest,
   TF_ASSERT_OK_AND_ASSIGN(auto source, CreateU8Source({raw}));
   TF_ASSERT_OK_AND_ASSIGN(auto dest,
                        WeightSynchronizerBase::Create(1, 1, kBytes, 0));
-  // Part 1a: WaitAndGetHostBufferPtr() waits for an in-flight explicit D2h().
+  // Part 1a: GetHostBufferWithLocalIndex() waits for an in-flight explicit
+  // D2h() before resolving.
   auto g1 = raw->ArmGate();
   TF_ASSERT_OK_AND_ASSIGN(auto first_d2h, source->D2h());
   g1.started->WaitForNotification();
   EXPECT_EQ(raw->d2h_call_count(), 1u);
-  absl::Notification host_read_done;
-  uint8_t observed_first_byte = 0;
-  std::thread host_reader([&]() {
-    TF_ASSERT_OK_AND_ASSIGN(const uint8_t* ptr,
-                         source->WaitAndGetHostBufferPtr(0, 0));
-    observed_first_byte = ptr[0];
-    host_read_done.Notify();
-  });
-  EXPECT_FALSE(
-      host_read_done.WaitForNotificationWithTimeout(absl::Milliseconds(50)));
+  xla::Future<absl::Span<const uint8_t>> host_buf_future =
+      std::as_const(*source).GetHostBufferWithLocalIndex(0, 0);
+  EXPECT_FALSE(host_buf_future.IsReady());
   g1.promise.Set(absl::OkStatus());
-  host_reader.join();
-  EXPECT_EQ(observed_first_byte, 0x11);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<const uint8_t> buf, host_buf_future.Await());
+  EXPECT_EQ(buf[0], 0x11);
   ABSL_ASSERT_OK(first_d2h.Await());
 
   // Part 1b: A second explicit D2h() serializes behind the in-flight D2h().
@@ -4623,7 +4717,10 @@ TEST_F(WeightSynchronizerTest,
   ABSL_ASSERT_OK(second_d2h.Await());
   ABSL_ASSERT_OK(third_d2h_done.get());
   EXPECT_EQ(raw->d2h_call_count(), 3u);
-  EXPECT_EQ(source->GetHostBufferPtr(0, 0)[0], 0x33);
+  TF_ASSERT_OK_AND_ASSIGN(
+      absl::Span<const uint8_t> after_d2h,
+      std::as_const(*source).GetHostBufferWithLocalIndex(0, 0).Await());
+  EXPECT_EQ(after_d2h[0], 0x33);
 
   // Part 2: In-push D2H (skip_d2h=false) and unawaited D2h() + BindWeights()
   // serialize behind explicit D2h().
@@ -4650,7 +4747,10 @@ TEST_F(WeightSynchronizerTest,
   ABSL_ASSERT_OK(in_push_done.get());
   ABSL_ASSERT_OK(dest->WaitForTransferCompletion(kInPushUuid));
   EXPECT_EQ(raw->d2h_call_count(), 5u);
-  EXPECT_EQ(dest->GetHostBufferPtr(0, 0)[0], 0x55);
+  TF_ASSERT_OK_AND_ASSIGN(
+      absl::Span<const uint8_t> after_push,
+      std::as_const(*dest).GetHostBufferWithLocalIndex(0, 0).Await());
+  EXPECT_EQ(after_push[0], 0x55);
   // Dropping the returned future without awaiting is still awaited by rebind.
   (void)source->D2h();
   ABSL_ASSERT_OK(source->BindWeights({{GatedRawBuffer::MakeU8Handle(raw)}}));
@@ -4755,8 +4855,14 @@ TEST_F(WeightSynchronizerTest,
     source->UnbindWeights();
     ABSL_ASSERT_OK(push_fut.get());
     ABSL_ASSERT_OK(dest->WaitForTransferCompletion(uuid));
-    EXPECT_EQ(dest->GetHostBufferPtr(0, 0)[0], v0);
-    EXPECT_EQ(dest->GetHostBufferPtr(1, 0)[0], v1);
+    TF_ASSERT_OK_AND_ASSIGN(
+        absl::Span<const uint8_t> dst0,
+        std::as_const(*dest).GetHostBufferWithLocalIndex(0, 0).Await());
+    TF_ASSERT_OK_AND_ASSIGN(
+        absl::Span<const uint8_t> dst1,
+        std::as_const(*dest).GetHostBufferWithLocalIndex(1, 0).Await());
+    EXPECT_EQ(dst0[0], v0);
+    EXPECT_EQ(dst1[0], v1);
   }
 }
 

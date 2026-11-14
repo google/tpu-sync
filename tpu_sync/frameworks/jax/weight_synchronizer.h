@@ -24,6 +24,8 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/types/span.h"
+#include "xla/future.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #ifndef WITHOUT_PYTHON
@@ -70,11 +72,13 @@ class WeightSynchronizer {
   weight_sync::WeightSyncMetrics GetMetrics() const;
   void ResetMetrics();
 
-  const uint8_t* GetHostBufferPtr(size_t layer_idx, size_t shard_idx) const;
-  // Returns the host staging buffer size of `(layer_idx, shard_idx)`, with the
-  // error contract of `WeightSynchronizerBase::GetHostBuffer()`.
-  absl::StatusOr<size_t> GetHostBufferSize(size_t layer_idx,
-                                           size_t shard_idx) const;
+  // Returns the local host staging buffer future of (|layer_idx|,
+  // |local_shard_idx|), with the contract of
+  // `WeightSynchronizerBase::GetHostBufferWithLocalIndex()`.
+  xla::Future<absl::Span<const uint8_t>> GetHostBufferWithLocalIndex(
+      size_t layer_idx, size_t local_shard_idx) const;
+  xla::Future<absl::Span<uint8_t>> GetHostBufferWithLocalIndex(
+      size_t layer_idx, size_t local_shard_idx);
   std::optional<int> local_port() const;
   std::optional<int> listener_port() const;
   bool is_listener_active() const;

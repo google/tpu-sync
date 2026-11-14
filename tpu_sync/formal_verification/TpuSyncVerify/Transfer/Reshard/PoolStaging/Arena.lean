@@ -23,8 +23,8 @@ structure Lease where
 
 /-- Look up the arena slot assigned to `blockId` in `lease`
 (`cur->slot_by_block.contains(block_id)` in `KVCacheManagerBase::AcquirePoolStagingLease`,
-`lease->slot_by_block.find(block_id)` in `KVCacheManagerBase::PoolBlockHostBase` and
-`KVCacheManagerBase::CopyPoolBlocks`, and `staging_lease->slot_by_block.find(block_id)` in
+`lease->slot_by_block.find(block_id)` in `KVCacheManagerBase::CopyPoolBlocks`, and
+`staging_lease->slot_by_block.find(block_id)` in
 `KVCacheManagerBase::GetBlockChunks`). -/
 def Lease.lookupSlot (l : Lease) (blockId : Nat) : Option Nat :=
   (l.slotByBlock.find? (fun p => p.1 == blockId)).map Prod.snd
@@ -54,8 +54,7 @@ def Arena.lookupLease (a : Arena) (uuid : Nat) : Option Lease :=
   (a.leases.find? (fun p => p.1 == uuid)).map Prod.snd
 
 /-- Look up the slot assigned to `(uuid, blockId)` on `a`
-(`KVCacheManagerBase::PoolBlockHostBase` / `KVCacheManagerBase::CopyPoolBlocks` /
-`KVCacheManagerBase::GetBlockChunks`). -/
+(`KVCacheManagerBase::CopyPoolBlocks` / `KVCacheManagerBase::GetBlockChunks`). -/
 def Arena.resolveBlockSlot (a : Arena) (uuid blockId : Nat) : Option Nat :=
   match a.lookupLease uuid with
   | none => none

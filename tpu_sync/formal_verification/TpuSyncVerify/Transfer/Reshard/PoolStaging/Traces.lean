@@ -104,7 +104,7 @@ def poolStagingCapacity (maxPoolBlocks : Nat) (boundedSlots : Option Nat) : Nat 
   boundedSlots.getD maxPoolBlocks
 
 /-- Remote address (`raddr`) resolution on sender `KVCacheManagerBase::GetBlockChunks`
-(`RemoteAddress`) vs. receiver `KVCacheManagerBase::PoolBlockHostBase`
+(`RemoteAddress`) vs. receiver `KVCacheManagerBase::CopyPoolBlocks`
 (`PoolStagingTest.SenderRaddrMatchesReceiverPointer`,
 `PoolStagingTest.SenderRaddrUsesReceiverLeaseSlot`):
 - On full-mirror storage (`arena = none`), `dstBlock < numBlocks` resolves to

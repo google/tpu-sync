@@ -679,14 +679,14 @@ raiden::PjRtCopyFuture RunOnCopySuccess(raiden::PjRtCopyFuture copy,
 
 void WeightSynchronizerBase::ClearExplicitD2hState() {
   absl::MutexLock lock(explicit_d2h_mu_);
-  explicit_d2h_ready_.assign(num_layers_, nullptr);
+  explicit_d2h_ready_.assign(num_layers_, xla::Future<>());
   explicit_d2h_skip_tiling_.assign(num_layers_, std::nullopt);
 }
 
 void WeightSynchronizerBase::ClearExplicitD2hLayer(size_t layer_idx) {
   absl::MutexLock lock(explicit_d2h_mu_);
   if (layer_idx < explicit_d2h_ready_.size()) {
-    explicit_d2h_ready_[layer_idx] = nullptr;
+    explicit_d2h_ready_[layer_idx] = xla::Future<>();
   }
   if (layer_idx < explicit_d2h_skip_tiling_.size()) {
     explicit_d2h_skip_tiling_[layer_idx] = std::nullopt;
@@ -729,51 +729,95 @@ absl::Status WeightSynchronizerBase::CheckNoActiveH2hPushes(
       "next sync."));
 }
 
-absl::Status WeightSynchronizerBase::WaitForExplicitD2h(
+xla::Future<> WeightSynchronizerBase::ExplicitD2hReadyFuture(
     size_t layer_idx) const {
-  std::shared_ptr<LayerTileReady> ready;
-  {
-    absl::MutexLock lock(explicit_d2h_mu_);
-    if (layer_idx < explicit_d2h_ready_.size()) {
-      ready = explicit_d2h_ready_[layer_idx];
-    }
+  absl::MutexLock lock(explicit_d2h_mu_);
+  if (layer_idx < explicit_d2h_ready_.size()) {
+    return explicit_d2h_ready_[layer_idx];
   }
-  if (ready != nullptr) {
-    return ready->Wait();
-  }
-  return absl::OkStatus();
+  return xla::Future<>();
 }
 
 absl::Status WeightSynchronizerBase::WaitForAllExplicitD2h() const {
-  std::vector<std::shared_ptr<LayerTileReady>> ready_list;
+  std::vector<xla::Future<>> ready_list;
   {
     absl::MutexLock lock(explicit_d2h_mu_);
     ready_list = explicit_d2h_ready_;
   }
-  for (const std::shared_ptr<LayerTileReady>& ready : ready_list) {
-    if (ready != nullptr) {
-      ABSL_RETURN_IF_ERROR(ready->Wait());
+  for (const xla::Future<>& ready : ready_list) {
+    if (ready.IsValid()) {
+      ABSL_RETURN_IF_ERROR(ready.Await());
     }
   }
   return absl::OkStatus();
 }
 
-absl::StatusOr<const uint8_t*> WeightSynchronizerBase::WaitAndGetHostBufferPtr(
-    size_t layer_idx, size_t shard_idx) const {
-  if (layer_idx >= num_layers_ || shard_idx >= num_shards_) {
+namespace {
+
+absl::Status ValidateLocalShardIndex(const tpu_raiden::StagingArena& layers,
+                                     size_t layer_idx, size_t local_shard_idx) {
+  if (layer_idx >= layers.size()) {
     return absl::OutOfRangeError(
         absl::StrCat("Host buffer index out of range: layer_idx=", layer_idx,
-                     " (num_layers=", num_layers_, "), shard_idx=", shard_idx,
-                     " (num_shards=", num_shards_, ")"));
+                     " (num_layers=", layers.size(),
+                     "), local_shard_idx=", local_shard_idx));
   }
-  ABSL_RETURN_IF_ERROR(WaitForExplicitD2h(layer_idx));
-  const uint8_t* host_ptr = layers_[layer_idx].shards[shard_idx].host_ptr;
-  if (host_ptr == nullptr) {
-    return absl::InternalError(
-        absl::StrCat("Host buffer pointer is null for layer_idx=", layer_idx,
-                     ", shard_idx=", shard_idx));
+  if (local_shard_idx >= layers[layer_idx].shards.size()) {
+    return absl::OutOfRangeError(
+        absl::StrCat("Host buffer index out of range: layer_idx=", layer_idx,
+                     ", local_shard_idx=", local_shard_idx,
+                     " (num_shards=", layers[layer_idx].shards.size(), ")"));
   }
-  return host_ptr;
+  return absl::OkStatus();
+}
+
+template <typename Byte>
+xla::Future<absl::Span<Byte>> MakeLocalHostBufferFuture(
+    const tpu_raiden::StagingArena& layers, size_t layer_idx,
+    size_t local_shard_idx,
+    absl::AnyInvocable<xla::Future<>() const> get_ready) {
+  if (absl::Status status =
+          ValidateLocalShardIndex(layers, layer_idx, local_shard_idx);
+      !status.ok()) {
+    return xla::Future<absl::Span<Byte>>(std::move(status));
+  }
+  const tpu_raiden::ShardBufferInfoBase& shard =
+      layers[layer_idx].shards[local_shard_idx];
+  if (shard.host_ptr == nullptr) {
+    return xla::Future<absl::Span<Byte>>(absl::FailedPreconditionError(
+        absl::StrCat("layer ", layer_idx, " local shard ", local_shard_idx,
+                     " has no host buffer")));
+  }
+  absl::Span<Byte> span(const_cast<Byte*>(shard.host_ptr), shard.host_size);
+  xla::Future<> ready = get_ready();
+  if (!ready.IsValid()) {
+    return xla::Future<absl::Span<Byte>>(span);
+  }
+  if (ready.IsReady()) {
+    const absl::Status& status = ready.Await();
+    return status.ok() ? xla::Future<absl::Span<Byte>>(span)
+                       : xla::Future<absl::Span<Byte>>(status);
+  }
+  return ready.MapTo(span);
+}
+
+}  // namespace
+
+xla::Future<absl::Span<const uint8_t>>
+WeightSynchronizerBase::GetHostBufferWithLocalIndex(
+    size_t layer_idx, size_t local_shard_idx) const {
+  return MakeLocalHostBufferFuture<const uint8_t>(
+      layers_, layer_idx, local_shard_idx,
+      [this, layer_idx]() { return ExplicitD2hReadyFuture(layer_idx); });
+}
+
+xla::Future<absl::Span<uint8_t>>
+WeightSynchronizerBase::GetHostBufferWithLocalIndex(size_t layer_idx,
+                                                    size_t local_shard_idx) {
+  // The span views manager-owned mutable staging memory.
+  return MakeLocalHostBufferFuture<uint8_t>(
+      layers_, layer_idx, local_shard_idx,
+      [this, layer_idx]() { return ExplicitD2hReadyFuture(layer_idx); });
 }
 
 size_t WeightSynchronizerBase::LayerDeviceBytes(size_t layer_idx) const {
@@ -1275,10 +1319,14 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2h(
     metrics_.last_detiling_time_ms = 0.0;
     metrics_.last_detiled_bytes = 0;
   }
-  std::vector<std::shared_ptr<LayerTileReady>> layer_ready;
+  std::vector<xla::Promise<>> layer_promises;
+  std::vector<xla::Future<>> layer_ready;
+  layer_promises.reserve(num_layers_);
   layer_ready.reserve(num_layers_);
   for (size_t l = 0; l < num_layers_; ++l) {
-    layer_ready.push_back(std::make_shared<LayerTileReady>());
+    auto [promise, future] = xla::MakePromise();
+    layer_promises.push_back(std::move(promise));
+    layer_ready.push_back(std::move(future));
   }
   {
     absl::MutexLock lock(explicit_d2h_mu_);
@@ -1295,8 +1343,8 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2h(
   absl::Status schedule_error;
   auto partial_cleanup = absl::MakeCleanup([&]() {
     if (!schedule_error.ok()) {
-      for (size_t l = scheduled_layers; l < layer_ready.size(); ++l) {
-        layer_ready[l]->Set(schedule_error);
+      for (size_t l = scheduled_layers; l < layer_promises.size(); ++l) {
+        layer_promises[l].Set(schedule_error);
       }
       if (!layer_futures.empty()) {
         TrackInFlightD2h(raiden::JoinPjRtCopyFutures(layer_futures).future);
@@ -1313,19 +1361,18 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2h(
       return schedule_error;
     }
     ++scheduled_layers;
-    std::shared_ptr<LayerTileReady> ready = layer_ready[layer_idx];
     if (layer_copy->future.IsValid()) {
       auto [promise, gated_future] = xla::MakePromise();
       std::move(layer_copy->future)
-          .OnReady([ready = std::move(ready),
+          .OnReady([layer_promise = std::move(layer_promises[layer_idx]),
                     promise = std::move(promise)](absl::Status s) mutable {
-            ready->Set(s);
+            layer_promise.Set(s);
             promise.Set(std::move(s));
           });
       layer_futures.emplace_back(std::move(gated_future),
                                  raiden::BufferHolders{});
     } else {
-      ready->Set(absl::OkStatus());
+      layer_promises[layer_idx].Set(absl::OkStatus());
       layer_futures.push_back(*std::move(layer_copy));
     }
   }
@@ -1902,7 +1949,7 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
   const bool sync_explicit_d2h =
       request.skip_d2h() &&
       request.host_tiling_mode() != tpu_sync::rpc::HOST_TILING_MODE_PRE_TILED;
-  std::vector<std::shared_ptr<LayerTileReady>> explicit_d2h_ready;
+  std::vector<xla::Future<>> explicit_d2h_ready;
   std::vector<std::optional<bool>> staged_skip_tiling;
   bool needs_per_layer_staging_sync = false;
   if (sync_explicit_d2h) {
@@ -1915,8 +1962,8 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
     staged_skip_tiling.resize(num_layers_);
     for (size_t l = 0; l < num_layers_; ++l) {
       if (tasks_by_layer[l].empty()) continue;
-      if ((explicit_d2h_ready[l] != nullptr &&
-           !explicit_d2h_ready[l]->IsSet()) ||
+      if ((explicit_d2h_ready[l].IsValid() &&
+           !explicit_d2h_ready[l].IsReady()) ||
           (staged_skip_tiling[l].has_value() &&
            *staged_skip_tiling[l] != planned_skip_tiling[l])) {
         needs_per_layer_staging_sync = true;
@@ -1996,14 +2043,14 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
       }
       const auto& layer_tasks = tasks_by_layer[l];
       if (sync_explicit_d2h && !layer_tasks.empty()) {
-        if (explicit_d2h_ready[l] != nullptr) {
-          if (!explicit_d2h_ready[l]->IsSet()) {
+        if (explicit_d2h_ready[l].IsValid()) {
+          if (!explicit_d2h_ready[l].IsReady()) {
             schedule_push(std::exchange(group_tasks, {}));
           }
           absl::Time d2h_wait_start = ABSL_PREDICT_FALSE(diag_vlog)
                                           ? absl::Now()
                                           : absl::InfinitePast();
-          ABSL_RETURN_IF_ERROR(explicit_d2h_ready[l]->Wait());
+          ABSL_RETURN_IF_ERROR(explicit_d2h_ready[l].Await());
           if (ABSL_PREDICT_FALSE(diag_vlog)) {
             d2h_wait_duration += (absl::Now() - d2h_wait_start);
           }

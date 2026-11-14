@@ -84,6 +84,21 @@ xla::ffi::Error StatusToFfiError(const absl::Status& status) {
                          std::string(status.message()));
 }
 
+absl::StatusOr<absl::Span<uint8_t>> CheckedLocalHostBuffer(
+    WeightSynchronizerBase& ws, size_t layer_idx, size_t local_slot,
+    size_t required_bytes) {
+  ABSL_ASSIGN_OR_RETURN(
+      absl::Span<uint8_t> host_buf,
+      ws.GetHostBufferWithLocalIndex(layer_idx, local_slot).Await());
+  if (required_bytes > host_buf.size()) {
+    return absl::OutOfRangeError(
+        absl::StrCat("Host buffer smaller than block_bytes for layer ",
+                     layer_idx, " local shard ", local_slot, ": ",
+                     host_buf.size(), " < ", required_bytes));
+  }
+  return host_buf;
+}
+
 constexpr absl::string_view kClearRegistryHint =
     " Re-initializing with different arguments requires deleting the "
     "instances first (destroy_weight_synchronizer() in Python); a clear that "
@@ -780,8 +795,12 @@ xla::ffi::Error TriggerWeightSynchronizerInitAndD2hHelper(
     auto anchor = jax_arrays[i];
 
     size_t size = ws->block_bytes(i);
-    uint8_t* dst_host_ptr =
-        const_cast<uint8_t*>(ws->GetHostBufferPtr(i, local_slot));
+    absl::StatusOr<absl::Span<uint8_t>> host_buf =
+        CheckedLocalHostBuffer(*ws, i, local_slot, size);
+    if (!host_buf.ok()) {
+      return StatusToFfiError(host_buf.status());
+    }
+    uint8_t* dst_host_ptr = host_buf->data();
     const uint8_t* src_device_ptr =
         reinterpret_cast<const uint8_t*>(anchor.untyped_data());
 
@@ -845,10 +864,10 @@ xla::ffi::Error TriggerWeightSynchronizerInitAndD2hImpl(
 }
 
 // FFI custom call handler executing asynchronous Host-to-Device (H2D) memory
-// transfers from local staging buffers (`GetHostBufferPtr`) directly onto
-// device memory buffers. Uses multi-host modulo indexing (`shard_idx %
-// num_shards()`) to ensure global shard indices map to the correct local
-// staging slot.
+// transfers from local staging buffers (`GetHostBufferWithLocalIndex`) directly
+// onto device memory buffers. Uses multi-host local slot mapping
+// (`GetLocalSlot(shard_idx)`) to ensure global shard indices map to the
+// correct local staging slot.
 xla::ffi::Error TriggerH2DImpl(xla::ffi::AnyBuffer shard_idx_buf,
                                int32_t layer_idx,
                                xla::ffi::Result<xla::ffi::AnyBuffer> out) {
@@ -870,7 +889,12 @@ xla::ffi::Error TriggerH2DImpl(xla::ffi::AnyBuffer shard_idx_buf,
   size_t size = ws->block_bytes(layer_idx);
   size_t local_slot =
       WeightSynchronizerFfiManager::Default().GetLocalSlot(shard_idx);
-  const uint8_t* src_host_ptr = ws->GetHostBufferPtr(layer_idx, local_slot);
+  absl::StatusOr<absl::Span<uint8_t>> host_buf =
+      CheckedLocalHostBuffer(*ws, layer_idx, local_slot, size);
+  if (!host_buf.ok()) {
+    return StatusToFfiError(host_buf.status());
+  }
+  const uint8_t* src_host_ptr = host_buf->data();
 
   uint8_t* d_base = reinterpret_cast<uint8_t*>(out->untyped_data());
 
@@ -932,7 +956,12 @@ xla::ffi::Error TriggerMultiH2DImpl(xla::ffi::AnyBuffer shard_idx_buf,
     uint8_t* d_base = reinterpret_cast<uint8_t*>(out.untyped_data());
 
     size_t size = ws->block_bytes(i);
-    const uint8_t* src_host_ptr = ws->GetHostBufferPtr(i, local_slot);
+    absl::StatusOr<absl::Span<uint8_t>> host_buf =
+        CheckedLocalHostBuffer(*ws, i, local_slot, size);
+    if (!host_buf.ok()) {
+      return StatusToFfiError(host_buf.status());
+    }
+    const uint8_t* src_host_ptr = host_buf->data();
 
     if (g_streams[shard_idx] == nullptr) {
       std::memcpy(d_base, src_host_ptr, size);
@@ -973,7 +1002,7 @@ xla::ffi::Error TriggerMultiH2DImpl(xla::ffi::AnyBuffer shard_idx_buf,
 
 // FFI custom call handler executing asynchronous Device-to-Host (D2H) memory
 // transfers from device memory directly onto local staging buffers
-// (`GetHostBufferPtr`).
+// (`GetHostBufferWithLocalIndex`).
 xla::ffi::Error TriggerD2HImpl(xla::ffi::AnyBuffer anchor,
                                xla::ffi::AnyBuffer shard_idx_buf,
                                int32_t layer_idx,
@@ -997,8 +1026,12 @@ xla::ffi::Error TriggerD2HImpl(xla::ffi::AnyBuffer anchor,
   size_t size = ws->block_bytes(layer_idx);
   size_t local_slot =
       WeightSynchronizerFfiManager::Default().GetLocalSlot(shard_idx);
-  uint8_t* dst_host_ptr =
-      const_cast<uint8_t*>(ws->GetHostBufferPtr(layer_idx, local_slot));
+  absl::StatusOr<absl::Span<uint8_t>> host_buf =
+      CheckedLocalHostBuffer(*ws, layer_idx, local_slot, size);
+  if (!host_buf.ok()) {
+    return StatusToFfiError(host_buf.status());
+  }
+  uint8_t* dst_host_ptr = host_buf->data();
   const uint8_t* src_device_ptr =
       reinterpret_cast<const uint8_t*>(anchor.untyped_data());
 

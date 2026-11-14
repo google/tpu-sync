@@ -967,12 +967,6 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // Snapshot of uuid's lease on storage_idx (nullptr if none / unbounded).
   std::shared_ptr<const PoolStagingLease> PoolStagingLeaseSnapshot(
       size_t storage_idx, uint64_t uuid) const;
-  // Host address of pool block `block_id` (shard `shard_idx`) = storage host
-  // base + (slot or block) x stride + pool.base_offset. Bounded storages need
-  // a lease for `uuid` covering block_id.
-  absl::StatusOr<uint8_t*> PoolBlockHostBase(const PoolSpec& pool,
-                                             size_t shard_idx, int64_t block_id,
-                                             std::optional<uint64_t> uuid);
 
   HostBufferAllocator host_allocator_ = nullptr;
 

@@ -72,6 +72,7 @@ cc_library(
         "@com_google_absl//absl/types:span",
         "@peregrine//peregrine/src/api/v1:rate_limiter",
         "@torch_tpu//shims/torch:aten_headers",
+        "@xla//xla:future",
         "//tpu_sync/core:raiden_transfer_endpoint",
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/rpc:raiden_service_cc_proto",
@@ -247,8 +248,10 @@ nanobind_extension(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
         "@nanobind",
         "@torch_tpu//shims/torch:aten_headers",
+        "@xla//xla:future",
         "@xla//xla/pjrt:status_casters",
     ],
 )
@@ -483,6 +486,7 @@ cc_library(
         "@peregrine//peregrine/src/api/v1:rate_limiter",
         "@torch_tpu//shims/torch:aten_headers",
         "@torch_tpu//shims/torch:torch_headers",
+        "@xla//xla:future",
         "//tpu_sync/core:raiden_transfer_endpoint",
         "//tpu_sync/core:raw_transfer_core",
         "//tpu_sync/rpc:raiden_service_cc_proto",
@@ -529,6 +533,7 @@ cc_library(
         "@com_google_absl//absl/types:span",
         "@peregrine//peregrine/src/api/v1:rate_limiter",
         "@torch_tpu//csrc/api:tensor_buffer",
+        "@xla//xla:future",
     ],
 )
 

@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <string>
@@ -36,6 +39,7 @@
 #include <nanobind/stl/tuple.h>  // IWYU pragma: keep
 #include <nanobind/stl/unique_ptr.h>  // IWYU pragma: keep
 #include <nanobind/stl/vector.h>  // IWYU pragma: keep
+#include "xla/future.h"
 #include "xla/pjrt/status_casters.h"
 #include "tpu_sync/core/raiden_future.h"
 #include "tpu_sync/core/raw_transfer_core.h"
@@ -235,18 +239,6 @@ NB_MODULE(_tpu_raiden_jax, m) {
       .def("get_raiden_worker_port",
            &tpu_raiden::kv_cache::jax::KVCacheManager::GetRaidenWorkerPort)
       .def(
-          "get_host_pointer",
-          [](const tpu_raiden::kv_cache::jax::KVCacheManager& self,
-             size_t layer_idx, size_t shard_idx) -> const uint8_t* {
-            absl::StatusOr<absl::Span<const uint8_t>> host_buffer =
-                self.GetHostBuffer(layer_idx, shard_idx);
-            // Python contract: any unavailable host buffer (bad index or no
-            // buffer) is returned as None, never raised.
-            if (!host_buffer.ok()) return nullptr;
-            return host_buffer->data();
-          },
-          nb::arg("layer_idx"), nb::arg("shard_idx"))
-      .def(
           "read_host_memory",
           [](const tpu_raiden::kv_cache::jax::KVCacheManager& self,
              size_t layer_idx, size_t shard_idx,
@@ -257,10 +249,13 @@ NB_MODULE(_tpu_raiden_jax, m) {
             // Python contract: any unavailable host buffer (bad index or no
             // buffer) is returned as an empty list, never raised.
             if (!host_buffer.ok()) return lst;
-            const float* fptr =
-                reinterpret_cast<const float*>(host_buffer->data());
-            for (size_t i = 0; i < num_floats; ++i) {
-              lst.append(fptr[i]);
+            const size_t count =
+                std::min(num_floats, host_buffer->size() / sizeof(float));
+            const uint8_t* ptr = host_buffer->data();
+            for (size_t i = 0; i < count; ++i) {
+              float val = 0.0f;
+              std::memcpy(&val, ptr + i * sizeof(float), sizeof(float));
+              lst.append(val);
             }
             return lst;
           },
@@ -485,24 +480,16 @@ NB_MODULE(_tpu_raiden_jax, m) {
       .def(
           "get_host_buffer",
           [](WeightSynchronizer& self, size_t layer_idx, size_t shard_idx) {
-            const uint8_t* ptr = self.GetHostBufferPtr(layer_idx, shard_idx);
-            if (!ptr) {
-              throw std::runtime_error("Invalid layer or shard index");
+            xla::Future<absl::Span<uint8_t>> future =
+                self.GetHostBufferWithLocalIndex(layer_idx, shard_idx);
+            absl::Span<uint8_t> host_buffer;
+            {
+              nb::gil_scoped_release release;
+              host_buffer = xla::ValueOrThrow(std::move(future).Await());
             }
-            absl::StatusOr<size_t> host_size =
-                self.GetHostBufferSize(layer_idx, shard_idx);
-            if (!host_size.ok()) {
-              throw std::runtime_error(
-                  absl::StrCat("WeightSynchronizer get_host_buffer failed: ",
-                               host_size.status().message()));
-            }
-            size_t size = *host_size;
-            if (size == 0) {
-              size = self.slice_byte_size() + 256 * 1024;
-            }
-            size_t shape[1] = {size};
+            size_t shape[1] = {host_buffer.size()};
             return nb::ndarray<uint8_t, nb::numpy, nb::c_contig>(
-                const_cast<uint8_t*>(ptr), 1, shape, nb::find(&self));
+                host_buffer.data(), 1, shape, nb::find(&self));
           },
           nb::arg("layer_idx") = 0, nb::arg("shard_idx") = 0)
       .def_prop_ro("local_port", &WeightSynchronizer::local_port)

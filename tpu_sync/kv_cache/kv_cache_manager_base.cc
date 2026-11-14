@@ -2643,52 +2643,6 @@ KVCacheManagerBase::PoolStagingSummary() const {
   return out;
 }
 
-absl::StatusOr<uint8_t*> KVCacheManagerBase::PoolBlockHostBase(
-    const PoolSpec& pool, size_t shard_idx, int64_t block_id,
-    std::optional<uint64_t> uuid) {
-  if (block_id < 0 || block_id >= pool.num_blocks) {
-    return absl::OutOfRangeError(
-        absl::StrCat("block_id ", block_id, " out of range for pool ", pool.tag,
-                     ": num_blocks=", pool.num_blocks));
-  }
-  ABSL_ASSIGN_OR_RETURN(absl::Span<uint8_t> storage,
-                        GetHostBuffer(pool.storage_index, shard_idx));
-  uint8_t* storage_base = storage.data();
-  std::shared_ptr<const PoolStagingLease> lease;
-  {
-    absl::MutexLock l(staging_mu_);
-    if (pool.storage_index < pool_staging_.size() &&
-        pool_staging_[pool.storage_index].bounded) {
-      if (!uuid.has_value()) {
-        return absl::FailedPreconditionError(absl::StrCat(
-            "pool ", pool.tag, " storage ", pool.storage_index,
-            " uses bounded host staging: a transfer uuid with a lease is "
-            "required to address block ",
-            block_id));
-      }
-      auto it = pool_staging_[pool.storage_index].leases.find(*uuid);
-      if (it == pool_staging_[pool.storage_index].leases.end()) {
-        return absl::FailedPreconditionError(
-            absl::StrCat("pool staging: uuid ", *uuid,
-                         " holds no lease on storage ", pool.storage_index));
-      }
-      lease = it->second;
-    }
-  }
-  if (lease == nullptr) {
-    return storage_base + pool.base_offset_bytes +
-           block_id * pool.block_stride_bytes;
-  }
-  auto slot_it = lease->slot_by_block.find(block_id);
-  if (slot_it == lease->slot_by_block.end()) {
-    return absl::FailedPreconditionError(
-        absl::StrCat("pool staging: uuid ", *uuid, " lease on storage ",
-                     pool.storage_index, " does not cover block ", block_id));
-  }
-  return storage_base + pool.base_offset_bytes +
-         static_cast<int64_t>(slot_it->second) * pool.block_stride_bytes;
-}
-
 absl::Status KVCacheManagerBase::RegisterPools(std::vector<PoolSpec> pools) {
   return RegisterPools(std::move(pools), /*staging_leases=*/0);
 }

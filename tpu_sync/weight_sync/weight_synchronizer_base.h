@@ -216,19 +216,18 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   std::shared_ptr<grpc::Channel> GetPeregrineChannel(absl::string_view peer)
       override ABSL_LOCKS_EXCLUDED(peer_control_endpoints_mu_);
 
-  const uint8_t* GetHostBufferPtr(size_t layer_idx, size_t shard_idx) const {
-    if (layer_idx >= num_layers_ || shard_idx >= num_shards_) {
-      return nullptr;
-    }
-    return layers_[layer_idx].shards[shard_idx].host_ptr;
-  }
-
-  // Waits for any in-flight explicit D2h() on `layer_idx` and returns the host
-  // staging buffer pointer of `(layer_idx, shard_idx)`.
-  absl::StatusOr<const uint8_t*> WaitAndGetHostBufferPtr(size_t layer_idx,
-                                                         size_t shard_idx) const
+  // Local host staging buffer of (|layer_idx|, |local_shard_idx|) without
+  // `local_shard_indices_` or `global_shard_indices_` remapping. Checks index
+  // bounds (`OutOfRange`) and non-null `host_ptr` (`FailedPrecondition`), and
+  // waits on any in-flight explicit `D2h()` on |layer_idx| before resolving to
+  // the buffer span (an OK span has a non-null `data()` and may be empty). When
+  // no explicit `D2h()` is pending for |layer_idx|, the returned future is
+  // already ready.
+  xla::Future<absl::Span<const uint8_t>> GetHostBufferWithLocalIndex(
+      size_t layer_idx, size_t local_shard_idx) const
       ABSL_LOCKS_EXCLUDED(explicit_d2h_mu_);
-  absl::Status WaitForExplicitD2h(size_t layer_idx) const
+  xla::Future<absl::Span<uint8_t>> GetHostBufferWithLocalIndex(
+      size_t layer_idx, size_t local_shard_idx)
       ABSL_LOCKS_EXCLUDED(explicit_d2h_mu_);
 
   // Host staging buffer of (|layer_idx|, |shard_idx|), remapping |shard_idx|
@@ -285,11 +284,11 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   // `uuid`.
   absl::Status TileLayer(size_t layer_idx, uint64_t uuid = 0);
   // Copies bound device buffers into host staging buffers asynchronously:
-  // skip_d2h=true pushes and WaitAndGetHostBufferPtr() wait per layer; H2d()
-  // waits for the whole in-flight D2h(). The future holds no device buffers;
-  // once a shard's copy+detile completes it no longer holds them (bound weights
-  // keep theirs until UnbindWeights()). Serializes behind in-flight D2H; fails
-  // if unbound or H2H is sending.
+  // skip_d2h=true pushes and GetHostBufferWithLocalIndex() wait per layer;
+  // H2d() waits for the whole in-flight D2h(). The future holds no
+  // device buffers; once a shard's copy+detile completes it no longer holds
+  // them (bound weights keep theirs until UnbindWeights()). Serializes behind
+  // in-flight D2H; fails if unbound or H2H is sending.
   virtual absl::StatusOr<raiden::PjRtCopyFuture> D2h(uint64_t uuid = 0);
   absl::StatusOr<raiden::PjRtCopyFuture> D2hLayer(
       size_t layer_idx, uint64_t uuid = 0,
@@ -693,6 +692,8 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   void WaitForInFlightD2h() const ABSL_LOCKS_EXCLUDED(explicit_d2h_mu_);
   absl::Status WaitForAllExplicitD2h() const
       ABSL_LOCKS_EXCLUDED(explicit_d2h_mu_);
+  xla::Future<> ExplicitD2hReadyFuture(size_t layer_idx) const
+      ABSL_LOCKS_EXCLUDED(explicit_d2h_mu_);
   absl::Status CheckNoActiveH2hPushes(absl::string_view caller) const
       ABSL_LOCKS_EXCLUDED(metrics_mu_);
   void ClearExplicitD2hState() ABSL_LOCKS_EXCLUDED(explicit_d2h_mu_);
@@ -764,7 +765,7 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   // OnLayerDataReceived(); preserved across UnbindWeights() so a subsequent
   // skip_d2h=true push can detect layout mismatches.
   mutable absl::Mutex explicit_d2h_mu_;
-  std::vector<std::shared_ptr<LayerTileReady>> explicit_d2h_ready_
+  std::vector<xla::Future<>> explicit_d2h_ready_
       ABSL_GUARDED_BY(explicit_d2h_mu_);
   std::vector<std::optional<bool>> explicit_d2h_skip_tiling_
       ABSL_GUARDED_BY(explicit_d2h_mu_);

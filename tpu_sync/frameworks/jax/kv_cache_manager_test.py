@@ -789,8 +789,10 @@ class KVCacheManagerTest(parameterized.TestCase):
     # An empty block list still returns 0 ("nothing to send").
     self.assertEqual(producer.notify_for_read("empty", 8, []), 0)
 
-  def test_host_buffer_accessors_map_out_of_range_layer_to_empty(self) -> None:
-    """Verifies get_host_pointer/read_host_memory return None/[], not raise."""
+  def test_read_host_memory_clamps_and_maps_out_of_range_layer_to_empty(
+      self,
+  ) -> None:
+    """Verifies read_host_memory clamps num_floats and returns [] on OOR."""
     tpu_sharding = self.setup_shardings()
     n_layers = 2
     shape = (8, 128, 8, 8, 128)
@@ -807,12 +809,15 @@ class KVCacheManagerTest(parameterized.TestCase):
     num_floats = 16
 
     # In range: the last layer has a host buffer.
-    self.assertIsNotNone(manager.get_host_pointer(n_layers - 1, 0))
     self.assertLen(
         manager.read_host_memory(n_layers - 1, 0, num_floats), num_floats
     )
-    # Out of range: GetHostBuffer fails and the bindings return None / [].
-    self.assertIsNone(manager.get_host_pointer(n_layers, 0))
+    # Oversized read clamps to the host buffer capacity instead of reading OOB.
+    oversized_num_floats = 10_000_000
+    clamped = manager.read_host_memory(n_layers - 1, 0, oversized_num_floats)
+    self.assertGreater(len(clamped), num_floats)
+    self.assertLess(len(clamped), oversized_num_floats)
+    # Out of range: GetHostBuffer fails and read_host_memory returns [].
     self.assertEqual(manager.read_host_memory(n_layers, 0, num_floats), [])
 
 

@@ -233,20 +233,6 @@ void BindPoolApi(ClassT& cls) {
           },
           nb::arg("pool_idx"))
       .def(
-          "get_block_host_pointer",
-          [](ManagerT& self, size_t layer_idx, size_t shard_idx, int block_id) {
-            auto status_or = BaseOf(self)->GetBlockHostPointerValue(
-                layer_idx, shard_idx, block_id);
-            if (!status_or.ok()) {
-              throw std::runtime_error(
-                  absl::StrCat("KVCacheManager get_block_host_pointer failed: ",
-                               status_or.status().message()));
-            }
-            return status_or.value();
-          },
-          nb::arg("layer_idx"), nb::arg("shard_idx") = 0,
-          nb::arg("block_id") = 0)
-      .def(
           "layer_block_byte_size",
           [](ManagerT& self, size_t layer_idx) {
             return BaseOf(self)->LayerBlockByteSize(layer_idx);

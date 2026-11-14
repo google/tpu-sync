@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -36,6 +37,8 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "absl/types/span.h"
+#include "xla/future.h"
 #include "xla/pjrt/status_casters.h"
 #include "tpu_sync/core/raiden_future.h"
 #include "tpu_sync/core/raw_transfer_core.h"
@@ -47,7 +50,6 @@
 #include "tpu_sync/frameworks/torch/weight_synchronizer.h"
 #include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
-#include "tpu_sync/transport/peer_endpoint.h"
 #include "tpu_sync/kv_cache/kv_cache_store.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/kv_cache/kv_cache_store_wrapper.h"
@@ -56,6 +58,7 @@
 #include "tpu_sync/solutions/mooncake/mooncake_provider.h"
 #include "tpu_sync/solutions/mooncake/torch/mooncake_provider_bindings.h"
 #include "tpu_sync/telemetry/python/telemetry_binding.h"
+#include "tpu_sync/transport/peer_endpoint.h"
 
 namespace nb = nanobind;
 
@@ -825,35 +828,19 @@ NB_MODULE(_tpu_raiden_torch, m) {
           "get_host_buffer",
           [](WeightSynchronizer& self, size_t layer_idx, size_t shard_idx)
               -> nb::ndarray<uint8_t, nb::pytorch, nb::c_contig> {
-            const uint8_t* ptr = nullptr;
+            xla::Future<absl::Span<uint8_t>> future =
+                self.GetHostBufferWithLocalIndex(layer_idx, shard_idx);
+            absl::Span<uint8_t> host_buffer;
             {
               nb::gil_scoped_release release;
-              absl::StatusOr<const uint8_t*> host_ptr =
-                  self.WaitAndGetHostBufferPtr(layer_idx, shard_idx);
-              if (!host_ptr.ok()) {
-                throw std::runtime_error(
-                    absl::StrCat("WeightSynchronizer get_host_buffer failed: ",
-                                 host_ptr.status().message()));
-              }
-              ptr = *host_ptr;
-            }
-            absl::StatusOr<size_t> host_size =
-                self.GetHostBufferSize(layer_idx, shard_idx);
-            if (!host_size.ok()) {
-              throw std::runtime_error(
-                  absl::StrCat("WeightSynchronizer get_host_buffer failed: ",
-                               host_size.status().message()));
-            }
-            size_t size = *host_size;
-            if (size == 0) {
-              size = self.slice_byte_size() + 256 * 1024;
+              host_buffer = xla::ValueOrThrow(std::move(future).Await());
             }
             // The tensor aliases staging memory owned by `self`, its owner.
             // nanobind drops it under the GIL on whichever thread frees the
             // storage, and leaks it once the interpreter cannot be entered.
-            size_t shape[1] = {size};
+            size_t shape[1] = {host_buffer.size()};
             return nb::ndarray<uint8_t, nb::pytorch, nb::c_contig>(
-                const_cast<uint8_t*>(ptr), 1, shape, nb::find(&self));
+                host_buffer.data(), 1, shape, nb::find(&self));
           },
           nb::arg("layer_idx") = 0, nb::arg("shard_idx") = 0)
       .def_prop_ro("local_port", &WeightSynchronizer::local_port)

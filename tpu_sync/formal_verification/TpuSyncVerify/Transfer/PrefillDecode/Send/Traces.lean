@@ -157,7 +157,7 @@ def tr_deadline_during_copy : List Ev :=
   [.beginPull, .start, .d2hBegin, .d2hIssue true, .cancel, .d2hReady, .wake true, .d2hEnd, .publish]
 
 /-- The deadline fires while a copy runs: the send drains, keeps its staging,
-issues nothing more, and settles once the copy's `OnReady` and `SendNextLayer(0)`'s
+issues nothing more, and settles once the copy's `OnReady` and `SendNextUnit(0)`'s
 callback have ended both ops. The one-layer form is `tr_expired_while_copying`
 below. -/
 theorem trace_deadline_during_copy :
@@ -239,7 +239,7 @@ two layers; layer 0's H2H push and layer 1's D2H copy are both in flight when
 `Finish` that changes nothing (`.cancel`; the model's `.start` is refused).
 `WaitForH2hCalls` returns as soon as `H2hWriteDirectAsync` is entered, before
 the pool task's tail, so the test's `Finish` may also land before `sendNext`;
-that order refuses `SendNextLayer(1)` instead of `wake` and ends in the same
+that order refuses `SendNextUnit(1)` instead of `wake` and ends in the same
 state. -/
 theorem trace_drain_h2h_and_d2h :
     ((sys 2).run (tr_drain_h2h_and_d2h.take 13)).map
@@ -298,9 +298,9 @@ def tr_d2h_dispatch_fail_drains_issued : List Ev :=
 
 /-- `TransferSendSessionTest.D2hDispatchFailureFailsUnissuedLayersAndDrainsIssuedCopies`:
 three layers; layer 0's D2H copy is issued, layer 1's `D2hSyncDispatch` fails
-(`d2hIssue false`), and layer 2 is never tried (`fail_unissued_layers` resolves
+(`d2hIssue false`), and layer 2 is never tried (`fail_unissued_units` resolves
 layers 1 and 2 with that failure); layer 0's in-flight copy keeps staging
-pinned until `CompleteD2h(0)` drains both its copy op and `SendNextLayer(0)`'s
+pinned until `CompleteD2h(0)` drains both its copy op and `SendNextUnit(0)`'s
 callback without issuing any H2H push. -/
 theorem trace_d2h_dispatch_fail_drains_issued :
     ((sys 3).run (tr_d2h_dispatch_fail_drains_issued.take 6)).map
@@ -326,7 +326,7 @@ held inside `SetD2hDispatchHook` (`d2hBegin`); layer 0 completes and is pushed,
 still `false` because layer 2's pending dispatch holds the last op), and when
 layer 2's dispatch returns an error (`d2hIssue false`), its `EndSendOp` settles
 the session. (`WaitForH2hCalls` returns before the pool task's tail, so `Finish`
-may also land before `sendNext`, refusing `SendNextLayer(1)` instead of `wake`.) -/
+may also land before `sendNext`, refusing `SendNextUnit(1)` instead of `wake`.) -/
 theorem trace_failed_dispatch_ends_send :
     ((sys 3).run (tr_failed_dispatch_ends_send.take 17)).map
       (fun s => (s.life.draining, s.life.done, s.life.inFlight)) = some (true, false, 1) ∧
@@ -362,8 +362,8 @@ def cancelEager (s : Send) : Option Send :=
         | .counterexample _ => true
         | _ => false)
 
-/-- And the point of the op `SendNextLayer` takes (`++in_flight_`): without it a
-send settles under a `Finish` while `SendNextLayer` is armed or waiting on the
+/-- And the point of the op `SendNextUnit` takes (`++in_flight_`): without it a
+send settles under a `Finish` while `SendNextUnit` is armed or waiting on the
 pool, and the callback or pool task that then runs ends an op the session no
 longer owns. -/
 def trySendNextUncounted (s : Send) : Send :=
@@ -385,10 +385,10 @@ def sendNextUncounted (s : Send) : Option Send :=
         | .counterexample _ => true
         | _ => false)
 
-/-- Mutant for `NoOpLeak`: `SendNextLayer(l)` omits the
-`l >= base_->num_layers()` / `l >= d2h_layer_futures_.size()`
-bounds checks and takes an op unconditionally. After the last
-layer's pool task calls `SendNextLayer(numLayers)`, that call claims
+/-- Mutant for `NoOpLeak`: `SendNextUnit(u)` omits the
+`u >= d2h_unit_futures_.size()`
+bound check and takes an op unconditionally. After the last
+layer's pool task calls `SendNextUnit(numLayers)`, that call claims
 an op for a non-existent layer whose D2H future never becomes ready, leaking the
 session and its staging forever (`SettleSafe` holds vacuously, `NoOpLeak`
 catches it). -/
@@ -407,10 +407,10 @@ def sendNextUnbounded (s : Send) : Option Send :=
         | .counterexample _ => true
         | _ => false)
 
-/-- Mutant for `fail_unissued_layers` in `StartPush`: `wake` only fires on a
+/-- Mutant for `fail_unissued_units` in `StartPush`: `wake` only fires on a
 completed D2H copy (`woken < d2hReady`), omitting the cleanup that resolves
 unissued layers' promises when the D2H loop exits early. If the send is
-cancelled after `StartPush` arms `SendNextLayer(0)` and before layer 0's copy
+cancelled after `StartPush` arms `SendNextUnit(0)` and before layer 0's copy
 is issued, `in_flight_ = 1` has no enabled `drainEvents` step under the mutant
 and leaks forever. -/
 def stepWithoutFailUnissued (s : Send) : Ev → Option Send
@@ -435,7 +435,7 @@ theorem trace_without_fail_unissued_leaks :
 A failed session records the phase it failed in:
 `FinishLocked(status, phase)` latches `failed_phase_` from the
 explicit `phase` argument when the failing step knows it (`kD2hPhase` in
-`SendNextLayer`'s `layer_future->OnReady`, `kPushPhase` in
+`SendNextUnit`'s `unit_future->OnReady`, `kPushPhase` in
 `H2hWriteDirectAsync`'s callback) and otherwise from `CurrentPhaseLocked`,
 and `Details()` reports it to
 `CompleteReadWithDetails` (`transfer_details_[session->req_id()] = session->Details()`).
@@ -486,7 +486,7 @@ theorem trace_details_unpulled_send_awaits_pull :
     ((sys 1).run tr_idle_cancel).map (fun s => s.published) = some (some false) := by
   decide
 
-/-- One layer; the deadline fires with the copy in flight and `SendNextLayer(0)`'s
+/-- One layer; the deadline fires with the copy in flight and `SendNextUnit(0)`'s
 op taken; the copy's callbacks end both ops. -/
 def tr_expired_while_copying : List Ev :=
   [.beginPull, .start, .d2hBegin, .d2hIssue true, .cancel, .d2hReady, .wake true, .d2hEnd, .publish]
@@ -536,7 +536,7 @@ say `d2h` (a future is not ready), but the push callback passes `kPushPhase`
 (`self->FinishLocked(push_res.status(), kPushPhase)`), so the failure is reported in `push`; the send still drains layer
 1's copy before it settles. The injected failure
 (`hooks::kRaidenManagerBaseH2hWrite`) is reported synchronously inside the
-pool task, before its tail, so `SendNextLayer(1)` finds the send draining and
+pool task, before its tail, so `SendNextUnit(1)` finds the send draining and
 layer 1 gets no `wake`. -/
 theorem trace_details_failed_push_while_copies_run :
     let pre := tr_failed_push_while_copies_run.take 10

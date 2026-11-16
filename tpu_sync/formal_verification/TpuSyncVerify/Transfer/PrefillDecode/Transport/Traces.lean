@@ -261,6 +261,27 @@ theorem trace_session_two_streams_complete :
       some ([1], [false]) := by
   decide
 
+/-- `BlockTransportTest.BlockGroupPushesCompleteTheirArrayOnce`: one layer of
+three blocks pushed by one sender in two block groups at parallelism 2, chunk-count
+contract (no `ExpectSenders`). The group of blocks 0 and 1 opens two streams and
+the group of block 2 one; every stream declares the three (`layer_streams = 3`),
+so the receiver sees one sender declaring three streams: the first push's two
+streams complete nothing (`layer_completion_count() == 0`), and the second
+push's stream fires `OnLayerReceived` once and retires the table. Which push a
+stream belongs to is not visible to `CompleteIncomingPush`, so the replay is
+three `stream 0 0` events. (The test's `OnBlocksLanded` reports go to a stub
+session; `GroupLanding.lean` models what a receive session does with them.) -/
+def tr_block_group_pushes_complete_once : List Ev := [.stream 0 0, .stream 0 0, .stream 0 0]
+
+theorem trace_block_group_pushes_complete_once :
+    ((sys (cfgChunk 1 1 3 true)).run (tr_block_group_pushes_complete_once.take 2)).map
+      (fun s => (s.layers.map (·.dispatched), s.layers.map (·.entry.isSome))) =
+      some ([0], [true]) ∧
+    ((sys (cfgChunk 1 1 3 true)).run tr_block_group_pushes_complete_once).map
+      (fun s => (s.layers.map (·.dispatched), s.layers.map (·.entry.isSome))) =
+      some ([1], [false]) := by
+  decide
+
 /-- `BlockTransportTest.LayerCompletesOnlyAfterEveryDeclaredSender`: two
 layers, two declared senders (`ExpectSenders(kUuid, 2)`), one stream each. A
 layer completes only when both senders' streams have landed, in either order
@@ -326,7 +347,13 @@ theorem trace_undeclared_uuid_chunk_count :
   declares two streams and sender 1 one for the same layer) and
   `BlockTransportTest.SenderChangingDeclaredStreamCountIsRejected` (one sender
   declares one stream and then two, `else if (streams.declared != num_streams)`):
-  both vary per-sender declarations, which A3 fixes to one `numStreams`.
+  both vary per-sender declarations, which A3 fixes to one `numStreams`; so
+  does `BlockTransportTest.DeclaredSenderMayPushItsArrayInBlockGroups` (sender
+  0 pushes its two blocks as two one-stream groups declaring two streams,
+  sender 1 one push declaring one; the layer completes on the third stream).
+- `BlockTransportTest.PushDeclaringFewerStreamsThanItOpensIsRejected` and
+  `TransportBackendTest.PeregrineBlockGroupPushIsUnimplemented`: the sender
+  refuses the push before it opens a stream, so no stream reaches the receiver.
 - `BlockTransportServerPushSessionTest.Cancel` (`BlockTransportServerPushSession::Cancel`
   on a push session with no receive session behind it) and
   `BlockTransportTest.ForgetPushProgressAllowsUuidReuse` (clearing a partial
@@ -336,6 +363,7 @@ theorem trace_undeclared_uuid_chunk_count :
   is not an event (`Transport.lean` §"Lock scopes").
 - `BlockTransportTest.PushSplitBySourceNumaCompletesPlanDeclaredPool`,
   `BlockTransportTest.PoolProgressWaitsForEveryStreamOfEveryDeclaredPoolAndRetires`,
+  `BlockTransportTest.PlanDeclaredPoolRejectsBlockGroupPushes`,
   and `BlockTransportTest.ForgetPushProgressResetsPartialPoolGeneration` exercise
   the plan-declared pool contract (`Reshard/Pipeline.lean` `landStream`), and
   `PeregrineRecvCompleteTest` exercises `OnPeregrinePostComplete` and the

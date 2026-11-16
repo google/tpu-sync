@@ -46,7 +46,7 @@ structure Inv (s : Pipeline) : Prop where
   d2hReady_lt : ∀ l : Nat, s.d2hReadyL[l]? = some true → l < s.send.d2hIssued
   /-- Only issued H2H pushes have retired. -/
   h2hRetired_lt : ∀ l : Nat, s.h2hRetiredL[l]? = some true → l < s.send.h2hIssued
-  /-- `SendNextLayer(l)`'s callback has run for an issued layer only after that
+  /-- `SendNextUnit(l)`'s callback has run for an issued layer only after that
   layer's copy finished. -/
   woken_d2hReady : ∀ l : Nat, l < s.send.woken → l < s.send.d2hIssued → s.d2hReadyL[l]? = some true
   /-- While the send holds its staging, every finished copy's layer is there. -/

@@ -134,6 +134,14 @@ class BlockTransport final {
   // most kMaxShardMaskBits shards; otherwise, and whenever every shard is on
   // one node, the legacy single-group layout is used unchanged.
   //
+  // A sender that moves one block array in several pushes, each carrying a
+  // group of its blocks, passes as `layer_streams` the streams those pushes
+  // open together per source NUMA node: the sum, over the pushes, of
+  // min(parallelism, blocks in the push). Every stream then declares the
+  // array's total, so the receiver completes the array only once every push
+  // has landed. nullopt declares this push's own streams. Not supported on
+  // the Peregrine backend.
+  //
   // Returns a future that resolves with the destination block ids once every
   // peer has acknowledged, or with the first error. Callers that need a
   // blocking push call `Await()` on the result; asynchronous callers attach a
@@ -144,7 +152,8 @@ class BlockTransport final {
       const std::vector<int>& src_block_ids,
       const std::vector<int>& dst_block_ids = {}, int parallelism = 1,
       MajorOrder major_order = MajorOrder::kLayerMajor, uint64_t uuid = 0,
-      int layer_idx = -1, std::optional<int> wire_layer_idx = std::nullopt);
+      int layer_idx = -1, std::optional<int> wire_layer_idx = std::nullopt,
+      std::optional<size_t> layer_streams = std::nullopt);
 
   // Synchronous Scatter-Gather Pull (op = 2)
   // When explicit_dst_ptrs is supplied it contains one base pointer per
@@ -227,13 +236,15 @@ class BlockTransport final {
   // once per source NUMA node group and joins the futures; |num_groups| is the
   // number of such calls, so the header declares the stream count over all of
   // them and the receiver completes only once every group has landed.
+  // |layer_streams| is `AsyncPush`'s.
   tsl::Future<std::vector<int>> AsyncPushShards(
       absl::Span<const PeerEndpoint> peers,
       const std::vector<int>& src_block_ids,
       const std::vector<int>& dst_block_ids, int parallelism,
       MajorOrder major_order, uint64_t uuid, int layer_idx,
       std::optional<int> wire_layer_idx, absl::Span<const int> shard_ids,
-      size_t num_groups, lib::TransportAdapter* adapter);
+      size_t num_groups, lib::TransportAdapter* adapter,
+      std::optional<size_t> layer_streams);
 
   lib::Request BuildBlockRequest(
       lib::TransferOp op, uint8_t* laddr, uint8_t* raddr, size_t len,

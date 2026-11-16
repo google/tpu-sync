@@ -263,6 +263,10 @@ class KVCacheManager {
   size_t block_bytes(size_t block_array_idx) const {
     return torch_manager_->base()->block_bytes(block_array_idx);
   }
+  // kv_cache::KVCacheManagerBase::SetPushGroups.
+  void SetPushGroups(size_t group_bytes, size_t window) {
+    torch_manager_->base()->SetPushGroups(group_bytes, window);
+  }
 
   std::vector<RaidenTransferEndpoint> get_local_endpoints() const {
     return torch_manager_->get_local_endpoints();

@@ -93,6 +93,18 @@ class TransferSession {
       size_t major_dimension_idx, absl::Span<const int> minor_dimension_indices,
       absl::Span<const int> shard_ids) = 0;
 
+  // Reports that one push stream landed |shard_ids| of destination blocks
+  // |minor_dimension_indices| of unit |major_dimension_idx| in host staging,
+  // before the stream counts toward the unit's completion, so a receive
+  // session may copy those blocks onward while the rest of the unit is still
+  // in flight. The stream's block report (OnDataReceived) still follows. The
+  // default ignores the report. Thread-safe.
+  virtual absl::Status OnBlocksLanded(
+      size_t major_dimension_idx, absl::Span<const int> minor_dimension_indices,
+      absl::Span<const int> shard_ids) {
+    return absl::OkStatus();
+  }
+
   // Returns a future that resolves once the data of unit |major_dimension_idx|
   // (a layer index on the layer transfer path, a pool index on the pool
   // reshard path, matching ResolveStagingSlot()) is ready in host memory for

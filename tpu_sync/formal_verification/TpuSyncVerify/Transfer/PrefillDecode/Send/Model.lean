@@ -45,12 +45,13 @@ def endOp (s : Send) : Send :=
 /-- `Finish(status)` / `FinishLocked(status)`. -/
 def finish (ok : Bool) (s : Send) : Send := { s with life := s.life.finishOnceLocked ok }
 
-/-- `SendNextLayer(l)` up to its lock (`if (l >= base_->num_layers())` .. `++in_flight_;`)
-for `l = queued`: takes an op unless `l` is past the last layer or the session
-is draining. Every layer's future exists from `StartPush`'s locked section on
-(`d2h_layer_futures_.emplace_back`), so `l >= d2h_layer_futures_.size()` only
-refuses once the settle has cleared them (`ReleaseStagingBlocksLocked`), when
-`draining_` already does. -/
+/-- `SendNextUnit(u)` up to its lock (`if (draining_ || u >= d2h_unit_futures_.size())` .. `++in_flight_;`)
+for `u = queued`: takes an op unless `u` is past the last unit (one per layer
+here) or the session is draining. Every unit's future exists from
+`StartPush`'s locked section on (`d2h_unit_futures_.emplace_back`) until the
+settle clears them (`ReleaseStagingBlocksLocked`), when `draining_` already
+refuses, so `u >= d2h_unit_futures_.size()` refuses exactly past the last
+unit. -/
 def trySendNext (s : Send) : Send :=
   if s.queued < s.numLayers then
     match s.life.beginOp with
@@ -90,9 +91,9 @@ def beginPull (s : Send) : Option Send :=
 acquisition (`!acquire_status.ok()`) or worker spawn failure (`HandlePullStream`'s
 `counter_cleanup`) is `Finish(error)` with nothing in flight, i.e. `cancel`. On
 a session that finished meanwhile the call returns (`if (draining_ || done_) return;`)
-and nothing changes. Otherwise the locked section creates every layer's
-future (`tsl::MakePromise<>()` per layer into `d2h_layer_futures_`) and, before
-the D2H loop, `SendNextLayer(0)` arms the push chain on layer 0's future,
+and nothing changes. Otherwise the locked section creates every unit's
+future (`tsl::MakePromise<>()` per unit into `d2h_unit_futures_`) and, before
+the D2H loop, `SendNextUnit(0)` arms the push chain on unit 0's future,
 taking its op (A6). -/
 def start (s : Send) : Option Send :=
   if s.pullStarted = false ∨ s.started = true ∨ s.life.draining = true ∨ s.life.done = true then none
@@ -100,7 +101,7 @@ def start (s : Send) : Option Send :=
   else some { s with started := true }.trySendNext
 
 /-- One iteration of `StartPush`'s D2H loop up to `++in_flight_`
-(`AcquireStagingSlot(l)`, then `if (draining_) { ...; return; } ++in_flight_;`). -/
+(`AcquireStagingSlot(unit.layer)`, then `if (draining_) { ...; return; } ++in_flight_;`). -/
 def d2hBegin (s : Send) : Option Send :=
   if s.started = true ∧ s.d2hPending = false ∧ s.d2hIssued < s.numLayers then
     s.life.beginOp.map fun l => { s with life := l, d2hPending := true }
@@ -118,7 +119,7 @@ def d2hIssue (ok : Bool) (s : Send) : Option Send :=
 
 /-- A dispatched copy finishes on the device: its `OnReady` in `StartPush`
 resolves the layer's promise (`promise.Set(status_or.status())`), so
-`d2h_layer_futures_[l]` becomes ready. -/
+`d2h_unit_futures_[u]` becomes ready. -/
 def markD2hReady (s : Send) : Option Send :=
   if s.d2hReady < s.d2hIssued then some { s with d2hReady := s.d2hReady + 1 } else none
 
@@ -127,10 +128,10 @@ def d2hEnd (s : Send) : Option Send :=
   if s.d2hRetired < s.d2hReady then some { s with d2hRetired := s.d2hRetired + 1 }.endOp
   else none
 
-/-- `SendNextLayer`'s `layer_future->OnReady` callback for layer `woken`, which
+/-- `SendNextUnit`'s `unit_future->OnReady` callback for layer `woken`, which
 runs once that layer's promise is resolved: by its copy's `OnReady` in
 `StartPush` (the copy is ready, `woken < d2hReady`), or — for a layer whose
-copy was never issued (`d2hIssued ≤ woken`) — by `fail_unissued_layers` with
+copy was never issued (`d2hIssued ≤ woken`) — by `fail_unissued_units` with
 the send's status once the D2H loop has returned, which it only does on a
 draining send with no dispatch in progress; that resolution is always an
 error (`ok = false`). -/
@@ -145,7 +146,8 @@ def wake (ok : Bool) (s : Send) : Option Send :=
     else some { s with pooled := s.pooled + 1 }
   else none
 
-/-- The `push_pool()->Schedule` task in `SendNextLayer` up to and including `H2hWriteDirectAsync`. -/
+/-- The `push_pool()->Schedule` task, `AdmitPush` then `IssuePush`, up to and including
+`H2hWriteDirectAsync`. -/
 def h2hIssue (s : Send) : Option Send :=
   if s.pooled = 0 then none
   else
@@ -154,13 +156,13 @@ def h2hIssue (s : Send) : Option Send :=
     | some l => some { s with life := l, h2hIssued := s.h2hIssued + 1, chaining := s.chaining + 1 }
     | none => some s.endOp
 
-/-- The pool task's tail in `SendNextLayer`: `self->SendNextLayer(l + 1)`, then
+/-- The pool task's tail in `AdmitPush`: `SendNextUnit(u + 1)`, then
 `absl::Cleanup end_op` ends the op it carried. -/
 def sendNext (s : Send) : Option Send :=
   if s.chaining = 0 then none
   else some { s with chaining := s.chaining - 1 }.trySendNext.endOp
 
-/-- The `H2hWriteDirectAsync` push callback in `SendNextLayer`. -/
+/-- The `H2hWriteDirectAsync` push callback in `IssuePush`. -/
 def h2hDone (ok : Bool) (s : Send) : Option Send :=
   if s.h2hRetired < s.h2hIssued then
     let s := { s with h2hRetired := s.h2hRetired + 1 }
@@ -231,9 +233,9 @@ def PullClaimed (s : Send) : Prop :=
   ((s.d2hPending = true ∨ 0 < s.d2hIssued) → s.started = true)
 
 /-- Events that advance or retire an in-flight operation: a loop iteration
-issuing the copy an armed `SendNextLayer` waits for, a dispatch outcome, a
+issuing the copy an armed `SendNextUnit` waits for, a dispatch outcome, a
 copy or push completing, a callback or pool task running — including the
-`SendNextLayer` callback that `fail_unissued_layers` resolves with the send's
+`SendNextUnit` callback that `fail_unissued_units` resolves with the send's
 failure (`wake false`). -/
 def drainEvents : List Ev :=
   [.d2hBegin, .d2hIssue true, .d2hReady, .d2hEnd, .wake true, .wake false, .h2hIssue, .sendNext,

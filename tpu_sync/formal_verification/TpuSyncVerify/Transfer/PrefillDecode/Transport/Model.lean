@@ -195,9 +195,9 @@ def Layer.copyDone (L : Layer) : Layer := { L with pending := L.pending - 1 }
 @[simp] theorem Layer.copyDone_sent (L : Layer) : L.copyDone.sent = L.sent := rfl
 @[simp] theorem Layer.copyDone_entry (L : Layer) : L.copyDone.entry = L.entry := rfl
 
-/-- The H2D `future.OnReady` callback in `ExecuteLayerH2d`: on success
-`num_completed_layers_++` and, at `num_layers()` while not draining, the
-success `FinishLocked()`; on failure `FinishLocked(status_or.status(), kH2dPhase)`;
+/-- `OnLayerH2dDone`, the H2D copy's callback: on success `CompleteLayerLocked`
+(`++num_completed_layers_` and, at `num_layers()` while not draining, the
+success `FinishLocked()`); on failure `FinishLocked(status, kH2dPhase)`;
 then `absl::Cleanup end_op`'s `EndRecvOp()`. -/
 def callbackLife (c : Cfg) (l : Lifecycle) (ok : Bool) (completed : Nat) : Lifecycle :=
   let l :=

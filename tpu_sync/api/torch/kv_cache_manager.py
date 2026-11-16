@@ -585,6 +585,33 @@ class KVCacheManager:
         )
     )
 
+  def set_push_groups(self, group_bytes: int, window: int = 0) -> None:
+    """Moves layers larger than ``group_bytes`` in pipelined block groups.
+
+    A send splits each layer whose transfer exceeds ``group_bytes`` into
+    contiguous groups of blocks, each copied to the host and pushed on its
+    own, so the copies of some groups overlap the pushes of others. A receive
+    copies landed blocks to the device once ``group_bytes`` of them wait,
+    instead of once their whole layer has landed. Grouped pushes need the
+    socket data plane: they fail on the Peregrine backend. Applies to
+    transfers that start after the call.
+
+    Args:
+      group_bytes: Largest group, in bytes over every shard of a block (one
+        block at least); 0 moves every layer whole.
+      window: Most pushes (groups or whole layers) one send has in flight; 0
+        for no cap. A cap lets pushes of other sends to the same peer start
+        between those of a large send.
+
+    Raises:
+      ValueError: If ``group_bytes`` or ``window`` is negative.
+    """
+    if group_bytes < 0 or window < 0:
+      raise ValueError(
+          f"group_bytes ({group_bytes}) and window ({window}) must be >= 0"
+      )
+    self._impl.set_push_groups(group_bytes, window)
+
   def start_read(
       self,
       req_id: str,

@@ -48,8 +48,8 @@ theorem trace_poll_before_callbacks :
 /-- `RecvDrainTest.ExpiredReceiveKeepsStagingUntilH2dEnds` and
 `RecvDrainTest.TimeoutDuringH2dDispatchKeepsStaging`: the deadline fires while
 an H2D copy is in flight (or while the thread is inside `H2dSyncDispatch` in
-`ExecuteLayerH2d`, after the `if (done_ || draining_)` re-check has passed —
-since `ExecuteLayerH2d` never re-reads `draining_`/`done_` after the re-check,
+`DispatchLayerH2d`, after the `if (done_ || draining_)` re-check has passed —
+since `DispatchLayerH2d` never re-reads `draining_`/`done_` after the re-check,
 that deadline linearises after `h2dIssue`). The session drains but does not
 settle until the copy's callback ends the op, and is then published as failed.
 Both tests seat the session with `RecvTestManager::AddRecv` (push-plan `Create`,
@@ -64,9 +64,10 @@ theorem trace_deadline_during_copy :
       (fun s => (s.life.done, s.life.hasStaging, s.published)) = some (true, false, some false) := by
   decide
 
-/-- The race the second `if (done_ || draining_)` check in `ExecuteLayerH2d`
-closes: the session finishes between the two locks of `ExecuteLayerH2d`, so no
-copy is issued and the op is released (`EndRecvOpLocked()`). -/
+/-- The race the second `if (done_ || draining_)` check, in `DispatchLayerH2d`,
+closes: the session finishes between `ExecuteLayerH2d`'s lock and
+`DispatchLayerH2d`'s, so no copy is issued and the op is released
+(`EndRecvOpLocked()`). -/
 theorem trace_finish_between_locks :
     ((sysPush 1).run [.h2dBegin, .cancel, .h2dIssue true]).map
       (fun s => (s.issued, s.life.done)) = some (0, true) := by
@@ -215,7 +216,7 @@ def netAccountUnordered (s : Recv) : Option Recv :=
         | .counterexample _ => true
         | _ => false)
 
-/-- Mutant for `NoOpLeak`: `ExecuteLayerH2d` returns early on the second
+/-- Mutant for `NoOpLeak`: `DispatchLayerH2d` returns early on the second
 `if (done_ || draining_)` check without calling `EndRecvOpLocked()`. A cancel
 between the two locks leaks the op: `inFlight` stays positive with no enabled
 drain event, so the session never settles (`SettleSafe` holds vacuously,
@@ -240,8 +241,8 @@ def h2dIssueLeak (ok : Bool) (s : Recv) : Option Recv :=
 /-! ## Failure phase (`TransferDetails`)
 
 As on the send side: `FinishLocked(status, phase)` latches `failed_phase_` from
-the explicit `kH2dPhase` in the `ExecuteLayerH2d` paths (`FinishLocked(future_or.status(), kH2dPhase)`
-and `self->FinishLocked(status_or.status(), kH2dPhase)`) and otherwise from
+the explicit `kH2dPhase` in the H2D paths (`FinishLocked(future_or.status(), kH2dPhase)`
+in `DispatchLayerH2d` and `FinishLocked(status, kH2dPhase)` in `OnLayerH2dDone`) and otherwise from
 `CurrentPhaseLocked` (`handshake_pending_` → `connect`, `network_completed_` →
 `h2d`, else `receive`); `Details()` reports it (`CompleteReadWithDetails`:
 `transfer_details_[session->req_id()] = session->Details()`). Not state;

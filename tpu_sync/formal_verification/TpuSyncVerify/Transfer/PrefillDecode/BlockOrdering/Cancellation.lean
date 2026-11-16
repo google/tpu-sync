@@ -52,7 +52,7 @@ def landStage (l numBlocks numHostBlocks : Nat) (plan : CopyPlan) : List BlockCe
 
 /-- Stage 3 (Consumer H2D): coalesced scatter from consumer `h2d_host_block_ids`
 into consumer device `h2d_local_block_ids` (`BuildLoadCopyPlan` and
-`base_->H2dSyncDispatch` in `TransferReceiveSession::ExecuteLayerH2d`). -/
+`base_->H2dSyncDispatch` in `TransferReceiveSession::DispatchLayerH2d`). -/
 def h2dStage (l numBlocks numHostBlocks : Nat) (plan : CopyPlan) : List BlockCell :=
   execCoalesced .junk (landStage l numBlocks numHostBlocks plan) (blankBlockLayer numBlocks) plan.h2dSpec
 

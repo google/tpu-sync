@@ -82,7 +82,7 @@ theorem trace_normal :
 
 /-- A two-layer producer whose D2H copies finish in reverse order and whose
 pushes complete in reverse order. The push *chain* is still 0 then 1
-(`SendNextLayer`), and `wake` for layer 0 waits for layer 0's copy. -/
+(`SendNextUnit`), and `wake` for layer 0 waits for layer 0's copy. -/
 def producer2 : List Ev :=
   [.send .beginPull, .send .start, .send .d2hBegin, .send (.d2hIssue true), .send .d2hBegin, .send (.d2hIssue true),
    .d2hReady 1, .d2hReady 0, .send .d2hEnd, .send .d2hEnd,
@@ -109,7 +109,7 @@ theorem trace_layers_out_of_order :
     some (some true, some true, [.kv 0, .kv 1]) := by
   decide
 
-/-- The push chain is ordered: `SendNextLayer(0)` cannot proceed on layer 1's
+/-- The push chain is ordered: `SendNextUnit(0)` cannot proceed on layer 1's
 copy, however early it finished. -/
 theorem trace_wake_needs_own_layer :
     (sys 2).run
@@ -144,7 +144,7 @@ theorem trace_no_dispatch_before_land :
     (sys 1).run [.send .beginPull, .recv (.pullReply true), .h2dBegin 0] = none := by
   decide
 
-/-- An H2D copy cannot finish for a layer whose `ExecuteLayerH2d` was aborted at
+/-- An H2D copy cannot finish for a layer whose `DispatchLayerH2d` was aborted at
 the re-check (`h2dIssue l false` or draining), even if another layer's copy was
 issued. -/
 theorem trace_aborted_issue_cannot_ready :

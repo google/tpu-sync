@@ -67,7 +67,7 @@ theorem drain_step {s : Send} (h : Inv s) (hdr : s.life.draining = true)
           · have hs₁ : step s (.wake true) = some { s with woken := s.woken + 1 }.endOp := by
               simp [step, wake, hwk, hwr, hdr]
             exact ⟨.wake true, _, hs₁, by simp [hdr], by rw [drainRank_endOp]; simp [drainRank]; omega⟩
-          · -- layer `woken` was never issued: `fail_unissued_layers` resolved its promise
+          · -- layer `woken` was never issued: `fail_unissued_units` resolved its promise
             have hle : s.d2hIssued ≤ s.woken := by omega
             have hs₁ : step s (.wake false) = some ({ s with woken := s.woken + 1 }.finish false).endOp := by
               simp [step, wake, hwk, hwr, hdr, hp', hle]

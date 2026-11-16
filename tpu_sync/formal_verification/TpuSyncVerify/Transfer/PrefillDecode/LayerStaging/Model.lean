@@ -172,7 +172,7 @@ def d2hReady (s : BoundedPipeline) (l : Nat) : Option BoundedPipeline :=
     withSlot s.sendMgr s.prefillSlots l { s with pipe := p } fun slot =>
       { s with pipe := p, prefillSlots := s.prefillSlots.set slot (s.pipe.prefillHbm.getD l .junk) }
 
-/-- `SendNextLayer(woken)`'s `layer_future->OnReady` callback (`send.cc`). -/
+/-- `SendNextUnit(woken)`'s `unit_future->OnReady` callback (`send.cc`). -/
 def sendWake (s : BoundedPipeline) (ok : Bool) : Option BoundedPipeline :=
   let l := s.pipe.send.woken
   if s.pipe.d2hReadyL[l]? = some true ∨
@@ -184,7 +184,7 @@ def sendWake (s : BoundedPipeline) (ok : Bool) : Option BoundedPipeline :=
       else { s with pipe := p }
   else none
 
-/-- `SendNextLayer`'s `push_pool` task up to `H2hWriteDirectAsync` (`send.cc`). -/
+/-- The `push_pool` task (`AdmitPush`, `IssuePush`) up to `H2hWriteDirectAsync` (`send.cc`). -/
 def sendH2hIssue (s : BoundedPipeline) : Option BoundedPipeline :=
   let l := s.pipe.send.h2hIssued
   (Pipeline.step s.pipe (.send .h2hIssue)).map fun p =>
@@ -272,7 +272,7 @@ def h2dBegin (s : BoundedPipeline) (l : Nat) : Option BoundedPipeline :=
         { s with pipe := p, recvPhaseL := s.recvPhaseL.set l .h2dPending }
   else none
 
-/-- `ExecuteLayerH2d(l)` second `mu_` lock + `H2dSyncDispatch` (`recv.cc`). -/
+/-- `DispatchLayerH2d(l)`'s `mu_` lock + `H2dSyncDispatch` (`recv.cc`). -/
 def h2dIssue (s : BoundedPipeline) (l : Nat) (ok : Bool) : Option BoundedPipeline :=
   if s.recvPhaseL[l]? = some .h2dPending then
     (Pipeline.step s.pipe (.h2dIssue l ok)).map fun p =>
@@ -290,7 +290,7 @@ def h2dReady (s : BoundedPipeline) (l : Nat) : Option BoundedPipeline :=
         { s with pipe := p, decodeHbmB := s.decodeHbmB.set l (s.decodeSlots.getD slot .junk) }
   else none
 
-/-- `ExecuteLayerH2d(l)`'s `future.OnReady` callback (`recv.cc`). -/
+/-- `OnLayerH2dDone(l)`, the H2D copy's callback (`recv.cc`). -/
 def h2dDone (s : BoundedPipeline) (l : Nat) (ok : Bool) : Option BoundedPipeline :=
   if s.recvPhaseL[l]? = some .h2dRunning ∧ s.pipe.h2dReadyL[l]? = some true then
     (Pipeline.step s.pipe (.recv (.h2dDone ok))).map fun p =>

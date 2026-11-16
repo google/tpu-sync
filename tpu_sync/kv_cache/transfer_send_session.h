@@ -22,6 +22,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/base/nullability.h"
@@ -51,9 +52,11 @@ namespace tpu_raiden {
 // Encapsulates the per-transfer state and execution lifecycle of a producer
 // pull-serve send operation, including block registration/validation,
 // reference-counted drain and sticky-failure tracking, block readiness
-// callbacks, and pipelined multi-layer D2H -> H2H execution. A send whose
+// callbacks, and pipelined D2H -> H2H execution over the send's units: one
+// per layer, or one per block group of a layer whose transfer exceeds the
+// manager's push group size (KVCacheManagerBase::SetPushGroups). A send whose
 // blocks are already host-resident (`BlockLocation::kHost`) skips staging and
-// D2H and pushes every layer from the registered host blocks.
+// D2H and pushes every unit from the registered host blocks.
 //
 // Thread-safe: all mutable session state is synchronized via internal |mu_|.
 // Lock ordering: when both |KVCacheManagerWithTransfer::mu_| and |mu_| are
@@ -141,7 +144,7 @@ class TransferSendSession
 
   // Serves a pull of |src_block_ids| into the consumer's host blocks
   // |dst_block_ids|: stages device blocks into host staging and runs the
-  // multi-layer D2H copy and pipelined H2H push, or pushes host-resident
+  // per-unit D2H copies and pipelined H2H pushes, or pushes host-resident
   // blocks directly.
   void StartPush(
       const std::vector<transport::PeerEndpoint>& remote_data_endpoints,
@@ -153,6 +156,13 @@ class TransferSendSession
   static CopySpec BuildCoalescedCopySpec(
       const std::vector<int64_t>& src_block_ids,
       const std::vector<int64_t>& dst_block_ids);
+
+  // [begin, end) of the contiguous block groups a layer of |num_blocks|
+  // blocks of |block_bytes| each moves in: one group when |group_bytes| is 0
+  // or the blocks fit in it, otherwise the fewest groups of at most
+  // |group_bytes| (one block at least), whose sizes differ by at most one.
+  static std::vector<std::pair<size_t, size_t>> BlockGroupBounds(
+      size_t num_blocks, size_t block_bytes, size_t group_bytes);
 
   // Returns the buffer the device-to-host copy leased to |layer_idx|.
   absl::StatusOr<size_t> ResolveStagingSlot(size_t layer_idx) override {
@@ -217,7 +227,26 @@ class TransferSendSession
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   void EndSendOpLocked() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
   absl::Status AcquireStagingWithRetry(int64_t num_blocks);
-  void SendNextLayer(size_t l);
+
+  // What the send copies and pushes as one: blocks [begin, end) of the pulled
+  // list in |layer|.
+  struct PushUnit {
+    size_t layer = 0;
+    size_t begin = 0;
+    size_t end = 0;
+  };
+  // Splits every layer of a pull of |num_blocks| blocks into units (see
+  // BlockGroupBounds), in push order, and records how each layer's pushes
+  // declare their streams and when its host buffer is free again.
+  void PlanUnitsLocked(size_t num_blocks) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  // Hands unit |u|'s push to the push pool once its D2H copy completes; the
+  // push of each unit chains the next, so pushes start in unit order.
+  void SendNextUnit(size_t u);
+  // Pushes unit |u|, or parks it while |push_window_| pushes are in flight,
+  // and chains the next unit. Runs on the push pool.
+  void AdmitPush(size_t u);
+  // Issues unit |u|'s push. The caller holds an op; the push takes its own.
+  void IssuePush(size_t u);
 
   mutable absl::Mutex mu_;
   kv_cache::KVCacheManagerBase* const base_ = nullptr;
@@ -247,13 +276,30 @@ class TransferSendSession
   // The last op already closed the idle data connections (kPerTransfer).
   bool connections_released_ ABSL_GUARDED_BY(mu_) = false;
   std::chrono::steady_clock::time_point completed_at_ ABSL_GUARDED_BY(mu_);
+  // The send's units in push order, layer by layer, and each one's D2H copy.
+  std::vector<PushUnit> units_ ABSL_GUARDED_BY(mu_);
+  std::vector<raiden::PjRtCopyFuture> d2h_unit_futures_ ABSL_GUARDED_BY(mu_);
+  // Per layer: the D2H copies of all its units, joined.
   std::vector<raiden::PjRtCopyFuture> d2h_layer_futures_ ABSL_GUARDED_BY(mu_);
+  // Per layer: the streams its units' pushes open together, declared by each
+  // so the consumer completes the layer on the last; nullopt for a layer
+  // that moves whole.
+  std::vector<std::optional<size_t>> layer_streams_ ABSL_GUARDED_BY(mu_);
+  // Per layer: units not yet pushed. Its host layer buffer is released when
+  // the last one has been.
+  std::vector<size_t> unpushed_units_ ABSL_GUARDED_BY(mu_);
+  // At most this many pushes in flight, 0 for no cap (SetPushGroups).
+  size_t push_window_ ABSL_GUARDED_BY(mu_) = 0;
+  size_t pushes_in_flight_ ABSL_GUARDED_BY(mu_) = 0;
+  // The unit whose copy completed while the window was full; the push that
+  // frees the window issues it.
+  std::optional<size_t> parked_unit_ ABSL_GUARDED_BY(mu_);
   // The consumer's data endpoints, populated once `StartPush` serves its pull.
   std::vector<transport::PeerEndpoint> remote_data_endpoints_
       ABSL_GUARDED_BY(mu_);
   std::vector<int> src_ints_ ABSL_GUARDED_BY(mu_);
   std::vector<int> dst_ints_ ABSL_GUARDED_BY(mu_);
-  std::atomic<size_t> remaining_h2h_layers_{0};
+  std::atomic<size_t> remaining_h2h_units_{0};
   std::atomic<bool> cancelled_{false};
   StagingLayerManager staging_layer_manager_;
 };

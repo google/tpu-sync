@@ -11,14 +11,18 @@ data paths and machine-checked proofs about them.
 **Prefill-to-decode transfer** — [prefill_decode.md](docs/transfer/prefill_decode.md)
 - C++: `TransferSendSession`, `TransferReceiveSession`, `StagingLayerManager`,
   `KVCacheManagerWithTransfer`, the receiver side of `BlockTransport`
-  (`BlockTransportServerPushSession`).
+  (`BlockTransportServerPushSession`), and push groups
+  (`KVCacheManagerBase::SetPushGroups`).
 - Lean: [`Transfer/Session.lean`](TpuSyncVerify/Transfer/Session.lean),
   [`Transfer/LayerStaging.lean`](TpuSyncVerify/Transfer/LayerStaging.lean),
   [`Transfer/PrefillDecode/`](TpuSyncVerify/Transfer/PrefillDecode/).
 - Proved: data correctness on publication (both full host mirror and bounded
   host layer staging under `TPU_RAIDEN_NUM_STAGING_LAYERS`), HBM and staging
   safety, host-slot conservation/exclusivity and `1`-slot sufficiency,
-  drain-to-settle termination, cross-peer isolation.
+  drain-to-settle termination, cross-peer isolation; with push groups
+  (`SetPushGroups`), the push window bound and settlement of the send's push
+  chain, a grouped layer's host buffer staying leased until its last push, and
+  a receive completing each layer once, after all of its group copies.
 
 **Pool resharding** — [reshard.md](docs/transfer/reshard.md)
 - C++: `ReshardSendSession`, `ReshardReceiveSession`, `PoolStagingStorage`,

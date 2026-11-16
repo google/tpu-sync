@@ -31,7 +31,6 @@
 #include <cstring>
 #include <filesystem>  // NOLINT(build/c++17)
 #include <functional>
-#include <future>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -40,7 +39,6 @@
 #include <utility>
 #include <vector>
 
-#include "absl/algorithm/container.h"
 #include "absl/base/const_init.h"
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
@@ -62,6 +60,8 @@
 #include "tpu_sync/core/controller/raiden_controller.h"
 #include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/kv_cache/backends/backend.h"
+#include "tpu_sync/kv_cache/backends/storage/storage_lookup_helper.h"
+#include "tpu_sync/kv_cache/kv_backend_factory.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/telemetry/metrics_api.h"
@@ -902,6 +902,7 @@ PosixKVCacheStoreBackend::PosixKVCacheStoreBackend(
                                                : kDefaultLookupBatchSize),
       cache_options_(cache_options),
       dp_rank_(dp_rank.empty() ? "0" : std::move(dp_rank)),
+      lookup_helper_(name_, dp_rank_, lookup_batch_size_),
       cache_(cache_options.max_entries) {
   if (cache_options_.enabled()) {
     LOG(INFO) << "PosixKVCacheStoreBackend '" << name_
@@ -920,48 +921,6 @@ PosixKVCacheStoreBackend::PosixKVCacheStoreBackend(
 size_t PosixKVCacheStoreBackend::metadata_cache_size() const {
   absl::MutexLock lock(cache_mu_);
   return cache_.size();
-}
-
-RaidenBlockId PosixKVCacheStoreBackend::MakeSharedStorageBlock() const {
-  RaidenBlockId block;
-  block.status = BlockStatus::SHARED_STORAGE;
-  block.raiden_id.job_replica_id = "shared";
-  block.raiden_id.data_name = name_;
-  return block;
-}
-
-absl::StatusOr<std::vector<BlockKey>> PosixKVCacheStoreBackend::MapShardKeys(
-    const std::string& block_hash) const {
-  const std::shared_ptr<BlockKeyMapper> mapper = storage_backend_->mapper();
-  const int pp_size = mapper->pp_size();
-  const int pcp_size = mapper->pcp_size();
-  const int tp_size = mapper->tp_size();
-  // In secondary storage every (pp_rank, pcp_rank, tp_rank) worker writes its
-  // own shard file of each block. The block is available only if every shard
-  // is present. An undeclared axis spans a single shard and is left unset in
-  // the mapping options, so it adds no path segment.
-  auto declare = [](int size, int rank, int* size_field, int* rank_field) {
-    if (size == kAxisUndeclared) return;
-    *size_field = size;
-    *rank_field = rank;
-  };
-  std::vector<BlockKey> keys;
-  keys.reserve(mapper->shards_per_block());
-  for (int pp_rank = 0; pp_rank < std::max(1, pp_size); ++pp_rank) {
-    for (int pcp_rank = 0; pcp_rank < std::max(1, pcp_size); ++pcp_rank) {
-      for (int tp_rank = 0; tp_rank < std::max(1, tp_size); ++tp_rank) {
-        backends::KeyMappingOptions lookup_opts;
-        ParallelismConfig& p = lookup_opts.parallelism;
-        declare(pp_size, pp_rank, &p.pp_size, &p.pp_rank);
-        declare(pcp_size, pcp_rank, &p.pcp_size, &p.pcp_rank);
-        declare(tp_size, tp_rank, &p.tp_size, &p.tp_rank);
-        ABSL_ASSIGN_OR_RETURN(BlockKey key,
-                              mapper->MapKey(block_hash, lookup_opts));
-        keys.push_back(std::move(key));
-      }
-    }
-  }
-  return keys;
 }
 
 std::vector<std::vector<bool>> PosixKVCacheStoreBackend::CachedFresh(
@@ -1005,170 +964,38 @@ void PosixKVCacheStoreBackend::CacheInsert(
   }
 }
 
-std::vector<bool> PosixKVCacheStoreBackend::ProbeExists(
-    absl::Span<const BlockKey> keys) {
-  std::vector<bool> exists(keys.size(), false);
-  std::promise<std::vector<absl::StatusOr<bool>>> promise;
-  auto future = promise.get_future();
-  storage_backend_->BatchExistsAsync(
-      keys, [&promise](std::vector<absl::StatusOr<bool>> res) {
-        promise.set_value(std::move(res));
-      });
-  const std::vector<absl::StatusOr<bool>> answers = future.get();
-  // A short answer cannot be attributed to keys reliably; treat it as absent.
-  if (answers.size() != keys.size()) return exists;
-  for (size_t i = 0; i < answers.size(); ++i) {
-    exists[i] = answers[i].ok() && *answers[i];
-  }
-  return exists;
-}
-
-// Queries `block_hashes` on storage according to `options`:
-// - Returns empty immediately when `options.host_resident_only` is set (POSIX
-//   is not host-DRAM-resident) or when `block_hashes` is empty.
-// - Each block hash maps via MapShardKeys(hash) to N = max(1, S) * max(1, P) *
-//   max(1, T) shard file keys across the (PP, PCP, TP) topology; all shard keys
-//   must exist for a block to be available. When the positive-only TTL metadata
-//   cache is enabled, fresh shard hits avoid storage probes.
-// - Phase 0 (map): maps each block hash to its shard keys (`kPrefix` stops at
-//   the first unmappable hash; `kSubset` records an empty key list and
-//   continues to preserve index alignment).
-// - Phase 1 (cache): marks shard keys with a fresh metadata cache entry as
-//   present and refreshes their `last_used` timestamp.
-// - Phase 2 (storage): probes cache-missed shard keys via BatchExistsAsync in
-//   chunks of `lookup_batch_size_` (`kPrefix` exits early after the first chunk
-//   with an absent key; `kSubset` probes all chunks) and caches confirmed keys.
-// - Phase 3 (merge): emits SHARED_STORAGE entries (`kPrefix` up to the first
-//   unavailable block; `kSubset` for all available blocks).
+// Queries `block_hashes` on storage according to `options`. Each block hash
+// maps to one shard file key per (PP, PCP, TP) rank, and all of them must
+// exist for the block to be available. StorageLookupHelper::Lookup describes
+// the lookup phases. CachedFresh and CacheInsert connect it to the metadata
+// cache, so that fresh shard hits avoid storage probes.
 absl::StatusOr<BlockSliceList> PosixKVCacheStoreBackend::Lookup(
     absl::Span<const std::string> block_hashes, const LookupOptions& options) {
-  if (options.match_mode == LookupMatchMode::kSubset && options.enable_global) {
-    return absl::InvalidArgumentError(
-        "LookupMatchMode::kSubset is not supported with enable_global=true");
-  }
-  if (options.host_resident_only && options.enable_global) {
-    return absl::InvalidArgumentError(
-        "host_resident_only is not supported with enable_global=true");
-  }
-  if (options.include_eviction_candidates && options.pin_found) {
-    return absl::InvalidArgumentError(
-        "include_eviction_candidates is not supported with pin_found=true");
-  }
+  // Checked before the early return below, so an invalid option combination
+  // is reported even when there is no backend to probe.
+  ABSL_RETURN_IF_ERROR(StorageLookupHelper::ValidateLookupOptions(options));
 
-  BlockSliceList results;
   if (options.host_resident_only || !storage_backend_ ||
       !storage_backend_->mapper() || block_hashes.empty()) {
-    return results;
+    return BlockSliceList();
   }
   if (posix_backend_ != nullptr) {
     MaybeRecordFilesystemMetrics(posix_backend_->options().root_dir);
   }
 
-  // Phase 0 (map).
-  std::vector<std::vector<BlockKey>> shard_keys;
-  shard_keys.reserve(block_hashes.size());
-  for (const std::string& hash : block_hashes) {
-    absl::StatusOr<std::vector<BlockKey>> keys = MapShardKeys(hash);
-    if (!keys.ok()) {
-      if (options.match_mode == LookupMatchMode::kSubset) {
-        shard_keys.emplace_back();
-        continue;
-      }
-      break;
-    }
-    shard_keys.push_back(*std::move(keys));
-  }
-  if (shard_keys.empty()) return results;
-
-  // Phase 1 (cache).
-  std::vector<std::vector<bool>> present = CachedFresh(shard_keys);
-
-  // Phase 2 (storage): flat list of cache-missed shard keys across all blocks,
-  // probed in chunks of lookup_batch_size_.
-  struct ShardRef {
-    size_t block;
-    size_t shard;
-  };
-  uint64_t cache_hits = 0;
-  std::vector<ShardRef> misses;
-  for (size_t i = 0; i < shard_keys.size(); ++i) {
-    for (size_t j = 0; j < shard_keys[i].size(); ++j) {
-      if (present[i][j]) {
-        ++cache_hits;
-      } else {
-        misses.push_back({i, j});
-      }
-    }
-  }
-  uint64_t stat_hits = 0;
-  uint64_t stat_misses = 0;
-  std::vector<const BlockKey*> confirmed;
-  for (size_t offset = 0; offset < misses.size();
-       offset += lookup_batch_size_) {
-    const size_t chunk_len =
-        std::min(lookup_batch_size_, misses.size() - offset);
-    std::vector<BlockKey> chunk_keys;
-    chunk_keys.reserve(chunk_len);
-    for (size_t k = 0; k < chunk_len; ++k) {
-      const ShardRef& miss = misses[offset + k];
-      chunk_keys.push_back(shard_keys[miss.block][miss.shard]);
-    }
-    const std::vector<bool> exists = ProbeExists(chunk_keys);
-    bool chunk_has_absent = false;
-    for (size_t k = 0; k < chunk_len; ++k) {
-      const ShardRef& miss = misses[offset + k];
-      if (exists[k]) {
-        present[miss.block][miss.shard] = true;
-        confirmed.push_back(&shard_keys[miss.block][miss.shard]);
-        ++stat_hits;
-      } else {
-        chunk_has_absent = true;
-        ++stat_misses;
-      }
-    }
-    if (options.match_mode == LookupMatchMode::kPrefix && chunk_has_absent) {
-      break;  // Early exit; see Phase 2 above.
-    }
-  }
-  CacheInsert(confirmed);
-
-  telemetry::RaidenMetricStore& metric_store =
-      telemetry::RaidenMetricStore::GetGlobalMetricStore();
-  if (metric_store.HasBackends()) {
-    auto record = [&](absl::string_view result, uint64_t count) {
-      if (count == 0) return;
-      const telemetry::MetricLabel labels[] = {
-          {telemetry::metric_labels::kDpRank, dp_rank_},
-          {telemetry::metric_labels::kResult, result},
-      };
-      metric_store.IncrementCounter(
-          telemetry::metric_names::kStorageMetadataCheckTotal, labels, count);
-    };
-    record(telemetry::metric_labels::kResultCacheHit, cache_hits);
-    record(telemetry::metric_labels::kResultStatHit, stat_hits);
-    record(telemetry::metric_labels::kResultStatMiss, stat_misses);
-  }
-
-  // Phase 3 (merge).
-  auto all_present = [](const std::vector<bool>& shards) {
-    return !shards.empty() && absl::c_all_of(shards, [](bool shard_present) {
-      return shard_present;
-    });
-  };
-  if (options.match_mode == LookupMatchMode::kSubset) {
-    for (size_t i = 0; i < shard_keys.size(); ++i) {
-      if (all_present(present[i])) {
-        results.push_back(
-            std::make_pair(block_hashes[i], MakeSharedStorageBlock()));
-      }
-    }
-  } else {
-    for (size_t i = 0; i < shard_keys.size() && all_present(present[i]); ++i) {
-      results.push_back(
-          std::make_pair(block_hashes[i], MakeSharedStorageBlock()));
-    }
-  }
-  return results;
+  return lookup_helper_.Lookup(
+      block_hashes, options,
+      [this](const std::string& block_hash) {
+        return StorageLookupHelper::ExpandShardKeys(*storage_backend_->mapper(),
+                                                    block_hash);
+      },
+      [this](absl::Span<const BlockKey> keys) {
+        return StorageLookupHelper::ProbeExists(*storage_backend_, keys);
+      },
+      [this](absl::Span<const std::vector<BlockKey>> shard_keys) {
+        return CachedFresh(shard_keys);
+      },
+      [this](absl::Span<const BlockKey* const> keys) { CacheInsert(keys); });
 }
 
 size_t PosixKVCacheStoreBackend::Delete(
@@ -1197,7 +1024,8 @@ size_t PosixKVCacheStoreBackend::Delete(
   std::vector<MappedBlock> mapped_blocks;
   mapped_blocks.reserve(block_hashes.size());
   for (const std::string& hash : block_hashes) {
-    absl::StatusOr<std::vector<BlockKey>> keys = MapShardKeys(hash);
+    absl::StatusOr<std::vector<BlockKey>> keys =
+        StorageLookupHelper::ExpandShardKeys(*storage_backend_->mapper(), hash);
     if (!keys.ok()) continue;  // Never cached; keep invalidating the rest.
     MappedBlock entry{.hash = hash};
     entry.resolved_keys.reserve(keys->size());
@@ -1244,7 +1072,7 @@ REGISTER_KV_CACHE_STORE_BACKEND(
         -> absl::StatusOr<
             std::shared_ptr<::tpu_raiden::kv_cache::KVCacheStoreBackend>> {
       // The coordinator probes every rank explicitly (see
-      // PosixKVCacheStoreBackend::MapShardKeys), so the default mapper rank of
+      // StorageLookupHelper::ExpandShardKeys), so the default mapper rank of
       // each declared axis is pinned to 0. Per-worker ranks live on the
       // worker's own config.
       ABSL_ASSIGN_OR_RETURN(
@@ -1282,4 +1110,27 @@ REGISTER_KV_CACHE_STORE_BACKEND(
           ::tpu_raiden::kv_cache::backends::storage::MetadataCacheOptions::
               FromPosixOptions(options),
           absl::StrCat(config.raiden_id.data_replica_idx));
+    });
+
+REGISTER_KV_BACKEND(
+    ::tpu_raiden::kv_cache::backends::storage::kPosixBackendName,
+    [](const ::tpu_raiden::kv_cache::BackendConfig& config)
+        -> absl::StatusOr<
+            std::shared_ptr<::tpu_raiden::kv_cache::backends::KVBackend>> {
+      ABSL_ASSIGN_OR_RETURN(
+          const PosixBackendOptions options,
+          PosixBackendOptions::FromProperties(config.properties));
+      const std::string backend_name =
+          config.type.empty() ? std::string(::tpu_raiden::kv_cache::backends::
+                                                storage::kPosixBackendName)
+                              : config.type;
+      LOG(INFO) << "[Worker] " << backend_name << " backend shard directory "
+                << options.root_dir << "/"
+                << ::tpu_raiden::kv_cache::backends::storage::SanitizeModelName(
+                       options.model_name)
+                << "/"
+                << ::tpu_raiden::kv_cache::backends::storage::FormatTopologyDir(
+                       config.parallelism)
+                << "/";
+      return std::make_shared<PosixKVBackend>(backend_name, config.properties);
     });

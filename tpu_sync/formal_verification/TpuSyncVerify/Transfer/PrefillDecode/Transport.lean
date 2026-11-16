@@ -46,10 +46,30 @@ critical section of the push session's `mu_` in
 (`auto& progress = layer_progress_[l]`) and the two delegate callbacks that
 follow run on the same reader thread, so interleaving other streams between
 them changes nothing the properties here observe. The sender always names one
-layer per stream (`TransferSendSession::SendNextLayer`'s `H2hWriteDirectAsync`
+layer per stream (`TransferSendSession::IssuePush`'s `H2hWriteDirectAsync`
 → `BlockTransport::BuildBlockRequests`'s `header_layer_idx`), so the
 all-layers form `local_id == 0xFFFFFFFF` in `ResolveIncomingPushSpec` and
 `CompleteIncomingPush` does not arise and `l` ranges over `0 .. numLayers - 1`.
+
+A sender with push groups (`KVCacheManagerBase::SetPushGroups`) moves a large
+layer in several pushes, one per block group, each opening
+`min(parallelism, blocks in the group)` streams per source NUMA group. Every
+stream of every such push declares the streams of all of them in
+`header.reserved` (`layer_streams` in `BlockTransport::AsyncPush`, computed by
+`TransferSendSession::PlanUnitsLocked` from the same `BlockGroupBounds` that
+cut the groups), so the receiver sees one sender sending its declared
+`numStreams` streams for the layer, and the streams of different pushes are
+indistinguishable to `CompleteIncomingPush`: the model covers a grouped layer
+with `numStreams` that sum. A push that declares fewer streams than it opens
+is refused before it is sent (`push opens ... streams but declares ...` in
+`BlockTransport::AsyncPushShards`); a declared sum below the streams actually
+sent would break A4. Block groups are a header-declared contract only: a
+plan-declared pool counts every stream as one of its expected pushes
+(`BlockTransportTest.PlanDeclaredPoolRejectsBlockGroupPushes`), and the
+Peregrine sender refuses them (`block-group pushes are not supported`). The
+receive-session side here is a receive without push groups; with them, a
+stream also offers its landed blocks (`session->OnBlocksLanded`) before it
+counts, which `GroupLanding.lean` models on top of `OnceDispatched` (its A1).
 
 Two of the four completion contracts of
 `BlockTransportServerPushSession::CompleteIncomingPush` are modelled, selected
@@ -102,9 +122,9 @@ only H2D copies whose callback has not run.
 | `Progress.called` | `LayerProgress::on_layer_received_called` | the once-latch |
 | `Layer.sent` | ghost | streams accepted per sender for this layer |
 | `Layer.dispatched` | ghost | `OnLayerReceived` → `ExecuteLayerH2d` entries for this layer |
-| `Layer.pending` | subset of `h2d_futures_` (`ExecuteLayerH2d`: `h2d_futures_.push_back(future)`) | copies issued for this layer whose callback has not run |
+| `Layer.pending` | subset of `h2d_futures_` (`DispatchLayerH2d`: `h2d_futures_.push_back(future)`) | copies issued for this layer whose callback has not run |
 | `blocks` | `blocks_received_per_shard_` collapsed to one shard (`RecordBlockShardsReceivedLocked`) | block units reported by `OnBlockShardsReceived` |
-| `completedLayers` | `num_completed_layers_` (`ExecuteLayerH2d`: `self->num_completed_layers_++`) | H2D callbacks that ran OK |
+| `completedLayers` | `num_completed_layers_` (`CompleteLayerLocked`: `++num_completed_layers_`) | H2D callbacks that ran OK |
 | `life` | `in_flight_`, `draining_`, `done_`, `status_`, staging (`Lifecycle`) | settle protocol |
 
 The shard dimension is collapsed: every shard shares the one target
@@ -119,7 +139,7 @@ completion behaviour (A4 in `Receive.lean` restates this over shards).
 | Event | C++ |
 |---|---|
 | `stream l s` | `HandleIncomingPush` → `GetOrCreatePushSession` → `StartStream`: `BeginIncomingPush` → `TryBeginRecvOp` (`hooks.begin_incoming_push`, refuses once `done_`/`draining_`), payload, `CompleteIncomingPush`, on completion `OnLayerReceived` → `ExecuteLayerH2d` (`hooks.on_layer_received`, `++in_flight_`), then `OnBlockShardsReceived`, `EndIncomingPush`. A rejection inside `CompleteIncomingPush` returns early and `absl::Cleanup end_incoming_push` ends the push with `InternalError("Incoming push failed")`, which `hooks.end_incoming_push` turns into `Finish(status)` then `EndRecvOp()`. |
-| `h2dDone l ok` | the `future.OnReady` callback of a layer's copy in `ExecuteLayerH2d`: on OK `num_completed_layers_++` and, at `num_layers()` while not draining, the success `FinishLocked()`; on error `FinishLocked(status_or.status(), kH2dPhase)`; then `absl::Cleanup end_op`'s `EndRecvOp()` |
+| `h2dDone l ok` | `OnLayerH2dDone`, the callback of a layer's copy: on OK `CompleteLayerLocked` (`++num_completed_layers_` and, at `num_layers()` while not draining, the success `FinishLocked()`); on error `FinishLocked(status, kH2dPhase)`; then `absl::Cleanup end_op`'s `EndRecvOp()` |
 | `publish` | `CompleteReadWithDetails`: a receive that is not draining and `IsReadyToComplete()` (`network_completed_ || num_completed_layers_ == num_layers`, and every issued future ready) is `Finish()`ed. "Every future ready" is taken as "every callback has run"; the window between the two is `ReceivePoll.lean`'s subject (`pollReady`) and changes no property here. |
 | `cancel` | the deadline sweep in `CompleteReadWithDetails` (`else if (session->deadline() <= now)`) or any other `Finish(error)` on a receive that is not yet draining |
 
@@ -267,9 +287,11 @@ published with a layer never copied; on either contract after retirement the
 layer is copied twice (the session's `in_flight_` still holds `done_` off
 until both copies return, and a failing duplicate copy fails the receive).
 
-Four transport unit tests replay on `step` (`Transport/Traces.lean`):
+Five transport unit tests replay on `step` (`Transport/Traces.lean`):
 `BlockTransportServerPushSessionTest.LifecycleAndStreamCompletion` (chunk-count,
 two streams complete and retire one layer),
+`BlockTransportTest.BlockGroupPushesCompleteTheirArrayOnce` (chunk-count, a
+layer pushed in two block groups completes once, on the last group's stream),
 `BlockTransportTest.LayerCompletesOnlyAfterEveryDeclaredSender` (sender-declared,
 either arrival order, then reuse after retirement),
 `BlockTransportTest.SenderOverDeliveryIsRejected` (the `streams.landed >
@@ -277,8 +299,9 @@ streams.declared` rejection) and
 `BlockTransportTest.UndeclaredUuidKeepsHeaderDeclaredCompletion` (the chunk-count
 contract on two senders, `Cfg.WF.chunkSingle`'s excluded instance); sibling
 push-progress tests that vary declarations per sender (outside A3), call
-`Cancel` / `ForgetPushProgress`, or exercise the plan-declared pool or Peregrine
-bitmask branches are documented alongside them.
+`Cancel` / `ForgetPushProgress`, check the sender side of a push, or exercise
+the plan-declared pool or Peregrine bitmask branches are documented alongside
+them.
 
 ## Source map
 
@@ -318,7 +341,8 @@ Generated by `tools/resolve_anchors.py`.
 | `recv.cc` | `TransferReceiveSession::OnRecvNetworkComplete` | `:699-709` |
 | `recv.cc` | `TransferReceiveSession::OnBlockShardsReceived` | `:711-758` |
 | `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` | `:786-925` |
-| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`future.OnReady`) | `:862-922` |
+| `recv.cc` | `TransferReceiveSession::DispatchLayerH2d` (`future.OnReady`) | `:979-981` |
+| `recv.cc` | `TransferReceiveSession::OnLayerH2dDone` | `:1021-1064` |
 | `block_transport_session_test.cc` | `MockSessionDelegate` | `:42-142` |
 | `block_transport_session_test.cc` | `BlockTransportServerPushSessionTest.LifecycleAndStreamCompletion` | `:144-179` |
 | `block_transport_session_test.cc` | `BlockTransportServerPushSessionTest.Cancel` | `:181-195` |
@@ -344,7 +368,16 @@ Generated by `tools/resolve_anchors.py`.
 | `mgr.cc` | `KVCacheManagerWithTransfer::StartRead(remote_endpoint)` | `:1045-1149` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = active_recv_sessions_.begin();`) | `:1207-1238` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::OnBlockShardsReceived` | `:1668-1692` |
-| `send.cc` | `TransferSendSession::SendNextLayer` (`self->base_->H2hWriteDirectAsync`) | `:625-653` |
+| `send.cc` | `TransferSendSession::IssuePush` (`base_->H2hWriteDirectAsync(`) | `:824-877` |
+| `send.cc` | `TransferSendSession::PlanUnitsLocked` | `:455-483` |
+| `bt.cc` | `BlockTransport::AsyncPush` (`if (layer_streams.has_value())`) | `:532-537` |
+| `bt.cc` | `BlockTransport::AsyncPushShards` (`if (layer_streams.has_value() && *layer_streams < static_cast<size_t>(P))` .. `layer_streams.value_or(static_cast<size_t>(P)) * num_groups;`) | `:617-624` |
+| `bts.cc` | `BlockTransportServerPushSession::StartStream` (`session->OnBlocksLanded(`) | `:492-493` |
+| `block_transport_test.cc` | `BlockTransportTest.BlockGroupPushesCompleteTheirArrayOnce` | `:1300-1334` |
+| `block_transport_test.cc` | `BlockTransportTest.DeclaredSenderMayPushItsArrayInBlockGroups` | `:1336-1376` |
+| `block_transport_test.cc` | `BlockTransportTest.PushDeclaringFewerStreamsThanItOpensIsRejected` | `:1378-1396` |
+| `block_transport_test.cc` | `BlockTransportTest.PlanDeclaredPoolRejectsBlockGroupPushes` | `:1401-1433` |
+| `block_transport_test.cc` | `TransportBackendTest.PeregrineBlockGroupPushIsUnimplemented` | `:2593-2611` |
 | `base.cc` | `KVCacheManagerBase::ExpectedPushSenders` | `:2745-2762` |
 | `base.cc` | `KVCacheManagerBase::RegisterActivePlan(host_block_of)` | `:3136-3222` |
 | `base.cc` | `KVCacheManagerBase::GetBlockChunks` (`if (sender_node_id != -1) {` .. `auto schedule_found_it = schedules.find(found_src_shard);`) | `:3512-3535` |

@@ -18,7 +18,7 @@ abbrev sendLoopOwnsSlot (s : BoundedPipeline) (l : Nat) : Prop :=
 
 /-- After `D2hSyncDispatch(l)` succeeds (`l < d2hIssued`), the async D2H →
 `push_pool` → H2H pipeline owns layer `l`'s slot lease until released by an
-aborted `SendNextLayer` callback (`woken ≤ l`), a draining `push_pool` task
+aborted `SendNextUnit` callback (`woken ≤ l`), a draining `push_pool` task
 (`l = h2hIssued ∧ pooled = 1`), or `H2hWriteDirectAsync`'s completion callback
 (`l < h2hIssued ∧ h2hRetiredL[l] = false`). -/
 abbrev sendPipeOwnsSlot (s : BoundedPipeline) (l : Nat) : Prop :=

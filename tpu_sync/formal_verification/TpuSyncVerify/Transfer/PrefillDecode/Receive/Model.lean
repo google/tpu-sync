@@ -101,8 +101,8 @@ def h2dBegin (s : Recv) : Option Recv :=
     s.life.beginOp.map fun l => { s with life := l, pending := s.pending + 1 }
   else none
 
-/-- `ExecuteLayerH2d` from the re-check on. If the session finished in the
-window between the two locks (`if (done_ || draining_) { EndRecvOpLocked(); return absl::OkStatus(); }`),
+/-- `DispatchLayerH2d`, called from `ExecuteLayerH2d`: the re-check on. If the session finished in the
+window between the two locks (`if (done_ || draining_) { ...; EndRecvOpLocked(); return absl::OkStatus(); }`),
 the op is released and no copy is issued. Otherwise the copy is dispatched via
 `H2dSyncDispatch`: on failure `FinishLocked(future_or.status(), kH2dPhase); EndRecvOpLocked()`;
 on success its future joins `h2d_futures_` (`h2d_futures_.push_back(future)`)
@@ -122,12 +122,12 @@ def h2dIssue (ok : Bool) (s : Recv) : Option Recv :=
 def h2dReady (s : Recv) : Option Recv :=
   if s.ready < s.issued then some { s with ready := s.ready + 1 } else none
 
-/-- H2D completion callback (`ExecuteLayerH2d`'s `future.OnReady`), run once per
-ready future. `absl::Cleanup end_op` calls `EndRecvOp()` on every path. On a
-retired session (`if (self->done_)`) the body returns early (`LOG(DFATAL)`). On
-success `self->num_completed_layers_++`; the last layer calls
-`self->FinishLocked()` unless `!self->draining_` fails. On failure
-`self->FinishLocked(status_or.status(), kH2dPhase)`. -/
+/-- H2D completion callback (`OnLayerH2dDone`, from `future.OnReady` in
+`DispatchLayerH2d`), run once per ready future. `absl::Cleanup end_op` calls
+`EndRecvOp()` on every path. On a retired session (`if (done_)`) the body returns
+early (`LOG(DFATAL)`). On success the layer completes (`CompleteLayerLocked`:
+`++num_completed_layers_`; the last layer calls `FinishLocked()` unless
+draining). On failure `FinishLocked(status, kH2dPhase)`. -/
 def h2dDone (ok : Bool) (s : Recv) : Option Recv :=
   if s.retired < s.ready then
     let s := { s with retired := s.retired + 1 }

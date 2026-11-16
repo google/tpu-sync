@@ -14,7 +14,11 @@ how the session drains and settles, when its host staging is released — along
 with the transport's block accounting, the readiness predicate
 `IsReadyToComplete`, and the manager's poll that publishes `done_recving` /
 `failed_recving`. Layer data, memory contents and the producer are modelled in
-`Send.lean` and `Pipeline.lean`.
+`Send.lean` and `Pipeline.lean`. This is a receive without push groups, the
+default (`h2d_group_bytes_ == 0`): a layer gets one H2D copy, issued when it
+lands. With push groups a layer's landed blocks may be copied in groups before
+the layer lands (`OnBlocksLanded`); `GroupLanding.lean` models that and shows
+the layer's copies acting toward this model as its one copy.
 
 `recv.h`/`recv.cc` are `tpu_sync/kv_cache/transfer_receive_session.{h,cc}`;
 `mgr.cc` is `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`; `bt.cc` is
@@ -36,7 +40,7 @@ The settle protocol itself is `Transfer.Lifecycle`. On top of it:
 | `published`       | membership in `done_recving_` / `failed_recving_` (`CompleteReadWithDetails`; a settled incumbent is also reported when displaced in `EmplaceRecvSessionLocked` and `StartRead`) | what `poll_stats()` shows the engine |
 | `pushes`          | ghost                                      | incoming pushes between `TryBeginRecvOp` and `EndRecvOp` |
 | `pullPending`     | `handshake_pending_` (set in `InitFromLoadPlan`, cleared in `ExecutePullRequest`'s `on_response`) | the StartRead pull handshake still holds its op |
-| `pending`         | ghost                                      | `ExecuteLayerH2d` calls between their first and second lock |
+| `pending`         | ghost                                      | `ExecuteLayerH2d` calls between their lock and `DispatchLayerH2d`'s |
 | `retired`         | ghost                                      | H2D callbacks that have run, OK or not |
 
 Ghost fields have no single C++ variable. They record where each unit of
@@ -64,9 +68,9 @@ is out of scope; see `Transport.lean`.)
 | `pushEnd`      | `EndRecvOp` from `hooks.end_incoming_push`, called in `StartStream` (`EndIncomingPush`). The hook takes the push's status and, when it is not OK, runs `DeferUnregisterOnSettle(); recv_session->Finish(status)` before `EndRecvOp()` (the transport's `absl::Cleanup end_incoming_push` passes `InternalError("Incoming push failed")` on any early return) — in the model, `cancel` followed by `pushEnd`, see `trace_push_lease_pins_staging_on_cancel` |
 | `pullReply ok` | `on_response` of `ExecutePullRequest`: a transport failure keeps its status code, a producer rejection (`response->status != 0`) becomes `FailedPrecondition`; under `mu_` the error runs `FinishLocked(pull_status)` and clears `handshake_pending_ = false`, then the `absl::Cleanup end_op` ends the op. Also the fault-injected `Finish(status); EndRecvOp()` in `StartRead` (`kKvCacheManagerApiStartReadSubmitPull`) |
 | `h2dBegin`     | `ExecuteLayerH2d`, first critical section (`++in_flight_`), from `hooks.on_layer_received` (`BlockTransportServerPushSession::CompleteIncomingPush` → `OnLayerReceived`) |
-| `h2dIssue ok`  | `ExecuteLayerH2d` from the `done_ || draining_` re-check through `H2dSyncDispatch` and `h2d_futures_.push_back(future)` |
+| `h2dIssue ok`  | `DispatchLayerH2d`, called from `ExecuteLayerH2d`: the `done_ || draining_` re-check through `H2dSyncDispatch` and `h2d_futures_.push_back(future)` |
 | `h2dReady`     | the device finishes a copy: its future becomes `IsReady()` |
-| `h2dDone ok`   | `ExecuteLayerH2d`'s `future.OnReady` H2D completion callback |
+| `h2dDone ok`   | `OnLayerH2dDone`, the H2D completion callback (`future.OnReady` in `DispatchLayerH2d`) |
 | `netAccount`   | `OnBlockShardsReceived` via `StartStream` / `KVCacheManagerWithTransfer::OnBlockShardsReceived`: accounts a stream's blocks per shard (`RecordBlockShardsReceivedLocked`), may set `network_completed_`, and finishes the session if every layer is also complete (`RecordNetworkCompleteLocked`) |
 | `pollReady`    | `CompleteReadWithDetails` / `CompleteReadRaw` sees `IsReadyToComplete()` and calls `Finish()` |
 | `cancel`       | any `Finish(error)` from outside the session: deadline (`CompleteReadWithDetails`), shutdown (`~KVCacheManagerWithTransfer`), plan unregister (`UnregisterActivePlan`) |
@@ -89,9 +93,9 @@ are the only other state an event reads outside `mu_`.
 | `pushEnd`      | `EndRecvOp`, plus `MaybeUnregisterSettledRecv` (`Done()`, and `TakePendingUnregister` if settled) and 1–2 read-only `GetStatus()` scopes for the hook's return value | on a failed push, the hook's `DeferUnregisterOnSettle()` and `Finish(status)` run in earlier scopes (`cancel` before `pushEnd`; `unregister_on_settle_` is not modelled) |
 | `pullReply`    | 2: `on_response`'s `absl::MutexLock lock(self->mu_)` (`FinishLocked(pull_status)` on failure, `handshake_pending_ = false`), then `EndRecvOp()` from `absl::Cleanup end_op` after `lock` is released (`ExecutePullRequest` also takes an initial `mu_` scope before scheduling to read `load_plan_` and set `peer_endpoint_`; the fault-injected `Finish(status); EndRecvOp()` in `StartRead` is the same two scopes without `ExecutePullRequest`, leaving `handshake_pending_ = true` on a settled session) | an `EndRecvOp` tail, below |
 | `h2dBegin`     | 1: first scope of `ExecuteLayerH2d` | — |
-| `h2dIssue`     | 1–2 in `ExecuteLayerH2d`: the `done_ || draining_` re-check (`EndRecvOpLocked()` and return in 1 scope when draining), then `h2d_futures_.push_back(future)` after the unlocked `H2dSyncDispatch` (or, on dispatch failure, `FinishLocked(future_or.status(), kH2dPhase); EndRecvOpLocked()`), followed by `MaybeUnregisterSettledRecv` | during `H2dSyncDispatch` the copy is not yet in `h2d_futures_`, so `AllH2dDoneLocked` does not see it. Harmless by A4: this thread calls `OnBlockShardsReceived` only after `ExecuteLayerH2d` returns, so `network_completed_` cannot be set in the gap, and `num_completed_layers_ == total_layers` is false while a layer is unissued, keeping `IsReadyToComplete` false. A `Finish(error)` before the re-check is `cancel` then `h2dIssue` (`trace_finish_between_locks`); one during the dispatch finds the op `h2dBegin` took, cannot settle, and commutes with `push_back`, i.e. `h2dIssue true` then `cancel` (`trace_deadline_during_copy`, `RecvDrainTest.TimeoutDuringH2dDispatchKeepsStaging`) |
+| `h2dIssue`     | 1–2 in `DispatchLayerH2d`: the `done_ || draining_` re-check (`EndRecvOpLocked()` and return in 1 scope when draining), then `h2d_futures_.push_back(future)` after the unlocked `H2dSyncDispatch` (or, on dispatch failure, `FinishLocked(future_or.status(), kH2dPhase); EndRecvOpLocked()`), followed by `MaybeUnregisterSettledRecv` | during `H2dSyncDispatch` the copy is not yet in `h2d_futures_`, so `AllH2dDoneLocked` does not see it. Harmless by A4: this thread calls `OnBlockShardsReceived` only after `ExecuteLayerH2d` returns, so `network_completed_` cannot be set in the gap, and `num_completed_layers_ == total_layers` is false while a layer is unissued, keeping `IsReadyToComplete` false. A `Finish(error)` before the re-check is `cancel` then `h2dIssue` (`trace_finish_between_locks`); one during the dispatch finds the op `h2dBegin` took, cannot settle, and commutes with `push_back`, i.e. `h2dIssue true` then `cancel` (`trace_deadline_during_copy`, `RecvDrainTest.TimeoutDuringH2dDispatchKeepsStaging`) |
 | `h2dReady`     | 0 (device) | — |
-| `h2dDone`      | 2: the callback's `absl::MutexLock lock(self->mu_)` (`done_` check, `num_completed_layers_++`, `FinishLocked`), then `EndRecvOp()` from `absl::Cleanup end_op` | an `EndRecvOp` tail, below (when this is the last op of a draining session with `unregister_on_settle_`, the unmodelled `UnregisterSettledPlan` also runs in this gap after `in_flight_ == 1`) |
+| `h2dDone`      | 2: `OnLayerH2dDone`'s `absl::MutexLock lock(mu_)` (`done_` check, `--layer.outstanding`, `CompleteLayerLocked`: `++num_completed_layers_` and `FinishLocked`), then `EndRecvOp()` from `absl::Cleanup end_op` | an `EndRecvOp` tail, below (when this is the last op of a draining session with `unregister_on_settle_`, the unmodelled `UnregisterSettledPlan` also runs in this gap after `in_flight_ == 1`) |
 | `netAccount`   | 1: `OnBlockShardsReceived` (`RecordBlockShardsReceivedLocked`, `RecordNetworkCompleteLocked`, `FinishLocked`), preceded by the manager's `active_recv_sessions_` lookup and followed by `MaybeUnregisterSettledRecv` | — |
 | `pollReady`    | on the poll thread under manager `mu_`: `IsDraining()`, `IsReadyToComplete()`, `req_id()` (for the log), `Finish()` | the poll, below |
 | `cancel`       | 1: `Finish(error)`, after its condition was checked in earlier scopes (`!IsDraining()`, `IsReadyToComplete()`, `deadline() <= now`, and `DeferUnregisterOnSettle()` for the sweep; `!Done()` under manager `mu_` and `DeferUnregisterOnSettle()` for `UnregisterActivePlan`, followed by `Done()` and `TakePendingUnregister` if settled) | `cancel` has no guard in the model, so it admits every such interleaving; late errors, below |
@@ -200,8 +204,8 @@ sufficient `1`-slot bound (`LayerStaging.reachable_safe`,
   `BlockTransport::HandleIncomingPush`, dispatched from `HandleCustomRequest`)
   calls `CompleteIncomingPush` → `OnLayerReceived` before
   `OnBlockShardsReceived`, on the same thread, and `ExecuteLayerH2d` pushes the
-  future into `h2d_futures_` (`h2d_futures_.push_back(future)`) before
-  returning. A layer's blocks are
+  future into `h2d_futures_` (`h2d_futures_.push_back(future)` in
+  `DispatchLayerH2d`) before returning. A layer's blocks are
   accounted as one event once its copy is issued: guard
   `layersAccounted < issued`. With several streams per layer (several senders,
   or one sender's push split by source NUMA node into shard groups, each stream
@@ -225,12 +229,12 @@ All proved on every reachable state (`reachable_safe`):
 
 * **Settle safety.** `done → inFlight = 0`: a settled session owns no work, so
   its blocks and staging can be reused. This is what the comment in
-  `ExecuteLayerH2d` relies on ("A copy already handed to the device cannot be
+  `DispatchLayerH2d` relies on ("A copy already handed to the device cannot be
   revoked; its in-flight count keeps the receive -- and its blocks -- owned
   until the copy ends").
 * **No retired callback.** `done → retired = issued`: the
-  `LOG(DFATAL) << "H2D callback for retired receive"` in `ExecuteLayerH2d`'s
-  `future.OnReady` callback is unreachable.
+  `LOG(DFATAL) << "H2D callback for retired receive"` in `OnLayerH2dDone` is
+  unreachable.
 * **Staging integrity.** `hasStaging = !done`.
 * **Prompt settle.** `draining → inFlight = 0 → done`.
 * **Readiness is sound.** `IsReadyToComplete → ready = numLayers`: when the
@@ -304,10 +308,12 @@ Generated by `tools/resolve_anchors.py`.
 | `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` | `:786-925` |
 | `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`std::optional<size_t> slot = staging_layer_manager_.Lookup(layer_idx);`) | `:793` |
 | `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`++in_flight_;` .. `trigger_enqueue = true;`) | `:809-814` |
-| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`// The receive may have been finished` .. `h2d_futures_.push_back(future);`) | `:826-858` |
-| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`if (!future_or.ok())`) | `:847-853` |
-| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`future.OnReady`) | `:862-922` |
-| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`absl::Cleanup end_op`) | `:869` |
+| `recv.cc` | `TransferReceiveSession::DispatchLayerH2d` (`// The receive may have been finished` .. `h2d_futures_.push_back(future);`) | `:943-977` |
+| `recv.cc` | `TransferReceiveSession::DispatchLayerH2d` (`if (!future_or.ok())`) | `:965-972` |
+| `recv.cc` | `TransferReceiveSession::DispatchLayerH2d` (`future.OnReady`) | `:979-981` |
+| `recv.cc` | `TransferReceiveSession::CompleteLayerLocked` | `:985-995` |
+| `recv.cc` | `TransferReceiveSession::OnLayerH2dDone` | `:1021-1064` |
+| `recv.cc` | `TransferReceiveSession::OnLayerH2dDone` (`absl::Cleanup end_op`) | `:1028` |
 | `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`absl::MutexLock lock(self->mu_);` .. `should_unregister = true;`) | `:875-901` |
 | `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`if (should_unregister && !manager.IsShuttingDown())`) | `:919-921` |
 | `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.on_layer_received =`) | `:303-319` |

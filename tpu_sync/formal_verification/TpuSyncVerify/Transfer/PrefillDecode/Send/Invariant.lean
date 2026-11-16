@@ -13,7 +13,7 @@ namespace Send
 /-! ## Inductive invariant -/
 
 /-- Where every unit of `in_flight_` comes from: a dispatch in progress, a copy
-whose `OnReady` has not ended it, a `SendNextLayer` waiting on its future, a
+whose `OnReady` has not ended it, a `SendNextUnit` waiting on its future, a
 layer waiting for the pool, a pool task that has not released its op, or a
 push whose callback has not run. -/
 def Accounted (s : Send) : Prop :=
@@ -21,7 +21,7 @@ def Accounted (s : Send) : Prop :=
     (if s.d2hPending then 1 else 0) + (s.d2hIssued - s.d2hRetired) + (s.queued - s.woken) +
       s.pooled + s.chaining + (s.h2hIssued - s.h2hRetired)
 
-/-- Single-baton invariant of `TransferSendSession::SendNextLayer`'s push chain:
+/-- Single-baton invariant of `TransferSendSession::SendNextUnit`'s push chain:
 at most one layer is waiting on its future (`queued - woken`), queued on
 `push_pool` (`pooled`), or chaining into the next layer (`chaining`). -/
 structure ChainInv (s : Send) : Prop where
@@ -38,10 +38,10 @@ structure Inv (s : Send) : Prop where
   no_underflow : s.underflow = false
   counters : CountersOrdered s
   pull_claimed : PullClaimed s
-  /-- `SendNextLayer(0)` is armed by `StartPush`: no op is queued before it started. -/
+  /-- `SendNextUnit(0)` is armed by `StartPush`: no op is queued before it started. -/
   queued_started : 0 < s.queued → s.started = true
   /-- The chain only runs past the issued copies once the D2H loop has returned
-  and `fail_unissued_layers` resolved the rest: the send is draining and no
+  and `fail_unissued_units` resolved the rest: the send is draining and no
   dispatch is in progress. -/
   woken_issued : s.d2hIssued < s.woken → s.life.draining = true ∧ s.d2hPending = false
   /-- A send that started draining without an error had pushed every layer. -/
@@ -50,7 +50,7 @@ structure Inv (s : Send) : Prop where
   published_done : ∀ b, s.published = some b → s.life.done = true
   /-- Once published as done, every layer had been pushed (and still has). -/
   published_ok : s.published = some true → s.h2hOk = s.numLayers
-  /-- Single-baton invariant of `SendNextLayer`'s sequential push chain. -/
+  /-- Single-baton invariant of `SendNextUnit`'s sequential push chain. -/
   chain : ChainInv s
 
 theorem inv_init (n : Nat) : Inv (init n) := by
@@ -79,7 +79,7 @@ theorem inv_noOpLeak {s : Send} (h : Inv s) : NoOpLeak s := by
             simp only [step, wake, hwk, hwr, true_or, and_self, ↓reduceIte, Bool.true_eq_false]
             split <;> rfl
           · -- layer `woken` has no copy yet: the loop issues it, or, draining,
-            -- `fail_unissued_layers` resolves its promise
+            -- `fail_unissued_units` resolves its promise
             have hle : s.d2hIssued ≤ s.woken := by omega
             cases hdr : s.life.draining
             · have hst : s.started = true := h.queued_started (by omega)
@@ -454,7 +454,7 @@ theorem step_inv {s s' : Send} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
     · rename_i hg
       obtain ⟨hwk, hres⟩ := hg
       -- after the callback, any layer past the issued copies was resolved by
-      -- `fail_unissued_layers`, on a draining send with no dispatch pending
+      -- `fail_unissued_units`, on a draining send with no dispatch pending
       have hwi' : s.d2hIssued < s.woken + 1 → s.life.draining = true ∧ s.d2hPending = false := by
         intro hlt
         rcases hres with hwr | ⟨_, hdr', hp', _⟩

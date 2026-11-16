@@ -35,9 +35,9 @@ structure Pipeline where
   landedL : List Bool
   /-- ghost: layers `OnLayerReceived` has entered `ExecuteLayerH2d` for -/
   claimedL : List Bool
-  /-- ghost: layers between the first and second lock of `ExecuteLayerH2d` -/
+  /-- ghost: layers between `ExecuteLayerH2d`'s lock and `DispatchLayerH2d`'s -/
   h2dPendingL : List Bool
-  /-- ghost: layers `ExecuteLayerH2d` has dispatched to the device -/
+  /-- ghost: layers `DispatchLayerH2d` has dispatched to the device -/
   h2dIssuedL : List Bool
   /-- ghost: layers whose H2D copy has finished -/
   h2dReadyL : List Bool
@@ -108,9 +108,9 @@ layer-indexed `d2hReady l` / `h2hDone l ok` and are disabled here. `beginPull`
 (`session->ValidateAndBeginPull` in `HandlePullStream`) requires the offer to be registered in
 `send_sessions_` (`s.registered = true`) and clears any grace-wait state
 (`pullWaiting := false`). `wake` gets the per-layer guard the counter model
-cannot state: `SendNextLayer(woken)` waits on layer `woken`'s own future
+cannot state: `SendNextUnit(woken)` waits on layer `woken`'s own future
 (`d2hReadyL[woken]? = some true`), unless layer `woken` was never issued
-(`d2hIssued ≤ woken`) and `fail_unissued_layers` resolves its promise on a
+(`d2hIssued ≤ woken`) and `fail_unissued_units` resolves its promise on a
 draining send with no dispatch in progress. -/
 def sendStep (s : Pipeline) (e : Send.Ev) : Option Pipeline :=
   match e with
@@ -139,8 +139,8 @@ def d2hReady (s : Pipeline) (l : Nat) : Option Pipeline :=
                d2hReadyL := s.d2hReadyL.set l true }
   else none
 
-/-- The push callback for layer `l` in `SendNextLayer` (`H2hWriteDirectAsync`). Pushes are issued in
-layer order by the `SendNextLayer` chain, so push `l` exists iff
+/-- The push callback for layer `l` in `IssuePush` (`H2hWriteDirectAsync`). Pushes are issued in
+layer order by the `SendNextUnit` chain, so push `l` exists iff
 `l < h2hIssued`; pushes complete in any order. A successful push delivers
 `prefillStaging[l]`. -/
 def h2hDone (s : Pipeline) (l : Nat) (ok : Bool) : Option Pipeline :=
@@ -178,8 +178,8 @@ def h2dBegin (s : Pipeline) (l : Nat) : Option Pipeline :=
                h2dPendingL := s.h2dPendingL.set l true }
   else none
 
-/-- `ExecuteLayerH2d(l)` from the `if (done_ || draining_)` re-check through
-`h2d_futures_.push_back(future)`: consumes
+/-- `DispatchLayerH2d(l)`, called from `ExecuteLayerH2d(l)`, from the
+`if (done_ || draining_)` re-check through `h2d_futures_.push_back(future)`: consumes
 layer `l`'s pending claim from `h2dBegin l` and, if the session is still active
 and dispatch succeeds (`ok = true`), marks layer `l`'s copy as issued. -/
 def h2dIssue (s : Pipeline) (l : Nat) (ok : Bool) : Option Pipeline :=

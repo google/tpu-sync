@@ -485,6 +485,14 @@ absl::Status BlockTransportServerPushSession::StartStream(
         metric_names::kReceivedBytesTotal, kPushLabels, total_received_bytes);
   }
 
+  // A header-declared stream of one block array offers its landed blocks to
+  // the session before it counts toward the array's completion.
+  if (session != nullptr && push_spec.target_layers.size() == 1 &&
+      !push_spec.pool_progress_spec.has_value()) {
+    ABSL_RETURN_IF_ERROR(session->OnBlocksLanded(
+        push_spec.target_layers.front(), allocated_ids, stream_shards));
+  }
+
   ABSL_RETURN_IF_ERROR(CompleteIncomingPush(
       session, header.local_id, header.remote_id, header.reserved,
       header.buffer_id == 0 ? 0 : stream_shards.size(),

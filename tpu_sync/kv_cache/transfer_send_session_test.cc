@@ -56,12 +56,14 @@ using ::testing::HasSubstr;
 
 class FakeSendBase : public kv_cache::KVCacheManagerBase {
  public:
-  explicit FakeSendBase(size_t num_layers = 1, int64_t host_blocks = 4)
-      : kv_cache::KVCacheManagerBase(num_layers, /*num_shards=*/1,
-                                     std::vector<size_t>(num_layers, 128),
-                                     /*local_port=*/std::nullopt,
-                                     /*host_blocks_to_allocate=*/host_blocks,
-                                     /*parallelism=*/1, nullptr) {}
+  explicit FakeSendBase(size_t num_layers = 1, int64_t host_blocks = 4,
+                        int parallelism = 1,
+                        std::optional<int> num_staging_layers = std::nullopt)
+      : kv_cache::KVCacheManagerBase(
+            num_layers, /*num_shards=*/1, std::vector<size_t>(num_layers, 128),
+            /*local_port=*/std::nullopt,
+            /*host_blocks_to_allocate=*/host_blocks, parallelism, nullptr,
+            /*bind_ip=*/std::nullopt, num_staging_layers) {}
 
   void SetManualD2h(bool manual) {
     absl::MutexLock lock(mu_);
@@ -120,11 +122,34 @@ class FakeSendBase : public kv_cache::KVCacheManagerBase {
     int layer_idx;
     std::vector<int> src_block_ids;
     std::vector<int> dst_block_ids;
+    std::optional<size_t> layer_streams;
   };
 
   std::vector<H2hPush> h2h_pushes() const {
     absl::MutexLock lock(mu_);
     return h2h_pushes_;
+  }
+
+  // One D2hSyncDispatch call, as the session issued it.
+  struct D2hCopy {
+    size_t layer_idx;
+    std::optional<size_t> host_layer_idx;
+    std::vector<int64_t> src_offsets;
+    std::vector<int64_t> dst_offsets;
+    std::vector<int64_t> sizes;
+  };
+
+  std::vector<D2hCopy> d2h_copies() const {
+    absl::MutexLock lock(mu_);
+    return d2h_copies_;
+  }
+
+  bool WaitForD2hCalls(int expected, absl::Duration timeout) const {
+    absl::MutexLock lock(mu_);
+    auto cond = [this, expected]() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_) {
+      return d2h_calls_ >= expected;
+    };
+    return mu_.AwaitWithTimeout(absl::Condition(&cond), timeout);
   }
 
   bool WaitForH2hCalls(int expected, absl::Duration timeout) const {
@@ -152,6 +177,9 @@ class FakeSendBase : public kv_cache::KVCacheManagerBase {
     }
     absl::MutexLock lock(mu_);
     ++d2h_calls_;
+    d2h_copies_.push_back({layer_idx.value_or(0), host_layer_idx,
+                           src_offsets_major_dim, dst_offsets_major_dim,
+                           copy_sizes_major_dim});
     if (fail_d2h_layer_.has_value() && layer_idx == fail_d2h_layer_) {
       return fail_d2h_status_;
     }
@@ -167,13 +195,14 @@ class FakeSendBase : public kv_cache::KVCacheManagerBase {
   void H2hWriteDirectAsync(const std::vector<transport::PeerEndpoint>& peers,
                            const std::vector<int>& src_block_ids,
                            const std::vector<int>& dst_block_ids, uint64_t uuid,
-                           int layer_idx,
+                           int layer_idx, std::optional<size_t> layer_streams,
                            std::function<void(absl::StatusOr<std::vector<int>>)>
                                on_complete) override {
     {
       absl::MutexLock lock(mu_);
       ++h2h_calls_;
-      h2h_pushes_.push_back({layer_idx, src_block_ids, dst_block_ids});
+      h2h_pushes_.push_back(
+          {layer_idx, src_block_ids, dst_block_ids, layer_streams});
       if (manual_h2h_) {
         h2h_callbacks_.push_back(std::move(on_complete));
         return;
@@ -192,6 +221,7 @@ class FakeSendBase : public kv_cache::KVCacheManagerBase {
   absl::Status fail_d2h_status_ ABSL_GUARDED_BY(mu_);
   std::function<void(size_t)> d2h_dispatch_hook_ ABSL_GUARDED_BY(mu_);
   std::vector<H2hPush> h2h_pushes_ ABSL_GUARDED_BY(mu_);
+  std::vector<D2hCopy> d2h_copies_ ABSL_GUARDED_BY(mu_);
   std::vector<xla::Promise<>> d2h_promises_ ABSL_GUARDED_BY(mu_);
   std::vector<std::function<void(absl::StatusOr<std::vector<int>>)>>
       h2h_callbacks_ ABSL_GUARDED_BY(mu_);
@@ -981,6 +1011,239 @@ TEST(TransferSendSessionTest, HostSourceFinishedBeforeStartPushIssuesNothing) {
   EXPECT_THAT(session->AwaitForDone(), StatusIs(absl::StatusCode::kCancelled));
   EXPECT_EQ(base.h2h_calls(), 0);
   EXPECT_EQ(base.d2h_calls(), 0);
+}
+
+// The host blocks a send's copies wrote, in copy order.
+std::vector<int> CopiedHostBlocks(
+    const std::vector<FakeSendBase::D2hCopy>& copies) {
+  std::vector<int> blocks;
+  for (const FakeSendBase::D2hCopy& copy : copies) {
+    for (size_t i = 0; i < copy.dst_offsets.size(); ++i) {
+      for (int64_t k = 0; k < copy.sizes[i]; ++k) {
+        blocks.push_back(static_cast<int>(copy.dst_offsets[i] + k));
+      }
+    }
+  }
+  return blocks;
+}
+
+TEST(TransferSendSessionTest, BlockGroupBoundsSplitEvenlyWithinTheGroupSize) {
+  using Bounds = std::vector<std::pair<size_t, size_t>>;
+  EXPECT_EQ(TransferSendSession::BlockGroupBounds(10, 100, 0),
+            (Bounds{{0, 10}}));
+  EXPECT_EQ(TransferSendSession::BlockGroupBounds(10, 100, 1000),
+            (Bounds{{0, 10}}));
+  EXPECT_EQ(TransferSendSession::BlockGroupBounds(10, 100, 300),
+            (Bounds{{0, 3}, {3, 6}, {6, 8}, {8, 10}}));
+  EXPECT_EQ(TransferSendSession::BlockGroupBounds(3, 100, 50),
+            (Bounds{{0, 1}, {1, 2}, {2, 3}}));
+  EXPECT_EQ(TransferSendSession::BlockGroupBounds(1, 0, 300), (Bounds{{0, 1}}));
+  EXPECT_TRUE(TransferSendSession::BlockGroupBounds(0, 100, 300).empty());
+}
+
+// A layer over the push group size moves as block groups, each copied and
+// pushed on its own in block order, and every push declares the streams of
+// all of them so the consumer completes the layer on the last.
+TEST(TransferSendSessionTest, PushGroupsSplitALargeLayerIntoCopiesAndPushes) {
+  FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/8, /*parallelism=*/2);
+  base.SetPushGroups(/*group_bytes=*/2 * base.block_bytes(0), /*window=*/0);
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateStagingBlockAllocator(&base, /*num_slots=*/1, /*max_blocks=*/5);
+  const auto now = std::chrono::steady_clock::now();
+  const std::vector<int64_t> blocks = {3, 4, 5, 6, 7};
+  std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
+      &base, allocator.get(), /*uuid=*/401, blocks,
+      /*deadline=*/now + std::chrono::seconds(10), /*register_start=*/now);
+  session->ValidateAndBeginPull(blocks, now);
+  session->StartPush({"127.0.0.1:9000"}, blocks,
+                     /*dst_block_ids=*/{10, 11, 12, 13, 14});
+  ABSL_ASSERT_OK(session->AwaitForDone());
+
+  // Five blocks of at most two per group: [0, 2), [2, 4) and [4, 5).
+  const std::vector<FakeSendBase::D2hCopy> copies = base.d2h_copies();
+  ASSERT_EQ(copies.size(), 3);
+  EXPECT_THAT(copies[0].src_offsets, ElementsAre(3));
+  EXPECT_THAT(copies[0].sizes, ElementsAre(2));
+  EXPECT_THAT(copies[1].src_offsets, ElementsAre(5));
+  EXPECT_THAT(copies[1].sizes, ElementsAre(2));
+  EXPECT_THAT(copies[2].src_offsets, ElementsAre(7));
+  EXPECT_THAT(copies[2].sizes, ElementsAre(1));
+
+  const std::vector<FakeSendBase::H2hPush> pushes = base.h2h_pushes();
+  ASSERT_EQ(pushes.size(), 3);
+  EXPECT_THAT(pushes[0].dst_block_ids, ElementsAre(10, 11));
+  EXPECT_THAT(pushes[1].dst_block_ids, ElementsAre(12, 13));
+  EXPECT_THAT(pushes[2].dst_block_ids, ElementsAre(14));
+  std::vector<int> pushed_host_blocks;
+  for (const FakeSendBase::H2hPush& push : pushes) {
+    EXPECT_EQ(push.layer_idx, 0);
+    // min(2, 2) + min(2, 2) + min(2, 1) streams.
+    EXPECT_EQ(push.layer_streams, std::optional<size_t>(5));
+    pushed_host_blocks.insert(pushed_host_blocks.end(),
+                              push.src_block_ids.begin(),
+                              push.src_block_ids.end());
+  }
+  // Each push sends what its own group's copy staged.
+  EXPECT_EQ(pushed_host_blocks, CopiedHostBlocks(copies));
+}
+
+// Without push groups every layer moves whole, as one copy and one push that
+// declares only its own streams.
+TEST(TransferSendSessionTest, WithoutPushGroupsEachLayerMovesWhole) {
+  FakeSendBase base(/*num_layers=*/2, /*host_blocks=*/8, /*parallelism=*/2);
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateStagingBlockAllocator(&base, /*num_slots=*/1, /*max_blocks=*/3);
+  const auto now = std::chrono::steady_clock::now();
+  const std::vector<int64_t> blocks = {0, 1, 2};
+  std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
+      &base, allocator.get(), /*uuid=*/402, blocks,
+      /*deadline=*/now + std::chrono::seconds(10), /*register_start=*/now);
+  session->ValidateAndBeginPull(blocks, now);
+  session->StartPush({"127.0.0.1:9000"}, blocks, /*dst_block_ids=*/{5, 6, 7});
+  ABSL_ASSERT_OK(session->AwaitForDone());
+
+  const std::vector<FakeSendBase::D2hCopy> copies = base.d2h_copies();
+  ASSERT_EQ(copies.size(), 2);
+  EXPECT_EQ(copies[0].layer_idx, 0);
+  EXPECT_EQ(copies[1].layer_idx, 1);
+  EXPECT_THAT(copies[0].sizes, ElementsAre(3));
+  const std::vector<FakeSendBase::H2hPush> pushes = base.h2h_pushes();
+  ASSERT_EQ(pushes.size(), 2);
+  for (int l = 0; l < 2; ++l) {
+    EXPECT_EQ(pushes[l].layer_idx, l);
+    EXPECT_THAT(pushes[l].dst_block_ids, ElementsAre(5, 6, 7));
+    EXPECT_EQ(pushes[l].layer_streams, std::nullopt);
+  }
+}
+
+// The push window caps the groups a send has pushing: the next group's push
+// starts when an earlier one completes, and the groups still push in order.
+TEST(TransferSendSessionTest, PushWindowCapsTheGroupsPushingAtOnce) {
+  FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/8);
+  base.SetManualH2h(true);
+  base.SetPushGroups(/*group_bytes=*/base.block_bytes(0), /*window=*/2);
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateStagingBlockAllocator(&base, /*num_slots=*/1, /*max_blocks=*/4);
+  const auto now = std::chrono::steady_clock::now();
+  const std::vector<int64_t> blocks = {0, 1, 2, 3};
+  std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
+      &base, allocator.get(), /*uuid=*/403, blocks,
+      /*deadline=*/now + std::chrono::seconds(10), /*register_start=*/now);
+  session->ValidateAndBeginPull(blocks, now);
+  session->StartPush({"127.0.0.1:9000"}, blocks,
+                     /*dst_block_ids=*/{4, 5, 6, 7});
+
+  ASSERT_TRUE(base.WaitForH2hCalls(2, absl::Seconds(2)));
+  EXPECT_FALSE(base.WaitForH2hCalls(3, absl::Milliseconds(200)));
+  base.CompleteH2h(0, std::vector<int>{4});
+  ASSERT_TRUE(base.WaitForH2hCalls(3, absl::Seconds(2)));
+  EXPECT_FALSE(base.WaitForH2hCalls(4, absl::Milliseconds(200)));
+  base.CompleteH2h(1, std::vector<int>{5});
+  ASSERT_TRUE(base.WaitForH2hCalls(4, absl::Seconds(2)));
+  EXPECT_FALSE(session->Done());
+  base.CompleteH2h(2, std::vector<int>{6});
+  base.CompleteH2h(3, std::vector<int>{7});
+  ABSL_ASSERT_OK(session->AwaitForDone());
+
+  const std::vector<FakeSendBase::H2hPush> pushes = base.h2h_pushes();
+  ASSERT_EQ(pushes.size(), 4);
+  for (int g = 0; g < 4; ++g) {
+    EXPECT_THAT(pushes[g].dst_block_ids, ElementsAre(4 + g));
+  }
+}
+
+// A send cancelled while a group waits for the window drops that group: the
+// push in flight settles the send and nothing more is pushed.
+TEST(TransferSendSessionTest, CancelledSendDropsTheGroupWaitingForTheWindow) {
+  FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
+  base.SetManualH2h(true);
+  base.SetPushGroups(/*group_bytes=*/base.block_bytes(0), /*window=*/1);
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateStagingBlockAllocator(&base, /*num_slots=*/1, /*max_blocks=*/2);
+  const auto now = std::chrono::steady_clock::now();
+  const std::vector<int64_t> blocks = {0, 1};
+  std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
+      &base, allocator.get(), /*uuid=*/405, blocks,
+      /*deadline=*/now + std::chrono::seconds(10), /*register_start=*/now);
+  session->ValidateAndBeginPull(blocks, now);
+  session->StartPush({"127.0.0.1:9000"}, blocks, /*dst_block_ids=*/{2, 3});
+  ASSERT_TRUE(base.WaitForH2hCalls(1, absl::Seconds(2)));
+  EXPECT_FALSE(base.WaitForH2hCalls(2, absl::Milliseconds(200)));
+
+  session->Finish(absl::CancelledError("consumer cancelled"));
+  EXPECT_FALSE(session->Done());
+  base.CompleteH2h(0, std::vector<int>{2});
+  EXPECT_THAT(session->AwaitForDone(), StatusIs(absl::StatusCode::kCancelled));
+  EXPECT_EQ(base.h2h_calls(), 1);
+  EXPECT_EQ(allocator->num_free_slots(), 1);
+}
+
+// With fewer host layer buffers than layers, a grouped layer keeps its buffer
+// until its last group has pushed: only then may the next layer copy into it.
+TEST(TransferSendSessionTest, GroupedLayerKeepsItsHostBufferUntilItsLastPush) {
+  FakeSendBase base(/*num_layers=*/2, /*host_blocks=*/4, /*parallelism=*/1,
+                    /*num_staging_layers=*/1);
+  ASSERT_EQ(base.num_host_layers(), 1);
+  base.SetManualH2h(true);
+  base.SetPushGroups(/*group_bytes=*/base.block_bytes(0), /*window=*/0);
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateStagingBlockAllocator(&base, /*num_slots=*/1, /*max_blocks=*/2);
+  const auto now = std::chrono::steady_clock::now();
+  const std::vector<int64_t> blocks = {0, 1};
+  std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
+      &base, allocator.get(), /*uuid=*/404, blocks,
+      /*deadline=*/now + std::chrono::seconds(10), /*register_start=*/now);
+  session->ValidateAndBeginPull(blocks, now);
+  // Blocks in AcquireStagingSlot for layer 1, so it runs off the test thread.
+  std::future<void> push = std::async(std::launch::async, [&]() {
+    session->StartPush({"127.0.0.1:9000"}, blocks, /*dst_block_ids=*/{2, 3});
+  });
+
+  // Both groups of layer 0 copy into the one buffer and push from it.
+  ASSERT_TRUE(base.WaitForH2hCalls(2, absl::Seconds(2)));
+  EXPECT_EQ(base.d2h_calls(), 2);
+  base.CompleteH2h(0, std::vector<int>{2});
+  EXPECT_FALSE(base.WaitForD2hCalls(3, absl::Milliseconds(200)));
+
+  // Layer 0's last push frees the buffer for layer 1's groups.
+  base.CompleteH2h(1, std::vector<int>{3});
+  ASSERT_TRUE(base.WaitForH2hCalls(4, absl::Seconds(2)));
+  base.CompleteH2h(2, std::vector<int>{2});
+  base.CompleteH2h(3, std::vector<int>{3});
+  ASSERT_EQ(push.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+  ABSL_ASSERT_OK(session->AwaitForDone());
+
+  const std::vector<FakeSendBase::D2hCopy> copies = base.d2h_copies();
+  ASSERT_EQ(copies.size(), 4);
+  for (size_t u = 0; u < copies.size(); ++u) {
+    EXPECT_EQ(copies[u].layer_idx, u / 2);
+    EXPECT_EQ(copies[u].host_layer_idx, std::optional<size_t>(0));
+  }
+}
+
+// A host-resident send splits its layers the same way, with no D2H copy.
+TEST(TransferSendSessionTest, HostSourcePushesEachBlockGroupOnItsOwn) {
+  FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
+  base.SetPushGroups(/*group_bytes=*/base.block_bytes(0), /*window=*/0);
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateHostPoolAllocator(base);
+  std::shared_ptr<TransferSendSession> session =
+      CreateHostSendSession(base, allocator.get());
+
+  session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{2, 0},
+                     /*dst_block_ids=*/{1, 3});
+  ABSL_ASSERT_OK(session->AwaitForDone());
+
+  EXPECT_EQ(base.d2h_calls(), 0);
+  const std::vector<FakeSendBase::H2hPush> pushes = base.h2h_pushes();
+  ASSERT_EQ(pushes.size(), 2);
+  EXPECT_THAT(pushes[0].src_block_ids, ElementsAre(2));
+  EXPECT_THAT(pushes[0].dst_block_ids, ElementsAre(1));
+  EXPECT_THAT(pushes[1].src_block_ids, ElementsAre(0));
+  EXPECT_THAT(pushes[1].dst_block_ids, ElementsAre(3));
+  for (const FakeSendBase::H2hPush& push : pushes) {
+    EXPECT_EQ(push.layer_streams, std::optional<size_t>(2));
+  }
 }
 
 }  // namespace

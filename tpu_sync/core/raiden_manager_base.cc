@@ -459,6 +459,7 @@ void RaidenManagerBase::H2hWriteDirectAsync(
     const std::vector<transport::PeerEndpoint>& peers,
     const std::vector<int>& src_block_ids,
     const std::vector<int>& dst_block_ids, uint64_t uuid, int layer_idx,
+    std::optional<size_t> layer_streams,
     std::function<void(absl::StatusOr<std::vector<int>>)> on_complete) {
   RAIDEN_TRACE_FN("RaidenBase::H2hWriteDirectAsync", [&]() {
     return absl::StrCat("blocks=", src_block_ids.size(),
@@ -472,7 +473,7 @@ void RaidenManagerBase::H2hWriteDirectAsync(
   server_
       ->AsyncPush(peers, src_block_ids, dst_block_ids, parallelism_,
                   tpu_raiden::transport::MajorOrder::kLayerMajor, uuid,
-                  layer_idx)
+                  layer_idx, /*wire_layer_idx=*/std::nullopt, layer_streams)
       .OnReady(std::move(on_complete));
 }
 

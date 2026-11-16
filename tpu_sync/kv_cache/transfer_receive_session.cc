@@ -374,6 +374,28 @@ void TransferReceiveSession::InitFromLoadPlan(
   num_completed_layers_ = 0;
   in_flight_ = load_plan.num_blocks > 0 ? 1 : 0;
   h2d_copy_ = load_plan.h2d_copy;
+  // Push groups copy landed blocks to the device ahead of their layer, which
+  // needs each host block's own layer buffer (a full host mirror) and one
+  // device block per host block.
+  const size_t group_bytes =
+      base_ != nullptr ? base_->push_groups().group_bytes : 0;
+  if (destination_ == BlockLocation::kDevice && group_bytes > 0 &&
+      base_->num_host_layers() >= base_->num_layers()) {
+    absl::flat_hash_map<int64_t, int64_t> device_of_host;
+    bool one_device_block_each = true;
+    for (size_t i = 0; i < load_plan.h2d_host_block_ids.size(); ++i) {
+      auto [it, inserted] = device_of_host.emplace(
+          load_plan.h2d_host_block_ids[i], load_plan.h2d_local_block_ids[i]);
+      if (!inserted && it->second != load_plan.h2d_local_block_ids[i]) {
+        one_device_block_each = false;
+        break;
+      }
+    }
+    if (one_device_block_each) {
+      h2d_group_bytes_ = group_bytes;
+      h2d_device_of_host_ = std::move(device_of_host);
+    }
+  }
   load_plan_ = std::move(load_plan);
 }
 
@@ -768,6 +790,73 @@ absl::Status TransferReceiveSession::SettleHostLayer(size_t layer_idx) {
   return absl::OkStatus();
 }
 
+CopySpec TransferReceiveSession::BuildGroupCopySpecLocked(
+    const std::vector<int64_t>& host_blocks) const {
+  std::vector<std::pair<int64_t, int64_t>> device_host;
+  device_host.reserve(host_blocks.size());
+  for (int64_t host : host_blocks) {
+    device_host.emplace_back(h2d_device_of_host_.at(host), host);
+  }
+  std::sort(device_host.begin(), device_host.end());
+  std::vector<int64_t> src_host;
+  std::vector<int64_t> dst_device;
+  src_host.reserve(device_host.size());
+  dst_device.reserve(device_host.size());
+  for (const auto& [device, host] : device_host) {
+    src_host.push_back(host);
+    dst_device.push_back(device);
+  }
+  return TransferSendSession::BuildCoalescedCopySpec(src_host, dst_device);
+}
+
+absl::Status TransferReceiveSession::OnBlocksLanded(
+    size_t major_dimension_idx, absl::Span<const int> minor_dimension_indices,
+    absl::Span<const int> shard_ids) {
+  const size_t layer_idx = major_dimension_idx;
+  CopySpec copy_spec;
+  bool trigger_enqueue = false;
+  {
+    absl::MutexLock lock(mu_);
+    if (done_ || draining_ || h2d_group_bytes_ == 0 ||
+        layer_idx >= layer_h2d_.size() ||
+        shard_ids.size() != base_->num_shards()) {
+      return absl::OkStatus();
+    }
+    LayerH2d& layer = layer_h2d_[layer_idx];
+    if (layer.landed) {
+      return absl::OkStatus();
+    }
+    for (int host : minor_dimension_indices) {
+      if (h2d_device_of_host_.contains(host) &&
+          layer.taken.insert(host).second) {
+        layer.pending.push_back(host);
+      }
+    }
+    const size_t block_bytes =
+        base_->block_bytes(layer_idx) * base_->num_shards();
+    if (layer.pending.size() * block_bytes < h2d_group_bytes_) {
+      return absl::OkStatus();
+    }
+    copy_spec = BuildGroupCopySpecLocked(layer.pending);
+    layer.pending.clear();
+    ++layer.outstanding;
+    ++in_flight_;
+    if (!h2d_started_) {
+      h2d_started_ = true;
+      trigger_enqueue = true;
+    }
+  }
+  if (trigger_enqueue && metrics_collector_ != nullptr) {
+    metrics_collector_->RecordH2dEnqueue(uuid_);
+  }
+  LOG(INFO) << "OnBlocksLanded (H2D copy start) layer " << layer_idx
+            << " segments=" << copy_spec.sizes.size() << ": uuid=" << uuid_
+            << ", numa=" << base_->assigned_numa_node().value_or(-1);
+  // Group copies run on a full host mirror only: each layer reads its own
+  // host buffer.
+  return DispatchLayerH2d(layer_idx, /*host_layer_idx=*/layer_idx, copy_spec);
+}
+
 absl::Status TransferReceiveSession::ExecuteLayerH2d(size_t layer_idx) {
   // Host source of the copy: the layer's own buffer on a full mirror, or its
   // leased buffer when fewer host layer buffers exist than layers (acquired
@@ -777,19 +866,59 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(size_t layer_idx) {
     ABSL_ASSIGN_OR_RETURN(host_layer_idx, LookupStagingSlot(layer_idx));
   }
   CopySpec copy_spec;
+  bool issue_copy = true;
   bool trigger_enqueue = false;
+  bool all_layers_done = false;
+  std::chrono::steady_clock::time_point session_start_time;
   {
     absl::MutexLock lock(mu_);
     if (done_ || draining_ || total_blocks_ == 0) {
       staging_layer_manager_.Release(layer_idx);
       return absl::OkStatus();
     }
-    ++in_flight_;
-    copy_spec = h2d_copy_;
-    if (!h2d_started_) {
-      h2d_started_ = true;
-      trigger_enqueue = true;
+    if (layer_idx >= layer_h2d_.size()) {
+      return absl::OutOfRangeError(
+          absl::StrCat("Layer ", layer_idx, " out of range for uuid ", uuid_,
+                       " (num_layers=", layer_h2d_.size(), ")"));
     }
+    LayerH2d& layer = layer_h2d_[layer_idx];
+    layer.landed = true;
+    if (h2d_group_bytes_ == 0) {
+      copy_spec = h2d_copy_;
+    } else {
+      // Every block has landed: copy those still waiting for a group, and
+      // those of streams that carried only some shards.
+      std::vector<int64_t> rest = std::move(layer.pending);
+      layer.pending.clear();
+      for (int64_t host : load_plan_.h2d_host_block_ids) {
+        if (layer.taken.insert(host).second) rest.push_back(host);
+      }
+      if (rest.empty()) {
+        // The group copies took every block: the last of them to finish
+        // completes the layer, or this does if they all have.
+        issue_copy = false;
+        RecordLayerDispatchedLocked(layer_idx);
+        if (layer.outstanding == 0) {
+          all_layers_done = CompleteLayerLocked(&session_start_time);
+        }
+      } else {
+        copy_spec = BuildGroupCopySpecLocked(rest);
+      }
+    }
+    if (issue_copy) {
+      ++layer.outstanding;
+      ++in_flight_;
+      if (!h2d_started_) {
+        h2d_started_ = true;
+        trigger_enqueue = true;
+      }
+    }
+  }
+  if (all_layers_done) {
+    RecordAllLayersCopied(session_start_time);
+  }
+  if (!issue_copy) {
+    return absl::OkStatus();
   }
   if (trigger_enqueue && metrics_collector_ != nullptr) {
     metrics_collector_->RecordH2dEnqueue(uuid_);
@@ -798,7 +927,18 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(size_t layer_idx) {
   LOG(INFO) << "OnLayerReceived (H2D copy start) layer " << layer_idx
             << ": uuid=" << uuid_
             << ", numa=" << base_->assigned_numa_node().value_or(-1);
+  ABSL_RETURN_IF_ERROR(DispatchLayerH2d(layer_idx, host_layer_idx, copy_spec));
 
+  // Every layer's bytes have landed once each layer's copies have been
+  // issued. A block report may have completed the network phase first (TCP),
+  // and a receive that finished meanwhile records nothing.
+  absl::MutexLock lock(mu_);
+  RecordLayerDispatchedLocked(layer_idx);
+  return absl::OkStatus();
+}
+
+absl::Status TransferReceiveSession::DispatchLayerH2d(
+    size_t layer_idx, size_t host_layer_idx, const CopySpec& copy_spec) {
   {
     // The receive may have been finished (deadline, cancellation) between
     // the check above and here. Re-check immediately before issuing so a
@@ -807,6 +947,7 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(size_t layer_idx) {
     // receive -- and its blocks -- owned until the copy ends.
     absl::MutexLock lock(mu_);
     if (done_ || draining_) {
+      --layer_h2d_[layer_idx].outstanding;
       staging_layer_manager_.Release(layer_idx);
       EndRecvOpLocked();
       return absl::OkStatus();
@@ -824,6 +965,7 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(size_t layer_idx) {
   if (!future_or.ok()) {
     staging_layer_manager_.Release(layer_idx);
     absl::MutexLock lock(mu_);
+    --layer_h2d_[layer_idx].outstanding;
     FinishLocked(future_or.status(), kH2dPhase);
     EndRecvOpLocked();
     return future_or.status();
@@ -834,63 +976,25 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(size_t layer_idx) {
     absl::MutexLock lock(mu_);
     h2d_futures_.push_back(future);
   }
-  const uint64_t uuid = uuid_;
-  const int numa_node = base_->assigned_numa_node().value_or(-1);
-  future.OnReady([self = shared_from_this(), uuid, numa_node,
-                  layer_idx](auto status_or) {
-    absl::Status injected =
-        FaultInjectStatus(hooks::kTransferRecvSessionH2dComplete);
-    if (status_or.ok() && !injected.ok()) {
-      status_or = injected;
-    }
-    absl::Cleanup end_op = [self]() { self->EndOp(); };
-    bool all_layers_done = false;
-    std::chrono::steady_clock::time_point session_start_time;
-    {
-      absl::MutexLock lock(self->mu_);
-      if (self->done_) {
-        LOG(DFATAL) << "H2D callback for retired receive UUID " << uuid;
-        return;
-      }
-      if (status_or.ok()) {
-        LOG(INFO) << "OnLayerReceived (H2D copy complete) layer " << layer_idx
-                  << ": uuid=" << uuid << ", numa=" << numa_node;
-        self->num_completed_layers_++;
-        if (self->num_completed_layers_ ==
-                static_cast<int32_t>(self->base_->num_layers()) &&
-            !self->draining_) {
-          all_layers_done = true;
-          session_start_time = self->start_time_;
-          self->FinishLocked();
-        }
-      } else {
-        LOG(ERROR) << "OnLayerReceived (H2D copy failed) layer " << layer_idx
-                   << " for uuid: " << uuid
-                   << ", error: " << status_or.status().ToString();
-        self->FinishLocked(status_or.status(), kH2dPhase);
-      }
-    }
-    // The device has the bytes (or never will): the staging buffer is free
-    // for the next layer either way. Release after FinishLocked() so a failed
-    // H2D shuts down the manager before waking any blocked layer.
-    self->staging_layer_manager_.Release(layer_idx);
-    if (all_layers_done) {
-      RecordTransferDuration(
-          DurationMs(session_start_time, std::chrono::steady_clock::now()));
-      if (self->metrics_collector_ != nullptr) {
-        self->metrics_collector_->RecordH2dComplete(uuid);
-      }
-      LOG(INFO) << "All layers H2D copy complete: uuid=" << uuid;
-      if (self->metrics_collector_ != nullptr) {
-        self->metrics_collector_->RecordEnd(uuid);
-      }
-    }
+  future.OnReady([self = shared_from_this(), layer_idx](auto status_or) {
+    self->OnLayerH2dDone(layer_idx, status_or.status());
   });
+  return absl::OkStatus();
+}
 
-  // Every layer's bytes have landed once each layer's copy has been issued.
-  // A block report may have completed the network phase first (TCP), and a
-  // receive that finished meanwhile records nothing.
-  absl::MutexLock lock(mu_);
+bool TransferReceiveSession::CompleteLayerLocked(
+    std::chrono::steady_clock::time_point* session_start_time) {
+  ++num_completed_layers_;
+  if (num_completed_layers_ != static_cast<int32_t>(base_->num_layers()) ||
+      draining_) {
+    return false;
+  }
+  *session_start_time = start_time_;
+  FinishLocked();
+  return true;
+}
+
+void TransferReceiveSession::RecordLayerDispatchedLocked(size_t layer_idx) {
   dispatched_layers_.insert(layer_idx);
   if (dispatched_layers_.size() == base_->num_layers() && !network_completed_ &&
       !done_ && !draining_) {
@@ -899,7 +1003,64 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(size_t layer_idx) {
       metrics_collector_->RecordLastPacket(uuid_);
     }
   }
-  return absl::OkStatus();
+}
+
+void TransferReceiveSession::RecordAllLayersCopied(
+    std::chrono::steady_clock::time_point session_start_time) {
+  RecordTransferDuration(
+      DurationMs(session_start_time, std::chrono::steady_clock::now()));
+  if (metrics_collector_ != nullptr) {
+    metrics_collector_->RecordH2dComplete(uuid_);
+  }
+  LOG(INFO) << "All layers H2D copy complete: uuid=" << uuid_;
+  if (metrics_collector_ != nullptr) {
+    metrics_collector_->RecordEnd(uuid_);
+  }
+}
+
+void TransferReceiveSession::OnLayerH2dDone(size_t layer_idx,
+                                            absl::Status status) {
+  absl::Status injected =
+      FaultInjectStatus(hooks::kTransferRecvSessionH2dComplete);
+  if (status.ok() && !injected.ok()) {
+    status = injected;
+  }
+  absl::Cleanup end_op = [this]() { EndOp(); };
+  const int numa_node = base_->assigned_numa_node().value_or(-1);
+  bool layer_done = false;
+  bool all_layers_done = false;
+  std::chrono::steady_clock::time_point session_start_time;
+  {
+    absl::MutexLock lock(mu_);
+    if (done_) {
+      LOG(DFATAL) << "H2D callback for retired receive UUID " << uuid_;
+      return;
+    }
+    LayerH2d& layer = layer_h2d_[layer_idx];
+    --layer.outstanding;
+    if (status.ok()) {
+      LOG(INFO) << "OnLayerReceived (H2D copy complete) layer " << layer_idx
+                << ": uuid=" << uuid_ << ", numa=" << numa_node;
+      if (layer.landed && layer.outstanding == 0) {
+        layer_done = true;
+        all_layers_done = CompleteLayerLocked(&session_start_time);
+      }
+    } else {
+      LOG(ERROR) << "OnLayerReceived (H2D copy failed) layer " << layer_idx
+                 << " for uuid: " << uuid_ << ", error: " << status.ToString();
+      FinishLocked(status, kH2dPhase);
+      layer_done = true;
+    }
+  }
+  // The device has the layer's bytes (or never will): its staging buffer is
+  // free for the next layer either way. Release after FinishLocked() so a
+  // failed H2D shuts down the manager before waking any blocked layer.
+  if (layer_done) {
+    staging_layer_manager_.Release(layer_idx);
+  }
+  if (all_layers_done) {
+    RecordAllLayersCopied(session_start_time);
+  }
 }
 
 }  // namespace tpu_raiden

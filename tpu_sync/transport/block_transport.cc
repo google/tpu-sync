@@ -522,12 +522,19 @@ tsl::Future<std::vector<int>> BlockTransport::AsyncPush(
     const std::vector<int>& src_block_ids,
     const std::vector<int>& dst_block_ids, int parallelism,
     MajorOrder major_order, uint64_t uuid, int layer_idx,
-    std::optional<int> wire_layer_idx) {
+    std::optional<int> wire_layer_idx, std::optional<size_t> layer_streams) {
   const size_t num_shards = block_delegate_->num_shards();
   const lib::TransferOp op = dst_block_ids.empty()
                                  ? lib::TransferOp::kBlockPush
                                  : lib::TransferOp::kBlockPushExplicit;
   if (config_.backend_for(op) == TransportBackend::kPeregrine) {
+    // A Peregrine receiver completes a block array on one Post per sender.
+    if (layer_streams.has_value()) {
+      const absl::Status status = absl::UnimplementedError(
+          "block-group pushes are not supported on the Peregrine backend");
+      RecordTransferFailure(status, metric_labels::kDirectionPush);
+      return tsl::Future<std::vector<int>>(status);
+    }
     absl::StatusOr<lib::TransportAdapter*> adapter = AdapterForOp(op);
     if (!adapter.ok()) {
       RecordTransferFailure(adapter.status(), metric_labels::kDirectionPush);
@@ -536,7 +543,8 @@ tsl::Future<std::vector<int>> BlockTransport::AsyncPush(
     const std::vector<int> all_shards = AllShards(num_shards);
     return AsyncPushShards(peers, src_block_ids, dst_block_ids, parallelism,
                            major_order, uuid, layer_idx, wire_layer_idx,
-                           all_shards, /*num_groups=*/1, *adapter)
+                           all_shards, /*num_groups=*/1, *adapter,
+                           /*layer_streams=*/std::nullopt)
         .Map<std::vector<int>>([dst_block_ids](const std::vector<int>&) {
           return dst_block_ids;
         });
@@ -560,7 +568,7 @@ tsl::Future<std::vector<int>> BlockTransport::AsyncPush(
     futures.push_back(AsyncPushShards(
         peers, src_block_ids, dst_block_ids, parallelism, major_order, uuid,
         layer_idx, wire_layer_idx, group.shards, groups.size(),
-        AdapterFor(group.numa_node)));
+        AdapterFor(group.numa_node), layer_streams));
   }
   // Every group returns the same destination ids; keep the first.
   return tsl::JoinFutures(absl::MakeSpan(futures))
@@ -573,7 +581,8 @@ tsl::Future<std::vector<int>> BlockTransport::AsyncPushShards(
     const std::vector<int>& dst_block_ids, int parallelism,
     MajorOrder major_order, uint64_t uuid, int layer_idx,
     std::optional<int> wire_layer_idx, absl::Span<const int> shard_ids,
-    size_t num_groups, lib::TransportAdapter* adapter) {
+    size_t num_groups, lib::TransportAdapter* adapter,
+    std::optional<size_t> layer_streams) {
   auto [promise, future] = tsl::MakePromise<std::vector<int>>();
   // The adapter's completion callback must be copyable, while tsl::Promise is
   // move-only.
@@ -603,8 +612,16 @@ tsl::Future<std::vector<int>> BlockTransport::AsyncPushShards(
   if (static_cast<int>(num_blocks) < P) P = num_blocks;
 
   // The receiver completes a block array once it has seen the stream count
-  // declared in the header, i.e. the streams of every shard group.
-  const size_t total_streams = static_cast<size_t>(P) * num_groups;
+  // declared in the header, i.e. the streams of every shard group (and of
+  // every block group, when the array moves in several pushes).
+  if (layer_streams.has_value() && *layer_streams < static_cast<size_t>(P)) {
+    on_complete(absl::InvalidArgumentError(
+        absl::StrCat("push opens ", P, " streams but declares ", *layer_streams,
+                     " for its whole block array")));
+    return std::move(future);
+  }
+  const size_t total_streams =
+      layer_streams.value_or(static_cast<size_t>(P)) * num_groups;
   if (total_streams > std::numeric_limits<uint16_t>::max()) {
     on_complete(absl::InvalidArgumentError(
         absl::StrCat("push declares ", total_streams,

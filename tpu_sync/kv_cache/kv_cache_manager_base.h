@@ -763,6 +763,34 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   bool has_device_buffers() const { return !buffer_holds_.empty(); }
   void AttachPlaceholderDeviceHoldForTest() { buffer_holds_.emplace_back(); }
   int parallelism() const { return parallelism_; }
+
+  // Push groups. A send splits each layer whose transfer exceeds
+  // |group_bytes| (counted over every shard of a block) into contiguous block
+  // groups of at most |group_bytes|, one block at least, and copies each group
+  // to the host and pushes it on its own, so the copies of some groups overlap
+  // the pushes of others. A receive copies landed blocks to the device
+  // whenever |group_bytes| of them wait, instead of once their whole layer has
+  // landed. |window| caps the pushes (block groups or whole layers) one send
+  // has in flight, 0 for no cap, so that pushes of other sends to the same
+  // peer can start between those of a large one. 0 |group_bytes| moves every
+  // layer whole. May be called while transfers run; applies to transfers that
+  // start after the call.
+  struct PushGroups {
+    size_t group_bytes = 0;
+    size_t window = 0;
+  };
+  void SetPushGroups(size_t group_bytes, size_t window) {
+    absl::MutexLock lock(push_groups_mu_);
+    push_groups_ = {.group_bytes = group_bytes, .window = window};
+  }
+  // Both settings as last set together. A session reads them once, when it
+  // plans, so a concurrent SetPushGroups never mixes two settings in one
+  // transfer.
+  PushGroups push_groups() const {
+    absl::MutexLock lock(push_groups_mu_);
+    return push_groups_;
+  }
+
   const std::shared_ptr<NumaThreadPool>& push_pool() const {
     return push_pool_;
   }
@@ -844,6 +872,8 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   std::unique_ptr<NumaThreadPool> dma_pool_;
   std::shared_ptr<NumaThreadPool> push_pool_;
   std::unique_ptr<NumaThreadPool> pull_pool_;
+  mutable absl::Mutex push_groups_mu_;
+  PushGroups push_groups_ ABSL_GUARDED_BY(push_groups_mu_);
   std::string worker_id_;
   int64_t node_id_ = -1;
   TransferEventHooks transfer_hooks_;

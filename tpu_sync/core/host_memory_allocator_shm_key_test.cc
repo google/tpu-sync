@@ -12,11 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <optional>
 #include <string>
+#include <vector>
 
-#include "xla/tsl/platform/test.h"
 #include "absl/status/status.h"
+#include "xla/tsl/platform/test.h"
 #include "tpu_sync/core/host_memory_allocator.h"
 
 namespace tpu_raiden {
@@ -102,6 +110,46 @@ TEST_F(ShmSegmentNameTest, CreateRejectsMalformedKey) {
   EXPECT_TRUE(SharedMemoryHostMemoryAllocator::Create(
                   /*client=*/nullptr, "raiden_pool", SharedMemoryHeader{})
                   .ok());
+}
+
+TEST_F(ShmSegmentNameTest, AllocatePopulatesShmFdAndPageAlignedOffset) {
+  const std::string shm_key = "test_shm_fd_offset_" + std::to_string(getpid());
+  const std::string seg_name =
+      SharedMemoryHostMemoryAllocator::ComposeSegmentName(shm_key,
+                                                          std::nullopt);
+  shm_unlink(seg_name.c_str());
+
+  SharedMemoryHeader schema = {};
+  std::snprintf(schema.model_uid, sizeof(schema.model_uid), "fd_offset_model");
+  auto allocator_or = SharedMemoryHostMemoryAllocator::Create(
+      /*client=*/nullptr, shm_key, schema);
+  ASSERT_TRUE(allocator_or.ok());
+
+  auto alloc1_or = (*allocator_or)->Allocate(1024);
+  ASSERT_TRUE(alloc1_or.ok());
+  auto alloc2_or = (*allocator_or)->Allocate(1024);
+  ASSERT_TRUE(alloc2_or.ok());
+
+  EXPECT_GE(alloc1_or->fd, 0);
+  EXPECT_EQ(alloc1_or->fd, alloc2_or->fd);
+  EXPECT_EQ(
+      alloc1_or->fd_offset,
+      static_cast<int64_t>(SharedMemoryHostMemoryAllocator::kPayloadOffset));
+  EXPECT_EQ(alloc2_or->fd_offset,
+            static_cast<int64_t>(
+                SharedMemoryHostMemoryAllocator::kPayloadOffset + 4096));
+  EXPECT_EQ(alloc1_or->shm_name, seg_name);
+
+  std::memset(alloc2_or->ptr, 0x5A, 1024);
+  std::vector<uint8_t> readback(1024, 0);
+  ASSERT_EQ(pread(alloc2_or->fd, readback.data(), readback.size(),
+                  alloc2_or->fd_offset),
+            1024);
+  for (uint8_t b : readback) {
+    EXPECT_EQ(b, 0x5A);
+  }
+
+  shm_unlink(seg_name.c_str());
 }
 
 }  // namespace

@@ -560,6 +560,9 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
                                                      size_t shard_idx,
                                                      int block_id);
 
+  int GetHostFd(size_t layer_idx, size_t shard_idx) const;
+  int64_t GetHostFdOffset(size_t layer_idx, size_t shard_idx) const;
+
   // Registers explicit block pools over the wrapped storages. Until this is
   // called the manager exposes one implicit pool per constructor storage (tag
   // "opaque", base_offset 0, block_stride LayerBlockByteSize) and all legacy

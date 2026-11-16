@@ -389,6 +389,8 @@ void RaidenManagerBase::SetExternalHostPointers(
       if (idx < host_ptrs.size() && idx < host_sizes.size()) {
         layers_[l].shards[sh].host_ptr = host_ptrs[idx];
         layers_[l].shards[sh].host_size = host_sizes[idx];
+        layers_[l].shards[sh].host_fd = -1;
+        layers_[l].shards[sh].host_fd_offset = 0;
         idx++;
       }
     }

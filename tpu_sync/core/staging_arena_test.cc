@@ -221,6 +221,8 @@ TEST(StagingArenaTest, ReleaseMemoryOnFreeResetsShardBuffers) {
     ASSERT_THAT(alloc, IsOk());
     (*alloc)->shards[0].host_ptr = backing_memory->data();
     (*alloc)->shards[0].host_size = backing_memory->size();
+    (*alloc)->shards[0].host_fd = 42;
+    (*alloc)->shards[0].host_fd_offset = 4096;
     (*alloc)->shards[0].device_size = 512;
     (*alloc)->shards[0].host_owner = backing_memory;
     EXPECT_EQ(backing_memory.use_count(), 2);
@@ -234,6 +236,8 @@ TEST(StagingArenaTest, ReleaseMemoryOnFreeResetsShardBuffers) {
   ASSERT_EQ((*reacquired)->shards.size(), 1);
   EXPECT_EQ((*reacquired)->shards[0].host_ptr, nullptr);
   EXPECT_EQ((*reacquired)->shards[0].host_size, 0);
+  EXPECT_EQ((*reacquired)->shards[0].host_fd, -1);
+  EXPECT_EQ((*reacquired)->shards[0].host_fd_offset, 0);
   EXPECT_EQ((*reacquired)->shards[0].host_owner, nullptr);
   EXPECT_EQ((*reacquired)->shards[0].device_size, 512);
 }

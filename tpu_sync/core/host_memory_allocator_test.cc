@@ -239,6 +239,20 @@ TEST(HostMemoryAllocatorTest, SharedMemoryAllocationsAreDistinctRegions) {
   // Each allocation advanced the recorded payload by a full page.
   EXPECT_EQ(ReadSegmentHeader(shm_key).total_payload_bytes, 2 * 4096);
 
+  // Each allocation carries its underlying shm fd, page-aligned region offset,
+  // and composed segment name.
+  EXPECT_GE(alloc1.fd, 0);
+  EXPECT_EQ(alloc1.fd, alloc2.fd);
+  EXPECT_EQ(
+      alloc1.fd_offset,
+      static_cast<int64_t>(SharedMemoryHostMemoryAllocator::kPayloadOffset));
+  EXPECT_EQ(alloc2.fd_offset,
+            static_cast<int64_t>(
+                SharedMemoryHostMemoryAllocator::kPayloadOffset + 4096));
+  EXPECT_EQ(alloc1.shm_name,
+            SharedMemoryHostMemoryAllocator::ComposeSegmentName(shm_key,
+                                                                std::nullopt));
+
   shm_unlink(shm_key.c_str());
 }
 

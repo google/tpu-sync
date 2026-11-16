@@ -1003,6 +1003,8 @@ KVCacheManagerBase::AllocateHostLayers(
         }
         shard_info.host_ptr = allocation.ptr;
         shard_info.host_size = allocation.size;
+        shard_info.host_fd = allocation.fd;
+        shard_info.host_fd_offset = allocation.fd_offset;
         shard_info.host_owner = std::move(allocation.owner);
       } else {
         void* ptr = nullptr;
@@ -1855,6 +1857,8 @@ void KVCacheManagerBase::SetExternalHostBuffer(
           new_total += new_size;
           layers_[l].shards[sh].host_ptr = reinterpret_cast<uint8_t*>(host_ptr);
           layers_[l].shards[sh].host_size = new_size;
+          layers_[l].shards[sh].host_fd = -1;
+          layers_[l].shards[sh].host_fd_offset = 0;
         }
         idx++;
       }
@@ -2288,6 +2292,23 @@ absl::StatusOr<uintptr_t> KVCacheManagerBase::GetBlockHostPointerValue(
   return reinterpret_cast<uintptr_t>(host_buffer.data() + block * block_bytes);
 }
 
+int KVCacheManagerBase::GetHostFd(size_t layer_idx, size_t shard_idx) const {
+  if (layer_idx >= layers_.size() || layers_[layer_idx].shards.empty()) {
+    return -1;
+  }
+  size_t local_idx = shard_idx % layers_[layer_idx].shards.size();
+  return layers_[layer_idx].shards[local_idx].host_fd;
+}
+
+int64_t KVCacheManagerBase::GetHostFdOffset(size_t layer_idx,
+                                            size_t shard_idx) const {
+  if (layer_idx >= layers_.size() || layers_[layer_idx].shards.empty()) {
+    return 0;
+  }
+  size_t local_idx = shard_idx % layers_[layer_idx].shards.size();
+  return layers_[layer_idx].shards[local_idx].host_fd_offset;
+}
+
 void KVCacheManagerBase::EnsureImplicitPools() const {
   absl::MutexLock l(pools_mu_);
   if (explicit_pools_ || !pools_.empty()) {
@@ -2364,7 +2385,7 @@ absl::Status KVCacheManagerBase::EnsureHostMirrorCovers(size_t storage_idx,
     const size_t prev_size = shard_info.host_size;
     if (host_allocator_) {
       ABSL_ASSIGN_OR_RETURN(HostBufferAllocation allocation,
-                            host_allocator_(alloc_size, nullptr));
+                            host_allocator_(alloc_size, shard_info.device));
       if (allocation.ptr == nullptr || allocation.size < alloc_size) {
         return absl::InternalError(absl::StrCat(
             "host allocator returned undersized buffer for pool mirror: ",
@@ -2375,6 +2396,8 @@ absl::Status KVCacheManagerBase::EnsureHostMirrorCovers(size_t storage_idx,
       }
       shard_info.host_ptr = allocation.ptr;
       shard_info.host_size = allocation.size;
+      shard_info.host_fd = allocation.fd;
+      shard_info.host_fd_offset = allocation.fd_offset;
       shard_info.host_owner = std::move(allocation.owner);
       shard_info.owned_host_buffer = {nullptr, [](void*) {}};
       old_total += prev_size;
@@ -2394,6 +2417,8 @@ absl::Status KVCacheManagerBase::EnsureHostMirrorCovers(size_t storage_idx,
               static_cast<uint8_t*>(ptr), [](void* p) { free(p); });
       shard_info.host_ptr = shard_info.owned_host_buffer.get();
       shard_info.host_size = alloc_size;
+      shard_info.host_fd = -1;
+      shard_info.host_fd_offset = 0;
       shard_info.host_owner.reset();
       old_total += prev_size;
       new_total += alloc_size;
@@ -4002,11 +4027,20 @@ KVCacheManagerBase::ResolveBlockSlices(int staging_block_id) const {
         // Recall scatter-reads write into manager-owned staging memory.
         ptr = const_cast<uint8_t*>(host_buffer->data()) + block * slice_bytes;
       }
+      const size_t storage_layer_idx =
+          (explicit_pools_ && l < pools_.size()) ? pools_[l].storage_index : l;
+      const absl::StatusOr<absl::Span<const uint8_t>> base_buf =
+          GetHostBuffer(storage_layer_idx, s);
+      const uint8_t* base_ptr = base_buf.ok() ? base_buf->data() : nullptr;
+      const int base_fd = GetHostFd(storage_layer_idx, s);
+      const int64_t base_fd_offset = GetHostFdOffset(storage_layer_idx, s);
       backends::HostBufferDescriptor desc;
       desc.ptr = ptr;
       desc.size = slice_bytes;
-      desc.fd = -1;
-      desc.offset = 0;
+      desc.fd = base_fd;
+      desc.offset = (base_fd >= 0 && base_ptr != nullptr)
+                        ? (base_fd_offset + (ptr - base_ptr))
+                        : 0;
       slices.push_back(desc);
     }
   }

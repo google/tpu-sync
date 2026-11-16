@@ -188,6 +188,8 @@ absl::Status StagingArena::AllocateShardUnlocked(ShardBufferInfoBase& shard,
   }
   shard.host_ptr = alloc->ptr;
   shard.host_size = alloc->size;
+  shard.host_fd = alloc->fd;
+  shard.host_fd_offset = alloc->fd_offset;
   shard.host_owner = std::move(alloc->owner);
   return absl::OkStatus();
 }

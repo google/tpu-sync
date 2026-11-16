@@ -37,6 +37,8 @@ namespace tpu_raiden {
 struct ShardBufferInfoBase {
   const uint8_t* host_ptr = nullptr;
   size_t host_size = 0;
+  int host_fd = -1;
+  int64_t host_fd_offset = 0;
   size_t device_size = 0;
   const xla::PjRtDevice* device = nullptr;
   std::unique_ptr<uint8_t[], void (*)(void*)> owned_host_buffer = {
@@ -53,6 +55,8 @@ struct ShardBufferInfoBase {
   void ReleaseMemory() {
     host_ptr = nullptr;
     host_size = 0;
+    host_fd = -1;
+    host_fd_offset = 0;
     owned_host_buffer.reset();
     host_owner.reset();
     owned_tiled_buffer.reset();
@@ -75,7 +79,8 @@ struct LayerInfoBase {
 };
 
 // Adapts a non-owning |allocator| pointer into a `HostBufferAllocator`
-// callback that invokes `AllocateDmaMappedForDevice`.
+// callback that invokes `AllocateDmaMappedForDevice`. |allocator| must outlive
+// both the returned callback and every `HostBufferAllocation` it produces.
 inline HostBufferAllocator MakeHostBufferAllocator(
     HostMemoryAllocator* allocator) {
   if (allocator == nullptr) {

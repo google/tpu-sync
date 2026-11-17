@@ -1992,7 +1992,8 @@ bool KVCacheStore::SweepOnce() {
         backend()->GetEvictableKeys(std::min(deficit, kMaxEvictBatchBlocks));
   }
   if (batch.empty()) {
-    // Everything left is pinned; nothing more this episode can free.
+    // Everything left is pinned or holds no host block; nothing more this
+    // episode can free.
     return end_episode();
   }
 

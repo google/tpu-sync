@@ -561,6 +561,45 @@ TEST(LRUCacheTest, NumEvictableHostBlocksGetAndPinOnEvictionCandidate) {
   EXPECT_EQ(cache.NumEvictableHostBlocks(), 2);
 }
 
+TEST(LRUCacheTest, GetEvictableHostKeysSkipsNonHostAndPinnedEntries) {
+  LRUCache<std::string, TestBlockValue> cache(6);
+  cache.Put("hbm_cand", TestBlockValue{-1, TestBlockStatus::HBM});
+  cache.Put("host_cand", TestBlockValue{0, TestBlockStatus::HOST});
+  cache.Put("hbm_old", TestBlockValue{-1, TestBlockStatus::HBM});
+  cache.Put("host_and_hbm", TestBlockValue{1, TestBlockStatus::HOST_AND_HBM});
+  cache.Put("pinned_host", TestBlockValue{2, TestBlockStatus::HOST});
+  cache.Put("host_new", TestBlockValue{3, TestBlockStatus::HOST});
+  ASSERT_TRUE(cache.Pin("pinned_host"));
+  ASSERT_TRUE(cache.Evict().has_value());
+  ASSERT_TRUE(cache.Evict().has_value());
+  ASSERT_EQ(cache.GetEvictCandidateKeys(),
+            (std::vector<std::string>{"hbm_cand", "host_cand"}));
+
+  // Same order as GetEvictableKeys, without the HBM-only entries.
+  EXPECT_EQ(cache.GetEvictableKeys(10),
+            (std::vector<std::string>{"hbm_cand", "host_cand", "hbm_old",
+                                      "host_and_hbm", "host_new"}));
+  EXPECT_EQ(
+      cache.GetEvictableHostKeys(10),
+      (std::vector<std::string>{"host_cand", "host_and_hbm", "host_new"}));
+  EXPECT_EQ(cache.GetEvictableHostKeys(2),
+            (std::vector<std::string>{"host_cand", "host_and_hbm"}));
+  EXPECT_TRUE(cache.GetEvictableHostKeys(0).empty());
+
+  // Unpin returns the entry as most recently used.
+  ASSERT_TRUE(cache.Unpin("pinned_host"));
+  EXPECT_EQ(cache.GetEvictableHostKeys(10),
+            (std::vector<std::string>{"host_cand", "host_and_hbm", "host_new",
+                                      "pinned_host"}));
+
+  // An entry that loses its host block is skipped.
+  ASSERT_TRUE(
+      cache.UpdateValue("host_new", TestBlockValue{-1, TestBlockStatus::HBM}));
+  EXPECT_EQ(
+      cache.GetEvictableHostKeys(10),
+      (std::vector<std::string>{"host_cand", "host_and_hbm", "pinned_host"}));
+}
+
 }  // namespace
 }  // namespace kv_cache
 }  // namespace tpu_raiden

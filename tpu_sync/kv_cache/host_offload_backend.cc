@@ -821,7 +821,7 @@ absl::StatusOr<size_t> HostOffloadBackend::RecoverFromLocalManifest() {
 
 std::vector<std::string> HostOffloadBackend::GetEvictableKeys(size_t count) {
   absl::MutexLock lock(mutex_);
-  return lru_cache_.GetEvictableKeys(count);
+  return lru_cache_.GetEvictableHostKeys(count);
 }
 
 absl::StatusOr<std::shared_ptr<KVCacheStoreClient>>

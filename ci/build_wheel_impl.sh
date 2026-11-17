@@ -33,9 +33,12 @@
 #
 # Environment:
 #   BUILD_MODE               jax (default) or torch
-#   WHEEL_VERSION_EXTRAS     suffix appended to the pyproject.toml base version
-#                            (default .dev<UTC timestamp>; set to the empty
-#                            string for a release wheel)
+#   WHEEL_VERSION_OVERRIDE   base version overriding pyproject.toml
+#                            [project].version (optional; e.g. "0.0.2" to cut a
+#                            release from a verified commit without editing it)
+#   WHEEL_VERSION_EXTRAS     suffix appended to the base version (default
+#                            .dev<UTC timestamp>; set to the empty string for a
+#                            release wheel)
 #   RAIDEN_TORCH_ABIS        torch releases the torch wheel ships an extension
 #                            variant for, space-separated, the first one being
 #                            the torch the rest of the wheel is compiled
@@ -67,10 +70,22 @@ if [[ "${BUILD_MODE}" != "torch" && "${BUILD_MODE}" != "jax" ]]; then
   echo "ERROR: BUILD_MODE must be 'torch' or 'jax', got '${BUILD_MODE}'" >&2
   exit 1
 fi
+WHEEL_VERSION_OVERRIDE="${WHEEL_VERSION_OVERRIDE:-}"
+export WHEEL_VERSION_OVERRIDE
 # Default only when UNSET: an empty-but-set WHEEL_VERSION_EXTRAS is a release
-# wheel with the bare pyproject version.
+# wheel with the bare base version.
 WHEEL_VERSION_EXTRAS="${WHEEL_VERSION_EXTRAS-.dev$(date -u +%Y%m%d%H%M%S)}"
 export WHEEL_VERSION_EXTRAS
+if [[ -n "${WHEEL_VERSION_OVERRIDE}" ]]; then
+  WHEEL_BASE_VERSION="${WHEEL_VERSION_OVERRIDE}"
+else
+  WHEEL_BASE_VERSION="$(sed -n -E 's/^version = "(.*)"/\1/p' "${REPO_ROOT}/pyproject.toml" | head -1)"
+fi
+if [[ -z "${WHEEL_BASE_VERSION}" ]]; then
+  echo "ERROR: could not determine base version from WHEEL_VERSION_OVERRIDE or pyproject.toml" >&2
+  exit 1
+fi
+WHEEL_FULL_VERSION="${WHEEL_BASE_VERSION}${WHEEL_VERSION_EXTRAS}"
 # The jax wheel carries the JAX version it was built against as its wheel build
 # tag, dots removed (0.11.2 -> tpu_sync_jax-<version>-0112-cp312-...whl). The
 # version itself is unchanged. Unset RAIDEN_JAX_VERSION means DEFAULT_VERSION in
@@ -86,7 +101,9 @@ export BAZEL_CACHE_DIR="${BAZEL_CACHE_DIR:-/cache}"
 export BAZEL_OUTPUT_BASE="${BAZEL_OUTPUT_BASE:-${BAZEL_CACHE_DIR}/output_base}"
 EXTRA_BAZEL_FLAGS="${EXTRA_BAZEL_FLAGS:-}"
 export TORCH_TPU_INDEX_URL="${TORCH_TPU_INDEX_URL:-https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/}"
+echo "WHEEL_VERSION_OVERRIDE: ${WHEEL_VERSION_OVERRIDE}"
 echo "WHEEL_VERSION_EXTRAS: ${WHEEL_VERSION_EXTRAS}"
+echo "WHEEL_FULL_VERSION: ${WHEEL_FULL_VERSION}"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -194,12 +211,10 @@ else
   WHEEL_DIST="tpu_sync_jax"
 fi
 # Match ONLY the wheel this build just produced. The output directory is shared
-# across builds, so bazel-bin/ci/wheel/ accumulates wheels from earlier runs,
-# each with a distinct .dev<timestamp>. A broad "${WHEEL_DIST}-*.whl" glob would
-# also match those stale wheels and hand multiple paths to the single-wheel
-# patchelf step below (which then fails). WHEEL_VERSION_EXTRAS (.dev<timestamp>)
-# is unique per build and appears verbatim in the filename, so scope to it.
-WHEEL_GLOB="${WHEEL_DIST}-*${WHEEL_VERSION_EXTRAS}-*.whl"
+# across builds, so bazel-bin/ci/wheel/ accumulates wheels from earlier runs.
+# Scoping to the exact resolved version followed by "-" prevents matching stale
+# .dev wheels when WHEEL_VERSION_EXTRAS is empty on a stable release build.
+WHEEL_GLOB="${WHEEL_DIST}-${WHEEL_FULL_VERSION}-*.whl"
 
 # Every extension carries a static copy of the runtime (the jax wheel ships
 # three, the torch wheel one per torch release); with default symbol
@@ -207,8 +222,16 @@ WHEEL_GLOB="${WHEEL_DIST}-*${WHEEL_VERSION_EXTRAS}-*.whl"
 # limit. Hidden visibility keeps only the module entry points exported and
 # shrinks each extension to about a third.
 EXTRA_BAZEL_FLAGS+=" --copt=-fvisibility=hidden --cxxopt=-fvisibility-inlines-hidden"
+VERSION_REPO_ENV_FLAGS=(
+  --repo_env=WHEEL_VERSION_EXTRAS="${WHEEL_VERSION_EXTRAS}"
+)
+if [[ -n "${WHEEL_VERSION_OVERRIDE}" ]]; then
+  VERSION_REPO_ENV_FLAGS+=(
+    --repo_env=WHEEL_VERSION_OVERRIDE="${WHEEL_VERSION_OVERRIDE}"
+  )
+fi
 ./build.sh "${BUILD_MODE}" "${WHEEL_TARGET}" \
-  --repo_env=WHEEL_VERSION_EXTRAS="${WHEEL_VERSION_EXTRAS}" \
+  "${VERSION_REPO_ENV_FLAGS[@]}" \
   ${EXTRA_BAZEL_FLAGS}
 
 mkdir -p "${REPO_ROOT}/dist"

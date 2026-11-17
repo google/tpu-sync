@@ -31,8 +31,9 @@
 #   ci/build_wheel.sh [jax]            # tpu_sync_jax
 #   ci/build_wheel.sh torch            # tpu_sync_torch
 #
+# WHEEL_VERSION_OVERRIDE optionally overrides the pyproject.toml base version.
 # WHEEL_VERSION_EXTRAS defaults to .dev<UTC timestamp> when unset; an empty
-# value builds a wheel with the bare pyproject.toml version (a release).
+# value builds a wheel with the bare base version (a release).
 # RAIDEN_TORCH_ABIS lists the torch releases the torch wheel ships an
 # extension variant for (see ci/build_wheel_impl.sh).
 # RAIDEN_JAX_VERSION selects the JAX version the jax wheel builds against
@@ -45,9 +46,23 @@ set -exu -o pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
+WHEEL_VERSION_OVERRIDE="${WHEEL_VERSION_OVERRIDE:-}"
+export WHEEL_VERSION_OVERRIDE
 WHEEL_VERSION_EXTRAS="${WHEEL_VERSION_EXTRAS-.dev$(date -u +%Y%m%d%H%M%S)}"
 export WHEEL_VERSION_EXTRAS
+if [[ -n "${WHEEL_VERSION_OVERRIDE}" ]]; then
+  WHEEL_BASE_VERSION="${WHEEL_VERSION_OVERRIDE}"
+else
+  WHEEL_BASE_VERSION="$(sed -n -E 's/^version = "(.*)"/\1/p' "${REPO_ROOT}/pyproject.toml" | head -1)"
+fi
+if [[ -z "${WHEEL_BASE_VERSION}" ]]; then
+  echo "ERROR: could not determine base version from WHEEL_VERSION_OVERRIDE or pyproject.toml" >&2
+  exit 1
+fi
+WHEEL_FULL_VERSION="${WHEEL_BASE_VERSION}${WHEEL_VERSION_EXTRAS}"
+echo "WHEEL_VERSION_OVERRIDE: ${WHEEL_VERSION_OVERRIDE}"
 echo "WHEEL_VERSION_EXTRAS: ${WHEEL_VERSION_EXTRAS}"
+echo "WHEEL_FULL_VERSION: ${WHEEL_FULL_VERSION}"
 
 RAIDEN_COMMIT="$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)"
 if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain 2>/dev/null)" ]]; then
@@ -92,6 +107,7 @@ docker run --rm \
   "${DOCKER_MOUNTS[@]}" \
   -w /workspace \
   -e BUILD_MODE="${BUILD_MODE}" \
+  -e WHEEL_VERSION_OVERRIDE="${WHEEL_VERSION_OVERRIDE}" \
   -e WHEEL_VERSION_EXTRAS="${WHEEL_VERSION_EXTRAS}" \
   -e RAIDEN_TORCH_ABIS="${RAIDEN_TORCH_ABIS}" \
   -e RAIDEN_JAX_VERSION="${RAIDEN_JAX_VERSION:-}" \
@@ -100,16 +116,17 @@ docker run --rm \
   "${CONTAINER_IMAGE}" \
   bash ci/build_wheel_impl.sh
 
-# Scope to THIS build's wheel(s) (.dev<timestamp>); REPO_ROOT/dist and WHEEL_DIR
-# are persistent and may hold wheels from earlier runs.
-if [[ -n "$(ls -A "${REPO_ROOT}"/dist/*"${WHEEL_VERSION_EXTRAS}"-*.whl 2>/dev/null)" ]]; then
-  cp "${REPO_ROOT}"/dist/*"${WHEEL_VERSION_EXTRAS}"-*.whl "${WHEEL_DIR}/"
-  echo "===> Wheel(s) built:"; ls -lh "${WHEEL_DIR}"/*"${WHEEL_VERSION_EXTRAS}"-*.whl
+# Scope to THIS build's wheel(s); REPO_ROOT/dist and WHEEL_DIR are persistent
+# and may hold wheels from earlier runs.
+WHEEL_GLOB="tpu_sync_${BUILD_MODE}-${WHEEL_FULL_VERSION}-*.whl"
+if [[ -n "$(ls -A "${REPO_ROOT}"/dist/${WHEEL_GLOB} 2>/dev/null)" ]]; then
+  cp "${REPO_ROOT}"/dist/${WHEEL_GLOB} "${WHEEL_DIR}/"
+  echo "===> Wheel(s) built:"; ls -lh "${WHEEL_DIR}"/${WHEEL_GLOB}
 else
-  echo "ERROR: wheel build produced no .whl for ${WHEEL_VERSION_EXTRAS} in dist/" >&2; exit 1
+  echo "ERROR: wheel build produced no .whl matching ${WHEEL_GLOB} in dist/" >&2; exit 1
 fi
 
 echo "===> twine check..."
 docker run --rm -v "${WHEEL_DIR}:/dist" "${CONTAINER_IMAGE}" \
-  bash -c "uv run --isolated --with twine twine check /dist/*${WHEEL_VERSION_EXTRAS}-*.whl"
+  bash -c "uv run --isolated --with twine twine check /dist/${WHEEL_GLOB}"
 echo "===> raiden wheel build successful!"

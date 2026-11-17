@@ -2,16 +2,29 @@
 # their publication to PyPI as tpu-sync-jax / tpu-sync-torch. RELEASING.md
 # describes the full process.
 #
-# Two ways to run it:
-#   - Pushing a vX.Y.Z tag on main builds wheels whose version is exactly the
-#     pyproject.toml base version (which must equal the tag), publishes them
-#     to PyPI and attaches them to a GitHub Release.
-#   - workflow_dispatch builds .dev<UTC timestamp> wheels. By default it only
-#     keeps them as workflow artifacts (a dry run); with publish=yes it
-#     publishes them to PyPI as a developmental pre-release, which pip only
-#     selects with --pre. The frameworks input narrows a dispatch to one
-#     wheel, so one package can be published while the other is still over
-#     the PyPI file-size limit.
+# Ways to run it:
+#   - Pushing a vX.Y.Z tag on main builds stable X.Y.Z wheels (overriding
+#     pyproject.toml's base version at build time via WHEEL_VERSION_OVERRIDE if
+#     needed), publishes them to PyPI and attaches them to a GitHub Release.
+#   - workflow_dispatch with default inputs builds .dev<UTC timestamp> wheels
+#     from the dispatched ref. By default it only keeps them as workflow
+#     artifacts (a dry run); with publish=yes it publishes them to PyPI as a
+#     developmental pre-release, which pip only selects with --pre.
+#   - workflow_dispatch with release_version=X.Y.Z (and optional ref=<sha|lkg>)
+#     builds stable X.Y.Z wheels directly from any verified commit on main
+#     (such as lkg.version) without editing that historical commit. With
+#     publish=yes it publishes them to PyPI and creates the vX.Y.Z GitHub
+#     Release targeting that commit.
+#   - The frameworks input narrows a dispatch to one wheel, so one package can
+#     be published while the other is still over the PyPI file-size limit.
+#
+# Preflight and post-build gates:
+#   - Publishing runs verify PyPI returns HTTP 404 for each target package and
+#     version before starting the 32-core wheel builds.
+#   - Every build verifies wheel METADATA and checks dependency resolution with
+#     `uv pip compile` against public pypi.org (Python 3.12 /
+#     x86_64-manylinux_2_31) before staging to the OSS exit gate (warn-only on
+#     publish=no dry runs).
 #
 # Publication goes through the OSS exit gate rather than straight to PyPI;
 # publish_pypi.yml does that part. A release refuses to publish if any wheel
@@ -35,12 +48,22 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: "Publish the .dev wheels to PyPI through the exit gate? (no = dry run, wheels kept as workflow artifacts only)"
+        description: "Publish built wheels to PyPI through the exit gate? (no = dry run, wheels kept as workflow artifacts only)"
         type: choice
         default: "no"
         options:
           - "no"
           - "yes"
+      ref:
+        description: "Git ref or commit SHA on main to build (empty = dispatched ref; 'lkg' = commit in lkg.version)"
+        required: false
+        default: ""
+        type: string
+      release_version:
+        description: "Stable X.Y.Z version to build/release without editing pyproject.toml (empty = .dev<UTC> pre-release)"
+        required: false
+        default: ""
+        type: string
       frameworks:
         description: "Wheels to build (and publish), space-separated: jax, torch, or both"
         required: false
@@ -73,57 +96,52 @@ concurrency:
 
 jobs:
   verify:
-    name: "Verify tag and version"
+    name: "Verify tag, version, and PyPI availability"
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.check.outputs.version }}
-      wheel_version_extras: ${{ steps.check.outputs.wheel_version_extras }}
-      frameworks: ${{ steps.frameworks.outputs.list }}
+      checkout_sha: ${{ steps.resolve.outputs.checkout_sha }}
+      version: ${{ steps.resolve.outputs.version }}
+      wheel_version: ${{ steps.resolve.outputs.wheel_version }}
+      wheel_version_override: ${{ steps.resolve.outputs.wheel_version_override }}
+      wheel_version_extras: ${{ steps.resolve.outputs.wheel_version_extras }}
+      is_stable_release: ${{ steps.resolve.outputs.is_stable_release }}
+      will_publish: ${{ steps.resolve.outputs.will_publish }}
+      tag_name: ${{ steps.resolve.outputs.tag_name }}
+      frameworks: ${{ steps.resolve.outputs.frameworks }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
         with:
           persist-credentials: false
           fetch-depth: 0
-      - id: check
-        run: |
-          BASE_VERSION=$(sed -n -E 's/^version = "(.*)"/\1/p' pyproject.toml | head -1)
-          echo "pyproject.toml version: ${BASE_VERSION}"
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            TAG_VERSION="${GITHUB_REF_NAME#v}"
-            if [[ "${TAG_VERSION}" != "${BASE_VERSION}" ]]; then
-              echo "ERROR: tag ${GITHUB_REF_NAME} does not match pyproject.toml version ${BASE_VERSION}." >&2
-              echo "       Bump pyproject.toml [project].version on main before tagging." >&2
-              exit 1
-            fi
-            if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
-              echo "ERROR: tag ${GITHUB_REF_NAME} is not reachable from origin/main; releases are cut from main only." >&2
-              exit 1
-            fi
-            EXTRAS=""
-          else
-            EXTRAS=".dev$(date -u +%Y%m%d%H%M%S)"
-          fi
-          echo "wheel version: ${BASE_VERSION}${EXTRAS}"
-          echo "version=${BASE_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "wheel_version_extras=${EXTRAS}" >> "$GITHUB_OUTPUT"
-      # A tag release builds both wheels; a dispatch builds the ones named in
-      # the frameworks input. The list feeds the build matrix.
-      - id: frameworks
+      - name: Resolve release parameters
+        id: resolve
         env:
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_RELEASE_VERSION: ${{ inputs.release_version }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
           INPUT_FRAMEWORKS: ${{ inputs.frameworks }}
         run: |
-          python3 - <<'PY'
-          import json, os
-          known = ["jax", "torch"]
-          wanted = os.environ["INPUT_FRAMEWORKS"].split() or known
-          unknown = sorted(set(wanted) - set(known))
-          if unknown:
-              raise SystemExit(f"ERROR: unknown frameworks {unknown}; choose from {known}")
-          selected = [f for f in known if f in wanted]
-          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
-              out.write("list=" + json.dumps(selected) + "\n")
-          print("wheels to build:", selected)
-          PY
+          python3 ci/release/release_checks.py resolve \
+            --repo-dir . \
+            --github-ref "${GITHUB_REF}" \
+            --github-ref-name "${GITHUB_REF_NAME}" \
+            --github-sha "${GITHUB_SHA}" \
+            --ref-input "${INPUT_REF}" \
+            --release-version-input "${INPUT_RELEASE_VERSION}" \
+            --publish-input "${INPUT_PUBLISH}" \
+            --frameworks-input "${INPUT_FRAMEWORKS}"
+      # Fail fast before starting the 32-core wheel builds if PyPI already has
+      # this version (PyPI versions are immutable).
+      - name: Check PyPI version availability (404 preflight)
+        if: steps.resolve.outputs.will_publish == 'true'
+        env:
+          WHEEL_VERSION: ${{ steps.resolve.outputs.wheel_version }}
+          FRAMEWORKS_SPACE: ${{ steps.resolve.outputs.frameworks_space }}
+        run: |
+          read -r -a FRAMEWORKS <<< "${FRAMEWORKS_SPACE}"
+          python3 ci/release/release_checks.py check-pypi \
+            --version "${WHEEL_VERSION}" \
+            --frameworks "${FRAMEWORKS[@]}"
 
   build:
     name: "Build ${{ matrix.framework }} wheel"
@@ -137,9 +155,18 @@ jobs:
       image: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:9644db6e0e969079b138547dd99818c02e6ab51d892c4675cf2f4edf02a1e71a
     timeout-minutes: 300
     steps:
+      # Check out ci/release from the workflow's own ref so historical commits
+      # predating this tooling can still run version override and wheel checks.
+      - name: Checkout release tools
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          persist-credentials: false
+          sparse-checkout: ci/release
+          path: release-tools
       - name: Checkout tpu-sync
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
         with:
+          ref: ${{ needs.verify.outputs.checkout_sha }}
           persist-credentials: false
           path: tpu-sync
       # Git security patch (CVE-2022-24765) blocks root from operating on
@@ -152,12 +179,18 @@ jobs:
         working-directory: tpu-sync
         env:
           BUILD_MODE: ${{ matrix.framework }}
+          WHEEL_VERSION_OVERRIDE: ${{ needs.verify.outputs.wheel_version_override }}
           WHEEL_VERSION_EXTRAS: ${{ needs.verify.outputs.wheel_version_extras }}
           INPUT_JAX_VERSION: ${{ inputs.jax_version }}
           INPUT_TORCH_ABIS: ${{ inputs.torch_abis }}
           EXTRA_BAZEL_FLAGS: ${{ (inputs.use_remote_cache || 'yes') == 'yes' && '--config=ci' || '' }}
         run: |
           export BAZEL_CACHE_DIR="${RUNNER_TEMP}/bazel_cache"
+          if [[ -n "${WHEEL_VERSION_OVERRIDE}" ]]; then
+            python3 ../release-tools/ci/release/release_checks.py apply-version-override \
+              --repo-dir . \
+              --version "${WHEEL_VERSION_OVERRIDE}"
+          fi
           # Tag builds take the script's default JAX version and torch release
           # list; a dispatch may override them.
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
@@ -178,18 +211,41 @@ jobs:
       - name: Check wheel metadata
         working-directory: tpu-sync
         env:
-          WHEEL_VERSION_EXTRAS: ${{ needs.verify.outputs.wheel_version_extras }}
-        run: uv run --isolated --with twine twine check dist/*"${WHEEL_VERSION_EXTRAS}"-*.whl
+          WHEEL_VERSION: ${{ needs.verify.outputs.wheel_version }}
+        run: uv run --isolated --with twine twine check dist/*-"${WHEEL_VERSION}"-*.whl
+      # Verify wheel METADATA version and resolve dependencies against public
+      # pypi.org (Python 3.12 / x86_64-manylinux_2_31) before staging to the
+      # exit gate. Dry runs (publish=no) warn instead of failing on resolution
+      # errors so unreleased jax_version stacks can still be dry-run built.
+      - name: Check wheel version and PyPI resolution
+        working-directory: tpu-sync
+        env:
+          BUILD_MODE: ${{ matrix.framework }}
+          WHEEL_VERSION: ${{ needs.verify.outputs.wheel_version }}
+          WILL_PUBLISH: ${{ needs.verify.outputs.will_publish }}
+        run: |
+          ARGS=(
+            --dist-dir dist
+            --framework "${BUILD_MODE}"
+            --expected-version "${WHEEL_VERSION}"
+          )
+          if [[ "${WILL_PUBLISH}" != "true" ]]; then
+            ARGS+=(--allow-resolution-failure)
+          fi
+          python3 ../release-tools/ci/release/release_checks.py check-wheels "${ARGS[@]}"
       # The JAX-stack coupling (jax/jaxlib/libtpu) is enforced through the
       # wheel's own Requires-Dist pins; extract them so the release records the
       # stack it must run with, mirroring torch_tpu_version.txt on the torch side.
       - name: Record JAX stack pins
         if: matrix.framework == 'jax'
         working-directory: tpu-sync
+        env:
+          WHEEL_VERSION: ${{ needs.verify.outputs.wheel_version }}
         run: |
           python3 - <<'PY'
-          import glob, re, zipfile
-          whl = sorted(glob.glob('dist/tpu_sync_jax-*.whl'))[-1]
+          import glob, os, re, zipfile
+          ver = os.environ['WHEEL_VERSION']
+          whl = sorted(glob.glob(f'dist/tpu_sync_jax-{ver}-*.whl'))[-1]
           with zipfile.ZipFile(whl) as z:
               meta = next(n for n in z.namelist() if n.endswith('.dist-info/METADATA'))
               text = z.read(meta).decode()
@@ -206,23 +262,23 @@ jobs:
         with:
           name: release-wheel-${{ matrix.framework }}
           path: |
-            tpu-sync/dist/*${{ needs.verify.outputs.wheel_version_extras }}-*.whl
+            tpu-sync/dist/*-${{ needs.verify.outputs.wheel_version }}-*.whl
             tpu-sync/dist/torch_tpu_version.txt
             tpu-sync/dist/jax_pins.txt
           if-no-files-found: error
       - name: Summarize
         working-directory: tpu-sync
         env:
-          WHEEL_VERSION_EXTRAS: ${{ needs.verify.outputs.wheel_version_extras }}
+          WHEEL_VERSION: ${{ needs.verify.outputs.wheel_version }}
         run: |
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          ls -lh dist/*"${WHEEL_VERSION_EXTRAS}"-*.whl >> "$GITHUB_STEP_SUMMARY"
+          ls -lh dist/*-"${WHEEL_VERSION}"-*.whl >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
   publish:
     name: "Publish"
     needs: [verify, build]
-    if: startsWith(github.ref, 'refs/tags/') || inputs.publish == 'yes'
+    if: needs.verify.outputs.will_publish == 'true'
     uses: ./.github/workflows/publish_pypi.yml
     with:
       artifact_pattern: release-wheel-*
@@ -230,7 +286,7 @@ jobs:
   github_release:
     name: "Create GitHub Release"
     needs: [verify, build, publish]
-    if: startsWith(github.ref, 'refs/tags/')
+    if: needs.verify.outputs.is_stable_release == 'true' && needs.verify.outputs.will_publish == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -245,13 +301,29 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ needs.verify.outputs.tag_name }}
+          CHECKOUT_SHA: ${{ needs.verify.outputs.checkout_sha }}
         run: |
-          NOTES="$(printf 'torch_tpu wheel: %s\n\nJAX stack pins:\n%s\n' \
+          NOTES="$(printf 'Source commit: %s\n\ntorch_tpu wheel: %s\n\nJAX stack pins:\n%s\n' \
+            "${CHECKOUT_SHA}" \
             "$(cat release/torch_tpu_version.txt 2>/dev/null || echo 'n/a')" \
             "$(cat release/jax_pins.txt 2>/dev/null || echo 'n/a')")"
-          gh release create "${GITHUB_REF_NAME}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --verify-tag \
-            --generate-notes \
-            --notes "${NOTES}" \
-            release/*.whl release/*.txt
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            gh release create "${TAG_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --verify-tag \
+              --generate-notes \
+              --notes "${NOTES}" \
+              release/*.whl release/*.txt
+          elif gh release view "${TAG_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${TAG_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              release/*.whl release/*.txt
+          else
+            gh release create "${TAG_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target "${CHECKOUT_SHA}" \
+              --generate-notes \
+              --notes "${NOTES}" \
+              release/*.whl release/*.txt
+          fi

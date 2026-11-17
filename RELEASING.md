@@ -4,13 +4,14 @@
 
 The base version is single-sourced from `[project].version` in
 [pyproject.toml](pyproject.toml) (read by the Bazel repo rule in
-[bazel/wheel_version.bzl](bazel/wheel_version.bzl)). A suffix from the
+[bazel/wheel_version.bzl](bazel/wheel_version.bzl), and optionally overridden
+at build time with `WHEEL_VERSION_OVERRIDE`). A suffix from the
 `WHEEL_VERSION_EXTRAS` environment variable is appended at build time:
 
-| Channel | Version format            | Built by                                    | Published to |
-|---------|---------------------------|---------------------------------------------|--------------|
-| nightly | `X.Y.Z.devYYYYMMDDHHMMSS` | `Nightly Wheels` workflow (daily 08:00 UTC) | Artifact Registry |
-| release | `X.Y.Z`                   | `Release Wheels` workflow (on `vX.Y.Z` tag) | PyPI + GitHub Release |
+| Channel | Version format            | Built by                                                       | Published to |
+|---------|---------------------------|----------------------------------------------------------------|--------------|
+| nightly | `X.Y.Z.devYYYYMMDDHHMMSS` | `Nightly Wheels` workflow (daily 08:00 UTC)                    | Artifact Registry + PyPI (`--pre`) |
+| release | `X.Y.Z`                   | `Release Wheels` workflow (`vX.Y.Z` tag or `release_version`)  | PyPI + GitHub Release |
 
 Two wheels are built per version, one per framework: `tpu_sync_jax` and
 `tpu_sync_torch`. On PyPI they are the projects `tpu-sync-jax` and
@@ -194,31 +195,36 @@ example to check a candidate before a release.
    commit, published in [lkg.version](lkg.version) and recorded with its
    downstream runs in [verified_commits.csv](verified_commits.csv). To release
    a newer commit, run the `Golden Commit` workflow on its nightly first.
-2. Open a release PR that:
-   - updates [torch_tpu.version](torch_tpu.version) to the torch_tpu wheel
-     the release was validated with,
-   - bumps `[project].version` in `pyproject.toml` to `X.Y.Z`,
-   - adds the `X.Y.Z` section to [CHANGELOG.md](CHANGELOG.md), including the
-     compatible `torch_tpu` nightly version.
-3. (Optional) Dry run: trigger the `Release Wheels` workflow via
-   `workflow_dispatch` with `publish=no` — it builds `.dev`-versioned wheels
-   as workflow artifacts without publishing anything.
-4. Merge the PR, then tag and push:
+2. Choose either way to trigger `Release Wheels` (both run the PyPI HTTP 404
+   preflight check in `verify` before the 32-core builds and the post-build
+   `uv pip compile` dependency resolution check against public `pypi.org` for
+   Python 3.12 / `x86_64-manylinux_2_31` before staging to the exit gate):
+   - **Direct from a verified commit (`workflow_dispatch`)**: dispatch
+     `Release Wheels` on `main` with `ref=lkg` (or an explicit commit SHA on
+     `main`), `release_version=X.Y.Z`, and `publish=no` for a dry run first
+     (then `publish=yes` to publish). This overrides the base version at build
+     time via `WHEEL_VERSION_OVERRIDE` without editing the historical commit,
+     publishes to PyPI through the exit gate, and creates the `vX.Y.Z` tag and
+     GitHub Release targeting that commit.
+   - **Tag push**: update [torch_tpu.version](torch_tpu.version),
+     `[project].version` in `pyproject.toml`, and [CHANGELOG.md](CHANGELOG.md)
+     if needed, then tag and push a commit on `main`:
 
-   ```bash
-   git tag vX.Y.Z <merge-commit>
-   git push origin vX.Y.Z
-   ```
+     ```bash
+     git tag vX.Y.Z <commit-on-main>
+     git push origin vX.Y.Z
+     ```
 
-   The `Release Wheels` workflow verifies the tag (must equal the pyproject
-   version and be reachable from `main`), builds both wheels with an empty
-   version suffix, stages them and triggers the exit gate, and creates the
-   GitHub Release with the wheels attached.
-5. Wait for the exit-gate emails and confirm both projects on pypi.org show
+     The `Release Wheels` workflow verifies the tagged commit is reachable from
+     `main`, builds both wheels with `WHEEL_VERSION_OVERRIDE=X.Y.Z` and an
+     empty version suffix, stages them and triggers the exit gate, and creates
+     the GitHub Release with the wheels attached.
+3. Wait for the exit-gate emails and confirm both projects on pypi.org show
    `X.Y.Z`.
-6. Bump `[project].version` on `main` to the next patch version
-   `X.Y.(Z+1)`. This keeps nightlies (`X.Y.(Z+1).devN`) sorting *above* the
-   just-released `X.Y.Z`, so `--pre` users keep receiving fresh builds.
+4. Bump `[project].version` on `main` to the next patch version
+   `X.Y.(Z+1)` if it is still `<= X.Y.Z`. This keeps nightlies
+   (`X.Y.(Z+1).devN`) sorting *above* the just-released `X.Y.Z`, so `--pre`
+   users keep receiving fresh builds.
 
 ## Prerequisites (one-time repo setup)
 

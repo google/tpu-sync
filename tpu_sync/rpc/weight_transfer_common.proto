@@ -19,27 +19,15 @@ package tpu_sync.rpc;
 option java_multiple_files = true;
 option java_outer_classname = "WeightTransferCommonProto";
 
-// Types and conventions used by `weight_transfer_worker_service.proto`.
-//
-// Incarnation IDs: an `incarnation_id` identifies one live worker (weight
-// synchronizer) of a registered `RaidenIdProto` work unit, for example one
-// host's worker in 1-process-per-host JAX or one rank's worker in
-// 1-process-per-device PyTorch. It must be positive and strictly increase
-// across restarts of that work unit, and callers must not interpret it as a
-// timestamp. Requests to a worker name the incarnation they are meant for in
-// `target_incarnation_id`, so a restarted worker rejects requests meant for
-// its predecessor.
-
-// Version of a model's weights, ordered lexicographically by
-// `(epoch, version_id)`. An unset message, or one with both fields 0, means
-// "no version".
+// Version of a model's weights: opaque bytes that name one set of weights and
+// are never reused for different weights. Raiden compares versions bytewise
+// for equality and never parses, orders or hashes them, so the caller chooses
+// the scheme and decides which version is newer. Wherever a request carries a
+// version, a `tag` over kMaxWeightVersionBytes = 256 bytes is
+// INVALID_ARGUMENT naming the field and both sizes. Logs and errors show a
+// version bounded and escaped: its length and at most its first 64 bytes.
 message WeightVersion {
-  // Optional major epoch that strictly increases when `version_id` may roll
-  // back (for example, when a restarted producer restores an older checkpoint
-  // on a machine whose wall clock may be skewed). Callers whose `version_id` is
-  // already globally monotonic leave this 0.
-  int64 epoch = 1;
-  // Monotonically increasing version identifier within `epoch` (for example, a
-  // publish sequence number or step counter).
-  int64 version_id = 2;
+  // 1 to 256 bytes. Empty, or an unset message, means "no version", which a
+  // request that requires a version rejects with INVALID_ARGUMENT.
+  bytes tag = 1;
 }

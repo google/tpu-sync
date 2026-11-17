@@ -157,10 +157,11 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   bool is_listener_active() const;
   virtual std::vector<RaidenTransferEndpoint> get_local_endpoints() const;
 
-  // Identifies this synchronizer among the incarnations of its work unit (see
-  // weight_transfer_common.proto). Derived from the creation time in
-  // microseconds since the Unix epoch, so a restarted worker, created seconds
-  // later, gets a larger ID.
+  // Positive ID identifying this live synchronizer instance (see
+  // `target_incarnation_id` in weight_transfer_worker_service.proto). Derived
+  // from the creation time in microseconds since the Unix epoch so a
+  // restarted worker gets a distinct ID; compared only for equality, never
+  // interpreted as a timestamp or ordered.
   int64_t incarnation_id() const { return incarnation_id_; }
 
   ~WeightSynchronizerBase() override;

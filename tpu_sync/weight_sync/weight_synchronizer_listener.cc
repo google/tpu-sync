@@ -45,6 +45,7 @@
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/rpc/weight_transfer_worker_service.pb.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
+#include "tpu_sync/weight_sync/weight_version.h"
 
 namespace tpu_raiden {
 namespace weight_sync {
@@ -388,10 +389,11 @@ WeightSynchronizerListener::HandlePrepareWeightReceive(
   }
   // TODO(raiden-eng): Commit the version into the staging buffer once the
   // buffer tracks versions; until then nothing on the worker reads it.
-  if (req.version().epoch() == 0 && req.version().version_id() == 0) {
-    return absl::InvalidArgumentError(absl::StrCat(
-        "PrepareWeightReceive (uuid=", req.uuid(), ") carries no version"));
-  }
+  ABSL_RETURN_IF_ERROR(
+      WeightVersion::FromProto(
+          req.version(),
+          absl::StrCat("PrepareWeightReceive (uuid=", req.uuid(), ") version"))
+          .status());
   ABSL_RETURN_IF_ERROR(CheckTargetIncarnation(*engine_, "PrepareWeightReceive",
                                               req.uuid(),
                                               req.target_incarnation_id()));

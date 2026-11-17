@@ -57,6 +57,7 @@
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/rpc/weight_transfer_worker_service.pb.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
+#include "tpu_sync/weight_sync/weight_version.h"
 
 namespace tpu_raiden {
 namespace weight_sync {
@@ -726,7 +727,7 @@ PrepareWeightReceiveRequest MakePrepareRequest(int64_t uuid,
                                                int64_t num_chunks) {
   PrepareWeightReceiveRequest req;
   req.set_uuid(uuid);
-  req.mutable_version()->set_version_id(7);
+  req.mutable_version()->set_tag("v7");
   req.set_expected_block_count(num_chunks);
   (*req.mutable_expected_layer_chunk_counts())[0] = num_chunks;
   return req;
@@ -925,6 +926,33 @@ TEST(WeightSynchronizerListenerTest, RendezvousRequestsRejectInvalidFields) {
   EXPECT_THAT(
       SendStartPush(listener, no_layer),
       StatusIs(absl::StatusCode::kInvalidArgument, HasSubstr("layer_idx")));
+}
+
+TEST(WeightSynchronizerListenerTest,
+     PrepareWeightReceiveTakesVersionsOfOneToMaxBytes) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> engine,
+      CreateShardedCpuEngine(/*num_shards=*/1, 2 * kSrcShardBytes));
+  WeightSynchronizerListener listener(engine.get(), /*listener_port=*/0);
+
+  PrepareWeightReceiveRequest req = MakePrepareRequest(kPushUuid, 2);
+  req.mutable_version()->set_tag("");
+  EXPECT_THAT(SendPrepare(listener, req),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("(uuid=4242) version is empty: the request "
+                                 "carries no version")));
+  req.mutable_version()->set_tag(std::string(kMaxWeightVersionBytes + 1, 'x'));
+  EXPECT_THAT(SendPrepare(listener, req),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("version has 257 bytes, more than "
+                                 "kMaxWeightVersionBytes=256")));
+
+  for (size_t size : {size_t{1}, kMaxWeightVersionBytes}) {
+    PrepareWeightReceiveRequest valid =
+        MakePrepareRequest(kPushUuid + static_cast<int64_t>(size), 2);
+    valid.mutable_version()->set_tag(std::string(size, 'x'));
+    ABSL_EXPECT_OK(SendPrepare(listener, valid)) << size << " bytes";
+  }
 }
 
 TEST(WeightSynchronizerListenerTest, RendezvousRequestsRejectedAfterShutdown) {

@@ -40,6 +40,32 @@ cc_library(
 )
 
 cc_library(
+    name = "weight_version",
+    srcs = ["weight_version.cc"],
+    hdrs = ["weight_version.h"],
+    deps = [
+        "//tpu_sync/rpc:weight_transfer_common_cc_proto",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_test(
+    name = "weight_version_test",
+    srcs = ["weight_version_test.cc"],
+    tags = ["no_oss"],
+    deps = [
+        ":weight_version",
+        "//tpu_sync/rpc:weight_transfer_common_cc_proto",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "weight_synchronizer_base",
     srcs = [
         "weight_synchronizer_base.cc",
@@ -57,6 +83,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":tiling_utils",
+        ":weight_version",
         "//tpu_sync/common:trace",
         "//tpu_sync/common/control_pipe",
         "//tpu_sync/common/control_pipe:grpc_control_pipe",
@@ -157,6 +184,7 @@ cc_test(
     tags = ["no_oss"],
     deps = [
         ":weight_synchronizer_base",
+        ":weight_version",
         "//tpu_sync/common/control_pipe",
         "//tpu_sync/common/control_pipe:control_pipe_types",
         "//tpu_sync/common/control_pipe:grpc_control_pipe",

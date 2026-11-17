@@ -328,6 +328,30 @@ class LRUCache {
     return keys;
   }
 
+  // Like GetEvictableKeys, but returns only keys whose value holds a host DRAM
+  // block (the entries NumEvictableHostBlocks() counts) and skips the rest.
+  // Only compiles when TracksHostResidency() is true.
+  std::vector<Key> GetEvictableHostKeys(size_t count) const {
+    static_assert(HasHostResidency<Value>::value,
+                  "GetEvictableHostKeys needs a Value with `status` and "
+                  "`host_block_id` members");
+    std::vector<Key> keys;
+    keys.reserve(std::min(count, evictable_host_blocks_));
+    for (auto it = evict_candidate_list_.begin();
+         it != evict_candidate_list_.end() && keys.size() < count; ++it) {
+      if (IsHostResidentValue(it->value)) {
+        keys.push_back(it->key);
+      }
+    }
+    for (auto it = lru_list_.rbegin();
+         it != lru_list_.rend() && keys.size() < count; ++it) {
+      if (IsHostResidentValue(it->value)) {
+        keys.push_back(it->key);
+      }
+    }
+    return keys;
+  }
+
   // Erases the given key from the cache entirely. Pinned entries cannot be
   // erased and will return false.
   // Returns true if the element was successfully erased, false otherwise.
@@ -359,8 +383,8 @@ class LRUCache {
   }
 
   // Test-only observability: the candidate list has no production reader.
-  // Production reclaims candidates through GetEvictableKeys, which scans this
-  // list before the active one.
+  // Production reclaims candidates through GetEvictableHostKeys, which scans
+  // this list before the active one.
   std::vector<Key> GetEvictCandidateKeys() const {
     std::vector<Key> keys;
     keys.reserve(evict_candidate_list_.size());

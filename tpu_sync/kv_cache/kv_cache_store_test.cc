@@ -1316,6 +1316,51 @@ TEST_F(KVCacheStoreEmbeddedControllerTest,
   EXPECT_THAT(evicted_seen, ::testing::ElementsAre("h2"));
 }
 
+TEST_F(KVCacheStoreEmbeddedControllerTest,
+       AllocateBlockIdsSkipsHbmEntriesLeftByAFailedSave) {
+  auto controller = MakeController(/*num_blocks=*/2);
+  RegisterAndInitWorker(*controller, "worker_0", test_server_->server_address);
+
+  RaidenId rid{"test_job", "0", "test_cache", 0};
+  KVCacheStore store(8, std::move(controller), "", rid, std::nullopt,
+                     /*store_server_ip=*/"127.0.0.1");
+  auto* ctrl = KVCacheStoreTest::GetController(store);
+  ASSERT_NE(ctrl, nullptr);
+
+  // Two pinned host blocks use the whole pool.
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<int> host_ids, ctrl->AllocateBlockIds(2));
+  const std::vector<std::string> host = {"host_1", "host_2"};
+  ABSL_ASSERT_OK(store.Insert(
+      host,
+      {RaidenBlockId(rid, host_ids[0], 0, BlockStatus::HOST),
+       RaidenBlockId(rid, host_ids[1], 1, BlockStatus::HOST)},
+      /*on_host=*/true));
+
+  // A save with no host block to allocate fails and leaves its HBM entries.
+  const std::vector<std::string> residue = {"hbm_1", "hbm_2"};
+  ABSL_ASSERT_OK(store.Insert(residue,
+                              {RaidenBlockId(rid, -1, 2, BlockStatus::HBM),
+                               RaidenBlockId(rid, -1, 3, BlockStatus::HBM)},
+                              /*on_host=*/false));
+  EXPECT_TRUE(absl::IsResourceExhausted(store.Save(residue)));
+  store.Release(residue);
+
+  // The HBM entries are now the oldest unpinned entries.
+  store.Release(host);
+
+  auto allocated = KVCacheStoreTest::AllocateBlockIds(store, 2);
+  ABSL_ASSERT_OK(allocated);
+  EXPECT_EQ(allocated->size(), 2);
+
+  // The host entries were evicted; the HBM entries stay in the index.
+  TF_ASSERT_OK_AND_ASSIGN(auto host_left, PeekLookup(store, host));
+  EXPECT_TRUE(host_left.empty());
+  TF_ASSERT_OK_AND_ASSIGN(auto residue_left, PeekLookup(store, residue));
+  ASSERT_EQ(residue_left.size(), 2);
+  EXPECT_EQ(residue_left[0].second.status, BlockStatus::HBM);
+  EXPECT_EQ(residue_left[1].second.status, BlockStatus::HBM);
+}
+
 TEST_F(KVCacheStoreEmbeddedControllerTest, SaveSuccess) {
   ::tpu_raiden::controller::MockTransferManager mock_mgr;
   test_server_->service->SetTransferManager(
@@ -5880,6 +5925,35 @@ TEST_F(EvictSweepTest, DropsLocallyWhenThereAreNoTargets) {
   AwaitSweepFreed(store, 6);
   EXPECT_EQ(store.backend()->GetSize(), 2);
   EXPECT_EQ(fake_destination_.write_calls(), 0);
+}
+
+// An unpinned HBM-only entry has no host block to offer. The sweep leaves it
+// out of the batch, so the target accepts the batch.
+TEST_F(EvictSweepTest, LeavesHbmOnlyEntriesOutOfTheBatch) {
+  RaidenId src{"sweep_src_hbm", "0", "kv", 0};
+  RaidenId dst{"sweep_dst_hbm", "0", "kv", 0};
+  TF_ASSERT_OK_AND_ASSIGN(auto store_ptr, MakeSweepStore(src, "hbmgroup"));
+  KVCacheStore& store = *store_ptr;
+
+  StartFakeDestination(dst, "hbmgroup", /*evict_tier=*/1);
+  proto::PollWriteRemoteResponse verdict;
+  verdict.set_state(proto::PollWriteRemoteResponse::COMMITTED);
+  fake_destination_.SetPollResponse(verdict);
+
+  // The coldest entry is HBM-only, as a failed save leaves it.
+  ABSL_ASSERT_OK(store.Insert({"hbm"},
+                              {RaidenBlockId(src, -1, 0, BlockStatus::HBM)},
+                              /*on_host=*/false));
+  store.Release({"hbm"});
+  PopulateCold(store, src, {"a", "b", "c", "d", "e", "f"});
+
+  // One batch of four host blocks goes to the target. The HBM-only entry
+  // and two host blocks stay.
+  AwaitSweepFreed(store, 6);
+  EXPECT_EQ(fake_destination_.write_calls(), 1);
+  EXPECT_EQ(CountResident(store, {"hbm"}), 1);
+  EXPECT_EQ(CountResident(store, {"a", "b", "c", "d", "e", "f"}), 2);
+  EXPECT_EQ(store.backend()->GetSize(), 3);
 }
 
 // --- Save() ownership ------------------------------------------------------

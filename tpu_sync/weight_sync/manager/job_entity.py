@@ -2103,7 +2103,7 @@ class WeightSyncWorkerRpcClient(WorkerRpcClient):
   ):
     if control_pipe is None:
       control_pipe = control_pipe_client.ControlPipeClient(
-          backend=control_pipe_client.ControlPipeBackendType.GRPC,
+          backend=control_pipe_client.resolve_weight_sync_listener_backend(),
           name_resolver=name_resolver,
           use_legacy_tcp_framing=use_legacy_tcp_framing,
       )

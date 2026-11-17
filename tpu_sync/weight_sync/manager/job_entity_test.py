@@ -16,6 +16,7 @@
 
 import asyncio
 import dataclasses
+import os
 from typing import Any
 from unittest import mock
 
@@ -673,6 +674,9 @@ class JobEntityTest(absltest.TestCase):
 
   def test_weight_sync_worker_rpc_client_defaults_to_grpc(self):
     """Verifies WeightSyncWorkerRpcClient and its created entities default to gRPC."""
+    self.enter_context(mock.patch.dict(os.environ, {}, clear=False))
+    os.environ.pop("TPU_RAIDEN_CONTROL_PLANE_BACKEND", None)
+    os.environ.pop("TPU_RAIDEN_USE_GRPC_CONTROL_PLANE", None)
     client = job_entity.WeightSyncWorkerRpcClient()
     try:
       self.assertEqual(
@@ -686,6 +690,62 @@ class JobEntityTest(absltest.TestCase):
       )
     finally:
       client.close()
+
+  def test_weight_sync_worker_rpc_client_honors_backend_env(self) -> None:
+    """Verifies WeightSyncWorkerRpcClient and entities honor backend env vars."""
+    backend_type = control_pipe_client.ControlPipeBackendType
+    for env, expected in (
+        ({"TPU_RAIDEN_CONTROL_PLANE_BACKEND": "tcp"}, backend_type.TCP),
+        ({"TPU_RAIDEN_CONTROL_PLANE_BACKEND": "zmq"}, backend_type.ZMQ),
+        ({"TPU_RAIDEN_USE_GRPC_CONTROL_PLANE": "0"}, backend_type.TCP),
+    ):
+      with self.subTest(env=env), mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("TPU_RAIDEN_CONTROL_PLANE_BACKEND", None)
+        os.environ.pop("TPU_RAIDEN_USE_GRPC_CONTROL_PLANE", None)
+        os.environ.update(env)
+        client = job_entity.WeightSyncWorkerRpcClient()
+        try:
+          self.assertEqual(client.control_pipe_client.backend, expected)
+          entity = client.get_or_create_entity(self.src_unit)
+          self.assertEqual(entity.control_pipe_client.backend, expected)
+        finally:
+          client.close()
+
+  def test_weight_sync_worker_rpc_client_tcp_start_transfer(self) -> None:
+    """Verifies real loopback TCP start_transfer round-trip under TCP env."""
+    received: list[bytes] = []
+    ok_resp = raiden_service_pb2.ControlResponse(
+        success=True
+    ).SerializeToString()
+
+    def _handle(payload: bytes) -> bytes:
+      received.append(payload)
+      return ok_resp
+
+    server = control_pipe_client.ControlPipeServer(
+        port=0, handler=_handle, max_frame_bytes=65536
+    )
+    self.addCleanup(server.stop)
+    self.enter_context(
+        mock.patch.dict(os.environ, {"TPU_RAIDEN_CONTROL_PLANE_BACKEND": "tcp"})
+    )
+    client = job_entity.WeightSyncWorkerRpcClient()
+    self.addCleanup(client.close)
+    client.register_worker_endpoint(
+        self.src_unit, f"localhost:{server.start()}"
+    )
+    plan = controller_types.TransferPlan(
+        src_units=[self.src_unit],
+        dst_units=[self.dst_unit],
+        plan={},
+        worker_data_addresses={self.dst_unit: ["10.11.0.3:8000"]},
+    )
+    asyncio.run(asyncio.wait_for(client.start_transfer(self.src_unit, plan), 5))
+    self.assertLen(received, 1)
+    req = raiden_service_pb2.ControlRequest.FromString(received[0])
+    self.assertEqual(
+        req.command, raiden_service_pb2.ControlRequest.COMMAND_START_TRANSFER
+    )
 
   def _encode_req(
       self,

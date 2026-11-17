@@ -561,6 +561,56 @@ TEST(LRUCacheTest, NumEvictableHostBlocksGetAndPinOnEvictionCandidate) {
   EXPECT_EQ(cache.NumEvictableHostBlocks(), 2);
 }
 
+TEST(LRUCacheTest, GetEvictableKeysSkipsNonHostAndPinnedEntries) {
+  LRUCache<std::string, TestBlockValue> cache(6);
+  cache.Put("hbm_cand", TestBlockValue{-1, TestBlockStatus::HBM});
+  cache.Put("host_cand", TestBlockValue{0, TestBlockStatus::HOST});
+  cache.Put("hbm_old", TestBlockValue{-1, TestBlockStatus::HBM});
+  cache.Put("host_and_hbm", TestBlockValue{1, TestBlockStatus::HOST_AND_HBM});
+  cache.Put("pinned_host", TestBlockValue{2, TestBlockStatus::HOST});
+  cache.Put("host_new", TestBlockValue{3, TestBlockStatus::HOST});
+  ASSERT_TRUE(cache.Pin("pinned_host"));
+  ASSERT_TRUE(cache.Evict().has_value());
+  ASSERT_TRUE(cache.Evict().has_value());
+  ASSERT_EQ(cache.GetEvictCandidateKeys(),
+            (std::vector<std::string>{"hbm_cand", "host_cand"}));
+
+  // Candidates first, then the LRU end; HBM-only and pinned entries skipped.
+  EXPECT_EQ(
+      cache.GetEvictableKeys(10),
+      (std::vector<std::string>{"host_cand", "host_and_hbm", "host_new"}));
+  EXPECT_EQ(cache.GetEvictableKeys(2),
+            (std::vector<std::string>{"host_cand", "host_and_hbm"}));
+  EXPECT_TRUE(cache.GetEvictableKeys(0).empty());
+
+  // Unpin returns the entry as most recently used.
+  ASSERT_TRUE(cache.Unpin("pinned_host"));
+  EXPECT_EQ(cache.GetEvictableKeys(10),
+            (std::vector<std::string>{"host_cand", "host_and_hbm", "host_new",
+                                      "pinned_host"}));
+
+  // An entry that loses its host block is skipped.
+  ASSERT_TRUE(
+      cache.UpdateValue("host_new", TestBlockValue{-1, TestBlockStatus::HBM}));
+  EXPECT_EQ(
+      cache.GetEvictableKeys(10),
+      (std::vector<std::string>{"host_cand", "host_and_hbm", "pinned_host"}));
+}
+
+TEST(LRUCacheTest, GetEvictableKeysSkipsEntriesWithoutALocalHostBlock) {
+  LRUCache<std::string, TestBlockValue> cache(5);
+  cache.Put("init", TestBlockValue{});
+  cache.Put("host_without_id", TestBlockValue{-1, TestBlockStatus::HOST});
+  cache.Put("remote", TestBlockValue{7, TestBlockStatus::REMOTE});
+  cache.Put("shared_storage",
+            TestBlockValue{8, TestBlockStatus::SHARED_STORAGE});
+  cache.Put("host", TestBlockValue{0, TestBlockStatus::HOST});
+
+  // Only the entry that NumEvictableHostBlocks() counts is returned.
+  EXPECT_EQ(cache.GetEvictableKeys(5), (std::vector<std::string>{"host"}));
+  EXPECT_EQ(cache.NumEvictableHostBlocks(), 1);
+}
+
 }  // namespace
 }  // namespace kv_cache
 }  // namespace tpu_raiden

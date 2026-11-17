@@ -290,7 +290,10 @@ class KVCacheStoreBackend {
   // Default implementation returns 0 (no recovery).
   virtual absl::StatusOr<size_t> RecoverFromLocalManifest() { return 0; }
 
-  // Retrieves evictable keys from the backend.
+  // Returns up to `count` unpinned keys, coldest first, whose eviction frees a
+  // host DRAM block: status HOST or HOST_AND_HBM with host_block_id >= 0.
+  // Entries without a host block, such as HBM-only entries, are not returned.
+  // Backends without a host DRAM tier return none.
   virtual std::vector<std::string> GetEvictableKeys(size_t count) { return {}; }
 
   // --- Remote write (WriteRemote) & registry helpers -----------------------

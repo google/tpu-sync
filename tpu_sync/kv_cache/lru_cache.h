@@ -15,6 +15,7 @@
 #ifndef THIRD_PARTY_TPU_RAIDEN_KV_CACHE_LRU_CACHE_H_
 #define THIRD_PARTY_TPU_RAIDEN_KV_CACHE_LRU_CACHE_H_
 
+#include <algorithm>
 #include <cstddef>
 #include <list>
 #include <optional>
@@ -307,21 +308,32 @@ class LRUCache {
     return map_;
   }
 
-  // Returns up to `count` oldest evictable (unpinned) keys in LRU order (oldest
-  // first).
+  // Returns up to `count` evictable keys, oldest first: eviction candidates,
+  // then the unpinned active entries from the LRU end. When
+  // TracksHostResidency() is true, only entries that hold a host DRAM block
+  // (those NumEvictableHostBlocks() counts) are returned: evicting any other
+  // entry frees no host block. Skipped entries are still visited, so the scan
+  // may cover both lists when fewer than `count` entries qualify.
   std::vector<Key> GetEvictableKeys(size_t count) const {
     std::vector<Key> keys;
     keys.reserve(
-        std::min(count, evict_candidate_list_.size() + lru_list_.size()));
+        std::min(count, TracksHostResidency()
+                            ? evictable_host_blocks_
+                            : evict_candidate_list_.size() + lru_list_.size()));
+    const auto evictable = [](const CacheNode& node) {
+      return !TracksHostResidency() || IsHostResidentValue(node.value);
+    };
     // 1. Scan evict_candidate_list_ first (oldest first, i.e. front to back)
     for (auto it = evict_candidate_list_.begin();
          it != evict_candidate_list_.end() && keys.size() < count; ++it) {
-      keys.push_back(it->key);
+      if (evictable(*it)) {
+        keys.push_back(it->key);
+      }
     }
     // 2. Scan lru_list_ (oldest first, i.e. back to front)
-    if (keys.size() < count) {
-      for (auto it = lru_list_.rbegin();
-           it != lru_list_.rend() && keys.size() < count; ++it) {
+    for (auto it = lru_list_.rbegin();
+         it != lru_list_.rend() && keys.size() < count; ++it) {
+      if (evictable(*it)) {
         keys.push_back(it->key);
       }
     }
@@ -359,8 +371,8 @@ class LRUCache {
   }
 
   // Test-only observability: the candidate list has no production reader.
-  // Production reclaims candidates through GetEvictableKeys, which scans this
-  // list before the active one.
+  // Production reclaims host-resident candidates through GetEvictableKeys,
+  // which scans this list before the active one.
   std::vector<Key> GetEvictCandidateKeys() const {
     std::vector<Key> keys;
     keys.reserve(evict_candidate_list_.size());

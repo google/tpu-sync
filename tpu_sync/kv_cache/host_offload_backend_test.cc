@@ -1970,6 +1970,32 @@ TEST(HostOffloadBackendTest, NumEvictableHostBlocksTracksPinsAndResidency) {
   EXPECT_EQ(backend.NumEvictableHostBlocks(), 1);
 }
 
+TEST(HostOffloadBackendTest, GetEvictableKeysSkipsUnsavedHbmEntry) {
+  HostOffloadBackendTest::Backend backend(/*capacity=*/4);
+  RaidenId id{"job", "0", "data", 0};
+  // An HBM entry pinned for a save and released without one being made.
+  ASSERT_TRUE(
+      backend.Insert({"hbm_only"},
+                     {RaidenBlockId(id, /*host_block_id=*/-1,
+                                    /*device_block_id=*/3, BlockStatus::HBM)},
+                     InsertOption::kInsertAndPin));
+  backend.Release({"hbm_only"});
+  ASSERT_TRUE(
+      backend.Insert({"host", "host_and_hbm"},
+                     {RaidenBlockId(id, 10, BlockStatus::HOST),
+                      RaidenBlockId(id, 11, BlockStatus::HOST_AND_HBM)}));
+  ASSERT_EQ(backend.GetPinCount("hbm_only"), 0);
+
+  EXPECT_THAT(backend.GetEvictableKeys(4),
+              ::testing::ElementsAre("host", "host_and_hbm"));
+  EXPECT_THAT(backend.GetEvictableKeys(1), ::testing::ElementsAre("host"));
+
+  // The entry stays in the index.
+  TF_ASSERT_OK_AND_ASSIGN(auto lookup_res, backend.Lookup({"hbm_only"}));
+  ASSERT_EQ(lookup_res.size(), 1);
+  EXPECT_EQ(lookup_res[0].second.status, BlockStatus::HBM);
+}
+
 // Captures the latest `host_pool_blocks` value per `state` and verifies the
 // label set is exactly {dp_rank, state}.
 class HostPoolGaugeRecorder {

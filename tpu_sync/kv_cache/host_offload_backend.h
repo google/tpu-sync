@@ -186,11 +186,12 @@ class HostOffloadBackend : public KVCacheStoreBackend {
 
   // Pulls blocks held by the peer `remote_id` into `device_block_ids`, in two
   // hops: a Fetch RPC that lands the bytes in host blocks allocated here, then
-  // a DRAM->HBM copy chained off it.
+  // a DRAM->HBM copy chained off it. Takes `metrics_mu_` and `mutex_` itself.
   tsl::Future<> LoadRemoteBlocks(const RaidenId& remote_id,
                                  absl::Span<const std::string> block_hashes,
                                  absl::Span<const int32_t> device_block_ids,
-                                 BlockTracker* absl_nonnull load_tracker);
+                                 BlockTracker* absl_nonnull load_tracker)
+      ABSL_LOCKS_EXCLUDED(metrics_mu_, mutex_);
 
   // Copies blocks already resident in this node's host DRAM into
   // `device_block_ids`, as a single TransferBuffers.

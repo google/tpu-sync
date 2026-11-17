@@ -8340,6 +8340,53 @@ TEST_F(KVRecallBlocksMetricsTest, RemoteDramRecallOutcomes) {
   WaitForLoadSettled(*store_, 1);
 }
 
+TEST_F(KVRecallBlocksMetricsTest, RemoteDramRecallFailuresLogTheOutcome) {
+  MakeStore({.peer_hashes = {"r0", "r1"}});
+  // An unpinned local host entry. An evicting allocation could free its
+  // block; the peer read staging allocation does not evict.
+  ASSERT_TRUE(
+      InsertResident(*store_, {"l0"}, {LocalSlice(0)}, /*on_host=*/true));
+  absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);
+  EXPECT_CALL(log,
+              Log(absl::LogSeverity::kWarning, testing::_,
+                  testing::AllOf(HasSubstr("Peer KV read failed "
+                                           "(staging_exhausted): 2 block(s)"),
+                                 HasSubstr("host pool free 0/10, unpinned "
+                                           "host LRU entries 1: "))));
+  EXPECT_CALL(log, Log(absl::LogSeverity::kWarning, testing::_,
+                       testing::AllOf(HasSubstr("Peer KV read failed "
+                                                "(not_found): 1 block(s)"),
+                                      HasSubstr("Fetch RPC: "))));
+  EXPECT_CALL(log,
+              Log(absl::LogSeverity::kWarning, testing::_,
+                  testing::AllOf(HasSubstr("Peer KV read failed "
+                                           "(transfer_failed): 1 block(s)"),
+                                 HasSubstr("no client: "))));
+  EXPECT_CALL(log,
+              Log(absl::LogSeverity::kWarning, testing::_,
+                  testing::AllOf(HasSubstr("Peer KV read failed "
+                                           "(transfer_failed): 2 block(s)"),
+                                 HasSubstr("H2D copy: "))));
+  log.StartCapturingLogs();
+
+  {
+    StagingExhaustionGuard staging = ExhaustStagingBlocks();
+    ABSL_ASSERT_OK(store_->ReadRemote(
+        {"r0", "r1"}, {PeerSlice(peer_a_, 0), PeerSlice(peer_a_, 1)}, {2, 3}));
+    WaitForLoadSettled(*store_, 2);
+  }
+  ABSL_ASSERT_OK(
+      store_->ReadRemote({"r_missing"}, {PeerSlice(peer_a_, 99)}, {2}));
+  WaitForLoadSettled(*store_, 1);
+  ABSL_ASSERT_OK(
+      store_->ReadRemote({"r_unknown_peer"}, {PeerSlice(peer_b_, 0)}, {2}));
+  WaitForLoadSettled(*store_, 1);
+  mgr_.fail_transfers = true;
+  ABSL_ASSERT_OK(store_->ReadRemote(
+      {"r0", "r1"}, {PeerSlice(peer_a_, 0), PeerSlice(peer_a_, 1)}, {2, 3}));
+  WaitForLoadSettled(*store_, 2);
+}
+
 TEST_F(KVRecallBlocksMetricsTest, SharedStorageRecallOutcomes) {
   MakeStore({});
 

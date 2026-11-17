@@ -1509,8 +1509,7 @@ void KVCacheStore::LoadFromSecondaryBackend(
   const RecallClock::time_point start_ts = RecallClock::now();
 
   // Host staging blocks for the recall. May evict UNPINNED entries if short,
-  // never pinned ones. Failure is reported through the tracker only, the same
-  // way the peer path reports its own staging failure, so it is reported once.
+  // never pinned ones. Failure is logged and reported through the tracker.
   absl::StatusOr<std::vector<int>> allocated =
       AllocateBlockIds(block_hashes.size());
   if (!allocated.ok()) {

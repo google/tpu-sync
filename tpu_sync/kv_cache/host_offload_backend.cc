@@ -1202,6 +1202,10 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
   };
   auto client = GetKVCacheStoreClient(remote_id);
   if (!client.ok()) {
+    LOG(WARNING) << "Peer KV read failed ("
+                 << telemetry::metric_labels::kOutcomeTransferFailed
+                 << "): " << block_hashes.size() << " block(s) from "
+                 << remote_id << ", no client: " << client.status();
     return fail_transfer(telemetry::metric_labels::kOutcomeTransferFailed,
                          client.status());
   }
@@ -1209,6 +1213,14 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
 
   auto host_blocks = raiden_controller_->AllocateBlockIds(block_hashes.size());
   if (!host_blocks.ok()) {
+    LOG(WARNING) << "Peer KV read failed ("
+                 << telemetry::metric_labels::kOutcomeStagingExhausted
+                 << "): " << block_hashes.size() << " block(s) from "
+                 << remote_id << ", host pool free "
+                 << raiden_controller_->num_free_blocks() << "/"
+                 << raiden_controller_->total_blocks()
+                 << ", unpinned host LRU entries " << NumEvictableHostBlocks()
+                 << ": " << host_blocks.status();
     return fail_transfer(telemetry::metric_labels::kOutcomeStagingExhausted,
                          host_blocks.status());
   }
@@ -1256,6 +1268,10 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
                 absl::IsNotFound(fetch_response.status())
                     ? telemetry::metric_labels::kOutcomeNotFound
                     : telemetry::metric_labels::kOutcomeTransferFailed;
+            LOG(WARNING) << "Peer KV read failed (" << outcome
+                         << "): " << hashes.size() << " block(s) from "
+                         << remote_id
+                         << ", Fetch RPC: " << fetch_response.status();
             MarkRecallFailed(load_tracker, dp_rank_str_,
                              telemetry::metric_labels::kTierRemoteDram, outcome,
                              hashes, start_ts);
@@ -1270,6 +1286,12 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
             std::string err_msg = response.error_message().empty()
                                       ? "Fetch RPC returned failed blocks"
                                       : response.error_message();
+            LOG(WARNING) << "Peer KV read failed ("
+                         << telemetry::metric_labels::kOutcomeTransferFailed
+                         << "): " << hashes.size() << " block(s) from "
+                         << remote_id << ", Fetch RPC reported "
+                         << response.failed_block_hashes_size()
+                         << " failed: " << err_msg;
             // TODO: FetchResponse.failed_block_hashes is not populated by
             // KVCacheStoreServiceImpl::Fetch today (missing blocks fail the RPC
             // with NOT_FOUND) and its proto semantics are generic fetch failure
@@ -1302,8 +1324,8 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
               raiden_controller_->TransferBuffers(src_buffers, dst_buffers);
         }
 
-        h2d_future.OnReady([this, lifetime, dst_host_block_ids, start_ts,
-                            hashes = std::move(hashes), load_tracker,
+        h2d_future.OnReady([this, lifetime, remote_id, dst_host_block_ids,
+                            start_ts, hashes = std::move(hashes), load_tracker,
                             load_promise = std::move(load_promise)](
                                absl::Status status) mutable {
           absl::ReaderMutexLock lock(lifetime->mu);
@@ -1318,6 +1340,10 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
                            telemetry::metric_labels::kTierRemoteDram, hashes,
                            start_ts);
           } else {
+            LOG(WARNING) << "Peer KV read failed ("
+                         << telemetry::metric_labels::kOutcomeTransferFailed
+                         << "): " << hashes.size() << " block(s) from "
+                         << remote_id << ", H2D copy: " << status;
             MarkRecallFailed(load_tracker, dp_rank_str_,
                              telemetry::metric_labels::kTierRemoteDram,
                              telemetry::metric_labels::kOutcomeTransferFailed,

@@ -55,8 +55,9 @@
 #include <utility>
 #include <vector>
 
-#include "absl/flags/flag.h"
 #include "absl/flags/parse.h"
+#include "absl/log/initialize.h"
+#include "absl/flags/flag.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/match.h"
@@ -71,6 +72,7 @@
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/logical_block_manager.h"
+#include "tpu_sync/transport/peer_endpoint.h"
 
 ABSL_FLAG(std::string, role, "", "Role: sender or receiver");
 ABSL_FLAG(std::string, control_ip, "127.0.0.1", "Local control IP");
@@ -356,6 +358,48 @@ uint8_t* GetLayerHostBaseOrFail(
   return host->data();
 }
 
+struct RemoteEndpoint {
+  std::string interface_name;
+  std::string ip;
+  int port = 0;
+  int peregrine_port = 0;
+};
+
+absl::StatusOr<std::vector<RemoteEndpoint>> ParseRemoteEndpoints(
+    absl::string_view peer_data_address) {
+  std::vector<RemoteEndpoint> remote_endpoints;
+  for (absl::string_view raw_token : absl::StrSplit(peer_data_address, ',')) {
+    absl::string_view token = raw_token;
+    int peregrine_port = 0;
+    const size_t at_pos = token.rfind('@');
+    if (at_pos != absl::string_view::npos) {
+      if (!absl::SimpleAtoi(token.substr(at_pos + 1), &peregrine_port)) {
+        return absl::InvalidArgumentError(absl::StrFormat(
+            "Invalid Peregrine port in endpoint token: %s", raw_token));
+      }
+      token = token.substr(0, at_pos);
+    }
+    const size_t first_colon = token.find(':');
+    const size_t last_colon = token.rfind(':');
+    if (first_colon != absl::string_view::npos &&
+        last_colon != absl::string_view::npos && first_colon < last_colon) {
+      int port = 0;
+      if (!absl::SimpleAtoi(token.substr(last_colon + 1), &port)) {
+        return absl::InvalidArgumentError(
+            absl::StrFormat("Invalid data port in endpoint token: %s", token));
+      }
+      remote_endpoints.push_back(RemoteEndpoint{
+          .interface_name = std::string(token.substr(0, first_colon)),
+          .ip = std::string(
+              token.substr(first_colon + 1, last_colon - first_colon - 1)),
+          .port = port,
+          .peregrine_port = peregrine_port,
+      });
+    }
+  }
+  return remote_endpoints;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -364,6 +408,7 @@ int main(int argc, char* argv[]) {
   std::signal(SIGPIPE, SIG_IGN);
 
   absl::ParseCommandLine(argc, argv);
+  absl::InitializeLog();
 
   std::string role = absl::GetFlag(FLAGS_role);
   std::string control_ip = absl::GetFlag(FLAGS_control_ip);
@@ -518,9 +563,13 @@ int main(int argc, char* argv[]) {
       allocated_block_ids.push_back(dst_block_ids);
 
       int port = *manager->local_port();
+      int peregrine_port = manager->peregrine_local_port();
       if (!endpoints_str.empty()) endpoints_str += ",";
       endpoints_str += absl::StrFormat("%s:%s:%d", iface.interface_name,
                                        iface.ip_address, port);
+      if (peregrine_port > 0) {
+        endpoints_str += absl::StrFormat("@%d", peregrine_port);
+      }
       managers.push_back(std::move(manager));
     }
 
@@ -676,31 +725,19 @@ int main(int argc, char* argv[]) {
               << std::endl;
 
     // 2. Parse endpoints
-    std::vector<std::string> endpoint_tokens =
-        absl::StrSplit(peer_data_address, ',');
-    struct RemoteEndpoint {
-      std::string interface_name;
-      std::string ip;
-      int port;
-    };
-    std::vector<RemoteEndpoint> remote_endpoints;
-    for (const auto& token : endpoint_tokens) {
-      size_t first_colon = token.find(':');
-      size_t last_colon = token.rfind(':');
-      if (first_colon != std::string::npos && last_colon != std::string::npos &&
-          first_colon < last_colon) {
-        std::string interface_name = token.substr(0, first_colon);
-        std::string ip =
-            token.substr(first_colon + 1, last_colon - first_colon - 1);
-        std::string port_str = token.substr(last_colon + 1);
-        remote_endpoints.push_back({interface_name, ip, std::stoi(port_str)});
-      }
+    absl::StatusOr<std::vector<RemoteEndpoint>> parsed_endpoints =
+        ParseRemoteEndpoints(peer_data_address);
+    if (!parsed_endpoints.ok()) {
+      std::cerr << parsed_endpoints.status() << std::endl;
+      close(control_fd);
+      return 1;
     }
+    const std::vector<RemoteEndpoint>& remote_endpoints = *parsed_endpoints;
 
     // 3. Map remote endpoints to local interfaces and spawn managers
     std::vector<std::unique_ptr<tpu_raiden::kv_cache::KVCacheManagerBase>>
         managers;
-    std::vector<std::string> mapped_peer_addresses;
+    std::vector<tpu_raiden::transport::PeerEndpoint> mapped_peer_endpoints;
     std::vector<std::vector<int>> allocated_block_ids;
 
     for (const auto& remote : remote_endpoints) {
@@ -787,7 +824,12 @@ int main(int argc, char* argv[]) {
 
       std::string peer_addr =
           tpu_raiden::FormatHostPort(remote.ip, remote.port);
-      mapped_peer_addresses.push_back(peer_addr);
+      std::string peregrine_addr =
+          remote.peregrine_port > 0
+              ? tpu_raiden::FormatHostPort(remote.ip, remote.peregrine_port)
+              : "";
+      mapped_peer_endpoints.emplace_back(std::move(peer_addr),
+                                         std::move(peregrine_addr));
       managers.push_back(std::move(manager));
     }
 
@@ -803,7 +845,7 @@ int main(int argc, char* argv[]) {
         std::iota(dst_block_ids.begin(), dst_block_ids.end(), 0);
         for (int i = 0; i < kNumWarmup; ++i) {
           auto status_or = managers[m]->H2hWrite(
-              mapped_peer_addresses[m], allocated_block_ids[m], dst_block_ids);
+              mapped_peer_endpoints[m], allocated_block_ids[m], dst_block_ids);
           if (!status_or.ok()) {
             std::cerr << "Warmup failed on manager " << m << " ("
                       << remote_endpoints[m].interface_name
@@ -825,7 +867,7 @@ int main(int argc, char* argv[]) {
     // Filter active (successful) managers
     std::vector<std::unique_ptr<tpu_raiden::kv_cache::KVCacheManagerBase>>
         active_managers;
-    std::vector<std::string> active_peer_addresses;
+    std::vector<tpu_raiden::transport::PeerEndpoint> active_peer_endpoints;
     std::vector<std::vector<int>> active_allocated_block_ids;
     std::vector<std::string> active_interface_names;
     std::string active_indices_str = "";
@@ -833,7 +875,7 @@ int main(int argc, char* argv[]) {
     for (size_t m = 0; m < managers.size(); ++m) {
       if (warmup_success[m]) {
         active_managers.push_back(std::move(managers[m]));
-        active_peer_addresses.push_back(mapped_peer_addresses[m]);
+        active_peer_endpoints.push_back(mapped_peer_endpoints[m]);
         active_allocated_block_ids.push_back(allocated_block_ids[m]);
         active_interface_names.push_back(remote_endpoints[m].interface_name);
 
@@ -878,7 +920,7 @@ int main(int argc, char* argv[]) {
           std::vector<int> dst_block_ids(num_blocks);
           std::iota(dst_block_ids.begin(), dst_block_ids.end(), 0);
           auto status_or = active_managers[m]->H2hWrite(
-              active_peer_addresses[m], active_allocated_block_ids[m],
+              active_peer_endpoints[m], active_allocated_block_ids[m],
               dst_block_ids);
           if (!status_or.ok()) {
             std::cerr << "Iteration " << i << " failed on active manager " << m

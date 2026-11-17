@@ -24,7 +24,7 @@
 # holds them, in JAX_REQUIRES and TORCH_REQUIRES.
 [project]
 name = "tpu_raiden"
-version = "0.0.1"
+version = "0.0.2"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 description = "High-bandwidth PJRT raw-transfer / KV-cache DMA engine for TPU (JAX + PyTorch/torch_tpu)."

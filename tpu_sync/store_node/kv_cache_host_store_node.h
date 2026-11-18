@@ -168,7 +168,7 @@ class KVCacheHostStoreNode {
 
   // Whole blocks of `spec`'s block geometry that fit in `dram_budget_bytes`.
   // Every worker's pool holds its own shards of every block, so one block
-  // costs num_workers x num_kv_shards x (sum of block_array_bytes).
+  // costs num_kv_shards x (sum of every worker's block_array_bytes).
   // InvalidArgument if the budget does not cover even one block.
   static absl::StatusOr<size_t> NumBlocksForBudget(size_t dram_budget_bytes,
                                                    const KVTransferSpec& spec);

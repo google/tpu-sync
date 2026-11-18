@@ -48,12 +48,16 @@ namespace kv_cache {
 // The deployment's KVTransferSpec (see global_registry.proto), registered
 // with the global registry when a backend that supports it is created.
 struct KVTransferSpecConfig {
-  // Bytes one block occupies in each block array, on one shard.
+  // Bytes one block occupies in each block array, on one shard. Empty when
+  // the workers' block arrays differ.
   std::vector<uint64_t> block_array_bytes;
   // Device shards each block array is split across on a serving host.
   int num_kv_shards = 0;
   // Transfer workers on the serving hosts, node ids [0, num_workers).
   int num_workers = 0;
+  // Set instead of block_array_bytes when the workers' block arrays differ:
+  // entry i is the block_array_bytes of the worker with node id i.
+  std::vector<std::vector<uint64_t>> worker_block_array_bytes;
 };
 
 // The knobs behind a store's StoreMonitor: the heartbeat it sends and the

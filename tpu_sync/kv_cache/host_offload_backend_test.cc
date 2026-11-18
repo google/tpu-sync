@@ -625,6 +625,58 @@ TEST(HostOffloadBackendTest, CreateRegistersKVTransferSpecFromConfig) {
       HostOffloadBackend::Create(config, controller.get()).status()));
 }
 
+TEST(HostOffloadBackendTest, CreateRegistersPerWorkerKVTransferSpec) {
+  auto reg_server = global_registry::CreateTestGlobalRegistryServer();
+  RaidenId node_id{"node_job", "0", "data", 0};
+  ::tpu_sync::rpc::RaidenIdProto unit_proto;
+  unit_proto.set_job_name(node_id.job_name);
+  unit_proto.set_job_replica_id(node_id.job_replica_id);
+  unit_proto.set_data_name(node_id.data_name);
+  unit_proto.set_data_replica_idx(node_id.data_replica_idx);
+  TF_ASSERT_OK_AND_ASSIGN(auto controller, controller::RaidenController::Create(
+                                               unit_proto, /*num_blocks=*/100,
+                                               /*num_shards=*/1,
+                                               /*shard_size_bytes=*/1024));
+
+  BackendConfig config;
+  config.type = "HostOffloadBackend";
+  config.capacity = 100;
+  config.global_registry_address = reg_server->server_address;
+  config.raiden_id = node_id;
+  config.kv_transfer_spec =
+      KVTransferSpecConfig{.num_kv_shards = 1,
+                           .num_workers = 2,
+                           .worker_block_array_bytes = {{4096}, {4096, 512}}};
+  config.kv_pool_group = "node_group";
+  TF_ASSERT_OK_AND_ASSIGN(auto backend,
+                          HostOffloadBackend::Create(config, controller.get()));
+
+  global_registry::GlobalRegistryClient registry_client(grpc::CreateChannel(
+      reg_server->server_address, grpc::InsecureChannelCredentials()));
+  TF_ASSERT_OK_AND_ASSIGN(auto spec,
+                          registry_client.GetKVTransferSpec("node_group"));
+  EXPECT_EQ(spec.block_arrays_size(), 0);
+  ASSERT_EQ(spec.workers_size(), 2);
+  EXPECT_EQ(spec.workers(0).node_id(), 0);
+  ASSERT_EQ(spec.workers(0).block_arrays_size(), 1);
+  EXPECT_EQ(spec.workers(0).block_arrays(0).block_bytes(), 4096);
+  EXPECT_EQ(spec.workers(1).node_id(), 1);
+  ASSERT_EQ(spec.workers(1).block_arrays_size(), 2);
+  EXPECT_EQ(spec.workers(1).block_arrays(1).block_bytes(), 512);
+
+  // A config sets exactly one of the two forms.
+  config.kv_pool_group = "other_group";
+  config.kv_transfer_spec->block_array_bytes = {4096};
+  EXPECT_THAT(HostOffloadBackend::Create(config, controller.get()).status(),
+              ::absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                       ::testing::HasSubstr("exactly one of")));
+  config.kv_transfer_spec =
+      KVTransferSpecConfig{.num_kv_shards = 1, .num_workers = 1};
+  EXPECT_THAT(HostOffloadBackend::Create(config, controller.get()).status(),
+              ::absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                       ::testing::HasSubstr("exactly one of")));
+}
+
 TEST(HostOffloadBackendTest, KVTransferSpecWithoutRegistryFailsCreation) {
   RaidenId node_id{"node_job", "0", "data", 0};
   ::tpu_sync::rpc::RaidenIdProto unit_proto;
@@ -686,13 +738,31 @@ TEST(HostOffloadBackendTest, ComposeKVTransferSpecRejectsMissingGeometry) {
               ::absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition));
 }
 
-TEST(HostOffloadBackendTest, ComposeKVTransferSpecRejectsMismatchedGeometry) {
+// Pipeline stages hold different layers, so their workers register different
+// block arrays: the spec then carries one geometry per worker, by node id.
+TEST(HostOffloadBackendTest, ComposeKVTransferSpecGivesEachWorkerItsGeometry) {
+  std::vector<core::controller::WorkerRegistration> workers;
+  workers.push_back(GeometryWorker("w1", /*node_id=*/1, {4096, 1024, 512}, 2));
+  workers.push_back(GeometryWorker("w0", /*node_id=*/0, {4096, 512}, 2));
+
+  auto spec = HostOffloadBackendTest::ComposeKVTransferSpec(workers);
+  ABSL_ASSERT_OK(spec.status());
+  EXPECT_TRUE(spec->block_array_bytes.empty());
+  EXPECT_EQ(
+      spec->worker_block_array_bytes,
+      (std::vector<std::vector<uint64_t>>{{4096, 512}, {4096, 1024, 512}}));
+  EXPECT_EQ(spec->num_kv_shards, 2);
+  EXPECT_EQ(spec->num_workers, 2);
+}
+
+TEST(HostOffloadBackendTest, ComposeKVTransferSpecRejectsMismatchedShards) {
   std::vector<core::controller::WorkerRegistration> workers;
   workers.push_back(GeometryWorker("w0", /*node_id=*/0, {4096, 512}, 2));
-  workers.push_back(GeometryWorker("w1", /*node_id=*/1, {4096, 1024}, 2));
+  workers.push_back(GeometryWorker("w1", /*node_id=*/1, {4096, 512}, 1));
 
   EXPECT_THAT(HostOffloadBackendTest::ComposeKVTransferSpec(workers).status(),
-              ::absl_testing::StatusIs(absl::StatusCode::kInvalidArgument));
+              ::absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                       ::testing::HasSubstr("num_kv_shards")));
 }
 
 TEST(HostOffloadBackendTest, ComposeKVTransferSpecRejectsSparseNodeIds) {

@@ -277,6 +277,145 @@ TEST_F(EvictE2ETest, SweepDemotesToTheStoreNodeAndReadsBack) {
   EXPECT_EQ(demoted, 4);
 }
 
+// Pipeline stages register different block arrays: worker 0 has one array,
+// worker 1 has two. With a per-worker spec the store node gives each worker
+// its own pool, and a demoted block round-trips every worker's arrays.
+TEST_F(EvictE2ETest, PerWorkerGeometryDemotesAndReadsBackEveryWorker) {
+  kv_cache::RaidenId src_id{"e2e_pp_serving", "0", "kv_pool", 0};
+  const std::vector<size_t> arrays_per_worker = {1, 2};
+  std::vector<std::unique_ptr<KVCacheManagerWithTransfer>> managers;
+  for (size_t w = 0; w < arrays_per_worker.size(); ++w) {
+    managers.push_back(std::make_unique<KVCacheManagerWithTransfer>(
+        arrays_per_worker[w], /*num_shards=*/1, kArrayBytes, /*local_port=*/0,
+        /*host_blocks_to_allocate=*/kSourceCapacity, /*parallelism=*/1,
+        /*node_id=*/static_cast<int64_t>(w), /*local_control_port=*/-1));
+  }
+  kv_cache::BackendConfig config;
+  config.type = "HostOffloadBackend";
+  config.capacity = kSourceCapacity;
+  config.raiden_id = src_id;
+  config.global_registry_address = registry_->server_address;
+  config.kv_pool_group = "e2e_pp_pool";
+  config.monitor_config.enable = true;
+  config.monitor_config.enable_evict_sweep = true;
+  config.monitor_config.evict_sweep_period = absl::Milliseconds(200);
+  config.monitor_config.evict_low_watermark = 0.5;
+  config.monitor_config.evict_high_watermark = 0.75;
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<kv_cache::KVCacheStore> store,
+      kv_cache::KVCacheStore::Create(
+          config, kSourceCapacity, registry_->server_address, src_id,
+          /*num_shards=*/1, /*shard_size_bytes=*/kArrayBytes,
+          /*store_server_ip=*/"localhost", /*raiden_controller_port=*/0));
+  std::vector<std::unique_ptr<controller::WorkerServiceServer>> servers;
+  core::controller::RaidenControllerClient controller_client(
+      store->raiden_controller_address());
+  for (size_t w = 0; w < managers.size(); ++w) {
+    servers.push_back(controller::WorkerServiceServer::Create());
+    ASSERT_TRUE(servers[w]
+                    ->StartServer(/*host_allocator=*/nullptr,
+                                  KVManagerHolder(managers[w].get()),
+                                  /*port=*/0)
+                    .ok());
+    ASSERT_TRUE(
+        controller_client
+            .RegisterWorker(
+                absl::StrCat("worker_", w),
+                absl::StrCat("localhost:", servers[w]->GetRaidenWorkerPort()),
+                managers[w]->get_local_data_endpoints(),
+                /*node_id=*/static_cast<int64_t>(w))
+            .ok());
+  }
+
+  KVCacheHostStoreNode::Options options;
+  options.raiden_id =
+      kv_cache::RaidenId{"e2e_pp_store_node", "0", "kv_pool", 0};
+  options.store_server_ip = "localhost";
+  options.global_registry_address = registry_->server_address;
+  options.kv_pool_group = "e2e_pp_pool";
+  options.dram_budget_bytes = 16 * 3 * kArrayBytes;
+  KVTransferSpec spec;
+  spec.worker_block_array_bytes = {{kArrayBytes}, {kArrayBytes, kArrayBytes}};
+  spec.num_kv_shards = 1;
+  spec.num_workers = 2;
+  StaticKVTransferSpecSource source(spec);
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<KVCacheHostStoreNode> node,
+                          KVCacheHostStoreNode::Create(options, &source));
+
+  // Worker w's array a of the block hashed i holds PatternByte(i, 10 * w + a).
+  const auto fill_or_check = [&](int block_id, int hash_idx, bool check) {
+    for (size_t w = 0; w < managers.size(); ++w) {
+      for (size_t a = 0; a < arrays_per_worker[w]; ++a) {
+        TF_ASSERT_OK_AND_ASSIGN(
+            absl::Span<uint8_t> base,
+            managers[w]->base()->GetHostBuffer(a, /*shard_idx=*/0));
+        for (size_t b = 0; b < kArrayBytes; ++b) {
+          uint8_t& byte = base[block_id * kArrayBytes + b];
+          const uint8_t want = PatternByte(hash_idx, 10 * w + a, b);
+          if (check) {
+            ASSERT_EQ(byte, want) << "worker " << w << " array " << a;
+          } else {
+            byte = want;
+          }
+        }
+      }
+    }
+  };
+
+  // 6 of 8 blocks in use, below the 0.5 low watermark: the sweep demotes 4.
+  constexpr int kNumBlocks = 6;
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::vector<int> ids,
+      store->raiden_controller()->AllocateBlockIds(kNumBlocks));
+  std::vector<std::string> hashes;
+  std::vector<kv_cache::RaidenBlockId> slices;
+  for (int i = 0; i < kNumBlocks; ++i) {
+    hashes.push_back(absl::StrCat("e2e_pp_blk_", i));
+    slices.push_back(
+        kv_cache::RaidenBlockId(src_id, ids[i], kv_cache::BlockStatus::HOST));
+    fill_or_check(ids[i], i, /*check=*/false);
+  }
+  ASSERT_TRUE(store->Insert(hashes, slices, /*on_host=*/true).ok());
+  store->Release(hashes);
+  auto* controller = store->raiden_controller();
+  for (int i = 0; i < 1000 && controller->num_free_blocks() != 6; ++i) {
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  ASSERT_EQ(controller->num_free_blocks(), 6);
+
+  const kv_cache::LookupOptions local_only{.enable_global = false};
+  int demoted = 0;
+  for (int i = 0; i < kNumBlocks; ++i) {
+    auto local = store->backend()->Lookup({hashes[i]}, local_only);
+    if (local.ok() && local->size() == 1) continue;
+    ++demoted;
+    auto resolved = store->Lookup({hashes[i]}, /*enable_global=*/true);
+    ASSERT_TRUE(resolved.ok()) << resolved.status();
+    ASSERT_EQ(resolved->size(), 1u);
+    const kv_cache::RaidenBlockId& remote = (*resolved)[0].second;
+    ASSERT_EQ(remote.raiden_id, options.raiden_id);
+    TF_ASSERT_OK_AND_ASSIGN(std::vector<int> dst,
+                            controller->AllocateBlockIds(1));
+    for (size_t w = 0; w < managers.size(); ++w) {
+      for (size_t a = 0; a < arrays_per_worker[w]; ++a) {
+        TF_ASSERT_OK_AND_ASSIGN(
+            absl::Span<uint8_t> base,
+            managers[w]->base()->GetHostBuffer(a, /*shard_idx=*/0));
+        std::memset(base.data() + dst[0] * kArrayBytes, 0xEE, kArrayBytes);
+      }
+    }
+    absl::Status read =
+        controller
+            ->ReadRemote(node->raiden_controller_address(),
+                         {remote.host_block_id}, {dst[0]}, {hashes[i]})
+            .Await();
+    ASSERT_TRUE(read.ok()) << read;
+    fill_or_check(dst[0], i, /*check=*/true);
+    ASSERT_TRUE(controller->DeallocateBlockIds(dst).ok());
+  }
+  EXPECT_EQ(demoted, 4);
+}
+
 // Tests that when a tier-1 host store node fills up, its own background evict
 // sweep proactively reclaims headroom down to its high watermark so that a new
 // demotion from tier 0 can land via FREE-only WriteRemote allocation, while

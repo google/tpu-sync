@@ -12,9 +12,12 @@ registration, multi-owner planning claims, claim abandonment, per-unit
 completion voting, and unclaimed cancellation tombstones.
 
 File aliases used in the source map below:
-`reg.h` / `reg.cc` (`tpu_sync/kv_cache/reshard/request_block_registry.{h,cc}`)
-and `reshard_service_test.cc`
-(`tpu_sync/kv_cache/reshard/reshard_service_test.cc`).
+`reg.h` / `reg.cc` (`tpu_sync/kv_cache/reshard/request_block_registry.{h,cc}`),
+`coord.cc` (`tpu_sync/kv_cache/reshard/reshard_coordinator.cc`),
+`planner.cc` (`tpu_sync/kv_cache/reshard/pool_reshard_planner.cc`),
+`reshard_service.cc` (`tpu_sync/kv_cache/reshard/reshard_service.cc`),
+`reshard_client.cc` (`tpu_sync/kv_cache/reshard/reshard_client.cc`), and
+`reshard_service_test.cc` (`tpu_sync/kv_cache/reshard/reshard_service_test.cc`).
 
   ## C++ anchorage
 
@@ -38,7 +41,9 @@ and `reshard_service_test.cc`
      `claimed_units_` already holds a different source unit set
      (`if (existing_units_it != claimed_units_.end() &&`), or if any requested
      `unit ∈ units` is missing from `request_blocks_` or has a different `uuid`
-     (`for (const RaidenId& unit : units)`). Otherwise marks
+     (`for (const RaidenId& unit : units)`). Otherwise refreshes
+     `registration.expires_at = now + ttl_s_;` on every claimed
+     `request_blocks_` row (`for (const auto& row : claimed_rows)`), marks
      `claimed_[(req_id, uuid)]`, sets `claimed_units_[(req_id, uuid)] = units`,
      and inserts `claim_owner` into `claimed_owners_[(req_id, uuid)]`
      (`claimed_[lifecycle_key] = now + ttl_s_;` ..
@@ -57,7 +62,10 @@ and `reshard_service_test.cc`
   4. **Full-set completion voting (`RequestBlockRegistry::Complete` in
      `tpu_sync/kv_cache/reshard/request_block_registry.cc`):**
      Rejects pre-claim completion of a non-empty registration
-     (`if (!has_expected && has_registration &&`). Otherwise inserts `unit` into
+     (`if (!has_expected && has_registration &&`). Returns `0` without changing
+     any map when `unit` has no registration under this `uuid` and is not in
+     `claimed_units_` (`if (!registration_matches && !unit_expected)`).
+     Otherwise inserts `unit` into
      `completed_units_[(req_id, uuid)].units`
      (`completion.units.insert(unit);`), and when `claimed_units_` is present
      and every expected unit has voted (`if (has_expected)` / `all_voted`),
@@ -77,9 +85,11 @@ and `reshard_service_test.cc`
   6. **TTL expiration (`RequestBlockRegistry::PurgeExpiredRequestBlocksLocked` /
      `RequestBlockRegistry::PurgeExpiredLifecycleLocked` in
      `tpu_sync/kv_cache/reshard/request_block_registry.cc`):**
-     Sweeps expired registrations, claims, and tombstones (Part V,
+     Sweeps expired registrations, claims, and tombstones; claiming a generation
+     refreshes its claimed rows' `expires_at` alongside `claimed_` (Part V,
      `purgeExpiredAll_inv`, `trace_single_stage_votes_retire_multi_owner_claim`,
-     and `trace_split_ttl_purges_request_blocks_while_claim_active`).
+     `trace_claim_refreshes_registration_ttl_while_failed_claim_does_not`, and
+     mutant `mutant_split_ttl_purges_request_blocks_while_claim_active`).
 
   ## Lock scopes
 
@@ -89,17 +99,65 @@ and `reshard_service_test.cc`
 
   | Event | `mu_` scopes | Between them |
   |---|---|---|
-  | `register` | 1 deciding `RequestBlockRegistry::mu_` scope (`PurgeExpiredRequestBlocksLocked`, `PurgeExpiredLifecycleLocked`, `cancelled_` / `claimed_` checks, `request_blocks_` insertion); when `pool_spans` is non-empty, `Register` takes `mu_` once beforehand only to snapshot `directory_->PoolManifestLocked(unit)` | the manifest snapshot touches none of the registry maps (`retired` in `RegGen` is a single-generation latch assuming no re-registration of the same `(req_id, uuid)` after `RetireLocked`) |
+  | `register` | 1 deciding `RequestBlockRegistry::mu_` scope (`PurgeExpiredRequestBlocksLocked`, `PurgeExpiredLifecycleLocked`, `cancelled_` / `claimed_` checks, `request_blocks_` insertion); when `pool_spans` is non-empty, `Register` takes `mu_` once beforehand only to snapshot `directory_->PoolManifestLocked(unit)` | the manifest snapshot touches none of the registry maps |
   | `lookupAndClaim`, `complete`, `release` | 1 `RequestBlockRegistry::mu_` scope (each runs `PurgeExpiredRequestBlocksLocked` and `PurgeExpiredLifecycleLocked` on entry) | — |
   | `cancelIfUnclaimed` | 1 `RequestBlockRegistry::mu_` scope (runs `PurgeExpiredLifecycleLocked` on entry) | — |
   | `abandonClaim` | 1 `RequestBlockRegistry::mu_` scope | — |
+
+  ## Scope and Abstractions
+
+  1. **Caller-enforced non-empty, deduplicated `units` vs. C++ set comparison:**
+     `RegGen.step` rejects an empty `units` list in `.lookupAndClaim`
+     (`units.isEmpty`) and `compatibleClaim` compares `existing == units` as a
+     canonical list. In C++, `RequestBlockRegistry::Register` accepts an empty
+     registration and `RequestBlockRegistry::LookupAndClaim` itself does not
+     reject empty `units`, instead converting `units` into
+     `std::set<RaidenId, RaidenIdLess> claimed_units(units.begin(), units.end());`
+     before comparing `existing_units_it->second != claimed_units`; non-empty
+     and duplicate-free `src_units` are enforced by the callers
+     (`ReshardCoordinator::StartPoolReshard` rejects `args.src_units.empty()`,
+     and `BuildPoolReshardPlan` rejects duplicate `request.src_units` before
+     calling `LookupAndClaim`), so canonical sorted/deduplicated `units` lists
+     in Lean match C++'s `std::set` equality.
+  2. **Pre-claim `Complete` guard checks `block_ids` only:**
+     `RegGen.step` abstracts a registration's payload emptiness as
+     `nonEmpty : Bool` and rejects pre-claim `.complete` when `nonEmpty = true`.
+     In `RequestBlockRegistry::Complete`, the pre-claim guard checks
+     `!registration_it->second.block_ids.empty()` only (not `pool_spans`),
+     matching `nonEmpty = !block_ids.empty()` because callers populate
+     `block_ids` alongside or instead of `pool_spans`.
+  3. **Worker-restart invalidation (`InvalidateUnitLocked`) outside scope:**
+     `RequestBlockRegistry::InvalidateUnitLocked` (invoked under the shared
+     controller lock when a worker re-registers in
+     `ReshardService::HandleRaidenCommand` for `COMMAND_REGISTER_WORK_UNIT`,
+     erasing `request_blocks_` entries for `unit` while leaving `claimed_`,
+     `claimed_units_`, `claimed_owners_`, `completed_units_`, and `cancelled_`
+     in place) is outside this single-worker-generation model. In the C++ it
+     leaves a claimed generation with a claimed unit that has no
+     `request_blocks_` row (`status = claimed` with the unit unregistered), in
+     which a sibling stage's `LookupAndClaim` fails with
+     `"Missing producer block registration"`; `ClaimOwnersConsistent` is
+     therefore a statement about executions without worker re-registration.
+  4. **No re-registration after `RetireLocked`:** `RegGen.retired` is a
+     single-generation latch, and `RegGen.step` refuses `.register` once it is
+     set. `RequestBlockRegistry::RetireLocked` erases every map entry of the
+     `(req_id, uuid)` and records nothing, so in the C++ a later
+     `Register(req_id, uuid, ...)` passes the `cancelled_` / `claimed_` checks
+     and inserts a row that lives until its TTL and can be claimed again.
+     Nothing in `RequestBlockRegistry` or the cited callers prevents such a
+     late duplicate `Register`; the model assumes it does not happen, and
+     `RetiredClean` is a property of the latch under that assumption.
+  5. **TTL purges are per-generation and all-or-nothing:** see Part V
+     (`purgeExpiredRequestBlocks`, `purgeExpiredLifecycle`) for the two places
+     where the C++ expiries are finer-grained than the helpers.
 
   ## Main results
 
   - `reachable_safe` (`Inv`): proves inductively across all reachable registry
     states that:
     1. `ClaimOwnersConsistent`: `claimedUnits.isSome ↔ claimOwners ≠ []`, and
-       every claimed unit is registered in `registeredUnits`.
+       every claimed unit is registered in `registeredUnits` (in executions
+       without worker re-registration, `InvalidateUnitLocked`; Scope item 3).
     2. `TombstoneClean` & `tombstone_blocks_register_and_claim`: when
        `cancelled = true`, `registeredUnits = []`, `claimedUnits = none`, and
        `claimOwners = []`, and any subsequent `register` or `lookupAndClaim`
@@ -108,12 +166,15 @@ and `reshard_service_test.cc`
        `register` is rejected and `cancelIfUnclaimed` cannot cancel or erase the
        registered producer blocks.
     4. `RetiredClean` & `PartialVotesNotAllVoted`: once `retired = true`,
-       `registeredUnits = []`, `claimedUnits = none`, and `claimOwners = []`;
+       `registeredUnits = []`, `claimedUnits = none`, and `claimOwners = []`
+       (the model has no re-registration after `RetireLocked`; in the C++ this
+       holds until the same `(req_id, uuid)` is registered again, Scope item 4);
        while `claimedUnits = some expected`, `allVoted expected completedUnits = false`,
        and `Complete` retires the generation only when every unit in `claimedUnits`
        has voted (`complete_retires_iff_all_claimed_voted`).
   - `purgeExpiredAll_inv`, `trace_single_stage_votes_retire_multi_owner_claim`,
-    and `trace_split_ttl_purges_request_blocks_while_claim_active`.
+    `trace_claim_refreshes_registration_ttl_while_failed_claim_does_not`, and
+    mutant `mutant_split_ttl_purges_request_blocks_while_claim_active`.
 
   ## Source map
 
@@ -142,21 +203,72 @@ and `reshard_service_test.cc`
   | `reg.cc` | `RequestBlockRegistry::CancelIfUnclaimed` (`if (claimed_.find(lifecycle_key) != claimed_.end())`) | `:388-390` |
   | `reg.cc` | `RequestBlockRegistry::CancelIfUnclaimed` (`cancelled_[lifecycle_key] = now + ttl_s_;` .. `return true;`) | `:391-404` |
   | `reg.cc` | `RequestBlockRegistry::Status` | `:407-436` |
-  | `reg.cc` | `RequestBlockRegistry::LookupAndClaim` | `:439-491` |
+  | `reg.cc` | `RequestBlockRegistry::LookupAndClaim` | `:439-501` |
   | `reg.cc` | `RequestBlockRegistry::LookupAndClaim` (`if (cancelled_.find(lifecycle_key) != cancelled_.end())`) | `:448-452` |
+  | `reg.cc` | `RequestBlockRegistry::LookupAndClaim` (`std::set<RaidenId, RaidenIdLess> claimed_units(units.begin(), units.end());`) | `:453` |
   | `reg.cc` | `RequestBlockRegistry::LookupAndClaim` (`if (existing_units_it != claimed_units_.end() &&`) | `:455-460` |
-  | `reg.cc` | `RequestBlockRegistry::LookupAndClaim` (`for (const RaidenId& unit : units)`) | `:462-470` |
-  | `reg.cc` | `RequestBlockRegistry::LookupAndClaim` (`claimed_[lifecycle_key] = now + ttl_s_;` .. `claimed_owners_[lifecycle_key].insert(claim_owner);`) | `:473-475` |
-  | `reg.cc` | `RequestBlockRegistry::LookupAndClaim` (`if (completion_it != completed_units_.end())`) | `:477-489` |
-  | `reg.cc` | `RequestBlockRegistry::AbandonClaim` | `:493-509` |
-  | `reg.cc` | `RequestBlockRegistry::AbandonClaim` (`if (owner_it->second.empty())`) | `:503-507` |
-  | `reshard_service_test.cc` | `ReshardStackTest.CancelTombstoneBlocksLateRegistration` | `:1399-1427` |
-  | `reshard_service_test.cc` | `ReshardStackTest.RequestBlockStatusProbeTracksLifecycle` | `:1429-1493` |
-  | `reshard_service_test.cc` | `ReshardStackTest.CompletionVotesRetireAfterClaim` | `:1495-1518` |
-  | `reshard_service_test.cc` | `ReshardStackTest.TtlPurgesExpiredRegistrations` | `:1520-1528` |
-  | `reshard_service_test.cc` | `ReshardStackTest.PipelinedDestinationStagesShareOneRequestClaim` | `:1744-1769` |
-  | `reshard_service_test.cc` | `ReshardStackTest.AbandonedStageLeavesTheSiblingClaimInPlace` | `:1771-1798` |
-  | `reshard_service_test.cc` | `ReshardStackTest.AbandoningTheLastStageFreesTheClaim` | `:1800-1827` |
+  | `reg.cc` | `RequestBlockRegistry::LookupAndClaim` (`for (const RaidenId& unit : units)`) | `:463-471` |
+  | `reg.cc` | `RequestBlockRegistry::LookupAndClaim` (`for (const auto& row : claimed_rows)`) | `:478-482` |
+  | `reg.cc` | `RequestBlockRegistry::LookupAndClaim` (`claimed_[lifecycle_key] = now + ttl_s_;` .. `claimed_owners_[lifecycle_key].insert(claim_owner);`) | `:483-485` |
+  | `reg.cc` | `RequestBlockRegistry::LookupAndClaim` (`if (completion_it != completed_units_.end())`) | `:487-499` |
+  | `reg.cc` | `RequestBlockRegistry::AbandonClaim` | `:503-519` |
+  | `reg.cc` | `RequestBlockRegistry::AbandonClaim` (`if (owner_it->second.empty())`) | `:513-517` |
+  | `reg.cc` | `RequestBlockRegistry::InvalidateUnitLocked` | `:521-529` |
+  | `coord.cc` | `ReshardCoordinator::StartPoolReshard` (`if (args.src_units.empty())`) | `:479-481` |
+  | `coord.cc` | `ReshardCoordinator::RunSubPlan` | `:681-935` |
+  | `planner.cc` | `BuildPoolReshardPlan` (`if (unique_src.size() != request.src_units.size())`) | `:660-663` |
+  | `reshard_service.cc` | `ReshardService::HandleControllerCommand` | `:167-353` |
+  | `reshard_service.cc` | `ReshardService::HandleRaidenCommand` (`registry_->InvalidateUnitLocked(registration.unit);`) | `:417` |
+  | `reshard_client.cc` | `ReshardClient::BuildReleaseRequestBlocks` | `:182-192` |
+  | `reshard_service_test.cc` | `ReshardStackTest.FullPoolReshardFlowEmitsArmThenDispatch` | `:806-880` |
+  | `reshard_service_test.cc` | `ReshardStackTest.RegisteredDestinationPeregrineEndpointsEmittedOnScheduleEntries` | `:882-913` |
+  | `reshard_service_test.cc` | `ReshardStackTest.GlobalSpaceSpansSplitAtPageBoundaries` | `:915-956` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ClipDropsTrimsAndRebasesGlobalSpans` | `:958-1014` |
+  | `reshard_service_test.cc` | `ReshardStackTest.WindowedRequestChainsOneSubTransferPerWindow` | `:1136-1196` |
+  | `reshard_service_test.cc` | `ReshardStackTest.WindowClipsStraddlingSpansAtWindowBoundaries` | `:1198-1283` |
+  | `reshard_service_test.cc` | `ReshardStackTest.WindowComposesWithPrefixClip` | `:1285-1322` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ChainedArmRetriesWhileReceiverStagingIsBusy` | `:1324-1349` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ChainedRequestStaysInProgressUntilTheChainEnds` | `:1351-1373` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ChainedArmFailureMarksTheTransferFailed` | `:1375-1397` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ClipValidationFailsClosed` | `:1399-1432` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ClipRejectsPageIndexedDeclarations` | `:1434-1446` |
+  | `reshard_service_test.cc` | `ReshardStackTest.MissingRegistrationKeepsContractString` | `:1448-1458` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ArmFailureAbandonsClaimAndSkipsSenders` | `:1460-1476` |
+  | `reshard_service_test.cc` | `ReshardStackTest.CancelTombstoneBlocksLateRegistration` | `:1478-1506` |
+  | `reshard_service_test.cc` | `ReshardStackTest.RequestBlockStatusProbeTracksLifecycle` | `:1508-1572` |
+  | `reshard_service_test.cc` | `ReshardStackTest.CompletionVotesRetireAfterClaim` | `:1574-1597` |
+  | `reshard_service_test.cc` | `ReshardStackTest.TtlPurgesExpiredRegistrations` | `:1599-1607` |
+  | `reshard_service_test.cc` | `ReshardStackTest.TwoDestinationsArmEachThenDispatchSendersOnce` | `:1610-1680` |
+  | `reshard_service_test.cc` | `ReshardStackTest.SubsetSourceManifestsPairPoolsByTag` | `:1682-1821` |
+  | `reshard_service_test.cc` | `ReshardStackTest.PipelinedDestinationStagesShareOneRequestClaim` | `:1823-1848` |
+  | `reshard_service_test.cc` | `ReshardStackTest.AbandonedStageLeavesTheSiblingClaimInPlace` | `:1850-1877` |
+  | `reshard_service_test.cc` | `ReshardStackTest.AbandoningTheLastStageFreesTheClaim` | `:1879-1906` |
+  | `reshard_service_test.cc` | `ReshardStackTest.SpansForAnUnregisteredTagAreRefusedAtRegistration` | `:1908-1933` |
+  | `reshard_service_test.cc` | `ReshardStackTest.SourceTagsAbsentOnTheDestinationAreIgnored` | `:1935-2016` |
+  | `reshard_service_test.cc` | `ReshardStackTest.MismatchedDestinationsFailClosed` | `:2018-2056` |
+  | `reshard_service_test.cc` | `ReshardStackTest.TwoDestinationsShardedSpansRouteBytesPerReceiver` | `:2061-2126` |
+  | `reshard_service_test.cc` | `ReshardStackTest.StridedGlobalSpansStayOneEntryPerDestination` | `:2128-2183` |
+  | `reshard_service_test.cc` | `ReshardStackTest.StridedGlobalSpansClipByWholePages` | `:2185-2216` |
+  | `reshard_service_test.cc` | `ReshardStackTest.StridedGlobalSpansMustStayInsideOnePage` | `:2218-2228` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ShardedSpanOrdinalOutOfRangeFailsClosed` | `:2230-2245` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ShardedDestinationWithoutCoverageFailsClosed` | `:2247-2260` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ShardedNonUniformExtentsFailClosed` | `:2262-2276` |
+  | `reshard_service_test.cc` | `ReshardStackTest.NegativeOrdinalRejectedAtRegistration` | `:2278-2284` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ReplicatedAndRoutedSpansCombine` | `:2289-2321` |
+  | `reshard_service_test.cc` | `ReshardStackTest.LegacyCommandsFailClosed` | `:2323-2334` |
+  | `reshard_service_test.cc` | `ReshardStackTest.UnsetTransferStreamsPlansOneStreamPerSourceRank` | `:2363-2383` |
+  | `reshard_service_test.cc` | `ReshardStackTest.TransferStreamsEnvCapsPlanStreamsAndExpectedPushes` | `:2385-2405` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ExplicitPlanParallelismOverridesTransferStreamsEnv` | `:2407-2424` |
+  | `reshard_service_test.cc` | `ReshardStackTest.InvalidTransferStreamsEnvFailsThePlan` | `:2426-2441` |
+  | `reshard_service_test.cc` | `ReshardStackTest.DuplicateRegistrationRefreshesTtlWhileConflictsAndPostClaimWritesFail` | `:2443-2474` |
+  | `reshard_service_test.cc` | `ReshardStackTest.IncompatibleClaimUnitSetAndNonOwnerAbandonPreserveClaim` | `:2476-2505` |
+  | `reshard_service_test.cc` | `ReshardStackTest.CompletionNoOpsAndPreClaimGuard` | `:2507-2569` |
+  | `reshard_service_test.cc` | `ReshardStackTest.EmptyRegistrationCompletesBeforeClaimAndRetiresOnClaim` | `:2571-2598` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ForcedReleaseClearsEveryLifecycleState` | `:2600-2663` |
+  | `reshard_service_test.cc` | `ReshardStackTest.TwoDestinationsOneArmRefusalAbandonsClaimAndSkipsSenders` | `:2665-2703` |
+  | `reshard_service_test.cc` | `ReshardStackTest.SenderDispatchFailurePropagatesErrorAfterReceiverArm` | `:2705-2741` |
+  | `reshard_service_test.cc` | `ReshardStackTest.ClaimRefreshesRegistrationTtlForSiblingStageAndCompletion` | `:2743-2786` |
+  | `reshard_service_test.cc` | `ReshardStackTest.FailedClaimDoesNotRefreshPartialRegistrationTtl` | `:2788-2806` |
   <!-- source-map:end -->
 -/
 
@@ -201,8 +313,9 @@ structure RegGen where
   (`RequestBlockRegistry::CancelIfUnclaimed`
   `cancelled_[lifecycle_key] = now + ttl_s_;`). -/
   cancelled : Bool
-  /-- Monotonic flag recording whether `RequestBlockRegistry::RetireLocked`
-  has fired to retire the generation. -/
+  /-- Ghost latch recording whether `RequestBlockRegistry::RetireLocked` has
+  fired for the generation. The C++ keeps no such record; `step` uses it to
+  exclude re-registration after retirement (Scope item 4). -/
   retired : Bool
   deriving DecidableEq, Repr, Hashable
 
@@ -259,7 +372,7 @@ def compatibleClaim (cur : Option (List Nat)) (units : List Nat) : Bool :=
 
 /-- Whether `unit` is in the claimed unit set `cur`
 (`RequestBlockRegistry::Complete`
-`expected_it->second.find(unit) != expected_it->second.end()`). -/
+`expected_it->second.count(unit) > 0`). -/
 def inClaimedUnits (cur : Option (List Nat)) (unit : Nat) : Bool :=
   match cur with
   | none => false
@@ -288,15 +401,16 @@ def RegGen.step (s : RegGen) (e : Ev) : Option RegGen :=
   match e with
   | .register unit nonEmpty =>
     -- Rejects if cancelled (`cancelled_.find(lifecycle_key) != cancelled_.end()`)
-    -- or already claimed (`claimed_.find(lifecycle_key) != claimed_.end()`), or
-    -- if generation was already retired.
+    -- or already claimed (`claimed_.find(lifecycle_key) != claimed_.end()`).
+    -- `s.retired` is a model-only guard (Scope item 4): the C++ accepts a
+    -- `Register` after `RetireLocked`.
     if s.cancelled || s.claimedUnits.isSome || s.retired then
       none
     else
       match s.lookupUnit unit with
       | some curNonEmpty =>
-        -- Conflicting payload is rejected (`ExistingRegistrationMatches`);
-        -- identical payload is an idempotent refresh (`existing->second.expires_at = now + ttl_s_;`).
+        -- Conflicting payload is rejected (`if (current.uuid != uuid || current.block_ids != normalized || current.pool_spans != normalized_pool_spans)`);
+        -- identical payload is an idempotent refresh (`registration.expires_at = now + ttl_s_;`, `request_blocks_[key] = std::move(registration);`).
         if curNonEmpty != nonEmpty then none else some s
       | none =>
         some { s with registeredUnits := s.registeredUnits ++ [(unit, nonEmpty)] }
@@ -398,7 +512,9 @@ def TombstoneClean (s : RegGen) : Prop :=
 /-- **Safety Property 3 (`RetiredClean`,
 `RequestBlockRegistry::RetireLocked`)**:
 Whenever `s.retired = true`, `registeredUnits = []` and `claimedUnits = none`
-and `claimOwners = []`. -/
+and `claimOwners = []`. This relies on `step` refusing `.register` on a retired
+generation (Scope item 4); the C++ has the same three maps empty immediately
+after `RetireLocked` and until the next `Register` of the same `(req_id, uuid)`. -/
 def RetiredClean (s : RegGen) : Prop :=
   s.retired = true →
     s.registeredUnits = [] ∧
@@ -844,11 +960,11 @@ theorem mutant_unconditional_abandon_exposes_sibling_owner_to_cancel :
 /-- **Multi-owner completion voting (`RequestBlockRegistry::Completions` and `claimed_owners_`
 in `request_block_registry.h`, `RequestBlockRegistry::Complete` in
 `request_block_registry.cc`)**:
-Although `claimed_owners_` tracks multiple pipelined `claim_owner` strings for a
+Although `claimed_owners_` tracks multiple pipelined `claim_owner` pointers for a
 shared source snapshot, `completed_units_[(req_id, uuid)].units` is keyed only
 by `(req_id, uuid)` (not `(req_id, uuid, claim_owner)`), and `Complete` calls
 `RetireLocked` as soon as every unit in `claimed_units_` votes once. Thus when
-stage `101` and stage `102` both hold active claims (`claimOwners = [102, 101]`),
+stage `101` and stage `102` both hold active claims (`claimOwners = [101, 102]`),
 stage `101`'s source units voting `.complete 0` and `.complete 1` immediately
 retires the generation and erases `102`'s claim and source blocks. -/
 theorem trace_single_stage_votes_retire_multi_owner_claim :
@@ -868,15 +984,33 @@ theorem trace_single_stage_votes_retire_multi_owner_claim :
 /-- `RequestBlockRegistry::PurgeExpiredRequestBlocksLocked`
 (`tpu_sync/kv_cache/reshard/request_block_registry.cc`):
 erases `request_blocks_` entries whose `registration.expires_at <= now` (set to
-`t_reg + ttl_s_` at `RequestBlockRegistry::Register`
-`registration.expires_at = now + ttl_s_;`). -/
+`now + ttl_s_` at `RequestBlockRegistry::Register`
+`registration.expires_at = now + ttl_s_;` and refreshed to `now + ttl_s_` on
+claimed rows at `RequestBlockRegistry::LookupAndClaim`
+`for (const auto& row : claimed_rows)`). Because every claim refreshes its
+claimed rows and `claimed_[lifecycle_key]` to the same `now + ttl_s_`, and
+`Register` refuses a claimed generation, the claimed rows of a claimed
+generation expire together with its claim (`purgeExpiredAll`); for those rows
+this rows-only purge applies on its own only to an unclaimed generation.
+
+Coarser than the C++: this helper clears every row of the generation at once.
+In the C++ each row has its own `expires_at`, and `LookupAndClaim` refreshes
+only the rows of the units it is called with, so a row registered under the
+same `(req_id, uuid)` for a unit outside the claimed set keeps its registration
+expiry and can be purged alone while the generation is claimed. -/
 def RegGen.purgeExpiredRequestBlocks (s : RegGen) : RegGen :=
   { s with registeredUnits := [] }
 
 /-- `RequestBlockRegistry::PurgeExpiredLifecycleLocked`
 (`tpu_sync/kv_cache/reshard/request_block_registry.cc`):
-erases `claimed_`, `cancelled_`, `completed_units_`, `claimed_owners_`, and
-`claimed_units_` entries whose lifecycle `expires_at <= now`. -/
+erases the `claimed_`, `cancelled_`, and `completed_units_` entries whose own
+`expires_at <= now`, then the `claimed_units_` / `claimed_owners_` entries whose
+`claimed_` entry is gone.
+
+Coarser than the C++: this helper drops the claim, the tombstone, and the votes
+together. In the C++ the three expiries are independent, and
+`completed_units_[key].expires_at` is refreshed by every `Complete`, so votes
+can outlive the claim they were cast under. -/
 def RegGen.purgeExpiredLifecycle (s : RegGen) : RegGen :=
   { s with
     claimedUnits := none
@@ -887,8 +1021,10 @@ def RegGen.purgeExpiredLifecycle (s : RegGen) : RegGen :=
 /-- Combined TTL purge when `now` advances past both `registration.expires_at`
 and lifecycle `expires_at` (`RequestBlockRegistry::PurgeExpiredRequestBlocksLocked`
 and `PurgeExpiredLifecycleLocked` in `request_block_registry.cc`,
-`ReshardStackTest.RequestBlockStatusProbeTracksLifecycle` and
-`ReshardStackTest.TtlPurgesExpiredRegistrations` in `reshard_service_test.cc`). -/
+`ReshardStackTest.RequestBlockStatusProbeTracksLifecycle`,
+`ReshardStackTest.TtlPurgesExpiredRegistrations`, and
+`ReshardStackTest.FailedClaimDoesNotRefreshPartialRegistrationTtl` in
+`reshard_service_test.cc`). -/
 def RegGen.purgeExpiredAll (s : RegGen) : RegGen :=
   s.purgeExpiredRequestBlocks.purgeExpiredLifecycle
 
@@ -919,23 +1055,60 @@ theorem trace_ttl_purges_expired_registrations_and_tombstones :
       some (.cancelled, .unknown)) := by
   decide
 
-/-- **Split TTL expiration (`RequestBlockRegistry::PurgeExpiredRequestBlocksLocked`,
+/-- Replay of
+`ReshardStackTest.ClaimRefreshesRegistrationTtlForSiblingStageAndCompletion` and
+`ReshardStackTest.FailedClaimDoesNotRefreshPartialRegistrationTtl`
+(`tpu_sync/kv_cache/reshard/reshard_service_test.cc`):
+1. `ClaimRefreshesRegistrationTtlForSiblingStageAndCompletion`: units `0` and
+   `1` register at `t_0 = 0`, and stage `100` claims `[0, 1]` at `t_1 = 400 s`
+   (`for (const auto& row : claimed_rows)` refreshes both rows'
+   `registration.expires_at` to `t_1 + ttl_s_ = 1000 s` alongside
+   `claimed_[lifecycle_key]`). At `t = 700 s` (past `t_0 + ttl_s_` and within
+   `t_1 + ttl_s_`), no row has expired: `status` is `.claimed`,
+   `cancelIfUnclaimed` leaves it `.claimed`, sibling stage `101` joins the
+   claim, unit `1`'s row is still registered (`lookupUnit 1 = some true`), and
+   completion votes from `0` and `1` retire the generation
+   (`status = .unknown`). The test observes the live row by registering unit
+   `1` under another `uuid`, which `RequestBlockRegistry::Register` refuses
+   with `"Conflicting request block registration"` (`current.uuid != uuid`);
+   a second `uuid` is outside this one-generation model, so the row's presence
+   is what the replay checks.
+2. `FailedClaimDoesNotRefreshPartialRegistrationTtl`: unit `0` registers at
+   `t_0 = 0`, a planning attempt for `[0, 1]` at `t_1 = 400 s` fails before the
+   claim linearization point (`none`, missing unit `1`) without refreshing unit
+   `0`'s TTL, and at `t = 601 s` unit `0` expires on its original TTL
+   (`purgeExpiredAll`, `status = .unknown`). -/
+theorem trace_claim_refreshes_registration_ttl_while_failed_claim_does_not :
+    (let pre := [.register 0 true, .register 1 true, .lookupAndClaim 100 [0, 1],
+                 .cancelIfUnclaimed, .lookupAndClaim 101 [0, 1]]
+     (RegGen.sys.run pre).map
+       (fun s => (s.status, s.lookupUnit 1)) =
+       some (.claimed, some true) ∧
+     (RegGen.sys.run (pre ++ [.complete 0, .complete 1])).map
+       (fun s => (s.retired, s.status)) = some (true, .unknown)) ∧
+    ((RegGen.sys.run [.register 0 true]).map
+      (fun s =>
+        ( (RegGen.step s (.lookupAndClaim 100 [0, 1])).isNone
+        , s.purgeExpiredAll.status )) =
+      some (true, .unknown)) := by
+  decide
+
+/-- **Mutant — unrefreshed registration TTL on claim
+(`RequestBlockRegistry::PurgeExpiredRequestBlocksLocked`,
 `RequestBlockRegistry::Register` `registration.expires_at = now + ttl_s_;`, and
-`RequestBlockRegistry::LookupAndClaim` `claimed_[lifecycle_key] = now + ttl_s_;`
-in `request_block_registry.cc`)**:
-`Register` at time `t_0` sets `registration.expires_at = t_0 + ttl_s_` on
-`request_blocks_[(req_id, unit)]`, whereas `LookupAndClaim` at time `t_1 > t_0`
-sets `claimed_[(req_id, uuid)] = t_1 + ttl_s_` **without** refreshing
-`registration.expires_at` on the claimed `request_blocks_` rows.
-In the window `[t_0 + ttl_s_, t_1 + ttl_s_)`, `PurgeExpiredRequestBlocksLocked`
-erases `request_blocks_[(req_id, unit)]` while `claimed_` is still active
-(`s_split = s.purgeExpiredRequestBlocks`):
+`RequestBlockRegistry::LookupAndClaim` `for (const auto& row : claimed_rows)` in
+`request_block_registry.cc`)**:
+If `LookupAndClaim` at `t_1 > t_0` set `claimed_[(req_id, uuid)] = t_1 + ttl_s_`
+**without** refreshing `registration.expires_at = now + ttl_s_` on the claimed
+`request_blocks_` rows, then in the window `[t_0 + ttl_s_, t_1 + ttl_s_)`
+`PurgeExpiredRequestBlocksLocked` would erase `request_blocks_[(req_id, unit)]`
+while `claimed_` remained active (`s_split = s.purgeExpiredRequestBlocks`):
 1. `s_split.status` still reports `.claimed` (`claimedUnits = some [0]`), but
    `s_split.registeredUnits = []` (violating `ClaimOwnersConsistent`), and
 2. A second pipelined stage calling `lookupAndClaim 102 [0]` in that window fails
    (`none`) with `"Missing producer block registration"`
    (`RequestBlockRegistry::LookupAndClaim` `for (const RaidenId& unit : units)`). -/
-theorem trace_split_ttl_purges_request_blocks_while_claim_active :
+theorem mutant_split_ttl_purges_request_blocks_while_claim_active :
     ((RegGen.sys.run [.register 0 true, .lookupAndClaim 101 [0]]).map
       (fun s =>
         let s_split := s.purgeExpiredRequestBlocks

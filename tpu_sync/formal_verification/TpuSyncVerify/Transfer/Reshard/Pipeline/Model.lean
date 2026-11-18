@@ -16,16 +16,20 @@ inductive Cell where
   | blank
   | kv (pool : Nat)
   | junk
-  deriving Repr, DecidableEq
+  deriving Repr, DecidableEq, Hashable
 
 namespace Pipeline
 
 /-- A memory holding `.kv p` at every pool index `0 … n - 1`. -/
 def good (n : Nat) : List Cell := (List.range n).map Cell.kv
 
-/-- Coarse lower-rank H2D copy clobbers any strictly higher-rank pool slot on an
-aliased arena page (`pool_order_ranks_` in `ReshardReceiveSession`,
-`D2hPoolBlocks` / `H2dPoolBlocks` in `KVCacheManagerBase`). -/
+/-- A rank-`r` pool's H2D copy overwrites the slot of every strictly
+higher-rank pool (`pool_order_ranks_` in `ReshardReceiveSession`,
+`D2hPoolBlocks` / `H2dPoolBlocks` in `KVCacheManagerBase`). This
+over-approximates the C++, where the copy writes only the pool's declared-live
+regions (`KVCacheManagerBase::CopyPoolBlocks`; padding is never copied) and so
+reaches another pool's bytes only where their declared-live regions overlap on
+a shared block. -/
 def clobberHigherRanks (pools : List Pool) (r : Nat) (hbm : List Cell) : List Cell :=
   List.zipWith (fun pool c => if r < pool.rank then .junk else c) pools hbm
 
@@ -54,15 +58,19 @@ structure Pipeline where
   wire : List Cell
   dstStaging : List Cell
   dstHbm : List Cell
-  /-- Completed sender peer pushes per pool (`ReshardSendSession::StartPoolPush`). -/
+  /-- Completed sender peer pushes per pool (the `AsyncPush(...).OnReady`
+  callback in `ReshardSendSession::StartPoolPush`). -/
   sentStreams : List Nat
-  /-- Streams landed by `BlockTransportServerPushSession::CompleteIncomingPush` per pool (`progress.completed_chunks++;`). -/
+  /-- Plan pushes landed per pool, as counted by
+  `BlockTransportServerPushSession::CompleteIncomingPush` (`plan_pushes`, after
+  `AccumulateLandedShards` folds a sender's NUMA shard groups). One model
+  stream is one plan push from one sender peer push (`Pipeline.lean` A3). -/
   landedStreams : List Nat
   /-- Whether source HBM has been freed after `send.published ≠ none`. -/
   reclaimed : Bool := false
   /-- Whether `PoolReshardRegisterRecv` has armed the receiver (`ReshardCoordinator::RunSubPlan`). -/
   armed : Bool := true
-  deriving Repr, DecidableEq
+  deriving Repr, DecidableEq, Hashable
 
 namespace Pipeline
 
@@ -108,11 +116,17 @@ def armRecv (s : Pipeline) : Option Pipeline :=
     some { s with armed := true }
   else none
 
-/-- Sender transition (`ReshardSendSession::ExecutePush`, `StartPoolPush`,
-`EndOp`). Launching a D2H copy (`d2hIssue p true`) requires the receiver to be
+/-- Sender transition (`ReshardSendSession::Start`, `ExecutePushPipeline`,
+`StartPoolPush`, `EndOp`). Launching a D2H copy (`d2hIssue p true`) requires the receiver to be
 armed (`ReshardCoordinator::RunSubPlan`); `d2hDone p true` copies
 `srcHbm[p]` into `srcStaging[p]`; `pushDone p true` places `srcStaging[p]` on
-`wire[p]` and increments `sentStreams[p]`. -/
+`wire[p]` and increments `sentStreams[p]`.
+
+`pushDone` is the sender's push completion callback, which in the C++ runs
+after the receiver has read the payload and acknowledged the stream. The model
+writes `wire[p]` at that point and lets `landStream p` follow; `srcStaging[p]`
+does not change while the push op is in flight, so the value is the one the
+receiver read (`Pipeline.lean` A2). -/
 def sendStep (s : Pipeline) (e : Send.Ev) : Option Pipeline :=
   match e with
   | .d2hIssue p ok =>
@@ -139,11 +153,11 @@ def sendStep (s : Pipeline) (e : Send.Ev) : Option Pipeline :=
 /-- Receiver transition (`ReshardReceiveSession::OnPoolReceived`,
 `ExecuteEligiblePoolH2ds`, `FinishPoolH2d`,
 `BlockTransportServerPushSession::CompleteIncomingPush`). `pushBegin` requires the receiver to be
-armed (`KVCacheManagerWithTransfer::InitializeBaseHooks`,
-`hooks.begin_incoming_push =`); `onPoolReceived p` requires all `peerCounts[p]`
+armed (`BeginIncomingPush` finds it through `delegate->GetSession(uuid)` →
+`KVCacheManagerWithTransfer::GetSession`); `onPoolReceived p` requires all `peerCounts[p]`
 expected streams to have landed (`BlockTransportServerPushSession::CompleteIncomingPush`);
-`h2dDone p true` writes `dstStaging[p]` to `dstHbm[p]` and clobbers any strictly
-higher-rank pool slots on the aliased page (`writePoolHbm`). -/
+`h2dDone p true` writes `dstStaging[p]` to `dstHbm[p]` and overwrites every
+strictly higher-rank pool's slot with `.junk` (`writePoolHbm`). -/
 def recvStep (s : Pipeline) (e : Recv.Ev) : Option Pipeline :=
   match e with
   | .pushBegin =>
@@ -170,8 +184,18 @@ def recvStep (s : Pipeline) (e : Recv.Ev) : Option Pipeline :=
 
 /-- `BlockTransportServerPushSession::StartStream` (`if (expected_size > 0)`,
 reached from `BlockTransport::HandleIncomingPush`) lands one push stream for
-pool `p` into `dstStaging[p]` and `CompleteIncomingPush` increments
-`completed_chunks`. -/
+pool `p` into `dstStaging[p]` and `CompleteIncomingPush` counts one more plan
+push for the pool.
+
+The guard `k < m` (`landedStreams[p] < sentStreams[p]`) orders the landing
+after the sender's `pushDone p true`. On the wire (TCP socket backend) the
+landing comes first: the receiver completes the stream and writes its ack before
+the sender's completion callback runs. The model therefore has no state in which
+a stream has landed while the sender's push is still in flight, and no push
+that landed and then fails on the sender. A receiver can still publish
+`done_recving` on a landed-then-failed push; the theorem (`PublicationCorrect`)
+does not cover that run, and its data integrity rests on the same informal
+constancy of `srcStaging[p]` while the push op was held (`Pipeline.lean` A2). -/
 def landStream (s : Pipeline) (p : Nat) : Option Pipeline :=
   if 0 < s.recv.pushes then
     match s.landedStreams[p]?, s.sentStreams[p]?, s.wire[p]? with

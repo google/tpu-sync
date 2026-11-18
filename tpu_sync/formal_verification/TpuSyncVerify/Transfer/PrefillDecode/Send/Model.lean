@@ -107,7 +107,7 @@ def d2hBegin (s : Send) : Option Send :=
   else none
 
 /-- The dispatch's outcome in `StartPush`. Failure: `FinishLocked(future.status())`
-then `EndSendOp()`, and the loop returns. Success: the copy's `OnReady` is
+then `EndOp()`, and the loop returns. Success: the copy's `OnReady` is
 registered to resolve the layer's promise and end the op. -/
 def d2hIssue (ok : Bool) (s : Send) : Option Send :=
   if s.d2hPending = false then none
@@ -122,7 +122,7 @@ resolves the layer's promise (`promise.Set(status_or.status())`), so
 def markD2hReady (s : Send) : Option Send :=
   if s.d2hReady < s.d2hIssued then some { s with d2hReady := s.d2hReady + 1 } else none
 
-/-- The same callback then ends the copy's op (`self->EndSendOp()`). -/
+/-- The same callback then ends the copy's op (`self->EndOp()`). -/
 def d2hEnd (s : Send) : Option Send :=
   if s.d2hRetired < s.d2hReady then some { s with d2hRetired := s.d2hRetired + 1 }.endOp
   else none
@@ -174,7 +174,9 @@ def h2hDone (ok : Bool) (s : Send) : Option Send :=
 def cancel (s : Send) : Option Send := some (s.finish false)
 
 /-- `CompleteReadWithDetails` / `CompleteReadRaw` publishes a settled session
-(`if (session->Done())`). -/
+(`RetireSettledSessionLocked`: `if (!send->Done()) return false;`, then
+`(failed ? failed_recving_ : done_sending_).insert(req_id);` under the
+`req_id` the manager keeps with the session in `SessionEntry`). -/
 def publish (s : Send) : Option Send :=
   if s.life.done = true ∧ s.published = none then
     some { s with published := some s.life.statusOk }

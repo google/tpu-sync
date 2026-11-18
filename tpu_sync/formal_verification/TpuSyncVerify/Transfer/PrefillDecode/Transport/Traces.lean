@@ -101,7 +101,7 @@ theorem trace_chunk_two_senders :
 /-- **Chunk-count contract, before retirement.** Layer 0 (one declared stream)
 lands twice; layer 1 never arrives. The duplicate is absorbed
 (`completed_chunks = 2 ≠ 1`, no second dispatch, no error) but still reported
-through `OnBlockShardsReceived`, so `network_completed_` is reached with
+through `OnBlockShardsReceived` → `RecordBlockShards`, so `network_completed_` is reached with
 layer 1's blocks never received. Once layer 0's copy lands, `IsReadyToComplete`
 is true, the poll's `Finish()` settles at once (`in_flight_ == 0`) and the
 receive is published in `done_recving_` with layer 1 never copied. -/
@@ -113,9 +113,10 @@ theorem trace_dup_chunk_publishes_missing_layer :
     some (true, true, [1, 0]) := by
   decide
 
-/-- **Either contract, after retirement.** Both layers land and the table
-entries are erased (`if (all_layers_called)` in `CompleteIncomingPush`). An
-extra stream for layer 0 then creates a fresh entry whose first stream
+/-- **Either contract, after retirement.** Both layers land and the push
+session is retired (`if (all_layers_called)` in `CompleteIncomingPush` sets
+`done_`; `GetOrCreatePushSession` then seats a fresh session for the uuid). An
+extra stream for layer 0 then starts a fresh entry whose first stream
 completes it: `OnLayerReceived` fires again and a second copy of layer 0 is
 issued while the first may still run (`dispatched = [2, 1]`). The session is
 not fooled about settlement — `in_flight_` holds `done_` off until every copy
@@ -164,10 +165,13 @@ theorem trace_dup_declared_rejected :
 
 Two small changes close every trace above without touching the honest
 behaviour: (1) the chunk-count contract rejects a stream beyond the declared
-count, as the other two contracts already do (`if (plan_pushes > expected_chunks)`
-and `else if (streams.landed > streams.declared)` in `CompleteIncomingPush`);
+count, as the other three contracts already do (`if (plan_pushes > expected_chunks)`,
+`if (streams.landed > 1 ||` on the Peregrine arm, and
+`else if (streams.landed > streams.declared)` in `CompleteIncomingPush`);
 (2) `ExecuteLayerH2d` keeps a per-layer once-latch of its own, so a dispatch
-after the transport retired its entries is a no-op. `stepHardened` is `step`
+after the transport retired its entries is a no-op (`dispatched_layers_`
+already records every layer dispatched, but only to set `network_completed_`;
+nothing consults it before `++in_flight_` and the copy). `stepHardened` is `step`
 with exactly those two edits. The dishonest state space stays infinite (after
 retirement a fresh entry's first stream is within the declared count and is
 accepted, so the block count is unbounded), so the searches below are bounded:
@@ -233,7 +237,7 @@ theorem trace_hardened_dups :
     some ⟨false, false, true, [1, 1], [0, 1]⟩ := by
   decide
 
-/-! ## Replay of upstream transport tests
+/-! ## Replay of transport unit tests
 
 The transport unit tests drive `CompleteIncomingPush` through mock delegates
 (`MockSessionDelegate` in `block_transport_session_test.cc`, `MockDelegate` and
@@ -245,11 +249,14 @@ calls (`dispatched`), retirement (`entry = none`), and rejected push streams
 ack, recorded on `step` as `life.statusOk = false`). The traces below replay
 them on `step` with those projections. -/
 
-/-- `BlockTransportServerPushSessionTest.LifecycleAndStreamCompletion`: one
-layer, one sender declaring two streams (`num_streams = 2`), chunk-count
-contract. The first stream completes nothing; the second fires
-`OnLayerReceived` once (`layers_received() == 1`) and, every layer now called,
-retires the table (`IsDone()`, `on_completed_`). -/
+/-- One layer, one sender declaring two streams (`num_streams = 2`),
+chunk-count contract. The first stream completes nothing; the second fires
+`OnLayerReceived` once and, every layer now called, retires the session
+(`done_ = true`, so `HandleIncomingPush` drops the push session and the uuid's
+next stream gets a fresh table). No C++ test drives this shape on the socket path:
+`BlockTransportServerPushSessionTest.LifecycleAndPostCompletion` retires a
+two-layer session through `OnPeregrinePostComplete` (`is_peregrine = true`),
+which is outside this model's event set. -/
 def tr_session_two_streams_complete : List Ev := [.stream 0 0, .stream 0 0]
 
 theorem trace_session_two_streams_complete :
@@ -321,6 +328,7 @@ theorem trace_undeclared_uuid_chunk_count :
       (fun s => s.layers.map (·.dispatched)) = some [2] := by
   decide
 
+
 /-! Sibling push-progress tests whose stimulus is outside this model's event set:
 - `BlockTransportTest.DeclaredSendersEachCompleteTheirOwnParallelism` (sender 0
   declares two streams and sender 1 one for the same layer) and
@@ -337,8 +345,17 @@ theorem trace_undeclared_uuid_chunk_count :
 - `BlockTransportTest.PushSplitBySourceNumaCompletesPlanDeclaredPool`,
   `BlockTransportTest.PoolProgressWaitsForEveryStreamOfEveryDeclaredPoolAndRetires`,
   and `BlockTransportTest.ForgetPushProgressResetsPartialPoolGeneration` exercise
-  the plan-declared pool contract (`Reshard/Pipeline.lean` `landStream`), and
-  `PeregrineRecvCompleteTest` exercises `OnPeregrinePostComplete` and the
-  `is_peregrine = true` shard-bitmask branch of `CompleteIncomingPush`. -/
+  the plan-declared pool contract (`Reshard/Pipeline.lean` `landStream`), while
+  `PeregrineRecvCompleteTest`,
+  `TransportBackendTest.ExplicitPushOverPeregrineIsReceiverResolved`,
+  `TransportBackendTest.AllLayerPushOverPeregrineWithUuidZero`, and
+  `BlockTransportServerPushSessionTest.LifecycleAndPostCompletion` exercise
+  `OnPeregrinePostComplete` and the `is_peregrine = true` shard-bitmask branch of
+  `CompleteIncomingPush` (`PeregrineRecvCompleteTest.RejectsSenderSession` the
+  `TryBeginOp` refusal of a send session in `BeginIncomingPush`),
+  `PeregrineResolveRecvBufferTest` and `PeregrineResolveRecvBufferLeaseTest`
+  drive `ResolveRecvBuffer` and its op lease, and `ValidateChunksTest` drives the
+  16-bit chunk-count cap and payload bounds check (`ValidateChunks` against
+  `GetBlockArrayHostSpan`). -/
 
 end TpuSyncVerify.Transfer.PrefillDecode.Transport

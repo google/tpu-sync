@@ -15,19 +15,57 @@
 # limitations under the License.
 """Resolve symbol and code-fragment anchors in `<!-- source-map:begin -->` tables.
 
-Usage (run from `tpu_sync/formal_verification/` or repo root):
-    python3 tpu_sync/formal_verification/tools/resolve_anchors.py [--ref REF] [--check | --apply] [SOURCE ...]
-    python3 tpu_sync/formal_verification/tools/resolve_anchors.py --diff OLD_REF NEW_REF [--apply] [SOURCE ...]
+Usage:
+    python3 tpu_sync/formal_verification/tools/resolve_anchors.py [--ref REF] [--check] [--apply] [SOURCE ...]
+    python3 tpu_sync/formal_verification/tools/resolve_anchors.py --diff OLD_REF NEW_REF [--check] [--apply] [SOURCE ...]
+
+The repository root is the nearest directory at or above the current directory
+that holds `.git` and `tpu_sync/formal_verification/`; when there is none (a
+source archive, or a run from elsewhere), it is the root this script sits in
+(`<root>/tpu_sync/formal_verification/tools/`). Without SOURCE arguments every
+`.lean` and `.md` file under `TpuSyncVerify/` and `docs/` is processed.
+
+Without `--diff`, every run resolves each `Lines` cell against the C++ tree
+(the working tree, or `--ref REF`), prints one line per cell that differs
+(`drift`) or does not resolve (`FAIL`), reports raw line citations outside
+source-map blocks (`stray`), and prints a summary. Under `--diff OLD_REF
+NEW_REF`, each anchor is compared between `OLD_REF` and `NEW_REF` instead of
+against the table's `Lines` cells (`drift` is always 0). Exit status:
+
+  (no flag)        non-zero if any anchor fails to resolve, or if no file was
+                   found to process.
+  --check          non-zero on any `FAIL`, `stray` or `drift` (with `--diff`, on
+                   `FAIL`, `stray`, `MODIFIED` or `NEW`; `shift` does not fail),
+                   or if no file was found to process. Writes nothing.
+  --apply          rewrites the `Lines` cells in place; non-zero only if an
+                   anchor fails to resolve, or if no file was found to process.
+  --check --apply  rewrites the cells as `--apply` does, then exits non-zero on
+                   any `FAIL` or `stray`, or if no file was found; the drift
+                   just rewritten (and, with `--diff`, `MODIFIED` / `NEW`) does
+                   not fail the run.
+
+`--diff OLD_REF NEW_REF` resolves every anchor at both refs and classifies it:
+
+  same      resolves at both refs to the same lines with the same text (not
+            printed, counted in the summary).
+  shift     the lines moved, the text is identical.
+  MODIFIED  the text of the span changed; a unified diff follows. Reread the
+            model against it.
+  NEW       resolves at NEW_REF but not at OLD_REF (counted as `modified` in
+            the summary).
+  FAIL      does not resolve at NEW_REF (renamed or removed).
+
+With `--apply`, `--diff` also writes the NEW_REF line numbers into the tables.
 
 Each `<!-- source-map:begin --> ... <!-- source-map:end -->` block is a Markdown
 table with `File`, `Symbol / anchor` (or `Symbol`), and `Lines` columns:
 
     | File | Symbol / anchor | Lines |
     |---|---|---|
-    | `recv.h` | `TransferReceiveSession::TryBeginRecvOp` | `:117-122` |
-    | `recv.h` | `TransferReceiveSession` (`std::vector<int64_t> blocks_received_per_shard_` .. `std::vector<raiden::PjRtCopyFuture> h2d_futures_`) | `:273-296` |
-    | `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`future.OnReady`) | `:702-760` |
-    | `send_drain_test.cc` | `RecvDrainTest.ExpiredReceiveKeepsStagingUntilH2dEnds` | `:751-778` |
+    | `recv.cc` | `TransferReceiveSession::TryBeginOp` | `:456-467` |
+    | `recv.h` | `TransferReceiveSession` (`std::vector<int64_t> blocks_received_per_shard_` .. `std::vector<raiden::PjRtCopyFuture> h2d_futures_`) | `:329-357` |
+    | `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`future.OnReady`) | `:839-888` |
+    | `send_drain_test.cc` | `RecvDrainTest.ExpiredReceiveKeepsStagingUntilH2dEnds` | `:1012-1039` |
 
 Supported anchor forms in the Symbol column:
   1. `` `Class::Method` `` / `` `Class::Method(param_substr)` `` / `` `Func` ``:
@@ -56,6 +94,7 @@ ALIASES = {
     "send.h": "tpu_sync/kv_cache/transfer_send_session.h",
     "staging.cc": "tpu_sync/kv_cache/staging_manager.cc",
     "staging.h": "tpu_sync/kv_cache/staging_manager.h",
+    "staging_test.cc": "tpu_sync/kv_cache/staging_manager_test.cc",
     "mgr.cc": "tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc",
     "mgr.h": "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h",
     "bt.cc": "tpu_sync/transport/block_transport.cc",
@@ -68,6 +107,7 @@ ALIASES = {
     "coord.h": "tpu_sync/kv_cache/reshard/reshard_coordinator.h",
     "base.cc": "tpu_sync/kv_cache/kv_cache_manager_base.cc",
     "base.h": "tpu_sync/kv_cache/kv_cache_manager_base.h",
+    "raw_core.h": "tpu_sync/core/raw_transfer_core.h",
     "slots.cc": "tpu_sync/core/pool_reshard_send_slots.cc",
     "slots.h": "tpu_sync/core/pool_reshard_send_slots.h",
     "reshard_recv.cc": "tpu_sync/kv_cache/reshard_receive_session.cc",
@@ -120,10 +160,28 @@ NO_MAP_FILES = {
 }
 
 
+VERIFY_SUBDIR = os.path.join("tpu_sync", "formal_verification")
+
+
 def find_repo(start):
+    """Return the repository root: the directory holding `tpu_sync/`.
+
+    Walks up from `start` to the nearest directory with a `.git` entry. If
+    there is none, or that directory has no `tpu_sync/formal_verification/`
+    (a source archive, a run from an unrelated directory, or the project
+    vendored inside another repository), falls back to the root implied by
+    this script's location, `<root>/tpu_sync/formal_verification/tools/`,
+    provided `<root>/tpu_sync/formal_verification/` exists there.
+    """
     d = os.path.abspath(start)
-    while d != "/" and not os.path.exists(os.path.join(d, ".git")):
+    while d != os.path.dirname(d) and not os.path.exists(os.path.join(d, ".git")):
         d = os.path.dirname(d)
+    if os.path.exists(os.path.join(d, ".git")) and os.path.isdir(os.path.join(d, VERIFY_SUBDIR)):
+        return d
+    here = os.path.dirname(os.path.realpath(__file__))
+    script_root = os.path.dirname(os.path.dirname(os.path.dirname(here)))
+    if os.path.isdir(os.path.join(script_root, VERIFY_SUBDIR)):
+        return script_root
     return d
 
 
@@ -608,12 +666,12 @@ def process_file(src_path, rel_path, loader, old_loader=None, apply=False):
 
     for lineno, line in enumerate(lines, 1):
         stripped = line.strip()
-        if "<!-- source-map:begin -->" in stripped:
+        if stripped == "<!-- source-map:begin -->":
             in_map = True
             has_map = True
             out_lines.append(line)
             continue
-        if "<!-- source-map:end -->" in stripped:
+        if stripped == "<!-- source-map:end -->":
             in_map = False
             out_lines.append(line)
             continue
@@ -726,16 +784,16 @@ def check_stray_citations(src_path, rel_path):
     stray = 0
     for lineno, line in enumerate(lines, 1):
         s = line.strip()
-        if "<!-- source-map:begin -->" in s:
+        if s.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if not in_fence and s == "<!-- source-map:begin -->":
             in_map = True
             continue
-        if "<!-- source-map:end -->" in s:
+        if not in_fence and s == "<!-- source-map:end -->":
             in_map = False
             continue
         if in_map:
-            continue
-        if s.startswith("```"):
-            in_fence = not in_fence
             continue
         if not in_fence:
             for m in RAW_CITE.finditer(line):
@@ -755,13 +813,29 @@ def main():
     ap.add_argument("--ref", default="WORKTREE", help="Git ref to resolve against (default: WORKTREE)")
     ap.add_argument("--diff", nargs=2, metavar=("OLD_REF", "NEW_REF"),
                     help="Compare resolved spans between OLD_REF and NEW_REF")
-    ap.add_argument("--apply", action="store_true", help="Write resolved line numbers into source-map tables")
-    ap.add_argument("--check", action="store_true", help="Exit non-zero on any drift, failure, or stray raw citation")
+    ap.add_argument("--apply", action="store_true",
+                    help="Write resolved line numbers into source-map tables; exits non-zero only on an "
+                         "unresolved anchor")
+    ap.add_argument("--check", action="store_true",
+                    help="Exit non-zero on any failure, stray citation, or drift "
+                         "(with --diff, on MODIFIED or NEW instead of drift), or if "
+                         "no file was found; with --apply the cells are rewritten "
+                         "first and only failures and stray citations fail the run")
     ap.add_argument("sources", nargs="*", help="Source files to process")
     args = ap.parse_args()
 
     repo = find_repo(os.getcwd())
     ver_root = os.path.join(repo, "tpu_sync", "formal_verification")
+
+    if args.sources:
+        for s in args.sources:
+            abs_s = os.path.abspath(s)
+            if os.path.relpath(abs_s, ver_root).startswith(".."):
+                print(
+                    f"WARNING: {s} lies outside chosen verification root {ver_root}; "
+                    f"resolving against C++ under {repo}",
+                    file=sys.stderr,
+                )
 
     if args.sources:
         sources = [os.path.abspath(s) for s in args.sources]
@@ -811,6 +885,14 @@ def main():
         f"{totals['modified']} modified, {totals['updated']} drift, "
         f"{totals['fail']} fail, {totals['stray']} stray"
     )
+    if not sources:
+        print(
+            f"ERROR: found no .lean or .md file to process under {ver_root} "
+            "(run from inside the repository, or keep this script at "
+            "<root>/tpu_sync/formal_verification/tools/)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     if args.check and (
         totals["fail"] > 0
         or totals["stray"] > 0

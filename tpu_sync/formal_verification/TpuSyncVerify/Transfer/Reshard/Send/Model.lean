@@ -14,7 +14,7 @@ inductive SendStage where
   | d2h
   | pushing (active : Nat)
   | aborted
-  deriving Repr, DecidableEq
+  deriving Repr, DecidableEq, Hashable
 
 namespace SendStage
 
@@ -33,7 +33,7 @@ end SendStage
 structure SendPool where
   peers : Nat
   stage : SendStage := .pending
-  deriving Repr, DecidableEq
+  deriving Repr, DecidableEq, Hashable
 
 namespace SendPool
 
@@ -52,9 +52,8 @@ structure Send where
   life : Lifecycle := { inFlight := 1 }
   execActive : Bool := true
   remainingPushes : Nat
-  planUnregistered : Bool := false
   published : Option Bool := none
-  deriving Repr, DecidableEq
+  deriving Repr, DecidableEq, Hashable
 
 namespace Send
 
@@ -71,7 +70,7 @@ def sumRemainingSlots : List SendPool → Nat
   | p :: ps => p.remainingSlots + sumRemainingSlots ps
 
 /-- Every pool in `pools` has positive peer count (`CountPoolReshardSendSlots`,
-`ReshardSendSession::Create`, `ReshardSendSession::ExecutePush`). -/
+`CreateReshardSendSession`, `ReshardSendSession::ExecutePushPipeline`). -/
 def allPosPeers (pools : List SendPool) : Bool :=
   pools.all fun p => decide (0 < p.peers)
 
@@ -81,9 +80,14 @@ def validPools (pools : List SendPool) : Bool :=
 def validSchedule (peerCounts : List Nat) : Bool :=
   !peerCounts.isEmpty && peerCounts.all fun n => decide (0 < n)
 
-/-- Every pool has been issued by the `ExecutePush` loop. -/
+/-- Every pool has been issued by the `ExecutePushPipeline` loop. -/
 def allIssued (pools : List SendPool) : Bool :=
   pools.all fun p => p.stage != .pending
+
+/-- Every pool is still `.pending`: no pool has been reached by the
+`ExecutePushPipeline` loop yet (`Start` before its pipeline thread runs). -/
+def allPending (pools : List SendPool) : Bool :=
+  pools.all fun p => p.stage == .pending
 
 /-- No pool has aborted its D2H or peer push launch. -/
 def noAborted (pools : List SendPool) : Bool :=
@@ -93,44 +97,37 @@ def noAborted (pools : List SendPool) : Bool :=
 def allPushed (pools : List SendPool) : Bool :=
   pools.all fun p => p.stage == .pushing 0
 
-/-- Initial state after `ReshardSendSession::Create` and the opening lock of
-`ReshardSendSession::ExecutePush` (`++in_flight_; manager_ = &manager;`). -/
+/-- Initial state after `CreateReshardSendSession` and the opening lock of
+`ReshardSendSession::Start` (`++in_flight_;`). -/
 def init (peerCounts : List Nat) : Send :=
   { pools := peerCounts.map fun n => { peers := n, stage := .pending }
     life := { inFlight := 1 }
     execActive := true
     remainingPushes := sumPeers peerCounts }
 
-/-- `ReshardSendSession::EndOp`: if this is the last op (`in_flight_ == 1`) of a
-finalizing session, unregisters the active plan before decrementing `in_flight_`
-and calling `SettleLocked()`. -/
+/-- `ReshardSendSession::EndOp`: the `while (true)` scope decrements `in_flight_`
+and, when the last op of a finalizing session ends, calls `SettleLocked()`
+(`ReleaseLeasesLocked`, `done_ = true`). -/
 def endOp (s : Send) : Send :=
-  let unreg :=
-    if s.life.inFlight == 1 && s.life.draining && !s.life.done then true
-    else s.planUnregistered
-  { s with
-    life := s.life.endOpLocked
-    planUnregistered := unreg }
+  { s with life := s.life.endOpLocked }
 
 /-- `ReshardSendSession::RecordPushCompletion`: on the first error or when
-`--remaining_pool_peer_pushes_ == 0`, latches `finalizing_ = true` and
-unregisters the active plan at once (`UnregisterActivePlan`), while sibling
-pools and peers may still have ops in flight. -/
+`--remaining_pool_peer_pushes_ == 0`, latches `finalizing_ = true` (and
+`staging_layer_manager_.Shutdown()`), while sibling pools and peers may still
+have ops in flight. -/
 def recordPushCompletion (ok : Bool) (s : Send) : Send :=
   if s.life.done = true ∨ s.life.draining = true then s
   else if !ok then
-    { s with
-      life := s.life.finishLocked false
-      planUnregistered := true }
+    { s with life := s.life.finishLocked false }
   else if s.remainingPushes <= 1 then
     { s with
       remainingPushes := 0
-      life := s.life.finishLocked true
-      planUnregistered := true }
+      life := s.life.finishLocked true }
   else
     { s with remainingPushes := s.remainingPushes - 1 }
 
 inductive Ev where
+  | startFail
   | d2hIssue (p : Nat) (ok : Bool)
   | execFinish
   | d2hDone (p : Nat) (ok : Bool)
@@ -139,7 +136,17 @@ inductive Ev where
   | publish
   deriving Repr, DecidableEq
 
-/-- Per-pool body of `ReshardSendSession::ExecutePush`. -/
+/-- `ReshardSendSession::Start` failing synchronously before its pipeline thread
+runs: `ValidatePushPreconditions` returned an error, or `std::thread` threw
+`std::system_error`. Either way `RecordPushCompletion(status)` latches
+`finalizing_` and the `absl::Cleanup` `EndOp()` ends the caller op; no pool was
+touched. -/
+def startFail (s : Send) : Option Send :=
+  if s.execActive = true ∧ allPending s.pools = true then
+    some (endOp (recordPushCompletion false { s with execActive := false }))
+  else none
+
+/-- Per-pool body of `ReshardSendSession::ExecutePushPipeline`. -/
 def d2hIssue (p : Nat) (ok : Bool) (s : Send) : Option Send :=
   if !s.execActive then none
   else match s.pools[p]? with
@@ -157,7 +164,8 @@ def d2hIssue (p : Nat) (ok : Bool) (s : Send) : Option Send :=
       some (endOp s₁)
   | none => none
 
-/-- Final `EndOp()` of `ReshardSendSession::ExecutePush` after the pool loop completes. -/
+/-- The pipeline thread's `EndOp()` after `ReshardSendSession::ExecutePushPipeline`
+returns from a completed pool loop. -/
 def execFinish (s : Send) : Option Send :=
   if s.execActive = true ∧ allIssued s.pools = true then
     some (endOp { s with execActive := false })
@@ -193,18 +201,22 @@ def pushDone (p : Nat) (ok : Bool) (s : Send) : Option Send :=
   | none => none
 
 /-- External `ReshardSendSession::Finish` (`KVCacheManagerWithTransfer::~KVCacheManagerWithTransfer`,
-`KVCacheManagerWithTransfer::CompleteReadWithDetails`). -/
+`KVCacheManagerWithTransfer::CompleteReadWithDetails`,
+`KVCacheManagerWithTransfer::UnregisterActivePlan`): `if (done_ || finalizing_) return;`
+comes first, so a send that is already finalizing keeps its status. -/
 def cancel (s : Send) : Option Send :=
-  some { s with life := s.life.finishLocked false }
+  some { s with life := s.life.finishOnceLocked false }
 
 /-- `KVCacheManagerWithTransfer::CompleteReadWithDetails` publishes a settled
-session (reported through `RecordPoolReshardTerminalLocked`). -/
+session (`RetireSettledSessionLocked`, reported through
+`RecordPoolReshardTerminalLocked`). -/
 def publish (s : Send) : Option Send :=
   if s.life.done = true ∧ s.published = none then
     some { s with published := some s.life.statusOk }
   else none
 
 def step (s : Send) : Ev → Option Send
+  | .startFail => s.startFail
   | .d2hIssue p ok => s.d2hIssue p ok
   | .execFinish => s.execFinish
   | .d2hDone p ok => s.d2hDone p ok

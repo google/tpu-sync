@@ -114,13 +114,16 @@ def init : S := {}
 
 inductive Ev where
   /-- tpu-sync publishes the send (`done_sending` if `ok`, else `failed_recving`,
-  `(failed ? failed_recving_ : done_sending_).insert(session->req_id())` in
-  `KVCacheManagerWithTransfer::CompleteReadWithDetails`) and P's next
+  `(failed ? failed_recving_ : done_sending_).insert(req_id)` in
+  `KVCacheManagerWithTransfer::RetireSettledSessionLocked`, from
+  `CompleteReadWithDetails`, under the `req_id` of the session's `SessionEntry`;
+  the lists' other writers are listed in `Caller.lean` §"What is modelled") and P's next
   `get_finished()` / `get_transfer_results()` forwards it. -/
   | pOutcome (ok : Bool)
   /-- tpu-sync publishes the receive (`done_recving` if `ok`, else
-  `failed_recving`, `(!session->GetStatus().ok() ? failed_recving_ : done_recving_).insert(session->req_id())`
-  in `KVCacheManagerWithTransfer::CompleteReadWithDetails`) and D's next
+  `failed_recving`, `(!recv->GetStatus().ok() ? failed_recving_ : done_recving_).insert(req_id)`
+  in `KVCacheManagerWithTransfer::RetireSettledSessionLocked`, from
+  `CompleteReadWithDetails`) and D's next
   `get_finished()` / `get_block_ids_with_load_errors()` (or
   `get_transfer_results()`) forward it. -/
   | dOutcome (ok : Bool)

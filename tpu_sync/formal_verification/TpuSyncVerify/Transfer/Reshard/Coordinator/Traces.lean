@@ -13,7 +13,8 @@ open TpuSyncVerify.Transfer.Reshard.Registry
 
 /-! ## Part IV — Failure-Cleanup Traces, Happy-Path Trace, Searches, and Mutants -/
 
-/-- **Partial-arm failure counterexample trace (`ReshardCoordinator::RunSubPlan`, `return arm_status[i];`)**:
+/-- **Partial-arm failure counterexample trace (`ReshardCoordinator::RunSubPlan`, `return arm_status[i];`;
+`ReshardStackTest.TwoDestinationsOneArmRefusalAbandonsClaimAndSkipsSenders`)**:
 Two source units `[0, 1]` and two destination units `[10, 11]`.
 During Stage 1 (receiver arming), `dst_unit 10` succeeds (`armDstResult 10 true`),
 creating an active `ReshardReceiveSession` holding a `PoolStagingLease`, while
@@ -41,7 +42,8 @@ theorem trace_partial_arm_orphans_armed_receiver :
       some (.aborted, [(10, true, true), (11, false, false)], none) := by
   decide
 
-/-- **Sender-dispatch failure counterexample trace (`ReshardCoordinator::RunSubPlan`, `for (const absl::Status& status : sender_status)`)**:
+/-- **Sender-dispatch failure counterexample trace (`ReshardCoordinator::RunSubPlan`, `for (const absl::Status& status : sender_status)`;
+its 2×1 form is `ReshardStackTest.SenderDispatchFailurePropagatesErrorAfterReceiverArm`)**:
 Two source units `[0, 1]` and two destination units `[10, 11]`.
 Both `dst_unit 10` and `dst_unit 11` arm in Stage 1 (`finishArmBarrier` transitions
 to `.dispatching`). During Stage 2 (sender dispatch), `src_unit 0` succeeds

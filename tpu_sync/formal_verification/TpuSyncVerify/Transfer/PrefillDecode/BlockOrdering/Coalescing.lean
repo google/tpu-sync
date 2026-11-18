@@ -19,7 +19,8 @@ structure CopyRun where
   deriving Repr, DecidableEq
 
 /-- Inner coalescing loop in `TransferSendSession::BuildCoalescedCopySpec`
-(`for (size_t i = 1; i < src_block_ids.size(); ++i)`): extends `cur` by 1
+(`while (end < n && src_block_ids[end] == src_block_ids[end - 1] + 1 && dst_block_ids[end] == dst_block_ids[end - 1] + 1)`):
+extends `cur` by 1
 whenever the next `(s, d)` pair continues both contiguous runs
 (`s = cur.srcOffset + cur.size` and `d = cur.dstOffset + cur.size`), and starts
 a new run otherwise. -/

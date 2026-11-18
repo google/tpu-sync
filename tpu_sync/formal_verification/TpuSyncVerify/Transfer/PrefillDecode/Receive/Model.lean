@@ -17,6 +17,10 @@ structure Recv where
   ready : Nat := 0
   completed : Nat := 0
   layersAccounted : Nat := 0
+  /-- `network_completed_` set by `ExecuteLayerH2d` once every layer's copy has
+  been issued (`dispatched_layers_.size() == base_->num_layers()`), the second
+  setter beside the block-accounting one in `RecordBlockShardsReceivedLocked`. -/
+  netIssued : Bool := false
   published : Option Bool := none
   pushes : Nat := 0
   pullPending : Bool := false
@@ -38,12 +42,15 @@ by A2). -/
 def initLoad (numLayers : Nat) : Recv :=
   { numLayers, life := { inFlight := 1 }, pullPending := true }
 
-/-- `network_completed_` (`RecordBlockShardsReceivedLocked`): every shard's
-blocks accounted (agrees with `TransferReceiveSession::network_completed_` for
-`numLayers > 0`; at `numLayers = 0`, C++'s `IsReadyToComplete` holds via its
+/-- `network_completed_`: set by `RecordBlockShardsReceivedLocked` when every
+shard's blocks are accounted, or by `ExecuteLayerH2d` when every layer's copy
+has been issued (`netIssued`). Agrees with
+`TransferReceiveSession::network_completed_` for `numLayers > 0`; at
+`numLayers = 0`, C++'s `IsReadyToComplete` holds via its
 `num_completed_layers_ == static_cast<int32_t>(total_layers)` disjunct while
-`network_completed_` stays `false`). -/
-def networkCompleted (s : Recv) : Prop := s.layersAccounted = s.numLayers
+`network_completed_` stays `false`. -/
+def networkCompleted (s : Recv) : Prop :=
+  s.layersAccounted = s.numLayers ∨ s.netIssued = true
 
 /-- `AllH2dDoneLocked`: every future in `h2d_futures_` is ready. -/
 def allH2dDone (s : Recv) : Prop := s.ready = s.issued
@@ -53,7 +60,7 @@ def isReadyToComplete (s : Recv) : Prop :=
   (networkCompleted s ∨ s.completed = s.numLayers) ∧ allH2dDone s
 
 instance : DecidablePred networkCompleted :=
-  fun s => inferInstanceAs (Decidable (s.layersAccounted = s.numLayers))
+  fun s => inferInstanceAs (Decidable (s.layersAccounted = s.numLayers ∨ s.netIssued = true))
 instance : DecidablePred allH2dDone :=
   fun s => inferInstanceAs (Decidable (s.ready = s.issued))
 instance : DecidablePred isReadyToComplete :=
@@ -73,40 +80,45 @@ inductive Ev where
   | publish
   deriving Repr, DecidableEq
 
-/-- `TryBeginRecvOp`. When it returns `false` the transport drops the push and
+/-- `TryBeginOp`. When it returns `false` the transport drops the push and
 the session is unchanged, so only the accepting case is a transition. -/
 def pushBegin (s : Recv) : Option Recv :=
   s.life.beginOp.map fun l => { s with life := l, pushes := s.pushes + 1 }
 
-/-- `EndRecvOp` for a push that was accepted. -/
+/-- `EndOp` for a push that was accepted. -/
 def pushEnd (s : Recv) : Option Recv :=
   if s.pushes = 0 then none
   else some { s with life := s.life.endOpLocked, pushes := s.pushes - 1 }
 
-/-- The pull handshake resolves (`ExecutePullRequest`'s `on_response`):
-`self->FinishLocked(pull_status)` if `!pull_status.ok()` and
-`self->handshake_pending_ = false`, then `absl::Cleanup end_op` calls
-`EndRecvOp()`. -/
+/-- The pull handshake resolves (`Start`'s `on_response`):
+`self->FinishLocked(pull_status)` only `if (!pull_status.ok() && !self->draining_)`
+— a receive that already settled or is draining keeps its verdict — then
+`self->handshake_pending_ = false`, and `absl::Cleanup end_op` calls
+`EndOp()`. -/
 def pullReply (ok : Bool) (s : Recv) : Option Recv :=
   if s.pullPending = false then none
   else
-    let l := if ok then s.life else s.life.finishLocked false
+    let l := if ok = true ∨ s.life.draining = true then s.life else s.life.finishLocked false
     some { s with life := l.endOpLocked, pullPending := false }
 
 /-- `ExecuteLayerH2d` up to the first unlock: refused once settled or draining
-(`if (done_ || draining_) return absl::OkStatus();`), and only while
-`issued + pending < numLayers` (A1); otherwise `++in_flight_`. -/
+(`if (done_ || draining_ || total_blocks_ == 0) { ...; return absl::OkStatus(); }`;
+`total_blocks_ > 0` by A2), and only while `issued + pending < numLayers` (A1);
+otherwise `++in_flight_`. -/
 def h2dBegin (s : Recv) : Option Recv :=
   if s.issued + s.pending < s.numLayers then
     s.life.beginOp.map fun l => { s with life := l, pending := s.pending + 1 }
   else none
 
 /-- `ExecuteLayerH2d` from the re-check on. If the session finished in the
-window between the two locks (`if (done_ || draining_) { EndRecvOpLocked(); return absl::OkStatus(); }`),
+window between the two locks (`if (done_ || draining_) { ...; EndRecvOpLocked(); return absl::OkStatus(); }`),
 the op is released and no copy is issued. Otherwise the copy is dispatched via
 `H2dSyncDispatch`: on failure `FinishLocked(future_or.status(), kH2dPhase); EndRecvOpLocked()`;
-on success its future joins `h2d_futures_` (`h2d_futures_.push_back(future)`)
-and the op stays in flight until the callback. -/
+on success its future joins `h2d_futures_` (`h2d_futures_.push_back(future)`),
+the op stays in flight until the callback, and the layer joins
+`dispatched_layers_` — when that is every layer and the receive is not
+draining, `network_completed_ = true` (`netIssued`; by A1 the set's size is
+`issued`). -/
 def h2dIssue (ok : Bool) (s : Recv) : Option Recv :=
   if s.pending = 0 then none
   else
@@ -114,7 +126,8 @@ def h2dIssue (ok : Bool) (s : Recv) : Option Recv :=
     if s.life.done = true ∨ s.life.draining = true then
       some { s with life := s.life.endOpLocked }
     else if ok then
-      some { s with issued := s.issued + 1 }
+      some { s with issued := s.issued + 1,
+                    netIssued := s.netIssued || decide (s.issued + 1 = s.numLayers) }
     else
       some { s with life := (s.life.finishLocked false).endOpLocked }
 
@@ -123,7 +136,7 @@ def h2dReady (s : Recv) : Option Recv :=
   if s.ready < s.issued then some { s with ready := s.ready + 1 } else none
 
 /-- H2D completion callback (`ExecuteLayerH2d`'s `future.OnReady`), run once per
-ready future. `absl::Cleanup end_op` calls `EndRecvOp()` on every path. On a
+ready future. `absl::Cleanup end_op` calls `EndOp()` on every path. On a
 retired session (`if (self->done_)`) the body returns early (`LOG(DFATAL)`). On
 success `self->num_completed_layers_++`; the last layer calls
 `self->FinishLocked()` unless `!self->draining_` fails. On failure
@@ -142,17 +155,19 @@ def h2dDone (ok : Bool) (s : Recv) : Option Recv :=
       some { s with life := (s.life.finishLocked false).endOpLocked }
   else none
 
-/-- `OnBlockShardsReceived` for the stream that completes a layer (A4). Ignored
-once settled or draining (`if (done_ || draining_) return absl::OkStatus();`).
+/-- `RecordBlockShards` (`OnDataReceived` with block ids) for the stream that
+completes a layer (A4). Ignored once settled or draining
+(`if (done_ || draining_ || total_blocks_ == 0) return absl::OkStatus();`).
 Otherwise `RecordBlockShardsReceivedLocked` accounts the stream's blocks per
-shard; if every shard reaches `per_shard_target` and
+shard; if `network_completed_` was not already set by a dispatch, every shard
+reaches `per_shard_target` and
 `num_completed_layers_ == static_cast<int32_t>(total_layers)`,
 `RecordNetworkCompleteLocked` calls `FinishLocked()`. -/
 def netAccount (s : Recv) : Option Recv :=
   if s.life.done = true ∨ s.life.draining = true then none
   else if s.layersAccounted < s.issued then
     let s := { s with layersAccounted := s.layersAccounted + 1 }
-    if networkCompleted s ∧ s.completed = s.numLayers then
+    if s.netIssued = false ∧ s.layersAccounted = s.numLayers ∧ s.completed = s.numLayers then
       some { s with life := s.life.finishLocked true }
     else some s
   else none
@@ -169,8 +184,8 @@ def pollReady (s : Recv) : Option Recv :=
 def cancel (s : Recv) : Option Recv :=
   some { s with life := s.life.finishLocked false }
 
-/-- `CompleteReadWithDetails` / `CompleteReadRaw` publishes a settled session
-(`if (session->Done())`). -/
+/-- `CompleteReadWithDetails` publishes a settled session
+(`RetireSettledSessionLocked`: `if (!recv->Done()) return false;`). -/
 def publish (s : Recv) : Option Recv :=
   if s.life.done = true ∧ s.published = none then
     some { s with published := some s.life.statusOk }

@@ -28,14 +28,14 @@ ranges for every symbol, sub-block, and test are in the generated
   * `ReshardCoordinator::ExecutePoolReshard`, `ReshardCoordinator::RunSubPlan`
     and `ReshardCoordinator::StartChain` (`coord.cc`)
   * `KVCacheListener::HandleControlRequest` (`tpu_sync/kv_cache/kv_cache_listener.cc`, `PoolReshardRegisterRecv` control-pipe handler)
-  * `KVCacheManagerWithTransfer::PoolReshardRegisterRecv` (`mgr.cc`: `ReshardReceiveSession::Create` + `RegisterActivePlanDirect`)
-  * `ReshardReceiveSession::Create`, `ReshardReceiveSession::AcquireStagingLeases`, and `ReshardReceiveSession::ReleaseStaging` / `ReshardReceiveSession::ReleaseStagingLocked` (`reshard_recv.cc`)
+  * `KVCacheManagerWithTransfer::PoolReshardRegisterRecv` (`mgr.cc`: the `pending_pool_reshard_recvs_` claim, `CreateReshardReceiveSession`, insertion into `sessions_`)
+  * `CreateReshardReceiveSession`, `ReshardReceiveSession::AcquireStagingLeases`, and `ReshardReceiveSession::ReleaseStaging` / `ReshardReceiveSession::ReleaseStagingLocked` (`reshard_recv.cc`)
 
   ## Scope: one sub-plan of a request
 
   `ReshardCoordinator::ExecutePoolReshard` fetches the source and destination
   metadata once, picks the request's `uuid`, plans the request's sub-transfer
-  chain (`ReshardCoordinator::PlanSubTransfers`: one sub-plan per
+  chain (the free function `PlanSubTransfers`: one sub-plan per
   `dst_window_blocks` window of the destination block lists, `chain.count == 1`
   when no tag is windowed), draws one `claim_owner` for the whole chain
   (`claim_counter.fetch_add(1)`, so the registry sees one claim per request),
@@ -62,9 +62,27 @@ ranges for every symbol, sub-block, and test are in the generated
   registry-claim ownership across sub-plans) together with worker-side
   per-request chain folding (`KVCacheManagerWithTransfer::NoteSubPlanRegisteredLocked`,
   `RecordPoolReshardTerminalLocked`, `SweepSubPlanChainsLocked`) are modelled
-  in `Reshard/SubPlanChain.lean`. The sender-dispatch failure path is the same
-  for every index: `for (const absl::Status& status : sender_status)` returns
-  the first error without disarming receivers and without `AbandonClaim`.
+  in `Reshard/SubPlanChain.lean`. `WorkerDelivery::Mode::kController`'s
+  `delivery_.controller == nullptr` post-arm error path (which calls
+  `AbandonClaim` after Phase 1 arming and returns `InternalError` before
+  dispatching senders) is excluded from `Ev` alongside transport and
+  serialization setup errors (matching `SubPlanChain.lean`). The sender-dispatch
+  failure path is the same for every index: `for (const absl::Status& status : sender_status)`
+  returns the first error without disarming receivers and without `AbandonClaim`.
+
+  Not modelled: the registry's clock and forced release. `Ev` has no TTL-expiry
+  event (`RequestBlockRegistry::PurgeExpiredLifecycleLocked` /
+  `PurgeExpiredRequestBlocksLocked`, run on entry by `Register`,
+  `LookupAndClaim`, `Complete`, `Release`, and the status probe;
+  `CancelIfUnclaimed` runs `PurgeExpiredLifecycleLocked` only, and `AbandonClaim`
+  runs neither) and no `RequestBlockRegistry::Release`
+  (`COMMAND_RELEASE_REQUEST_BLOCKS`, which retires a claimed generation
+  unconditionally). The claim is refreshed to `now + ttl_s_` only by the one
+  `LookupAndClaim` at the start of the call, so `ClaimedWhileArming` and the
+  traces below are statements about a call that finishes arming within `ttl_s_`
+  (`request_registry_ttl_s`, default 600 s; one `index == 0` arm round is
+  bounded by `kWorkerRpcTimeout`, 60 s) and during which nobody releases the
+  generation.
 
   What this file proves:
   1. **Universal Protocol Guarantees (`CoordInv`, `reachable_coord_inv`)**:
@@ -84,13 +102,17 @@ ranges for every symbol, sub-block, and test are in the generated
        if and only if its `ReshardReceiveSession` is currently armed.
   2. **What the two abort paths leave behind (`Traces.lean`)**:
      * `trace_partial_arm_orphans_armed_receiver`
-       (`ReshardCoordinator::RunSubPlan`, `return arm_status[i];`): When `dst_unit 10` succeeds in arming
+       (`ReshardCoordinator::RunSubPlan`, `return arm_status[i];`;
+       `ReshardStackTest.TwoDestinationsOneArmRefusalAbandonsClaimAndSkipsSenders`
+       drives it): When `dst_unit 10` succeeds in arming
        and `dst_unit 11` fails, `RunSubPlan` calls `AbandonClaim` (`if (index == 0)`) and
        aborts without disarming `dst_unit 10`, leaving `dst_unit 10`'s
        `ReshardReceiveSession` and `PoolStagingLease` orphaned until
        `timeout_s_`.
      * `trace_dispatch_failure_orphans_receivers_and_claim`
-       (`ReshardCoordinator::RunSubPlan`, `for (const absl::Status& status : sender_status)`): When all `dst_units` arm and
+       (`ReshardCoordinator::RunSubPlan`, `for (const absl::Status& status : sender_status)`;
+       `ReshardStackTest.SenderDispatchFailurePropagatesErrorAfterReceiverArm`
+       is its 2×1 form, asserting the registry still reads claimed): When all `dst_units` arm and
        `src_unit 0` succeeds but `src_unit 1` fails during Stage 2 dispatch,
        `RunSubPlan` returns `sender_status` without disarming
        `dst_units` AND without calling `registry_->AbandonClaim(...)`. Both
@@ -112,7 +134,7 @@ ranges for every symbol, sub-block, and test are in the generated
   request that did not continue as a chain (`if (!chain_started)`), again after
   it; a chained request's final status is written by `StartChain`'s thread under
   the same `status_mu_`. `ExecutePoolReshard` reads `directory_->LocalMetadata`
-  under `*directory_->mu_` (shared with `RequestBlockRegistry::mu_`) on entry.
+  under `*directory_->mu()` (shared with `RequestBlockRegistry::mu_`) on entry.
   `StartChain`, `ReapFinishedChainsLocked`, `WaitForSubTransferChains` and
   `~ReshardCoordinator` hold `ReshardCoordinator::chains_mu_` only to spawn,
   reap and join chain threads; `RunSubPlan` itself takes neither `status_mu_`
@@ -127,7 +149,7 @@ ranges for every symbol, sub-block, and test are in the generated
   |---|---|---|
   | `registerProducer srcUnit` | 1 `RequestBlockRegistry::mu_` scope (`RequestBlockRegistry::Register`) | — |
   | `startPlan planOk` | 1 `RequestBlockRegistry::mu_` scope in `BuildPoolReshardPlan` (`LookupAndClaim`), plus a second scope (`AbandonClaim`, `if (index == 0)`) if `planOk = false` after claiming | — |
-  | `armDstResult dstUnit ok` | 1 `armers` worker thread calling `PoolReshardRegisterRecv` on `dstUnit` (2 `KVCacheManagerWithTransfer::mu_` scopes, `Pipeline.lean`) and writing its own `arm_replies[i]` / `arm_status[i]` / `armed[i]` slot | worker threads write disjoint slots of `arm_replies` / `arm_status` / `armed`, joined at `finishArmBarrier` |
+  | `armDstResult dstUnit ok` | 1 `armers` worker thread calling `PoolReshardRegisterRecv` on `dstUnit` (2 `KVCacheManagerWithTransfer::mu_` scopes, `Pipeline.lean`, plus a third acquisition at function exit by the `clear_pending` cleanup, which only erases the UUID from `pending_pool_reshard_recvs_`) and writing its own `arm_replies[i]` / `arm_status[i]` / `armed[i]` slot | worker threads write disjoint slots of `arm_replies` / `arm_status` / `armed`, joined at `finishArmBarrier` |
   | `finishArmBarrier` | `for (std::thread& t : armers) t.join();`, followed for an unarmed destination (`if (armed[i]) continue;`) by 1 `RequestBlockRegistry::mu_` scope (`registry_->AbandonClaim`, `if (index == 0)`) before `return arm_status[i];` | `join()` orders all `arm_status[i]` / `armed[i]` writes before the scan that inspects them; with `index == 0` there is a single arm attempt (`attempts = 1`), so the re-arm loop is not entered |
   | `sendSrcResult srcUnit ok` | 1 `senders` worker thread (or `SubmitTransferProgram` future) calling `PoolReshardPush` on `srcUnit` and writing `sender_status[i]` on failure; on `ok = true`, folds the sender RPC, receiver settlement (`Receive.lean`), and the producer's `registry_->Complete` vote (1 `RequestBlockRegistry::mu_` scope) | folding `Complete` into `ok = true` is sound for `CoordInv` because whenever any `srcUnit` fails (`sendFailed = true`), that unit never calls `Complete`, keeping `allVoted = false` |
   | `finishSendBarrier` | `for (std::thread& t : senders) t.join();` (or the final `futures[i].Await()`) before `for (const absl::Status& status : sender_status)` | `join()` / `Await()` orders all `sender_status[i]` writes before the status check |
@@ -142,37 +164,66 @@ Generated by `tools/resolve_anchors.py`.
 | `coord.h` | `WorkerDelivery` | `:62-67` |
 | `coord.h` | `PoolReshardArgs` | `:70-92` |
 | `coord.h` | `ReshardCoordinator` | `:138-207` |
-| `coord.cc` | `*` (`struct ReshardCoordinator::ChainContext {` .. `std::atomic<bool> finished{false};`) | `:310-321` |
-| `coord.cc` | `ReshardCoordinator::StartPoolReshard` | `:474-526` |
-| `coord.cc` | `ReshardCoordinator::ExecutePoolReshard` | `:528-601` |
-| `coord.cc` | `ReshardCoordinator::ExecutePoolReshard` (`static std::atomic<uintptr_t> claim_counter` .. `reinterpret_cast<const void*>(claim_counter.fetch_add(1));`) | `:566-568` |
-| `coord.cc` | `ReshardCoordinator::ExecutePoolReshard` (`absl::Status first = RunSubPlan(ctx, 0);` .. `return absl::OkStatus();`) | `:592-600` |
-| `coord.cc` | `ReshardCoordinator::StartChain` | `:614-649` |
-| `coord.cc` | `ReshardCoordinator::RunSubPlan` | `:678-932` |
-| `coord.cc` | `ReshardCoordinator::RunSubPlan` (`auto plan_or = BuildPoolReshardPlan(plan_request, registry_, ctx->claim_owner);` .. `PoolReshardPlan& plan = *plan_or;`) | `:723-728` |
-| `coord.cc` | `ReshardCoordinator::RunSubPlan` (`std::vector<absl::Status> arm_status` .. `for (std::thread& t : armers) t.join();`) | `:743-776` |
-| `coord.cc` | `ReshardCoordinator::RunSubPlan` (`bool retry = false;` .. `return arm_status[i];`) | `:777-788` |
-| `coord.cc` | `ReshardCoordinator::RunSubPlan` (`std::vector<absl::Status> sender_status` .. `for (std::thread& t : senders) t.join();`) | `:813-873` |
-| `coord.cc` | `ReshardCoordinator::RunSubPlan` (`for (const absl::Status& status : sender_status)`) | `:876-878` |
+| `coord.cc` | `*` (`struct ReshardCoordinator::ChainContext {` .. `std::atomic<bool> finished{false};`) | `:313-324` |
+| `coord.cc` | `ReshardCoordinator::StartPoolReshard` | `:477-529` |
+| `coord.cc` | `ReshardCoordinator::ExecutePoolReshard` | `:531-604` |
+| `coord.cc` | `ReshardCoordinator::ExecutePoolReshard` (`static std::atomic<uintptr_t> claim_counter` .. `reinterpret_cast<const void*>(claim_counter.fetch_add(1));`) | `:569-571` |
+| `coord.cc` | `ReshardCoordinator::ExecutePoolReshard` (`absl::Status first = RunSubPlan(ctx, 0);` .. `return absl::OkStatus();`) | `:595-603` |
+| `coord.cc` | `ReshardCoordinator::StartChain` | `:617-652` |
+| `coord.cc` | `ReshardCoordinator::RunSubPlan` | `:681-935` |
+| `coord.cc` | `ReshardCoordinator::RunSubPlan` (`auto plan_or = BuildPoolReshardPlan(plan_request, registry_, ctx->claim_owner);` .. `PoolReshardPlan& plan = *plan_or;`) | `:726-731` |
+| `coord.cc` | `ReshardCoordinator::RunSubPlan` (`std::vector<absl::Status> arm_status` .. `for (std::thread& t : armers) t.join();`) | `:746-779` |
+| `coord.cc` | `ReshardCoordinator::RunSubPlan` (`bool retry = false;` .. `return arm_status[i];`) | `:780-791` |
+| `coord.cc` | `ReshardCoordinator::RunSubPlan` (`std::vector<absl::Status> sender_status` .. `for (std::thread& t : senders) t.join();`) | `:816-876` |
+| `coord.cc` | `ReshardCoordinator::RunSubPlan` (`if (delivery_.controller == nullptr)`) | `:818-824` |
+| `coord.cc` | `ReshardCoordinator::RunSubPlan` (`for (const absl::Status& status : sender_status)`) | `:879-881` |
 | `kv_cache_listener.cc` | `KVCacheListener::HandleControlRequest` (`} else if (is_pool_reshard) {` .. `(*resp->mutable_receiver_pool_addrs())[pool_idx] =`) | `:138-169` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardPush` | `:833-871` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardRegisterRecv` | `:873-910` |
-| `reshard_recv.cc` | `ReshardReceiveSession::Create` | `:351-390` |
-| `reshard_recv.cc` | `ReshardReceiveSession::AcquireStagingLeases` | `:422-461` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ReleaseStagingLocked` | `:463-467` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ReleaseStaging` | `:469-472` |
-| `reshard_recv.cc` | `ReshardReceiveSession::RecordPoolH2dResultLocked` | `:587-600` |
-| `reshard_recv.cc` | `ReshardReceiveSession::FinishPoolH2d` | `:670-708` |
-| `planner.cc` | `BuildPoolReshardPlan` (`auto registrations_or =` .. `if (!registrations_or.ok()) return registrations_or.status();`) | `:1119-1121` |
-| `planner.cc` | `BuildPoolReshardPlan` (`PoolReshardPlan plan;` .. `plan.dst_units = request.dst_units;`) | `:1289-1295` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardPush` | `:733-775` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardRegisterRecv` | `:777-826` |
+| `reshard_recv.cc` | `CreateReshardReceiveSession` | `:541-575` |
+| `reshard_recv.cc` | `ReshardReceiveSession::AcquireStagingLeases` | `:604-643` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ReleaseStagingLocked` | `:645-650` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ReleaseStaging` | `:652-655` |
+| `reshard_recv.cc` | `ReshardReceiveSession::RecordPoolH2dResultLocked` | `:796-809` |
+| `reshard_recv.cc` | `ReshardReceiveSession::FinishPoolH2d` | `:890-926` |
+| `planner.cc` | `SplitGlobalSpaceSpans` | `:267-338` |
+| `planner.cc` | `ValidateSpanCoverage` | `:350-487` |
+| `planner.cc` | `BuildPoolReshardPlan` (`auto registrations_or =` .. `if (!registrations_or.ok()) return registrations_or.status();`) | `:1128-1130` |
+| `planner.cc` | `BuildPoolReshardPlan` (`if (unique_peers.size() != request.dst_units.size())`) | `:1155-1161` |
+| `planner.cc` | `BuildPoolReshardPlan` (`PoolReshardPlan plan;` .. `plan.dst_units = request.dst_units;`) | `:1308-1314` |
 | `reg.cc` | `RequestBlockRegistry::Register` | `:118-300` |
 | `reg.cc` | `RequestBlockRegistry::Complete` | `:317-371` |
-| `reg.cc` | `RequestBlockRegistry::LookupAndClaim` | `:439-491` |
-| `reg.cc` | `RequestBlockRegistry::AbandonClaim` | `:493-509` |
+| `reg.cc` | `RequestBlockRegistry::LookupAndClaim` | `:439-501` |
+| `reg.cc` | `RequestBlockRegistry::AbandonClaim` | `:503-519` |
 | `reshard_service.cc` | `ReshardService::HandleControllerCommand` (`case tpu_sync::rpc::ControllerRequest::COMMAND_COMPLETE_REQUEST_BLOCKS:`) | `:293-305` |
-| `reshard_service_test.cc` | `ReshardStackTest.FullPoolReshardFlowEmitsArmThenDispatch` | `:760-834` |
-| `reshard_service_test.cc` | `ReshardStackTest.MissingRegistrationKeepsContractString` | `:1369-1379` |
-| `reshard_service_test.cc` | `ReshardStackTest.ArmFailureAbandonsClaimAndSkipsSenders` | `:1381-1397` |
-| `reshard_service_test.cc` | `ReshardStackTest.TwoDestinationsArmEachThenDispatchSendersOnce` | `:1531-1601` |
+| `reshard_service_test.cc` | `ReshardStackTest.FullPoolReshardFlowEmitsArmThenDispatch` | `:806-880` |
+| `reshard_service_test.cc` | `ReshardStackTest.RegisteredDestinationPeregrineEndpointsEmittedOnScheduleEntries` | `:882-913` |
+| `reshard_service_test.cc` | `ReshardStackTest.GlobalSpaceSpansSplitAtPageBoundaries` | `:915-956` |
+| `reshard_service_test.cc` | `ReshardStackTest.ClipDropsTrimsAndRebasesGlobalSpans` | `:958-1014` |
+| `reshard_service_test.cc` | `ReshardStackTest.ClipValidationFailsClosed` | `:1399-1432` |
+| `reshard_service_test.cc` | `ReshardStackTest.ClipRejectsPageIndexedDeclarations` | `:1434-1446` |
+| `reshard_service_test.cc` | `ReshardStackTest.MissingRegistrationKeepsContractString` | `:1448-1458` |
+| `reshard_service_test.cc` | `ReshardStackTest.ArmFailureAbandonsClaimAndSkipsSenders` | `:1460-1476` |
+| `reshard_service_test.cc` | `ReshardStackTest.RequestBlockStatusProbeTracksLifecycle` | `:1508-1572` |
+| `reshard_service_test.cc` | `ReshardStackTest.CompletionVotesRetireAfterClaim` | `:1574-1597` |
+| `reshard_service_test.cc` | `ReshardStackTest.TwoDestinationsArmEachThenDispatchSendersOnce` | `:1610-1680` |
+| `reshard_service_test.cc` | `ReshardStackTest.SubsetSourceManifestsPairPoolsByTag` | `:1682-1821` |
+| `reshard_service_test.cc` | `ReshardStackTest.SourceTagsAbsentOnTheDestinationAreIgnored` | `:1935-2016` |
+| `reshard_service_test.cc` | `ReshardStackTest.MismatchedDestinationsFailClosed` | `:2018-2056` |
+| `reshard_service_test.cc` | `ReshardStackTest.TwoDestinationsShardedSpansRouteBytesPerReceiver` | `:2061-2126` |
+| `reshard_service_test.cc` | `ReshardStackTest.StridedGlobalSpansStayOneEntryPerDestination` | `:2128-2183` |
+| `reshard_service_test.cc` | `ReshardStackTest.StridedGlobalSpansMustStayInsideOnePage` | `:2218-2228` |
+| `reshard_service_test.cc` | `ReshardStackTest.ShardedSpanOrdinalOutOfRangeFailsClosed` | `:2230-2245` |
+| `reshard_service_test.cc` | `ReshardStackTest.ShardedDestinationWithoutCoverageFailsClosed` | `:2247-2260` |
+| `reshard_service_test.cc` | `ReshardStackTest.ShardedNonUniformExtentsFailClosed` | `:2262-2276` |
+| `reshard_service_test.cc` | `ReshardStackTest.ReplicatedAndRoutedSpansCombine` | `:2289-2321` |
+| `reshard_service_test.cc` | `ReshardStackTest.UnsetTransferStreamsPlansOneStreamPerSourceRank` | `:2363-2383` |
+| `reshard_service_test.cc` | `ReshardStackTest.TransferStreamsEnvCapsPlanStreamsAndExpectedPushes` | `:2385-2405` |
+| `reshard_service_test.cc` | `ReshardStackTest.DuplicateRegistrationRefreshesTtlWhileConflictsAndPostClaimWritesFail` | `:2443-2474` |
+| `reshard_service_test.cc` | `ReshardStackTest.CompletionNoOpsAndPreClaimGuard` | `:2507-2569` |
+| `reshard_service_test.cc` | `ReshardStackTest.ForcedReleaseClearsEveryLifecycleState` | `:2600-2663` |
+| `reshard_service_test.cc` | `ReshardStackTest.TwoDestinationsOneArmRefusalAbandonsClaimAndSkipsSenders` | `:2665-2703` |
+| `reshard_service_test.cc` | `ReshardStackTest.SenderDispatchFailurePropagatesErrorAfterReceiverArm` | `:2705-2741` |
+| `reshard_service_test.cc` | `ReshardStackTest.FailedClaimDoesNotRefreshPartialRegistrationTtl` | `:2788-2806` |
 <!-- source-map:end -->
 -/

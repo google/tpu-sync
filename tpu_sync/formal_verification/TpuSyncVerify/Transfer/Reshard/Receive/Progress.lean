@@ -33,18 +33,6 @@ theorem poolDrainSteps_set_lt {ps : List Pool} {idx : Nat} {p p' : Pool}
       simp only [List.set_cons_succ, poolDrainSteps]
       omega
 
-@[simp] theorem maybeUnregisterSettled_life (s : Recv) :
-    (maybeUnregisterSettled s).life = s.life := by
-  unfold maybeUnregisterSettled; split <;> rfl
-
-@[simp] theorem maybeUnregisterSettled_pushes (s : Recv) :
-    (maybeUnregisterSettled s).pushes = s.pushes := by
-  unfold maybeUnregisterSettled; split <;> rfl
-
-@[simp] theorem maybeUnregisterSettled_pools (s : Recv) :
-    (maybeUnregisterSettled s).pools = s.pools := by
-  unfold maybeUnregisterSettled; split <;> rfl
-
 theorem poolOps_le_poolDrainSteps : ∀ ps : List Pool, poolOps ps ≤ poolDrainSteps ps
   | [] => Nat.le_refl 0
   | q :: qs => by
@@ -64,7 +52,7 @@ theorem drain_step (pol : PushEndPolicy) {s : Recv} (h : Inv s)
   by_cases hp : 0 < s.pushes
   · have hne : s.pushes ≠ 0 := by omega
     have hs₁ : step pol s (.pushEnd true) =
-        some (maybeUnregisterSettled { s with life := s.life.endOpLocked, pushes := s.pushes - 1 }) := by
+        some { s with life := s.life.endOpLocked, pushes := s.pushes - 1 } := by
       simp [step, pushEnd, hne]
     exact ⟨.pushEnd true, _, hs₁, by simp [hdr], by simp [drainRank]; omega⟩
   · have hpo : 0 < poolOps s.pools := by omega
@@ -92,27 +80,26 @@ theorem drain_step (pol : PushEndPolicy) {s : Recv} (h : Inv s)
         (by simp [hst, PoolStage.drainSteps])
       by_cases hfin : s.finalizing = true
       · have hs₁ : step pol s (.h2dDone p true) =
-            some (maybeUnregisterSettled { s with
+            some { s with
               pools := s.pools.set p { pool with stage := .aborted },
-              life := s.life.endOpLocked }) := by
+              life := s.life.endOpLocked } := by
           simp [step, h2dDone, hget, hst, hnd, hfin]
         exact ⟨.h2dDone p true, _, hs₁, by simp [hdr], by simp [drainRank]; omega⟩
       · simp only [Bool.not_eq_true] at hfin
         by_cases hall : allCompleted (s.pools.set p { pool with stage := .completed }) = true
         · have hs₁ : step pol s (.h2dDone p true) =
-              some (maybeUnregisterSettled { s with
+              some { s with
                 pools := s.pools.set p { pool with stage := .completed },
                 finalizing := true,
-                networkCompleted := true,
                 durationRecorded := true,
-                life := (s.life.finishLocked true).endOpLocked }) := by
+                life := (s.life.finishLocked true).endOpLocked } := by
             simp [step, h2dDone, hget, hst, hnd, hfin, hall]
           exact ⟨.h2dDone p true, _, hs₁, by simp, by simp [drainRank]; omega⟩
         · simp only [Bool.not_eq_true] at hall
           have hs₁ : step pol s (.h2dDone p true) =
-              some (maybeUnregisterSettled { s with
+              some { s with
                 pools := s.pools.set p { pool with stage := .completed },
-                life := s.life.endOpLocked }) := by
+                life := s.life.endOpLocked } := by
             simp [step, h2dDone, hget, hst, hnd, hfin, hall, launchEligible, hdr]
           exact ⟨.h2dDone p true, _, hs₁, by simp [hdr], by simp [drainRank]; omega⟩
     | waiting | received | completed | aborted =>

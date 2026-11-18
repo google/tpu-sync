@@ -24,8 +24,7 @@ structure Lease where
 /-- Look up the arena slot assigned to `blockId` in `lease`
 (`cur->slot_by_block.contains(block_id)` in `KVCacheManagerBase::AcquirePoolStagingLease`,
 `lease->slot_by_block.find(block_id)` in `KVCacheManagerBase::CopyPoolBlocks`, and
-`staging_lease->slot_by_block.find(block_id)` in
-`KVCacheManagerBase::GetBlockChunks`). -/
+`staging_lease->slot_by_block.find(block_id)` in `KVCacheManagerBase::GetBlockChunks`). -/
 def Lease.lookupSlot (l : Lease) (blockId : Nat) : Option Nat :=
   (l.slotByBlock.find? (fun p => p.1 == blockId)).map Prod.snd
 
@@ -103,7 +102,11 @@ def upsertLease : List (Nat × Lease) → Nat → Lease → List (Nat × Lease)
       (u, old) :: upsertLease rest uuid l
 
 /-- `KVCacheManagerBase::AcquirePoolStagingLease`.
-Returns `some a'` on `OkStatus` and `none` on `ResourceExhausted`. -/
+Returns `some a'` on `OkStatus` and `none` on `ResourceExhausted`. The C++
+fails at once only when `missing` exceeds `num_slots`; when too few slots are
+free it waits on `staging_cv_` for up to the caller's `timeout`
+(`pool_staging_lease_timeout()`), and `none` in that case stands for the wait
+timing out. The wait itself is not modelled. -/
 def Arena.acquireLease (a : Arena) (uuid : Nat) (blockIds : List Nat) : Option Arena :=
   let cur := a.lookupLease uuid
   let missing := missingBlocks cur blockIds

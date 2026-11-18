@@ -206,8 +206,9 @@ theorem enumFrom_fst_inj [DecidableEq α] {x : α} {j₁ j₂ idx : Nat} {xs : L
       exact (hnd.1 (fst_mem_of_mem_enumFrom htail₁)).elim
     · exact ih hnd.2 htail₁ htail₂
 
-/-- Deduplicate adjacent equal pairs (`if (!plan.h2d_local_block_ids.empty() && ...)`
-in `TransferReceiveSession::BuildLoadCopyPlan`). -/
+/-- Deduplicate adjacent equal pairs: `TransferReceiveSession::BuildLoadCopyPlan`
+appends a pair only
+`if (plan.h2d_local_block_ids.empty() || plan.h2d_local_block_ids.back() != local_bid)`. -/
 def dedupAdj [DecidableEq α] : List α → List α
   | [] => []
   | [x] => [x]

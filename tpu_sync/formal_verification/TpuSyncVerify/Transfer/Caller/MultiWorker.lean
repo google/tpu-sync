@@ -4,7 +4,11 @@ import TpuSyncVerify.Transfer.Caller.Traces
 /-!
 # Multi-worker `KVOutputAggregator` model (`TpuSyncVerify.Transfer.Caller.MultiWorker`)
 
-Discharges assumption **B1** of the single-worker caller model by placing vLLM's
+Models the aggregation step that assumption **B1** of the single-worker caller
+model refers to (B1 itself — each worker publishes once, and the aggregator's
+expected count equals the number of participating workers — stays an
+assumption here: `mwPWorker` / `mwDWorker` fire once per worker and
+`mw_contract_safe` requires `expectedP = 2`, `expectedD = 2`), by placing vLLM's
 `KVOutputAggregator` (`vllm/distributed/kv_transfer/kv_connector/utils.py`,
 configured by `get_finished_count()` in `conn.py` and `tpu_connector.py`)
 between two producer workers (`w ∈ {false, true}`)
@@ -996,6 +1000,7 @@ theorem mw_earlyLoadError_fail_holds_blocks {ch : AggChannel} {s : MWS}
 
 /-! ## Bounded search and concrete multi-worker traces -/
 
+/-- Every instance of every `MWEv` constructor. -/
 def mwAllEvents : List MWEv :=
   [ .pWorker false true, .pWorker false false,
     .pWorker true true, .pWorker true false,

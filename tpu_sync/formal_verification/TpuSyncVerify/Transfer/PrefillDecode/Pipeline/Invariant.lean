@@ -75,7 +75,7 @@ structure Inv (s : Pipeline) : Prop where
   /-- Every finished copy put its layer in decode HBM. -/
   dhbm_good : ∀ l : Nat, s.h2dReadyL[l]? = some true → s.decodeHbm[l]? = some (.kv l)
   /-- `ValidateAndBeginPull` can only claim the send session once `NotifyForRead`
-  has registered the offer in `send_sessions_[uuid]`. -/
+  has registered the offer in `sessions_[uuid]`. -/
   pullStarted_registered : s.send.pullStarted = true → s.registered = true
   /-- While `HandlePullStream` is in its grace wait (`cv_.WaitWithTimeout`),
   the consumer's pull RPC is still pending and `pull_started_` is still false. -/

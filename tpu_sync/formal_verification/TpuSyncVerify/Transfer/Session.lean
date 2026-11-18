@@ -3,13 +3,15 @@
 
 The settle protocol shared by TPU Sync's session classes
 (`TransferReceiveSession`, `TransferSendSession`, `ReshardReceiveSession`,
-`ReshardSendSession`): a count of in-flight operations, a `draining_` flag
-(`finalizing_` in `ReshardSendSession`) that stops new ones, and a `done_` flag
-set by whichever of `Finish` or the last `EndRecvOp`/`EndSendOp`/`EndOp` comes
+`ReshardSendSession`, all behind the `TransferSession` interface of
+`tpu_sync/transport/transfer_session.h`): a count of in-flight operations, a
+`draining_` flag (`finalizing_` in `ReshardSendSession`) that stops new ones,
+and a `done_` flag set by whichever of `Finish` or the last `EndOp` comes
 second. The session owns its host staging until it settles.
 
 `recv.h`/`recv.cc` are `tpu_sync/kv_cache/transfer_receive_session.{h,cc}`;
-`send.h`/`send.cc` are `tpu_sync/kv_cache/transfer_send_session.{h,cc}`. Exact
+`send.h`/`send.cc` are `tpu_sync/kv_cache/transfer_send_session.{h,cc}`;
+`arena.cc` is `tpu_sync/core/staging_arena.cc`. Exact
 line ranges for every symbol and sub-block are in the generated `## Source map`
 table below.
 
@@ -19,7 +21,10 @@ table below.
 | `draining`   | `draining_`              | `draining_`              |
 | `done`       | `done_`                  | `done_`                  |
 | `statusOk`   | `status_.ok()`           | `status_.ok()`           |
-| `hasStaging` | `!staging_.empty()` (`HasStaging`); see below | `!staging_.empty()` (`HasStaging`); see below |
+| `hasStaging` | `!staging_.empty()` (reset by `ReleaseStagingLocked`); see below | `!staging_.empty()` (reset by `ReleaseStagingBlocksLocked`); see below |
+
+Neither class exposes the staging flag directly; the tests observe it as the
+allocator's free-slot count (`StagingBlockAllocator::num_free_slots`).
 
 The two classes settle the same way but decide their status differently:
 
@@ -30,34 +35,41 @@ The two classes settle the same way but decide their status differently:
   **first `Finish` wins** — once draining or done, later calls are ignored,
   whatever their status.
 
-`endOpLocked` transcribes `TransferReceiveSession::EndRecvOpLocked`, whose
-underflow branch is a no-op. The sender's `TransferSendSession::EndSendOpLocked`
-decrements unconditionally (its caller `TransferSendSession::EndSendOp` may first
-drop `mu_` to close idle data connections via `ReleaseDataConnectionsAfterSend`
-when the policy is `per_transfer` and this is the last op of a draining send,
-`const bool release_due =` .. `ReleaseDataConnectionsAfterSend`; nothing in that
-window can change `in_flight_`, `draining_` or `done_`, so the atomic
-`endOpLocked` is exact); the send model records an underflow instead of
-reusing the no-op so that its absence can be proved. `beginOp` transcribes
-`TransferReceiveSession::TryBeginRecvOp` (and the same `done_ || draining_`
-refusal before `++in_flight_` in `TransferReceiveSession::AcquireStagingSlot`,
-the op held while a push waits for a bounded host layer buffer) and the
-sender's `if (draining_) return; ++in_flight_` pattern in
-`TransferSendSession::StartPush` and `TransferSendSession::SendNextLayer`, which
-refuses on `draining_` alone; the two agree under `Consistent`.
+The remaining lifecycle operations map as follows:
 
-Both `FinishLocked`s also mirror the start of draining outside `mu_` for the
-bounded-staging wait: `cancelled_.store(true, std::memory_order_relaxed)` and
-`staging_layer_manager_.Shutdown()` wake a thread blocked in
-`StagingLayerManager::Acquire`. Neither is read by any settle decision, so
-`Lifecycle` does not carry them.
+* `endOpLocked` transcribes `TransferReceiveSession::EndRecvOpLocked`, whose
+  underflow branch is a no-op. `TransferSendSession::EndSendOpLocked` decrements
+  unconditionally; its caller `TransferSendSession::EndOp` may first drop `mu_`
+  under `per_transfer` to close idle data connections via
+  `ReleaseDataConnectionsAfterSend` (`const bool release_due =` ..
+  `ReleaseDataConnectionsAfterSend`). Because nothing in that window can change
+  `in_flight_`, `draining_`, or `done_`, atomic `endOpLocked` is exact; the send
+  model records underflow explicitly so its absence can be proved.
+* `beginOp` transcribes `TransferReceiveSession::TryBeginOp` (and the same
+  `done_ || draining_` check before `++in_flight_` in
+  `TransferReceiveSession::AcquireStagingSlot`, held while a push waits for a
+  bounded host layer buffer). On the sender, `TransferSendSession::StartPush`
+  (its D2H loop; the `if (draining_ || done_)` entry checks take no op) and
+  `TransferSendSession::SendNextLayer` refuse on `draining_` alone, which agrees
+  with `beginOp` under `Consistent`. `TransferSendSession::TryBeginOp` always
+  returns `false` (a send admits no incoming push).
+* Outside `mu_`, both `FinishLocked`s mirror the start of draining via
+  `cancelled_.store(true, std::memory_order_relaxed)` and
+  `staging_layer_manager_.Shutdown()` to wake threads blocked in
+  `StagingLayerManager::Acquire`. Neither feeds back into settle decisions, so
+  `Lifecycle` omits them.
 
-The sender acquires its staging inside `StartPush` rather than at creation (and
-on the receiver, `RegisterRecv`, fixed-slot `InitFromActivePlan`, and
-caller-supplied `local_host_block_ids` in `AllocateStagingForLoad` leave
-`staging_` empty at creation). Both models start `Lifecycle` with
-`hasStaging = true` and read the flag as "not yet released": the slot is
-actually held iff the flag is set and the acquisition happened.
+Staging ownership (`hasStaging`) starts `true` in both models and means "not yet
+released" (a slot is actually held iff the flag is set and acquisition ran):
+
+* **Send:** `NotifyForRead` acquires staging inside `StartPush`
+  (`AcquireStagingWithRetry`), not at creation. `TransferSendSession::CreateFromActivePlan`
+  acquires non-blockingly at creation only for dynamic host staging on a
+  non-pool plan with `!device_blocks.empty()`. A host-source send
+  (`source_ == BlockLocation::kHost`) acquires no staging.
+* **Receive:** `RegisterRecv`, fixed-slot `InitFromActivePlan`, and
+  caller-supplied `local_host_block_ids` in `AllocateStagingForLoad` (including
+  host-destination receives) leave `staging_` empty at creation.
 
 `Consistent` is the invariant of the protocol on its own: a settled session has
 nothing in flight and no staging, and a draining session settles as soon as its
@@ -70,26 +82,32 @@ Generated by `tools/resolve_anchors.py`.
 <!-- source-map:begin -->
 | File | Symbol / anchor | Lines |
 |---|---|---|
-| `recv.h` | `TransferReceiveSession::HasStaging` | `:114-117` |
-| `recv.h` | `TransferReceiveSession::TryBeginRecvOp` | `:121-126` |
-| `recv.h` | `TransferReceiveSession` (`StagingAllocation staging_` .. `bool done_`) | `:298-326` |
-| `recv.cc` | `TransferReceiveSession::FinishLocked` | `:449-464` |
-| `recv.cc` | `TransferReceiveSession::EndRecvOpLocked` | `:500-511` |
-| `recv.cc` | `TransferReceiveSession::AcquireStagingSlot` | `:760-784` |
-| `recv.cc` | `TransferReceiveSession::OnBlockShardsReceived` (`if (done_ || draining_)`) | `:724-726` |
-| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` | `:786-925` |
-| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`if (self->done_)`) | `:876-879` |
-| `send.h` | `TransferSendSession::HasStaging` | `:92-95` |
-| `send.h` | `TransferSendSession` (`StagingAllocation staging_` .. `bool done_`) | `:216-234` |
-| `send.cc` | `TransferSendSession::AcquireStagingSlot` | `:197-226` |
-| `send.cc` | `TransferSendSession::LookupStagingSlot` | `:228-243` |
-| `send.cc` | `TransferSendSession::FinishLocked` | `:245-260` |
-| `send.cc` | `TransferSendSession::EndSendOpLocked` | `:307-314` |
-| `send.cc` | `TransferSendSession::EndSendOp` | `:316-343` |
-| `send.cc` | `TransferSendSession::EndSendOp` (`const bool release_due =` .. `ReleaseDataConnectionsAfterSend`) | `:330-341` |
-| `send.cc` | `TransferSendSession::AcquireStagingWithRetry` | `:376-410` |
-| `send.cc` | `TransferSendSession::StartPush` (`if (draining_ || done_)` .. `++in_flight_;`) | `:446-521` |
-| `send.cc` | `TransferSendSession::SendNextLayer` (`if (draining_ || l >= d2h_layer_futures_.size())` .. `++self->in_flight_;`) | `:572-620` |
+| `recv.h` | `TransferReceiveSession` (`bool TryBeginOp() override;` .. `void EndOp() override;`) | `:135-136` |
+| `recv.h` | `TransferReceiveSession` (`StagingAllocation staging_` .. `bool done_`) | `:322-352` |
+| `recv.cc` | `TransferReceiveSession::ReleaseStagingLocked` | `:380-383` |
+| `recv.cc` | `TransferReceiveSession::FinishLocked` | `:390-405` |
+| `recv.cc` | `TransferReceiveSession::EndRecvOpLocked` | `:443-454` |
+| `recv.cc` | `TransferReceiveSession::TryBeginOp` | `:456-467` |
+| `recv.cc` | `TransferReceiveSession::EndOp` | `:469-472` |
+| `recv.cc` | `TransferReceiveSession::AcquireStagingSlot` | `:680-709` |
+| `recv.cc` | `TransferReceiveSession::RecordBlockShards` (`if (done_ || draining_ || total_blocks_ == 0)`) | `:644-646` |
+| `recv.cc` | `TransferReceiveSession::SettleHostLayer` | `:742-769` |
+| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` | `:771-903` |
+| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`if (self->done_)`) | `:851-854` |
+| `send.h` | `TransferSendSession` (`bool TryBeginOp() override { return false; }`) | `:98` |
+| `send.h` | `TransferSendSession` (`StagingAllocation staging_` .. `bool done_`) | `:233-246` |
+| `send.cc` | `TransferSendSession::CreateFromActivePlan` | `:93-144` |
+| `send.cc` | `TransferSendSession::ReleaseStagingBlocksLocked` | `:225-229` |
+| `send.cc` | `TransferSendSession::AcquireStagingSlot` | `:236-265` |
+| `send.cc` | `TransferSendSession::LookupStagingSlot` | `:267-286` |
+| `send.cc` | `TransferSendSession::FinishLocked` | `:288-303` |
+| `send.cc` | `TransferSendSession::EndSendOpLocked` | `:364-371` |
+| `send.cc` | `TransferSendSession::EndOp` | `:373-400` |
+| `send.cc` | `TransferSendSession::EndOp` (`const bool release_due =` .. `ReleaseDataConnectionsAfterSend`) | `:387-398` |
+| `send.cc` | `TransferSendSession::AcquireStagingWithRetry` | `:433-467` |
+| `send.cc` | `TransferSendSession::StartPush` (`if (source_ == BlockLocation::kHost)` .. `++in_flight_;`) | `:488-602` |
+| `send.cc` | `TransferSendSession::SendNextLayer` (`if (draining_ || l >= d2h_layer_futures_.size())` .. `++self->in_flight_;`) | `:653-701` |
+| `arena.cc` | `StagingBlockAllocator::num_free_slots` | `:555-558` |
 <!-- source-map:end -->
 -/
 
@@ -132,7 +150,7 @@ def finishOnceLocked (ok : Bool) (l : Lifecycle) : Lifecycle :=
 def endOpLocked (l : Lifecycle) : Lifecycle :=
   if l.inFlight = 0 then l else settleLocked { l with inFlight := l.inFlight - 1 }
 
-/-- `TransferReceiveSession::TryBeginRecvOp`: refused once settled or draining. -/
+/-- `TransferReceiveSession::TryBeginOp`: refused once settled or draining. -/
 def beginOp (l : Lifecycle) : Option Lifecycle :=
   if l.done = true ∨ l.draining = true then none
   else some { l with inFlight := l.inFlight + 1 }
@@ -447,11 +465,15 @@ Audit of the `done_` mentions in the receiver's lifecycle guards (`recv`).
 * `TransferReceiveSession::EndRecvOpLocked`
   (`if (draining_ && in_flight_ == 0 && !done_)`): past the underflow return
   (`if (in_flight_ <= 0)`), `!done_` holds — `Consistent.not_done_of_inFlight`;
-* `done_ || draining_` in `TransferReceiveSession::TryBeginRecvOp`,
-  `TransferReceiveSession::OnBlockShardsReceived`, both checks in
+* `done_ || draining_` in `TransferReceiveSession::TryBeginOp`,
+  `TransferReceiveSession::RecordBlockShards`,
+  `TransferReceiveSession::SettleHostLayer`, both checks in
   `TransferReceiveSession::AcquireStagingSlot`, and both checks in
   `TransferReceiveSession::ExecuteLayerH2d` is `draining_` —
-  `Consistent.done_or_draining`.
+  `Consistent.done_or_draining` (the `total_blocks_ == 0` disjunct in
+  `RecordBlockShards` and the first check of `ExecuteLayerH2d` is a
+  registration property, A2 of `PrefillDecode/Receive.lean`, not a lifecycle
+  guard).
 
 The sender has `TransferSendSession::FinishLocked` (`if (draining_ || done_) return;`)
 and `TransferSendSession::EndSendOpLocked` (`if (draining_ && in_flight_ == 0 && !done_)`),
@@ -484,7 +506,7 @@ def finishLocked' (ok : Bool) (l : Lifecycle) : Lifecycle :=
 def endOpLocked' (l : Lifecycle) : Lifecycle :=
   if l.inFlight = 0 then l else settleLocked' { l with inFlight := l.inFlight - 1 }
 
-/-- `TryBeginRecvOp` refusing on `draining_` alone (the sender's pattern). -/
+/-- `TryBeginOp` refusing on `draining_` alone (the sender's pattern). -/
 def beginOp' (l : Lifecycle) : Option Lifecycle :=
   if l.draining = true then none else some { l with inFlight := l.inFlight + 1 }
 

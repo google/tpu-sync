@@ -25,37 +25,37 @@
 
 namespace tpu_raiden::weight_sync {
 
-// The longest version (`WeightVersion.tag`), in bytes.
+// Maximum length of `WeightVersion.tag`, in bytes.
 // TODO(raiden-eng): Confirm with the first clients.
 inline constexpr size_t kMaxWeightVersionBytes = 256;
 
-// The version of a model's weights (see tpu_sync.rpc.WeightVersion): opaque
-// bytes, 1 to kMaxWeightVersionBytes long, that name one set of weights and are
-// never reused for different weights. Versions are compared bytewise for
-// equality and never parsed, ordered or hashed. Only FromBytes() and
-// FromProto() build one, so every WeightVersion is valid; callers use
-// std::nullopt for "no version".
+// Opaque version identifier for a set of weights (0 to kMaxWeightVersionBytes
+// bytes), compared bytewise for equality. Empty bytes denote the default
+// version (version 0).
 class WeightVersion final {
  public:
-  WeightVersion() = delete;  // "No version" is std::nullopt, not an empty one.
+  // Constructs the default version (version 0, empty tag).
+  WeightVersion() = default;
 
-  // Returns the version `bytes`, or InvalidArgument naming `field` (for
-  // example "PrepareWeightReceive (uuid=3) version") if `bytes` is empty, which
-  // names no version, or longer than kMaxWeightVersionBytes, naming both sizes.
+  static WeightVersion Default() { return WeightVersion(); }
+
+  // Returns the version for `bytes` (empty denotes Default()), or
+  // InvalidArgument if longer than kMaxWeightVersionBytes.
   static absl::StatusOr<WeightVersion> FromBytes(absl::string_view bytes,
                                                  absl::string_view field);
 
-  // FromBytes() of `proto.tag()`; an unset message has an empty tag.
+  // Parses `proto.tag()`; an unset proto maps to Default().
   static absl::StatusOr<WeightVersion> FromProto(
       const tpu_sync::rpc::WeightVersion& proto, absl::string_view field);
 
   tpu_sync::rpc::WeightVersion ToProto() const;
 
+  bool is_default() const { return bytes_.empty(); }
+
   friend bool operator==(const WeightVersion&, const WeightVersion&) = default;
 
-  // Formats `version` as logs and errors show it: version(len=N, "E"), where E
-  // is absl::CHexEscape of at most the first 64 bytes, followed by "…" only
-  // when longer.
+  // Formats as "version(default)" or version(len=N, "E") with at most 64
+  // escaped bytes.
   template <typename Sink>
   friend void AbslStringify(Sink& sink, const WeightVersion& version) {
     sink.Append(version.FormatVersionBytes());

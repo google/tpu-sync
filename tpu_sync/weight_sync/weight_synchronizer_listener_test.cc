@@ -87,8 +87,10 @@ using ::testing::status::StatusIs;
 using ::tpu_sync::rpc::Chunks;
 using ::tpu_sync::rpc::ControlRequest;
 using ::tpu_sync::rpc::ControlResponse;
+using ::tpu_sync::rpc::DirectPush;
 using ::tpu_sync::rpc::PrepareWeightReceiveRequest;
 using ::tpu_sync::rpc::PrepareWeightReceiveResponse;
+using ::tpu_sync::rpc::PushDestination;
 using ::tpu_sync::rpc::ShardPushEntryProto;
 using ::tpu_sync::rpc::ShardPushScheduleProto;
 using ::tpu_sync::rpc::StartTransferRequest;
@@ -754,7 +756,8 @@ StartWeightPushRequest MakeSwapPushRequest(int64_t uuid,
   req.set_uuid(uuid);
   for (int shard = 0; shard < 2; ++shard) {
     ShardPushEntryProto* entry =
-        (*req.mutable_shard_push_schedules())[shard].add_entries();
+        (*req.mutable_coordinated()->mutable_shard_push_schedules())[shard]
+            .add_entries();
     entry->add_dst_peers(dst_peer);
     entry->set_dst_shard_idx(0);
     entry->set_src_offset_bytes(0);
@@ -762,6 +765,30 @@ StartWeightPushRequest MakeSwapPushRequest(int64_t uuid,
     entry->set_size_bytes(kSrcShardBytes);
     entry->set_layer_idx(0);
   }
+  return req;
+}
+
+// Push `uuid` of version "v7" in mode `direct` from kSender to two
+// destinations, by a schedule of source shard 0 and by identity of receiver
+// shard 0. Valid, so the listener answers it with the stub of mode `direct`.
+StartWeightPushRequest MakeDirectPushRequest(int64_t uuid) {
+  StartWeightPushRequest req;
+  req.set_uuid(uuid);
+  req.mutable_version()->set_tag("v7");
+  DirectPush& direct = *req.mutable_direct();
+  direct.set_sender(kSender);
+  for (const char* endpoint : {kEndpoint1, kEndpoint2}) {
+    PushDestination& destination = *direct.add_destinations();
+    destination.set_listener_endpoint(endpoint);
+    destination.add_expected_senders(kSender);
+  }
+  ShardPushEntryProto& entry = *(*direct.mutable_destinations(0)
+                                      ->mutable_schedules()
+                                      ->mutable_shard_push_schedules())[0]
+                                    .add_entries();
+  entry.set_size_bytes(kSrcShardBytes);
+  entry.set_layer_idx(0);
+  direct.mutable_destinations(1)->mutable_identity()->add_global_shards(0);
   return req;
 }
 
@@ -909,11 +936,6 @@ TEST(WeightSynchronizerListenerTest, RendezvousRequestsRejectInvalidFields) {
   EXPECT_THAT(
       SendPrepare(listener, MakePrepareRequest(/*uuid=*/0, /*num_chunks=*/2)),
       StatusIs(absl::StatusCode::kInvalidArgument, HasSubstr("positive uuid")));
-  PrepareWeightReceiveRequest no_version = MakePrepareRequest(kPushUuid, 2);
-  no_version.clear_version();
-  EXPECT_THAT(
-      SendPrepare(listener, no_version),
-      StatusIs(absl::StatusCode::kInvalidArgument, HasSubstr("no version")));
   // A negative count, which the other sender's counts would hide in the sum.
   PrepareWeightReceiveRequest negative = MakePrepareRequest(kPushUuid, 3);
   AddSender(negative, "trainer/1", -1);
@@ -934,7 +956,7 @@ TEST(WeightSynchronizerListenerTest, RendezvousRequestsRejectInvalidFields) {
       SendStartPush(listener, MakeSwapPushRequest(/*uuid=*/0, dst_peer)),
       StatusIs(absl::StatusCode::kInvalidArgument, HasSubstr("positive uuid")));
   StartWeightPushRequest no_layer = MakeSwapPushRequest(kPushUuid, dst_peer);
-  (*no_layer.mutable_shard_push_schedules())[1]
+  (*no_layer.mutable_coordinated()->mutable_shard_push_schedules())[1]
       .mutable_entries(0)
       ->clear_layer_idx();
   EXPECT_THAT(
@@ -943,27 +965,29 @@ TEST(WeightSynchronizerListenerTest, RendezvousRequestsRejectInvalidFields) {
 }
 
 TEST(WeightSynchronizerListenerTest,
-     PrepareWeightReceiveTakesVersionsOfOneToMaxBytes) {
+     PrepareWeightReceiveTakesDefaultAndValidVersions) {
   TF_ASSERT_OK_AND_ASSIGN(
       std::unique_ptr<WeightSynchronizerBase> engine,
       CreateShardedCpuEngine(/*num_shards=*/1, 2 * kSrcShardBytes));
   WeightSynchronizerListener listener(engine.get(), /*listener_port=*/0);
 
-  PrepareWeightReceiveRequest req = MakePrepareRequest(kPushUuid, 2);
-  req.mutable_version()->set_tag("");
-  EXPECT_THAT(SendPrepare(listener, req),
-              StatusIs(absl::StatusCode::kInvalidArgument,
-                       HasSubstr("(uuid=4242) version is empty: the request "
-                                 "carries no version")));
-  req.mutable_version()->set_tag(std::string(kMaxWeightVersionBytes + 1, 'x'));
-  EXPECT_THAT(SendPrepare(listener, req),
+  PrepareWeightReceiveRequest overlong = MakePrepareRequest(kPushUuid, 2);
+  overlong.mutable_version()->set_tag(
+      std::string(kMaxWeightVersionBytes + 1, 'x'));
+  EXPECT_THAT(SendPrepare(listener, overlong),
               StatusIs(absl::StatusCode::kInvalidArgument,
                        HasSubstr("version has 257 bytes, more than "
                                  "kMaxWeightVersionBytes=256")));
 
-  for (size_t size : {size_t{1}, kMaxWeightVersionBytes}) {
+  // Unset version (default version 0) and 0..256 byte tags are all valid.
+  PrepareWeightReceiveRequest unset_version =
+      MakePrepareRequest(kPushUuid + 1, 2);
+  unset_version.clear_version();
+  ABSL_EXPECT_OK(SendPrepare(listener, unset_version));
+
+  for (size_t size : {size_t{0}, size_t{1}, kMaxWeightVersionBytes}) {
     PrepareWeightReceiveRequest valid =
-        MakePrepareRequest(kPushUuid + static_cast<int64_t>(size), 2);
+        MakePrepareRequest(kPushUuid + 2 + static_cast<int64_t>(size), 2);
     valid.mutable_version()->set_tag(std::string(size, 'x'));
     ABSL_EXPECT_OK(SendPrepare(listener, valid)) << size << " bytes";
   }
@@ -1237,7 +1261,8 @@ TEST(WeightSynchronizerListenerTest, StartWeightPushForwardsItsFieldsToPush) {
   (*req.mutable_skip_tiling())[0] = true;
   req.set_parallelism(3);
   req.set_req_id("push-7");
-  (*req.mutable_peer_control_endpoints())[kPeerA] = kEndpoint1;
+  (*req.mutable_coordinated()->mutable_peer_control_endpoints())[kPeerA] =
+      kEndpoint1;
 
   ABSL_ASSERT_OK(SendStartPush(listener, req));
   const StartTransferRequest pushed = engine.pushed();
@@ -1255,6 +1280,187 @@ TEST(WeightSynchronizerListenerTest, StartWeightPushForwardsItsFieldsToPush) {
 }
 
 TEST(WeightSynchronizerListenerTest,
+     StartWeightPushHandlesModesVersionAndTimeout) {
+  PushCapturingEngine engine;
+  ABSL_ASSERT_OK(engine.Init());
+  WeightSynchronizerListener listener(&engine, /*listener_port=*/0);
+
+  StartWeightPushRequest no_mode = MakeSwapPushRequest(kPushUuid, kPeerA);
+  no_mode.clear_mode();
+  EXPECT_THAT(
+      SendStartPush(listener, no_mode),
+      StatusIs(absl::StatusCode::kInvalidArgument, HasSubstr("no mode")));
+  // Direct mode accepts default (unset) and explicit versions before its stub.
+  StartWeightPushRequest direct = MakeDirectPushRequest(kPushUuid);
+  direct.clear_version();
+  EXPECT_THAT(
+      SendStartPush(listener, direct),
+      StatusIs(absl::StatusCode::kUnimplemented,
+               HasSubstr("(uuid=4242) sets mode direct; direct pushes are not "
+                         "implemented yet")));
+  direct.mutable_version()->set_tag("v7");
+  EXPECT_THAT(
+      SendStartPush(listener, direct),
+      StatusIs(absl::StatusCode::kUnimplemented,
+               HasSubstr("(uuid=4242) sets mode direct; direct pushes are not "
+                         "implemented yet")));
+  StartWeightPushRequest overlong = MakeSwapPushRequest(kPushUuid, kPeerA);
+  overlong.mutable_version()->set_tag(
+      std::string(kMaxWeightVersionBytes + 1, 'x'));
+  EXPECT_THAT(SendStartPush(listener, overlong),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("version has 257 bytes, more than "
+                                 "kMaxWeightVersionBytes=256")));
+  EXPECT_EQ(engine.pushed().uuid(), 0);
+
+  // Coordinated pushes accept default version 0 and ignore valid version and
+  // timeout_ms for now, forwarding straight to PushWeightsResharded().
+  StartWeightPushRequest versioned_and_bounded =
+      MakeSwapPushRequest(kPushUuid, kPeerA);
+  versioned_and_bounded.mutable_version()->set_tag("v7");
+  versioned_and_bounded.set_timeout_ms(1000);
+  ABSL_ASSERT_OK(SendStartPush(listener, versioned_and_bounded));
+  EXPECT_EQ(engine.pushed().uuid(), kPushUuid);
+
+  ABSL_ASSERT_OK(
+      SendStartPush(listener, MakeSwapPushRequest(kPushUuid + 1, kPeerA)));
+  EXPECT_EQ(engine.pushed().uuid(), kPushUuid + 1);
+}
+
+TEST(WeightSynchronizerListenerTest, StartWeightPushValidatesBeforeItsStubs) {
+  PushCapturingEngine engine;
+  ABSL_ASSERT_OK(engine.Init());
+  WeightSynchronizerListener listener(&engine, /*listener_port=*/0);
+  constexpr int64_t kHourMs = 60 * 60 * 1000;
+
+  StartWeightPushRequest direct = MakeDirectPushRequest(kPushUuid);
+  direct.set_target_incarnation_id(engine.incarnation_id() + 1);
+  EXPECT_THAT(SendStartPush(listener, direct),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("targets incarnation_id")));
+  StartWeightPushRequest versioned = MakeSwapPushRequest(kPushUuid, kPeerA);
+  versioned.mutable_version()->set_tag("v7");
+  (*versioned.mutable_coordinated()->mutable_shard_push_schedules())[1]
+      .mutable_entries(0)
+      ->clear_layer_idx();
+  EXPECT_THAT(
+      SendStartPush(listener, versioned),
+      StatusIs(absl::StatusCode::kInvalidArgument, HasSubstr("layer_idx")));
+  // Out-of-range timeouts are invalid.
+  StartWeightPushRequest bounded = MakeSwapPushRequest(kPushUuid, kPeerA);
+  bounded.mutable_version()->set_tag("v7");
+  bounded.set_timeout_ms(-1);
+  EXPECT_THAT(SendStartPush(listener, bounded),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("(uuid=4242) timeout_ms must be in [0, 1h]; "
+                                 "got -1")));
+  bounded.set_timeout_ms(kHourMs + 1);
+  EXPECT_THAT(SendStartPush(listener, bounded),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("(uuid=4242) timeout_ms must be in [0, 1h]; "
+                                 "got 3600001")));
+  // An overlong version is rejected even when timeout_ms is at its upper bound.
+  bounded.set_timeout_ms(kHourMs);
+  bounded.mutable_version()->set_tag(
+      std::string(kMaxWeightVersionBytes + 1, 'x'));
+  EXPECT_THAT(SendStartPush(listener, bounded),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("kMaxWeightVersionBytes=256")));
+  // Out-of-range direct push receive deadlines are invalid before mode direct's
+  // stub.
+  StartWeightPushRequest direct_deadline = MakeDirectPushRequest(kPushUuid);
+  direct_deadline.mutable_direct()->set_receive_timeout_ms(-1);
+  EXPECT_THAT(
+      SendStartPush(listener, direct_deadline),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("(uuid=4242) direct.receive_timeout_ms must be in "
+                         "[0, 1h]; got -1")));
+  direct_deadline.mutable_direct()->set_receive_timeout_ms(kHourMs + 1);
+  EXPECT_THAT(
+      SendStartPush(listener, direct_deadline),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("(uuid=4242) direct.receive_timeout_ms must be "
+                         "in [0, 1h]; got 3600001")));
+  direct_deadline.mutable_direct()->set_receive_timeout_ms(kHourMs);
+  EXPECT_THAT(SendStartPush(listener, direct_deadline),
+              StatusIs(absl::StatusCode::kUnimplemented,
+                       HasSubstr("sets mode direct; direct pushes are not "
+                                 "implemented yet")));
+  EXPECT_EQ(engine.pushed().uuid(), 0);
+
+  // At the upper bound (1h), a coordinated push succeeds (timeout_ms ignored).
+  bounded.clear_version();
+  ABSL_ASSERT_OK(SendStartPush(listener, bounded));
+  EXPECT_EQ(engine.pushed().uuid(), kPushUuid);
+}
+
+TEST(WeightSynchronizerListenerTest,
+     StartWeightPushValidatesDirectPushesBeforeTheirStub) {
+  PushCapturingEngine engine;
+  ABSL_ASSERT_OK(engine.Init());
+  WeightSynchronizerListener listener(&engine, /*listener_port=*/0);
+
+  // A valid direct push reaches the stub of mode `direct`. Each request below
+  // breaks one rule of it and gets InvalidArgument instead, so every check
+  // runs before the stub.
+  EXPECT_THAT(SendStartPush(listener, MakeDirectPushRequest(kPushUuid)),
+              StatusIs(absl::StatusCode::kUnimplemented,
+                       HasSubstr("(uuid=4242) sets mode direct; direct pushes "
+                                 "are not implemented yet")));
+  StartWeightPushRequest no_sender = MakeDirectPushRequest(kPushUuid);
+  no_sender.mutable_direct()->clear_sender();
+  EXPECT_THAT(SendStartPush(listener, no_sender),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("(uuid=4242) sets no direct.sender")));
+  StartWeightPushRequest reserved = MakeDirectPushRequest(kPushUuid);
+  reserved.mutable_direct()->set_sender("raiden/pull");
+  EXPECT_THAT(SendStartPush(listener, reserved),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("sets direct.sender 'raiden/pull'; ids "
+                                 "starting with raiden/ are reserved")));
+  StartWeightPushRequest no_destinations = MakeDirectPushRequest(kPushUuid);
+  no_destinations.mutable_direct()->clear_destinations();
+  EXPECT_THAT(SendStartPush(listener, no_destinations),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("sets no direct.destinations")));
+  StartWeightPushRequest no_endpoint = MakeDirectPushRequest(kPushUuid);
+  no_endpoint.mutable_direct()
+      ->mutable_destinations(1)
+      ->clear_listener_endpoint();
+  EXPECT_THAT(
+      SendStartPush(listener, no_endpoint),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("sets no direct.destinations[1].listener_endpoint")));
+  StartWeightPushRequest no_plan = MakeDirectPushRequest(kPushUuid);
+  no_plan.mutable_direct()->mutable_destinations(1)->clear_plan();
+  EXPECT_THAT(SendStartPush(listener, no_plan),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("sets no direct.destinations[1].plan")));
+  StartWeightPushRequest unexpected = MakeDirectPushRequest(kPushUuid);
+  unexpected.mutable_direct()->mutable_destinations(1)->set_expected_senders(
+      0, "trainer/1");
+  EXPECT_THAT(SendStartPush(listener, unexpected),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("sets direct.destinations[1].expected_senders "
+                                 "to [trainer/1], which lacks "
+                                 "direct.sender 'trainer/0'")));
+  // The receive deadline must be at least the push deadline.
+  StartWeightPushRequest deadlines = MakeDirectPushRequest(kPushUuid);
+  deadlines.set_timeout_ms(1000);
+  deadlines.mutable_direct()->set_receive_timeout_ms(999);
+  EXPECT_THAT(SendStartPush(listener, deadlines),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("sets direct.receive_timeout_ms=999, less "
+                                 "than timeout_ms=1000")));
+  deadlines.mutable_direct()->set_receive_timeout_ms(1000);
+  EXPECT_THAT(SendStartPush(listener, deadlines),
+              StatusIs(absl::StatusCode::kUnimplemented,
+                       HasSubstr("sets mode direct; direct pushes are not "
+                                 "implemented yet")));
+  EXPECT_EQ(engine.pushed().uuid(), 0);
+}
+
+TEST(WeightSynchronizerListenerTest,
      StartWeightPushNamesDestinationsWithoutPeerControlEndpoints) {
   absl::FlagSaver flag_saver;
   absl::SetFlag(&FLAGS_peregrine_enable_psp_tcp, true);
@@ -1266,9 +1472,11 @@ TEST(WeightSynchronizerListenerTest,
   WeightSynchronizerListener listener(src.get(), /*listener_port=*/0,
                                       ControlPipeBackendType::kGrpc);
   StartWeightPushRequest push = MakeSwapPushRequest(kPushUuid, kPeerA);
-  (*push.mutable_shard_push_schedules())[1].mutable_entries(0)->set_dst_peers(
-      0, kPeerB);
-  (*push.mutable_peer_control_endpoints())[kPeerA] = kEndpoint1;
+  (*push.mutable_coordinated()->mutable_shard_push_schedules())[1]
+      .mutable_entries(0)
+      ->set_dst_peers(0, kPeerB);
+  (*push.mutable_coordinated()->mutable_peer_control_endpoints())[kPeerA] =
+      kEndpoint1;
 
   // Fails before anything is sent, naming only the destination without an
   // endpoint.

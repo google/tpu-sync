@@ -28,35 +28,42 @@ namespace {
 
 using ::absl_testing::StatusIs;
 
-TEST(WeightVersionTest, FromBytesTakesOneToMaxBytes) {
-  for (const std::string& bytes :
-       {std::string("v"), std::string(kMaxWeightVersionBytes, 'x')}) {
+TEST(WeightVersionTest, DefaultAndEmptyBytesMapToVersionZero) {
+  const WeightVersion default_version = WeightVersion::Default();
+  EXPECT_TRUE(default_version.is_default());
+  EXPECT_EQ(default_version, WeightVersion());
+  EXPECT_TRUE(default_version.ToProto().tag().empty());
+
+  TF_ASSERT_OK_AND_ASSIGN(const WeightVersion from_empty,
+                       WeightVersion::FromBytes("", "version"));
+  TF_ASSERT_OK_AND_ASSIGN(
+      const WeightVersion from_unset_proto,
+      WeightVersion::FromProto(tpu_sync::rpc::WeightVersion(), "version"));
+  EXPECT_EQ(from_empty, default_version);
+  EXPECT_EQ(from_unset_proto, default_version);
+
+  TF_ASSERT_OK_AND_ASSIGN(const WeightVersion explicit_zero,
+                       WeightVersion::FromBytes("0", "version"));
+  EXPECT_FALSE(explicit_zero.is_default());
+  EXPECT_NE(default_version, explicit_zero);
+}
+
+TEST(WeightVersionTest, FromBytesTakesZeroToMaxBytes) {
+  for (const std::string& bytes : {std::string(""), std::string("v"),
+                                   std::string(kMaxWeightVersionBytes, 'x')}) {
     TF_ASSERT_OK_AND_ASSIGN(const WeightVersion version,
                          WeightVersion::FromBytes(bytes, "version"));
     EXPECT_EQ(version.ToProto().tag(), bytes);
   }
 }
 
-TEST(WeightVersionTest, FromBytesRejectsEmptyAndOverlongBytes) {
-  EXPECT_THAT(
-      WeightVersion::FromBytes("", "PrepareWeightReceive (uuid=3) version"),
-      StatusIs(absl::StatusCode::kInvalidArgument,
-               "PrepareWeightReceive (uuid=3) version is empty: the request "
-               "carries no version"));
+TEST(WeightVersionTest, FromBytesAndFromProtoRejectOverlongBytes) {
   EXPECT_THAT(
       WeightVersion::FromBytes(std::string(kMaxWeightVersionBytes + 1, 'x'),
                                "PrepareWeightReceive (uuid=3) version"),
       StatusIs(absl::StatusCode::kInvalidArgument,
                "PrepareWeightReceive (uuid=3) version has 257 bytes, more than "
                "kMaxWeightVersionBytes=256"));
-}
-
-TEST(WeightVersionTest, FromProtoRejectsAnUnsetAndAnOverlongTag) {
-  EXPECT_THAT(WeightVersion::FromProto(tpu_sync::rpc::WeightVersion(),
-                                       "PrepareWeightReceive version"),
-              StatusIs(absl::StatusCode::kInvalidArgument,
-                       "PrepareWeightReceive version is empty: the request "
-                       "carries no version"));
   tpu_sync::rpc::WeightVersion overlong;
   overlong.set_tag(std::string(kMaxWeightVersionBytes + 1, 'x'));
   EXPECT_THAT(
@@ -75,6 +82,7 @@ TEST(WeightVersionTest, FromProtoReadsTheTagAndToProtoWritesIt) {
                        WeightVersion::FromBytes("step-7", "version"));
 
   EXPECT_EQ(version, step_7);
+  EXPECT_FALSE(version.is_default());
   EXPECT_EQ(version.ToProto().tag(), "step-7");
 }
 
@@ -94,7 +102,9 @@ TEST(WeightVersionTest, EqualityIsBytewise) {
   EXPECT_NE(v7, v7_nul);
 }
 
-TEST(WeightVersionTest, PrintsTheLengthAndAtMost64EscapedBytes) {
+TEST(WeightVersionTest, PrintsDefaultOrLengthAndAtMost64EscapedBytes) {
+  EXPECT_EQ(absl::StrCat(WeightVersion::Default()), "version(default)");
+
   TF_ASSERT_OK_AND_ASSIGN(const WeightVersion short_version,
                        WeightVersion::FromBytes("v7", "version"));
   EXPECT_EQ(absl::StrCat(short_version), "version(len=2, \"v7\")");

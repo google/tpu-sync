@@ -36,17 +36,18 @@ class WeightSynchronizerBase;
 // Control-Plane Server Daemon that runs natively in C++ to accept management
 // RPC commands (like PushWeights and Shutdown) directly via ControlPipeServer.
 //
-// The listener also serves the two-phase weight push rendezvous of
+// The listener also serves the coordinated weight push of
 // weight_transfer_worker_service.proto, which moves one weight version from S
 // source workers to D destination workers with D + S control RPCs, all sent by
-// the controller to the workers' listeners:
+// the coordinator to the workers' listeners:
 //   1. A PrepareWeightReceiveRequest to each destination (D RPCs, in
-//      parallel) registers the chunks the destination expects and returns
-//      before any data moves.
-//   2. Once every destination has answered, a StartWeightPushRequest to each
-//      source (S RPCs, in parallel) makes the source stream its scheduled
-//      slices straight to the destinations' data endpoints over TCP. The
-//      source answers once the destinations have acknowledged every slice.
+//      parallel), carrying the chunk counts of every source, registers the
+//      chunks the destination expects and returns before any data moves.
+//   2. Once every destination has answered, a StartWeightPushRequest in mode
+//      `coordinated` to each source (S RPCs, in parallel) makes the source
+//      stream its scheduled slices straight to the destinations' data
+//      endpoints over TCP. The source answers once the destinations have
+//      acknowledged every slice.
 // A destination's transfer completes once all of its expected chunks have
 // arrived. Apart from the PSP-TCP key exchange, which a source runs with each
 // destination's listener when PSP-TCP is required, workers send each other no
@@ -127,26 +128,16 @@ class WeightSynchronizerListener final {
   absl::StatusOr<::tpu_sync::rpc::ControlResponse> HandleControlRequest(
       const ::tpu_sync::rpc::ControlRequest& req);
 
-  // Step 1 of the rendezvous on a destination worker: registers the incoming
-  // transfer like a receiver COMMAND_START_TRANSFER, expecting per layer the
-  // sum of every sender's chunk counts. Returns Unavailable once the listener
-  // is stopping, FailedPrecondition if a non-zero `req.target_incarnation_id`
-  // is not the engine's incarnation_id(), InvalidArgument if `req.uuid` is not
-  // positive, `req.version` is empty or over 256 bytes,
-  // `req.receive_timeout_ms` is negative or over an hour, or the expected
-  // senders or chunk counts are invalid, and Unimplemented, stating what is not
-  // implemented yet, for a positive `req.receive_timeout_ms` and `req.chunks`
-  // that cover only some expected senders. `req.version` is not recorded yet.
+  // Step 1 of a coordinated push on a destination worker: registers the
+  // incoming transfer with the summed per-layer chunk counts. `req.version`
+  // (empty = default version 0) is validated and not recorded yet.
   absl::StatusOr<::tpu_sync::rpc::PrepareWeightReceiveResponse>
   HandlePrepareWeightReceive(
       const ::tpu_sync::rpc::PrepareWeightReceiveRequest& req);
 
-  // Step 2 of the rendezvous on a source worker: pushes the scheduled slices
-  // with PushWeightsResharded(). Returns Unavailable once the listener is
-  // stopping, FailedPrecondition if a non-zero `req.target_incarnation_id` is
-  // not the engine's incarnation_id() or, when the engine requires PSP-TCP, if
-  // `req.peer_control_endpoints` lacks a destination, and InvalidArgument if
-  // `req.uuid` is not positive or a schedule entry has no `layer_idx`.
+  // Step 2 of a weight push on a source worker: validates the request, returns
+  // Unimplemented for mode `direct`, and executes `req.coordinated()` via
+  // PushWeightsResharded() (ignoring valid `version` and `timeout_ms` for now).
   absl::StatusOr<::tpu_sync::rpc::StartWeightPushResponse>
   HandleStartWeightPush(const ::tpu_sync::rpc::StartWeightPushRequest& req);
 

@@ -104,6 +104,58 @@ absl::Status RejectReservedSenders(
   return absl::OkStatus();
 }
 
+// Returns InvalidArgument naming the field if direct push `direct` of
+// `push_name`, with push deadline `timeout_ms`, is malformed. Schedule keys and
+// identity shards need the engine's shards and are not checked yet.
+absl::Status CheckDirectPush(absl::string_view push_name,
+                             const ::tpu_sync::rpc::DirectPush& direct,
+                             int64_t timeout_ms) {
+  const std::string& sender = direct.sender();
+  if (sender.empty()) {
+    return absl::InvalidArgumentError(
+        absl::StrCat(push_name, " sets no direct.sender"));
+  }
+  if (absl::StartsWith(sender, kReservedSenderPrefix)) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        push_name, " sets direct.sender '", sender, "'; ids starting with ",
+        kReservedSenderPrefix, " are reserved"));
+  }
+  if (direct.destinations().empty()) {
+    return absl::InvalidArgumentError(
+        absl::StrCat(push_name, " sets no direct.destinations"));
+  }
+  for (int i = 0; i < direct.destinations_size(); ++i) {
+    const ::tpu_sync::rpc::PushDestination& destination =
+        direct.destinations(i);
+    const std::string field = absl::StrCat("direct.destinations[", i, "]");
+    if (destination.listener_endpoint().empty()) {
+      return absl::InvalidArgumentError(
+          absl::StrCat(push_name, " sets no ", field, ".listener_endpoint"));
+    }
+    if (destination.plan_case() ==
+        ::tpu_sync::rpc::PushDestination::PLAN_NOT_SET) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          push_name, " sets no ", field, ".plan; set schedules or identity"));
+    }
+    const auto& senders = destination.expected_senders();
+    if (std::find(senders.begin(), senders.end(), sender) == senders.end()) {
+      return absl::InvalidArgumentError(
+          absl::StrCat(push_name, " sets ", field, ".expected_senders to [",
+                       absl::StrJoin(senders, ", "),
+                       "], which lacks direct.sender '", sender, "'"));
+    }
+  }
+  // The receive must not time out before the push. 0 sets no deadline (valid
+  // only until deadlines are implemented), so only positive deadlines compare.
+  if (timeout_ms > 0 && direct.receive_timeout_ms() > 0 &&
+      direct.receive_timeout_ms() < timeout_ms) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        push_name, " sets direct.receive_timeout_ms=",
+        direct.receive_timeout_ms(), ", less than timeout_ms=", timeout_ms));
+  }
+  return absl::OkStatus();
+}
+
 // The most chunks a receive can expect, in total and from one sender per
 // layer: the transport counts a transfer's chunks in 32 bits.
 constexpr int64_t kMaxReceiveChunks = std::numeric_limits<uint32_t>::max();
@@ -584,9 +636,17 @@ WeightSynchronizerListener::HandleStartWeightPush(
     return absl::InvalidArgumentError(absl::StrCat(
         "StartWeightPush requires a positive uuid; got ", req.uuid()));
   }
+  const std::string push_name =
+      absl::StrCat("StartWeightPush (uuid=", req.uuid(), ")");
+  if (req.mode_case() ==
+      ::tpu_sync::rpc::StartWeightPushRequest::MODE_NOT_SET) {
+    return absl::InvalidArgumentError(
+        absl::StrCat(push_name, " sets no mode; set coordinated or direct"));
+  }
+  const ::tpu_sync::rpc::CoordinatedPush& coordinated = req.coordinated();
   // Without StartTransferRequest.src_units, PushWeightsResharded() cannot
   // infer the layer of an entry.
-  for (const auto& [shard, schedule] : req.shard_push_schedules()) {
+  for (const auto& [shard, schedule] : coordinated.shard_push_schedules()) {
     for (const ::tpu_sync::rpc::ShardPushEntryProto& entry :
          schedule.entries()) {
       if (!entry.has_layer_idx()) {
@@ -598,17 +658,35 @@ WeightSynchronizerListener::HandleStartWeightPush(
   }
   ABSL_RETURN_IF_ERROR(CheckTargetIncarnation(
       *engine_, "StartWeightPush", req.uuid(), req.target_incarnation_id()));
+  ABSL_RETURN_IF_ERROR(
+      Prepend(CheckDurationMs(req.timeout_ms(), kMaxTransferTimeout), push_name,
+              " timeout_ms "));
+  ABSL_RETURN_IF_ERROR(Prepend(
+      CheckDurationMs(req.direct().receive_timeout_ms(), kMaxTransferTimeout),
+      push_name, " direct.receive_timeout_ms "));
+  // TODO(raiden-eng): Bind the version in the staging buffer and enforce
+  // `timeout_ms` once versioned pushes and deadlines are implemented; an empty
+  // `version` tag denotes the default version (version 0).
+  ABSL_RETURN_IF_ERROR(WeightVersion::FromProto(
+                           req.version(), absl::StrCat(push_name, " version"))
+                           .status());
+  if (req.has_direct()) {
+    ABSL_RETURN_IF_ERROR(
+        CheckDirectPush(push_name, req.direct(), req.timeout_ms()));
+    return absl::UnimplementedError(absl::StrCat(
+        push_name, " sets mode direct; direct pushes are not implemented yet"));
+  }
 
   ::tpu_sync::rpc::StartTransferRequest push;
   push.set_is_sender(true);
   push.set_uuid(req.uuid());
-  *push.mutable_shard_push_schedules() = req.shard_push_schedules();
+  *push.mutable_shard_push_schedules() = coordinated.shard_push_schedules();
   push.set_skip_d2h(req.skip_d2h());
   push.set_host_tiling_mode(req.host_tiling_mode());
   *push.mutable_skip_tiling() = req.skip_tiling();
   push.set_parallelism(req.parallelism());
   push.set_req_id(req.req_id());
-  *push.mutable_peer_control_endpoints() = req.peer_control_endpoints();
+  *push.mutable_peer_control_endpoints() = coordinated.peer_control_endpoints();
   ABSL_RETURN_IF_ERROR(engine_->PushWeightsResharded(push));
   return ::tpu_sync::rpc::StartWeightPushResponse();
 }

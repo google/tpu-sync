@@ -27,12 +27,15 @@
 namespace tpu_raiden::weight_sync {
 namespace {
 
-// The most bytes of a version that logs and errors show.
+// Maximum bytes of a version shown in logs and errors.
 constexpr size_t kMaxShownVersionBytes = 64;
 
 }  // namespace
 
 std::string WeightVersion::FormatVersionBytes() const {
+  if (bytes_.empty()) {
+    return "version(default)";
+  }
   const absl::string_view bytes = bytes_;
   return absl::StrCat("version(len=", bytes.size(), ", \"",
                       absl::CHexEscape(bytes.substr(0, kMaxShownVersionBytes)),
@@ -42,10 +45,6 @@ std::string WeightVersion::FormatVersionBytes() const {
 
 absl::StatusOr<WeightVersion> WeightVersion::FromBytes(
     absl::string_view bytes, absl::string_view field) {
-  if (bytes.empty()) {
-    return absl::InvalidArgumentError(
-        absl::StrCat(field, " is empty: the request carries no version"));
-  }
   if (bytes.size() > kMaxWeightVersionBytes) {
     return absl::InvalidArgumentError(absl::StrCat(
         field, " has ", bytes.size(),

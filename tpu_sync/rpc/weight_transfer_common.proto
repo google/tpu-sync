@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// TODO(raiden-eng): Move proto definitions to a proto/ folder.
 syntax = "proto3";
 
 package tpu_sync.rpc;
@@ -19,15 +20,15 @@ package tpu_sync.rpc;
 option java_multiple_files = true;
 option java_outer_classname = "WeightTransferCommonProto";
 
-// Version of a model's weights: opaque bytes that name one set of weights and
-// are never reused for different weights. Raiden compares versions bytewise
-// for equality and never parses, orders or hashes them, so the caller chooses
-// the scheme and decides which version is newer. Wherever a request carries a
-// version, a `tag` over kMaxWeightVersionBytes = 256 bytes is
-// INVALID_ARGUMENT naming the field and both sizes. Logs and errors show a
-// version bounded and escaped: its length and at most its first 64 bytes.
+// Opaque version identifier for a set of weights (0 to 256 bytes), compared
+// bytewise for equality. An unset message or empty `tag` denotes the default
+// version (version 0).
 message WeightVersion {
-  // 1 to 256 bytes. Empty, or an unset message, means "no version", which a
-  // request that requires a version rejects with INVALID_ARGUMENT.
   bytes tag = 1;
+}
+
+// Canonical absl::Status representation (code 0 = OK).
+message StatusProto {
+  int32 code = 1;
+  string message = 2;
 }

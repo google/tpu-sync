@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// TODO(raiden-eng): Move proto definitions to a proto/ folder.
 syntax = "proto3";
 
 package tpu_sync.rpc;
@@ -22,142 +23,136 @@ import "tpu_sync/rpc/weight_transfer_common.proto";
 option java_multiple_files = true;
 option java_outer_classname = "WeightTransferWorkerServiceProto";
 
-// Worker-facing control-plane messages for weight push transfers.
+// Worker-facing control-plane messages for weight push transfers, dispatched
+// over the control pipe by full protobuf message name.
 //
-// Rendezvous protocol for a two-phase weight push from `S` sender workers to
-// `D` receiver workers (`D + S` control RPCs total), named by a `uuid` that
-// the client draws from [1, 2^63) and never reuses (a retry is a new uuid):
-//   1. Prepare (`D` parallel RPCs, coordinator -> each receiver worker):
-//      `PrepareWeightReceiveRequest` validates the request, verifies
-//      `target_incarnation_id`, registers the summed per-layer chunk counts
-//      from `chunks` and the receiver's tiling settings, and returns
-//      before any bytes move.
-//   2. Push (`S` parallel RPCs, coordinator -> each sender worker, issued only
-//      after all `D` receivers acknowledge step 1): `StartWeightPushRequest`
-//      verifies `target_incarnation_id`, stages source weights from HBM unless
-//      `skip_d2h` is set, streams the scheduled byte slices over TCP to the
-//      armed receivers, and returns once every TCP batch ACK arrives.
+// Each push moves one `WeightVersion` in an attempt identified by a positive
+// `uuid` (never reused; retries use a new uuid):
+//   1. Coordinated push: coordinator calls `PrepareWeightReceiveRequest` on
+//      receivers, then `StartWeightPushRequest` (mode `coordinated`) on
+//      senders.
+//   2. Direct push: each sender prepares and awaits its own receivers via
+//      `StartWeightPushRequest` (mode `direct`; not implemented yet).
 //
-// Conventions:
-// - Each request is dispatched over the control pipe by its full protobuf
-//   message name (`ControlEnvelope.message_type`). Request-level errors are
-//   absl status codes in `ControlResponseEnvelope`, and every error names the
-//   offending value, ID or state.
-// - Incarnation IDs: each live worker (weight synchronizer, for example one
-//   host's worker in 1-process-per-host JAX or one rank's worker in
-//   1-process-per-device PyTorch) has a positive `incarnation_id` that changes
-//   across restarts; callers must not interpret it as a timestamp or order two
-//   incarnations. Every request names the incarnation it is meant for in
-//   `target_incarnation_id`: a non-zero value other than the worker's own is
-//   FAILED_PRECONDITION, so a restarted worker rejects requests meant for its
-//   predecessor, and 0 skips the check explicitly.
-// - Request timeouts (`receive_timeout_ms`) are in milliseconds: in
-//   (0, kMaxTransferTimeout = 1 h] once implemented, and 0 (no deadline) until
-//   then. A negative value or one over 1 h is INVALID_ARGUMENT naming it.
-// - Unimplemented fields (prepares that cover only some `expected_senders` and
-//   a positive `receive_timeout_ms`) fail with UNIMPLEMENTED stating what is
-//   not implemented yet, after the listener's validation; they are never
-//   ignored.
+// Shared conventions:
+// - `target_incarnation_id`: non-zero must match the worker's incarnation ID
+//   (else FAILED_PRECONDITION); 0 skips the check.
+// - Timeouts (`timeout_ms`, `receive_timeout_ms`): milliseconds in [0, 1 h].
 
-// The op-7 items (chunks) one sender sends to one receiver, per layer.
+// Outcome of a push for one receiver.
+message PeerResult {
+  enum Phase {
+    PHASE_UNSPECIFIED = 0;
+    PHASE_PREPARE = 1;
+    PHASE_TRANSFER = 2;
+    PHASE_COMMIT = 3;
+  }
+  // Receiver's listener endpoint (or data endpoint for coordinated pushes).
+  string peer = 1;
+  StatusProto status = 2;
+  // Last phase reached.
+  Phase phase = 3;
+}
+
+// Per-layer chunk counts sent by one sender to one receiver.
 message Chunks {
-  // One of `PrepareWeightReceiveRequest.expected_senders`, at most once per
-  // request; otherwise INVALID_ARGUMENT naming it.
+  // Sender ID; must appear in `PrepareWeightReceiveRequest.expected_senders`.
   string sender = 1;
-  // Layer index -> chunks of that layer. Layers lie in [0, num_layers),
-  // counts in [0, 2^32 - 1], and the counts have a positive sum; otherwise
-  // INVALID_ARGUMENT naming the sender, the layer and the count.
+  // Layer index -> expected chunk count (sum must be positive).
   map<int32, int64> layer_chunk_counts = 2;
 }
 
-// Phase 1: prepares this worker (the receiver) to receive version `version` in
-// transfer `uuid`. Answers before any bytes move.
-//
-// The receiver validates the request, sums the per-layer chunk counts across
-// `chunks` (deriving the total chunk count), and registers the summed
-// counts and tiling settings of `uuid`. The receive completes once every
-// expected chunk has arrived and every layer was tiled (for ON_ARRIVAL).
-// `version` is validated now and recorded into the staging buffer once
-// versioned staging-buffer claims are implemented.
-//
-// Errors: UNAVAILABLE while the listener stops; FAILED_PRECONDITION for
-// another incarnation; INVALID_ARGUMENT naming an invalid field; UNIMPLEMENTED
-// stating what is not implemented yet for `chunks` that cover only some
-// `expected_senders` or a positive `receive_timeout_ms`.
+// Phase 1: prepares this receiver to accept `version` for transfer `uuid`.
 message PrepareWeightReceiveRequest {
-  // The transfer attempt; positive. Every op-7 chunk header of the attempt
-  // carries it.
   int64 uuid = 1;
-  // The version this transfer delivers. Required: an unset message or an
-  // empty tag is INVALID_ARGUMENT ("carries no version"), and so is a tag over
-  // 256 bytes.
+  // Unset or empty `tag` denotes the default version (version 0).
   WeightVersion version = 2;
-  // See the file comment.
   int64 target_incarnation_id = 3;
-  // What the receiver does with the bytes on arrival; unset behaves like
-  // DEFERRED. See HostTilingMode.
   HostTilingMode host_tiling_mode = 4;
-  // Layer index -> true to skip tiling that layer, because the source and
-  // destination shards have identical layouts.
+  // Layer index -> true to skip tiling when layouts match.
   map<int32, bool> skip_tiling = 5;
-  // Optional correlation ID for logs.
+  // Optional correlation ID for logging.
   string req_id = 6;
-  // Every sender of this receive: non-empty, without empty or repeated ids;
-  // otherwise INVALID_ARGUMENT naming the id. Ids starting with "raiden/" are
-  // reserved for Raiden's own internal receives: a request to the listener
-  // that names one, here or in `chunks`, is INVALID_ARGUMENT.
+  // Non-empty list of distinct sender IDs ("raiden/" prefix is reserved).
   repeated string expected_senders = 7;
-  // Non-empty: each sender appears at most once and must be in
-  // `expected_senders`; otherwise INVALID_ARGUMENT naming it. Every
-  // entry is validated before the counts are summed per layer, and the
-  // sum must not exceed 2^32 - 1. Until multi-prepare joins are implemented, a
-  // prepare must carry every expected sender's chunks: an otherwise
-  // valid one that covers only some of them is UNIMPLEMENTED naming the
-  // missing senders and stating what is not implemented yet.
+  // Per-sender chunk counts; must cover `expected_senders`.
   repeated Chunks chunks = 8;
-  // The receive's deadline in milliseconds. Required once receive deadlines
-  // are implemented: (0, 1 h], so 0 is INVALID_ARGUMENT then. Until then, only
-  // 0 (no deadline) is accepted: a value in (0, 1 h] is UNIMPLEMENTED stating
-  // that receive deadlines are not implemented yet, and a negative value or
-  // one over 1 h is INVALID_ARGUMENT already.
+  // Receive deadline in milliseconds; 0 disables deadline (not implemented
+  // yet).
   int64 receive_timeout_ms = 9;
 }
 
 message PrepareWeightReceiveResponse {}
 
-// Phase 2 (controller -> source worker): executes the sender side of a weight
-// push into destinations already armed by `PrepareWeightReceiveRequest`.
-message StartWeightPushRequest {
-  // Unique transfer identifier matching `PrepareWeightReceiveRequest.uuid`.
-  // Required (> 0).
-  int64 uuid = 1;
-  // Incarnation ID the controller expects of this source work unit. Rejected
-  // with FAILED_PRECONDITION when non-zero and different from the worker's own
-  // incarnation ID (for example, preventing a restarted worker from executing a
-  // `skip_d2h` push out of an empty staging buffer). 0 skips the check.
-  int64 target_incarnation_id = 2;
-  // Push schedules keyed by local (or global) source shard index. Every entry
-  // must set `layer_idx`.
-  map<int32, ShardPushScheduleProto> shard_push_schedules = 3;
-  // When true, streams directly from existing host staging buffers without a
-  // D2H copy.
-  bool skip_d2h = 4;
-  // Layout of the host buffers carried by this push.
-  HostTilingMode host_tiling_mode = 5;
-  // Per-layer flag skipping detiling when source and destination shards share
-  // an identical layout.
-  map<int32, bool> skip_tiling = 6;
-  // Optional stream parallelism override; 0 uses the worker's default.
-  int32 parallelism = 7;
-  // Optional correlation ID for logging and diagnostics.
-  string req_id = 8;
-  // Listener endpoint (`control_plane_rpc_address`) of each destination worker
-  // this worker pushes to, keyed by the destination's data endpoint exactly as
-  // the schedule entries name it (`dst_peers`, or `dst_peer` when that is
-  // empty). The worker dials the endpoint for the PSP-TCP key exchange. When
-  // the worker requires PSP-TCP, the push fails with FAILED_PRECONDITION unless
-  // every destination has an entry; otherwise this map is ignored.
-  map<string, string> peer_control_endpoints = 9;
+// Push mode where a coordinator has already prepared the receivers.
+message CoordinatedPush {
+  // Push schedules keyed by source shard index; every entry sets `layer_idx`.
+  map<int32, ShardPushScheduleProto> shard_push_schedules = 1;
+  // Receiver data endpoint -> listener endpoint for PSP-TCP key exchange.
+  map<string, string> peer_control_endpoints = 2;
 }
 
-message StartWeightPushResponse {}
+// Explicit per-shard push plan for one destination in a direct push.
+message PushSchedules {
+  // Schedules keyed by local source shard index (`dst_shard_idx` is a receiver
+  // global shard; `dst_peers` is left unset).
+  map<int32, ShardPushScheduleProto> shard_push_schedules = 1;
+}
+
+// Identity push plan: sends whole receiver shards 1:1 without resharding.
+message IdentityPush {
+  repeated int64 global_shards = 1;
+}
+
+// One receiver of a direct push.
+message PushDestination {
+  string listener_endpoint = 1;
+  int64 target_incarnation_id = 2;
+  // Full sender roster for the receiver; must contain `DirectPush.sender`.
+  repeated string expected_senders = 3;
+  // Required.
+  oneof plan {
+    PushSchedules schedules = 4;
+    IdentityPush identity = 5;
+  }
+}
+
+// Push mode where this sender prepares and awaits its own receivers (not
+// implemented yet).
+message DirectPush {
+  // Copied into each receiver's `PrepareWeightReceiveRequest`; if positive and
+  // `timeout_ms` is positive, must be >= `timeout_ms`.
+  int64 receive_timeout_ms = 1;
+  // This sender's ID ("raiden/" prefix is reserved).
+  string sender = 2;
+  repeated PushDestination destinations = 3;
+  HostTilingMode receiver_host_tiling_mode = 4;
+}
+
+// Phase 2: executes the sender side of a weight push.
+message StartWeightPushRequest {
+  int64 uuid = 1;
+  int64 target_incarnation_id = 2;
+  // Stream directly from host staging buffers without D2H staging.
+  bool skip_d2h = 4;
+  HostTilingMode host_tiling_mode = 5;
+  map<int32, bool> skip_tiling = 6;
+  // Optional stream parallelism override; 0 uses worker default.
+  int32 parallelism = 7;
+  string req_id = 8;
+  // End-to-end push timeout in milliseconds (currently ignored for coordinated
+  // pushes).
+  int64 timeout_ms = 10;
+  // Required.
+  oneof mode {
+    CoordinatedPush coordinated = 11;
+    DirectPush direct = 12;
+  }
+  // Unset or empty `tag` denotes the default version (version 0).
+  WeightVersion version = 13;
+}
+
+message StartWeightPushResponse {
+  // One result per destination (currently left empty).
+  repeated PeerResult destinations = 1;
+}

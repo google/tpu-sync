@@ -1,16 +1,16 @@
 import TpuSyncVerify.Transfer.Reshard.Pipeline
 
 /-!
-# Sub-block byte coverage and multi-sender stream accounting
+# Sub-block byte coverage and multi-sender push accounting
 
 Horizontal data-plane refinement of `Reshard/Pipeline.lean` for sub-block
-byte-interval coverage and multi-sender push-stream accounting:
+byte-interval coverage and the receiver's multi-sender plan-push count:
 * `tpu_sync/kv_cache/reshard_receive_session.cc` (`ReshardReceiveSession::ValidatePlan`,
   `ReshardReceiveSession::ValidateReceiverCoverage`)
 * `tpu_sync/kv_cache/reshard/pool_reshard_planner.cc` (`ValidateSpanCoverage`,
   `EmitSpanSchedule` `expected_pushes` computation, `DefaultTransferStreams`,
   and `BuildPoolReshardPlan`)
-* `tpu_sync/kv_cache/reshard_send_session.cc` (`ReshardSendSession::ExecutePush` /
+* `tpu_sync/kv_cache/reshard_send_session.cc` (`ReshardSendSession::ExecutePushPipeline` /
   `ReshardSendSession::StartPoolPush` per-peer `(src_block_id, dst_block_id)`
   deduplication)
 * `tpu_sync/core/pool_reshard_send_slots.cc` (`CountPoolReshardSendSlots`)
@@ -19,7 +19,7 @@ byte-interval coverage and multi-sender push-stream accounting:
   `tpu_sync/transport/block_transport_session.cc` (the per-uuid
   `BlockTransportServerPushSession::StartStream` /
   `BlockTransportServerPushSession::CompleteIncomingPush` plan-declared
-  progress counter)
+  progress counter, with `AccumulateLandedShards`)
 
 The coverage check is per plan: for a sub-plan of a windowed request
 (`ReshardCoordinator::StartChain`), `BuildPoolReshardPlan` clips each tag's
@@ -42,17 +42,27 @@ File aliases used in the source map below:
 `pool_reshard_planner_streams_test.cc` (`tpu_sync/kv_cache/reshard/pool_reshard_planner_streams_test.cc`).
 
 What this module proves:
-1. **Multi-sender stream count conservation (`stream_count_matches`,
-   `senderStreams_pos_iff`).** Each sender `s` deduplicates its scheduled
-   `(src_block_id, dst_block_id)` pairs for a pool group and opens
-   `min(parallelism, |pairs_s|)` TCP push streams
-   (`BlockTransport::AsyncPushShards` in `block_transport.cc`,
-   `ReshardSendSession::StartPoolPush` in `reshard_send_session.cc`).
+1. **The receiver validator's plan-push count (`stream_count_matches`,
+   `senderStreams_pos_iff`).**
    `ReshardReceiveSession::ValidateReceiverCoverage`
    (`int64_t calculated_pushes = 0;` .. `if (calculated_pushes != view.expected_pushes)`
-   in `reshard_receive_session.cc`) checks that the receiver's `expected_pushes`
-   equals `∑_s min(parallelism, |pairs_s|)`, matching the planner
+   in `reshard_receive_session.cc`) collects, per `source_rank` `s`, the
+   distinct `(dst_peer, src_block_id, dst_block_id)` tuples of a pool group and
+   checks that the plan's `expected_pushes` equals
+   `∑_s min(parallelism, |pairs_s|)`, matching the planner
    (`BuildPoolReshardPlan` in `pool_reshard_planner.cc`).
+   `stream_count_matches` states that contract: a plan the validator accepts
+   has positive `parallelism` and `expected_pushes` equal to that sum. It says
+   nothing about what senders put on the wire. That each sender's fan-out
+   produces exactly these plan pushes is assumed: `ReshardSendSession::StartPoolPush`
+   issues one `AsyncPush` per `(pool, peer)` with that peer's deduplicated
+   pairs (a peer there is a `transport::PeerEndpoint`, `dst_peer` with its
+   `dst_peregrine_peer`; one endpoint per `dst_peer` is `Send.lean` A1), `BlockTransport::AsyncPushShards` clamps each to
+   `P = min(parallelism, num_blocks)` streams per NUMA shard group, and
+   `BlockTransportServerPushSession::AccumulateLandedShards` folds the shard
+   groups of one sender back into plan pushes before `CompleteIncomingPush`
+   compares `plan_pushes` with `expected_chunks`. The model's pairs omit
+   `dst_peer` (one receiver).
 2. **Exact sub-block byte reconstruction under out-of-order stream arrival
    (`checkContiguous_covers`, `checkContiguous_head_disjoint`,
    `partition_reconstructs_block`, `partition_reconstructs_perm`).**
@@ -70,59 +80,66 @@ What this module proves:
    queue of sub-block intervals and a byte-addressed staging buffer. Every
    `CoveragePipeline` step projects to a `Pipeline.step`, lifting all
    pipeline invariants together with byte-level destination reconstruction.
+   `CoveragePipeline` identifies one stream with one coverage interval and one
+   sender peer push: a pool's `peerCounts` entry is the length of its interval
+   list, and each `landStream` lands the next interval. It is not derived from
+   the push counts of item 1.
 
 ## Source map
 
 <!-- source-map:begin -->
 | File | Symbol / anchor | Lines |
 |------|-----------------|-------|
-| `reshard_recv.cc` | `ReshardReceiveSession::ValidatePlan` | `:67-144` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` | `:146-349` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`const int64_t parallelism = plan.parallelism();`) | `:188` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`for (size_t ordinal = 0; ordinal < view.extents.size(); ++ordinal)`) | `:245-258` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`for (int64_t repeat = 0; repeat < entry.count(); ++repeat)` .. `state.pairs_by_sender[source_rank].insert`) | `:286-305` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`int64_t calculated_pushes = 0;` .. `if (calculated_pushes != view.expected_pushes)`) | `:314-319` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`std::sort(intervals.begin(), intervals.end());` .. `if (covered_until != view.extents[ordinal])`) | `:328-339` |
-| `planner.h` | `*` (`inline constexpr char kTransferStreamsEnvVar[]`) | `:163` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ValidatePlan` | `:257-334` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` | `:336-539` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`const int64_t parallelism = plan.parallelism();`) | `:378` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`for (size_t ordinal = 0; ordinal < view.extents.size(); ++ordinal)`) | `:435-448` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`for (int64_t repeat = 0; repeat < entry.count(); ++repeat)` .. `state.pairs_by_sender[source_rank].insert`) | `:476-495` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`int64_t calculated_pushes = 0;` .. `if (calculated_pushes != view.expected_pushes)`) | `:504-509` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ValidateReceiverCoverage` (`std::sort(intervals.begin(), intervals.end());` .. `if (covered_until != view.extents[ordinal])`) | `:518-529` |
+| `planner.h` | `*` (`inline constexpr char kTransferStreamsEnvVar[]`) | `:164` |
 | `planner.cc` | `ValidateSpanCoverage` | `:350-487` |
-| `planner.cc` | `EmitSpanSchedule` | `:503-607` |
-| `planner.cc` | `DefaultTransferStreams` | `:611-628` |
-| `planner.cc` | `BuildPoolReshardPlan` (`int64_t requested_parallelism = 0;` .. `if (requested_parallelism > topology_parallelism)`) | `:984-994` |
-| `planner.cc` | `BuildPoolReshardPlan` (`expected_pushes_by_dst;` .. `if (expected_pushes_by_dst.at(dst_unit_id) <= 0)`) | `:1234-1246` |
-| `reshard_send.cc` | `ReshardSendSession::ExecutePush` (`for (int32_t encoded_pool_idx : plan_.transfer_pool_indices())` .. `if (pool_src_block_ids.empty())`) | `:204-217` |
-| `reshard_send.cc` | `ReshardSendSession::StartPoolPush` | `:267-349` |
+| `planner.cc` | `EmitSpanSchedule` | `:503-616` |
+| `planner.cc` | `DefaultTransferStreams` | `:620-637` |
+| `planner.cc` | `BuildPoolReshardPlan` (`int64_t requested_parallelism = 0;` .. `if (requested_parallelism > topology_parallelism)`) | `:993-1003` |
+| `planner.cc` | `BuildPoolReshardPlan` (`expected_pushes_by_dst;` .. `if (expected_pushes_by_dst.at(dst_unit_id) <= 0)`) | `:1253-1265` |
+| `reshard_send.cc` | `ReshardSendSession::ExecutePushPipeline` (`for (size_t pool_idx : ordered_pools)` .. `if (pool_src_block_ids.empty())`) | `:516-528` |
+| `reshard_send.cc` | `ReshardSendSession::StartPoolPush` | `:592-697` |
 | `slots.cc` | `CountPoolReshardSendSlots` | `:27-51` |
-| `bts.cc` | `BlockTransportServerPushSession::StartStream` (`if (expected_size > 0)`) | `:423-427` |
-| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` | `:506-702` |
-| `bt.cc` | `BlockTransport::AsyncPushShards` (`size_t num_blocks = src_block_ids.size();` .. `auto requests = BuildBlockRequests(`) | `:568-598` |
-| `base.cc` | `KVCacheManagerBase::GetPoolPushProgressSpec` | `:2700-2743` |
-| `base.cc` | `KVCacheManagerBase::ExpectedPushSenders` | `:2745-2762` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.ChecksEveryPoolSpanAndDestinationZeroCover` | `:227-255` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsCoverageGap` | `:278-289` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsCoverageOverlap` | `:291-302` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsShortCoverage` | `:304-314` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsNonPrefixExtents` | `:316-330` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsMissingExtents` | `:332-341` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsMissingParallelism` | `:343-352` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsExpectedPushMismatch` | `:354-363` |
-| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsWriteBeyondDeclaredLiveTail` | `:365-403` |
-| `pool_reshard_test.cc` | `ExpectedPushSendersTest.CountsReceiverPlanSchedules` | `:222-269` |
+| `bts.cc` | `BlockTransportServerPushSession::StartStream` (`if (expected_size > 0)`) | `:473-477` |
+| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` | `:724-893` |
+| `bts.cc` | `BlockTransportServerPushSession::AccumulateLandedShards` | `:715-722` |
+| `bt.cc` | `BlockTransport::AsyncPushShards` (`size_t num_blocks = src_block_ids.size();` .. `auto requests = BuildBlockRequests(`) | `:588-618` |
+| `base.cc` | `KVCacheManagerBase::GetPoolPushProgressSpec` | `:3101-3110` |
+| `base.cc` | `KVCacheManagerBase::ExpectedPushSenders` | `:3112-3120` |
+| `tpu_sync/kv_cache/transfer_plan.cc` | `TransferPlan::GetPoolPushProgressSpec` | `:241-271` |
+| `tpu_sync/kv_cache/transfer_plan.cc` | `TransferPlan::ExpectedPushSenders` | `:273-279` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.ChecksEveryPoolSpanAndDestinationZeroCover` | `:267-292` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsCoverageGap` | `:311-321` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsCoverageOverlap` | `:323-333` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsShortCoverage` | `:335-344` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsNonPrefixExtents` | `:346-359` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsMissingExtents` | `:361-369` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsMissingParallelism` | `:371-379` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsExpectedPushMismatch` | `:381-389` |
+| `reshard_recv_test.cc` | `ReshardReceiveSessionTest.RejectsWriteBeyondDeclaredLiveTail` | `:391-426` |
+| `pool_reshard_test.cc` | `ExpectedPushSendersTest.CountsReceiverPlanSchedules` | `:286-333` |
 | `pool_reshard_send_slots_test.cc` | `PoolReshardSendSlots.SingleDestinationIsPoolsTimesOnePeer` | `:49-55` |
 | `pool_reshard_send_slots_test.cc` | `PoolReshardSendSlots.ReplicatedDestinationsIsPoolsTimesPeers` | `:57-65` |
 | `pool_reshard_send_slots_test.cc` | `PoolReshardSendSlots.ShardedGroupCountsOnlyItsPeers` | `:67-76` |
 | `pool_reshard_send_slots_test.cc` | `PoolReshardSendSlots.GroupWithoutEntriesContributesNoSlot` | `:78-83` |
 | `pool_reshard_send_slots_test.cc` | `PoolReshardSendSlots.EmptyScheduleHasNoSlots` | `:85-89` |
-| `reshard_service_test.cc` | `ReshardStackTest.TwoDestinationsShardedSpansRouteBytesPerReceiver` | `:1982-2047` |
-| `reshard_service_test.cc` | `ReshardStackTest.ShardedDestinationWithoutCoverageFailsClosed` | `:2168-2181` |
-| `reshard_service_test.cc` | `ReshardStackTest.ReplicatedAndRoutedSpansCombine` | `:2210-2242` |
+| `reshard_service_test.cc` | `ReshardStackTest.TwoDestinationsShardedSpansRouteBytesPerReceiver` | `:2061-2126` |
+| `reshard_service_test.cc` | `ReshardStackTest.ShardedDestinationWithoutCoverageFailsClosed` | `:2247-2260` |
+| `reshard_service_test.cc` | `ReshardStackTest.ReplicatedAndRoutedSpansCombine` | `:2289-2321` |
 | `pool_reshard_planner_streams_test.cc` | `DefaultTransferStreamsTest.UnsetEmptyOrZeroKeepsOneStreamPerSourceRank` | `:59-72` |
 | `pool_reshard_planner_streams_test.cc` | `DefaultTransferStreamsTest.PositiveValueCapsStreamsWithinAdmission` | `:74-87` |
 | `pool_reshard_planner_streams_test.cc` | `DefaultTransferStreamsTest.RejectsUnparsableValueNamingVariableAndValue` | `:89-95` |
 | `pool_reshard_planner_streams_test.cc` | `DefaultTransferStreamsTest.RejectsNegativeValueNamingVariableAndValue` | `:97-103` |
-| `reshard_service_test.cc` | `ReshardStackTest.UnsetTransferStreamsPlansOneStreamPerSourceRank` | `:2284-2304` |
-| `reshard_service_test.cc` | `ReshardStackTest.TransferStreamsEnvCapsPlanStreamsAndExpectedPushes` | `:2306-2326` |
-| `reshard_service_test.cc` | `ReshardStackTest.ExplicitPlanParallelismOverridesTransferStreamsEnv` | `:2328-2345` |
-| `reshard_service_test.cc` | `ReshardStackTest.InvalidTransferStreamsEnvFailsThePlan` | `:2347-2362` |
+| `reshard_service_test.cc` | `ReshardStackTest.UnsetTransferStreamsPlansOneStreamPerSourceRank` | `:2363-2383` |
+| `reshard_service_test.cc` | `ReshardStackTest.TransferStreamsEnvCapsPlanStreamsAndExpectedPushes` | `:2385-2405` |
+| `reshard_service_test.cc` | `ReshardStackTest.ExplicitPlanParallelismOverridesTransferStreamsEnv` | `:2407-2424` |
+| `reshard_service_test.cc` | `ReshardStackTest.InvalidTransferStreamsEnvFailsThePlan` | `:2426-2441` |
 <!-- source-map:end -->
 -/
 
@@ -133,7 +150,7 @@ open TpuSyncVerify.Transfer
 open TpuSyncVerify.Transfer.Reshard
 open TpuSyncVerify.Transfer.Reshard.Pipeline
 
-/-! ## Part 1: Multi-sender `(src_block, dst_block)` pair deduplication and stream counts -/
+/-! ## Part 1: Multi-sender `(src_block, dst_block)` pair deduplication and plan-push counts -/
 
 /-- A logical sub-block range `[startByte, endByte)` inside a destination block's
 live byte extent (`ReshardReceiveSession::ValidateReceiverCoverage`
@@ -155,21 +172,26 @@ structure ScheduleEntry where
   deriving Repr, DecidableEq
 
 /-- Distinct `(srcBlock, dstBlock)` pairs scheduled for `sender`
-(`ReshardSendSession::StartPoolPush` `block_pairs` in `reshard_send_session.cc`,
+(`ReshardSendSession::StartPoolPush` `transfers_by_peer` / `seen_by_peer` in
+`reshard_send_session.cc`,
 `ReshardReceiveSession::ValidateReceiverCoverage` `state.pairs_by_sender[source_rank].insert`
 in `reshard_receive_session.cc`). -/
 def senderPairs (entries : List ScheduleEntry) (sender : Nat) : List (Nat × Nat) :=
   ((entries.filter fun e => e.sender == sender).map fun e => (e.srcBlock, e.dstBlock)).eraseDups
 
-/-- Number of TCP push streams opened by `sender` under `parallelism`:
+/-- Number of plan pushes the validator attributes to `sender` under
+`parallelism`: `std::min(parallelism, pairs.size())` in
+`ReshardReceiveSession::ValidateReceiverCoverage`. On the sender side
 `BlockTransport::AsyncPushShards` clamps `P = min(parallelism, num_blocks)`
-(`block_transport.cc`), and a sender with zero pairs opens no streams
-(`ReshardSendSession::ExecutePush` `if (pool_src_block_ids.empty())` in
-`reshard_send_session.cc`). -/
+streams per NUMA shard group (`block_transport.cc`), which the receiver folds
+back into plan pushes (`AccumulateLandedShards`), and a sender with zero pairs
+pushes nothing (`ReshardSendSession::ExecutePushPipeline`
+`if (pool_src_block_ids.empty())` in `reshard_send_session.cc`); that the two
+sides agree is assumed. -/
 def senderStreams (parallelism : Nat) (entries : List ScheduleEntry) (sender : Nat) : Nat :=
   Nat.min parallelism (senderPairs entries sender).length
 
-/-- Total push streams recomputed across `senders` (`BuildPoolReshardPlan` in
+/-- Total plan pushes recomputed across `senders` (`BuildPoolReshardPlan` in
 `pool_reshard_planner.cc`, `ReshardReceiveSession::ValidateReceiverCoverage`
 `int64_t calculated_pushes = 0;` in `reshard_receive_session.cc`). -/
 def recomputedExpectedPushes (parallelism : Nat) (senders : List Nat)
@@ -208,9 +230,11 @@ theorem senderStreams_le_pairs (parallelism : Nat) (entries : List ScheduleEntry
     senderStreams parallelism entries sender ≤ (senderPairs entries sender).length :=
   Nat.min_le_right _ _
 
-/-- When `validateExpectedPushes` succeeds, the sum of streams emitted by all
-senders in `senders` equals the receiver's `expectedPushes`, and `0 < expectedPushes`
-(`ReshardReceiveSession::ValidateReceiverCoverage`
+/-- The validator's contract: when `validateExpectedPushes` succeeds, the
+per-sender plan-push counts it recomputes sum to the receiver's
+`expectedPushes`, and `0 < expectedPushes`. This is the check itself restated;
+it does not relate the count to the streams senders open
+(validator: `ReshardReceiveSession::ValidateReceiverCoverage`
 `if (calculated_pushes != view.expected_pushes)` in `reshard_receive_session.cc`,
 `BuildPoolReshardPlan` in `pool_reshard_planner.cc`). -/
 theorem stream_count_matches {parallelism : Nat} {senders : List Nat}
@@ -455,7 +479,9 @@ structure PoolCoverage where
 
 /-- `CoveragePipeline` refines `Reshard.Pipeline` by tracking sub-block byte
 intervals and byte-level destination staging alongside the abstract pipeline
-state `pipe`. -/
+state `pipe`. One stream is one interval and one sender peer push: `init` sets
+`peerCounts[p]` to the length of pool `p`'s interval list, and `landStream p`
+lands `planIntervals[k]` for the `k`-th landing. -/
 structure CoveragePipeline where
   pipe : Pipeline
   pools : List PoolCoverage
@@ -559,9 +585,9 @@ theorem trace_tp4_to_tp2_subblock_merge :
     writeIntervals [iv1, iv0] (List.replicate 32 .blank) = good 32 := by
   decide
 
-/-- Multi-sender stream count witness: sender 0 has 3 `(src, dst)` pairs and
+/-- Multi-sender plan-push count witness: sender 0 has 3 `(src, dst)` pairs and
 sender 1 has 1 pair under `parallelism = 2`, yielding `min(2, 3) + min(2, 1) = 3`
-expected push streams (`BuildPoolReshardPlan` in `pool_reshard_planner.cc`). -/
+expected plan pushes (`BuildPoolReshardPlan` in `pool_reshard_planner.cc`). -/
 theorem trace_multi_sender_stream_count :
     let entries : List ScheduleEntry :=
       [ ⟨0, 10, 0, ⟨0, 8⟩⟩
@@ -640,15 +666,17 @@ def validGroupExtents (liveBytes : Nat) : List Nat → Bool
   | e :: rest => decide (e = liveBytes) && validGroupExtents liveBytes rest
 
 /-- `KVCacheManagerBase::ExpectedPushSenders`
-(`tpu_sync/kv_cache/kv_cache_manager_base.cc`):
-returns `some schedules.length` when the active plan is a block-addressed
-receiver plan (`!isSender` and `pool_groups_size() == 0`) with non-empty
+(`tpu_sync/kv_cache/kv_cache_manager_base.cc`, resolving the uuid's session
+plan through `GetTransferPlan` and answering with
+`TransferPlan::ExpectedPushSenders` in `tpu_sync/kv_cache/transfer_plan.cc`):
+returns `some schedules.length` when the plan is a block-addressed receiver
+plan (`!is_sender_` and `pool_groups_size() == 0`) with non-empty
 `shard_push_schedules`, and `none` for sender plans, pool-grouped plans (which
-use `KVCacheManagerBase::GetPoolPushProgressSpec`), bare plans, or after
-`UnregisterActivePlan`. -/
-def expectedPushSenders (isSender : Bool) (schedules : List (Nat × List ScheduleEntry)) :
-    Option Nat :=
-  if isSender || schedules.isEmpty then none
+use `TransferPlan::GetPoolPushProgressSpec`), bare plans, or once the session
+is gone (`UnregisterActivePlan`, `GetSession` failing). -/
+def expectedPushSenders (isSender hasPoolGroups : Bool)
+    (schedules : List (Nat × List ScheduleEntry)) : Option Nat :=
+  if isSender || hasPoolGroups || schedules.isEmpty then none
   else some schedules.length
 
 /-- Replay of `ReshardReceiveSessionTest` coverage and push-count unit tests
@@ -688,17 +716,21 @@ theorem trace_reshard_receive_coverage_test_parity :
   decide
 
 /-- Replay of `ExpectedPushSendersTest.CountsReceiverPlanSchedules`
-(`tpu_sync/kv_cache/kv_cache_manager_with_transfer_pool_reshard_test.cc`):
-- Receiver plan (`isSender = false`) with 2 source schedules (`ranks 4 and 5`)
-  reports `some 2`.
+(`tpu_sync/kv_cache/kv_cache_manager_with_transfer_pool_reshard_test.cc`) and
+`TransferPlan::ExpectedPushSenders` (`tpu_sync/kv_cache/transfer_plan.cc`):
+- Block-addressed receiver plan (`isSender = false`, `hasPoolGroups = false`)
+  with 2 source schedules (`ranks 4 and 5`) reports `some 2`.
+- Pool-grouped receiver plan (`isSender = false`, `hasPoolGroups = true`,
+  `request_.pool_groups_size() > 0`) reports `none`.
 - Sender plan (`isSender = true`) reports `none`.
 - Bare plan (`schedules = []`) reports `none`. -/
 theorem trace_expected_push_senders_test_parity :
     let sched4 : List ScheduleEntry := [⟨4, 0, 1, ⟨0, 16⟩⟩]
     let sched5 : List ScheduleEntry := [⟨5, 0, 2, ⟨0, 16⟩⟩]
-    expectedPushSenders false [(4, sched4), (5, sched5)] = some 2 ∧
-    expectedPushSenders true [(0, sched4)] = none ∧
-    expectedPushSenders false [] = none := by
+    expectedPushSenders false false [(4, sched4), (5, sched5)] = some 2 ∧
+    expectedPushSenders false true [(4, sched4), (5, sched5)] = none ∧
+    expectedPushSenders true false [(0, sched4)] = none ∧
+    expectedPushSenders false false [] = none := by
   decide
 
 /-- Replay of the per-destination routing tests of `ReshardStackTest`

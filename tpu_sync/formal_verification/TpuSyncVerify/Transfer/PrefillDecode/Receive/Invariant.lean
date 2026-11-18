@@ -27,6 +27,8 @@ structure Inv (s : Recv) : Prop where
   ready_le : s.ready ≤ s.issued
   issued_le : s.issued + s.pending ≤ s.numLayers
   accounted_le : s.layersAccounted ≤ s.issued
+  /-- `network_completed_` set by the last dispatch means every layer was issued. -/
+  netIssued_issued : s.netIssued = true → s.issued = s.numLayers
   /-- While no error has been recorded, every callback that ran succeeded. -/
   ok_completed : s.life.statusOk = true → s.completed = s.retired
   /-- A session that started draining without an error had issued every layer. -/
@@ -37,11 +39,11 @@ structure Inv (s : Recv) : Prop where
   published_ok : s.published = some true → s.completed = s.numLayers
 
 theorem inv_initPush (n : Nat) : Inv (initPush n) := by
-  refine ⟨Lifecycle.consistent_init, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;>
+  refine ⟨Lifecycle.consistent_init, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;>
     simp [initPush, Accounted]
 
 theorem inv_initLoad (n : Nat) : Inv (initLoad n) := by
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> simp [initLoad, Accounted]
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> simp [initLoad, Accounted]
   constructor <;> simp
 
 theorem inv_noOpLeak {s : Recv} (h : Inv s) : NoOpLeak s := by
@@ -69,14 +71,15 @@ theorem inv_noOpLeak {s : Recv} (h : Inv s) : NoOpLeak s := by
 
 theorem inv_safe {s : Recv} (h : Inv s) : Safe s := by
   have hnl := inv_noOpLeak h
-  obtain ⟨hl, hacc, hc, hr, hy, hi, ha, hok, hdr, hpd, hpub⟩ := h
+  obtain ⟨hl, hacc, hc, hr, hy, hi, ha, hni, hok, hdr, hpd, hpub⟩ := h
   unfold Accounted at hacc
   refine ⟨hl.done_idle, ?_, hl.staging, hl.prompt, ?_, hpub, ⟨hc, hr, hy, by omega, ha⟩, hnl, ?_⟩
   · intro hd
     have h0 := hl.done_idle hd
     omega
-  · rintro ⟨hnet | hcomp, hall⟩
-    · unfold networkCompleted at hnet; unfold allH2dDone at hall; omega
+  · rintro ⟨(hnet | hnet) | hcomp, hall⟩
+    · unfold allH2dDone at hall; omega
+    · have := hni hnet; unfold allH2dDone at hall; omega
     · unfold allH2dDone at hall; omega
   · intro hp
     have hd : s.life.done = true := by
@@ -89,7 +92,7 @@ theorem inv_safe {s : Recv} (h : Inv s) : Safe s := by
 /-- Each event preserves the invariant. One case per event; the `Lifecycle`
 lemmas discharge the settle protocol and `omega` the arithmetic. -/
 theorem step_inv {s s' : Recv} {e : Ev} (h : Inv s) (hs : step s e = some s') : Inv s' := by
-  obtain ⟨hl, hacc, hc, hr, hy, hi, ha, hok, hdr, hpd, hpub⟩ := h
+  obtain ⟨hl, hacc, hc, hr, hy, hi, ha, hni, hok, hdr, hpd, hpub⟩ := h
   unfold Accounted at hacc
   cases e with
   | pushBegin =>
@@ -99,7 +102,7 @@ theorem step_inv {s s' : Recv} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
     have hact := Lifecycle.beginOp_active hb
     have hok' := Lifecycle.beginOp_statusOk hb
     have hdr' := Lifecycle.beginOp_draining hb
-    refine ⟨Lifecycle.beginOp_consistent hl hb, ?_, hc, hr, hy, hi, ha, ?_, ?_, ?_, hpub⟩
+    refine ⟨Lifecycle.beginOp_consistent hl hb, ?_, hc, hr, hy, hi, ha, hni, ?_, ?_, ?_, hpub⟩
     · unfold Accounted; simp; omega
     · simpa [hok'] using hok
     · simp [hdr']
@@ -111,7 +114,7 @@ theorem step_inv {s s' : Recv} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
     split at hs
     · cases hs
     · cases hs
-      refine ⟨Lifecycle.endOpLocked_consistent hl, ?_, hc, hr, hy, hi, ha, ?_, ?_, ?_, hpub⟩
+      refine ⟨Lifecycle.endOpLocked_consistent hl, ?_, hc, hr, hy, hi, ha, hni, ?_, ?_, ?_, hpub⟩
       · unfold Accounted; simp; omega
       · simpa using hok
       · simpa using hdr
@@ -126,16 +129,19 @@ theorem step_inv {s s' : Recv} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
         cases hq : s.pullPending
         · exact absurd hq hp
         · rfl
-      refine ⟨?_, ?_, hc, hr, hy, hi, ha, ?_, ?_, ?_, hpub⟩
+      refine ⟨?_, ?_, hc, hr, hy, hi, ha, hni, ?_, ?_, ?_, hpub⟩
       · apply Lifecycle.endOpLocked_consistent
         split
         · exact hl
         · exact Lifecycle.finishLocked_consistent _ hl
       · unfold Accounted
-        cases ok <;> simp [hp'] at hacc ⊢ <;> omega
-      · cases ok <;> simp <;> exact hok
-      · cases ok <;> simp
-        · exact hdr
+        split <;> simp [hp'] at hacc ⊢ <;> omega
+      · split
+        · simpa using hok
+        · simp
+      · split
+        · simpa using hdr
+        · simp
       · intro b hp
         have hd := hpd b hp
         apply Lifecycle.endOpLocked_done_mono
@@ -151,8 +157,8 @@ theorem step_inv {s s' : Recv} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
       have hact := Lifecycle.beginOp_active hb
       have hok' := Lifecycle.beginOp_statusOk hb
       have hdr' := Lifecycle.beginOp_draining hb
-      refine ⟨Lifecycle.beginOp_consistent hl hb, ?_, hc, hr, hy, by simp; omega, ha, ?_, ?_, ?_,
-        hpub⟩
+      refine ⟨Lifecycle.beginOp_consistent hl hb, ?_, hc, hr, hy, by simp; omega, ha, hni, ?_, ?_,
+        ?_, hpub⟩
       · unfold Accounted; simp; omega
       · simpa [hok'] using hok
       · simp [hdr']
@@ -167,8 +173,8 @@ theorem step_inv {s s' : Recv} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
     · rename_i hp
       split at hs
       · cases hs
-        refine ⟨Lifecycle.endOpLocked_consistent hl, ?_, hc, hr, hy, by simp; omega, ha, ?_, ?_, ?_,
-          hpub⟩
+        refine ⟨Lifecycle.endOpLocked_consistent hl, ?_, hc, hr, hy, by simp; omega, ha, hni, ?_,
+          ?_, ?_, hpub⟩
         · unfold Accounted; simp; omega
         · simpa using hok
         · simpa using hdr
@@ -176,13 +182,18 @@ theorem step_inv {s s' : Recv} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
       · rename_i hact
         split at hs
         · cases hs
-          refine ⟨hl, ?_, hc, hr, by simp; omega, by simp; omega, by simp; omega, hok, ?_, hpd, hpub⟩
+          refine ⟨hl, ?_, hc, hr, by simp; omega, by simp; omega, by simp; omega, ?_, hok, ?_,
+            hpd, hpub⟩
           · unfold Accounted; simp; omega
+          · simp only [Bool.or_eq_true, decide_eq_true_eq]
+            rintro (hn | hn)
+            · have := hni hn; omega
+            · exact hn
           · intro _ hd
             exact absurd (Or.inr hd) hact
         · cases hs
           refine ⟨Lifecycle.endOpLocked_consistent (Lifecycle.finishLocked_consistent _ hl),
-            ?_, hc, hr, hy, by simp; omega, ha, ?_, ?_, ?_, hpub⟩
+            ?_, hc, hr, hy, by simp; omega, ha, hni, ?_, ?_, ?_, hpub⟩
           · unfold Accounted; simp; omega
           · simp
           · simp
@@ -193,7 +204,7 @@ theorem step_inv {s s' : Recv} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
     split at hs
     · cases hs
       exact ⟨hl, by unfold Accounted; simpa using hacc, hc, by simp; omega, by simp; omega,
-        hi, ha, hok, hdr, hpd, hpub⟩
+        hi, ha, hni, hok, hdr, hpd, hpub⟩
     · cases hs
   | h2dDone ok =>
     simp only [step, h2dDone] at hs
@@ -207,7 +218,7 @@ theorem step_inv {s s' : Recv} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
       · rename_i hnd
         split at hs
         · cases hs
-          refine ⟨?_, ?_, by simp; omega, by simp; omega, hy, hi, ha, ?_, ?_, ?_, ?_⟩
+          refine ⟨?_, ?_, by simp; omega, by simp; omega, hy, hi, ha, hni, ?_, ?_, ?_, ?_⟩
           · apply Lifecycle.endOpLocked_consistent
             split
             · exact Lifecycle.finishLocked_consistent _ hl
@@ -230,7 +241,7 @@ theorem step_inv {s s' : Recv} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
             exact absurd (hpd true hp) hnd
         · cases hs
           refine ⟨Lifecycle.endOpLocked_consistent (Lifecycle.finishLocked_consistent _ hl),
-            ?_, by simp; omega, by simp; omega, hy, hi, ha, ?_, ?_, ?_, hpub⟩
+            ?_, by simp; omega, by simp; omega, hy, hi, ha, hni, ?_, ?_, ?_, hpub⟩
           · unfold Accounted; simp; omega
           · simp
           · simp
@@ -247,7 +258,7 @@ theorem step_inv {s s' : Recv} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
         · rename_i hfin
           cases hs
           refine ⟨Lifecycle.finishLocked_consistent _ hl, ?_, hc, hr, hy, hi, by simp; omega,
-            ?_, ?_, ?_, hpub⟩
+            hni, ?_, ?_, ?_, hpub⟩
           · unfold Accounted; simpa using hacc
           · simpa using hok
           · intro _ _
@@ -255,7 +266,7 @@ theorem step_inv {s s' : Recv} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
             omega
           · exact fun b hp => Lifecycle.finishLocked_done_mono _ (hpd b hp)
         · cases hs
-          refine ⟨hl, ?_, hc, hr, hy, hi, by simp; omega, hok, ?_, hpd, hpub⟩
+          refine ⟨hl, ?_, hc, hr, hy, hi, by simp; omega, hni, hok, ?_, hpd, hpub⟩
           · unfold Accounted; simpa using hacc
           · simpa using hdr
       · cases hs
@@ -265,14 +276,18 @@ theorem step_inv {s s' : Recv} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
     · rename_i hrd
       obtain ⟨hndr, hnet | hcomp, hall⟩ := hrd
       · cases hs
-        refine ⟨Lifecycle.finishLocked_consistent _ hl, ?_, hc, hr, hy, hi, ha, ?_, ?_, ?_, hpub⟩
+        refine ⟨Lifecycle.finishLocked_consistent _ hl, ?_, hc, hr, hy, hi, ha, hni, ?_, ?_, ?_,
+          hpub⟩
         · unfold Accounted; simpa using hacc
         · simpa using hok
-        · unfold networkCompleted at hnet; unfold allH2dDone at hall
-          intro _ _; simp; omega
+        · unfold allH2dDone at hall
+          rcases hnet with hnet | hnet
+          · intro _ _; simp; omega
+          · have := hni hnet; intro _ _; simp; omega
         · exact fun b hp => Lifecycle.finishLocked_done_mono _ (hpd b hp)
       · cases hs
-        refine ⟨Lifecycle.finishLocked_consistent _ hl, ?_, hc, hr, hy, hi, ha, ?_, ?_, ?_, hpub⟩
+        refine ⟨Lifecycle.finishLocked_consistent _ hl, ?_, hc, hr, hy, hi, ha, hni, ?_, ?_, ?_,
+          hpub⟩
         · unfold Accounted; simpa using hacc
         · simpa using hok
         · intro _ _; simp; omega
@@ -281,7 +296,7 @@ theorem step_inv {s s' : Recv} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
   | cancel =>
     simp only [step, cancel] at hs
     cases hs
-    refine ⟨Lifecycle.finishLocked_consistent _ hl, ?_, hc, hr, hy, hi, ha, ?_, ?_, ?_, hpub⟩
+    refine ⟨Lifecycle.finishLocked_consistent _ hl, ?_, hc, hr, hy, hi, ha, hni, ?_, ?_, ?_, hpub⟩
     · unfold Accounted; simpa using hacc
     · simp
     · simp
@@ -292,7 +307,7 @@ theorem step_inv {s s' : Recv} {e : Ev} (h : Inv s) (hs : step s e = some s') : 
     · rename_i hd
       obtain ⟨hdone, _⟩ := hd
       cases hs
-      refine ⟨hl, by unfold Accounted; simpa using hacc, hc, hr, hy, hi, ha, hok, hdr,
+      refine ⟨hl, by unfold Accounted; simpa using hacc, hc, hr, hy, hi, ha, hni, hok, hdr,
         fun _ _ => hdone, ?_⟩
       simp
       intro hst

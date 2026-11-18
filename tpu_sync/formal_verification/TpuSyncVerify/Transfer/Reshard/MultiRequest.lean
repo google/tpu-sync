@@ -9,11 +9,20 @@ module composes.
 Multiple reshard transfers $R_0, R_1, R_2, \dots$ (`reqs : List Pipeline`) run
 concurrently and recycle the four caller- and arena-visible memories (`srcHbm`,
 `srcStaging`, `dstStaging`, `dstHbm`) across two ownership boundaries:
-- **Host staging (`srcStaging`, `dstStaging`)** is owned by `PoolStagingStorage`
-  and is returned to the bounded staging arena by `Lifecycle.settleLocked`
+- **Host staging (`srcStaging`, `dstStaging`)** is each pool's host staging:
+  when host layers are bounded (`HostLayersBounded()`, `num_staging_layers < num_layers`),
+  each session leases per-pool host layer buffers from its own
+  `StagingLayerManager` (`staging_manager.h`); otherwise (`!HostLayersBounded()`,
+  full host mirror), each pool uses its storage's host layer (`StaticHostLayer`),
+  backed by leased arena slots on a bounded `PoolStagingStorage` or the blocks' own bytes
+  at device offsets in the host mirror. `Lifecycle.settleLocked`
   (`ReshardSendSession::SettleLocked` / `ReshardSendSession::ReleaseLeasesLocked`
-  and `ReshardReceiveSession::ReleaseStagingLocked`) as soon as each session
-  settles (`hasStaging = false`).
+  and `ReshardReceiveSession::ReleaseStagingLocked`) gives it up as soon as
+  each session settles (`hasStaging = false`): on a bounded storage the slots
+  return to the arena; on a full mirror nothing is leased
+  (`AcquirePoolStagingLease` returns OK without allocating) and the session
+  simply stops using the bytes. Under `HostLayersBounded()`, each session
+  returns its host layer buffers via `StagingLayerManager::ReleaseAll()`.
 - **TPU HBM (`srcHbm`, `dstHbm`)** is owned by the serving engines and
   is handed back to the caller when `KVCacheManagerWithTransfer::CompleteReadWithDetails`
   publishes the session outcome (`send.published ≠ none`, `recv.published ≠ none`).
@@ -57,7 +66,8 @@ The top-level system theorems establish for **every** transfer `idx` (under both
    counterparts): across any reachable multi-transfer state and any number of
    concurrent or recycled transfers, whenever transfer `idx` publishes
    `done_recving`, its `dstHbm` holds `good ranks.length` (no within-transfer
-   aliased-page rank clobbering and no straggling reads from recycled buffers)
+   aliased-page rank clobbering, for pools with disjoint host staging bytes —
+   A2 below — and no straggling reads from recycled buffers)
    and remains `good ranks.length` across all subsequent multi-transfer
    transitions (no post-publication writes by `idx` and no write-after-release
    by any concurrent or recycled transfer `j`).
@@ -70,29 +80,66 @@ The top-level system theorems establish for **every** transfer `idx` (under both
 
 ## Assumptions
 
-* **A1 — Cross-transfer destination page disjointness (`dstHbm` per transfer):**
+* **A1 — Cross-transfer page and host-staging disjointness (`dstHbm`, `srcStaging`, `dstStaging` per transfer):**
   Each transfer `r ∈ ms.reqs` owns its own `dstHbm` vector while in flight, and
   aliased-page rank ordering (`writePoolHbm`, `AliasedPageCorrect`) is enforced
-  within each `ReshardReceiveSession` (`CollectEligiblePoolH2dsLocked`). Across
-  concurrent transfers, destination physical pages are disjoint:
-  - On any shared storage (`PoolSpec::storage_index`), all pools declared for
-    bounded pool staging agree on `block_stride_bytes` and `num_blocks`
-    (`KVCacheManagerBase::ConfigurePoolStaging`), and `ComputePoolBlockCopyExtents`
+  within each `ReshardReceiveSession` (`CollectEligiblePoolH2dsLocked`) for pools
+  of distinct `order_rank`s (same-rank device overlap is outside the model, `Pipeline.lean` A1).
+  Across concurrent transfers, destination physical pages and host staging bytes
+  must stay disjoint:
+  - On any uniform-stride storage (including bounded `PoolStagingStorage`s, and
+    full-mirror storages whose pools share `block_stride_bytes` and
+    `num_blocks`; pools that disagree on stride are accepted and the storage
+    falls back to a full host mirror), `ComputePoolBlockCopyExtents`
     places every region of block $b$ of pool $P$ at device offset
     $\text{base\_offset\_bytes} + b \cdot \text{block\_stride\_bytes} + \text{region\_offset} \in [b \cdot S, (b + 1) \cdot S)$
     when each pool's `base_offset_bytes + region.extent_end_bytes()` fits within
     one storage page $S = \text{block\_stride\_bytes}$ (`PoolSpec::Validate(storage_bytes)`
     with `storage_bytes = num_blocks * block_stride_bytes`, and the caller's
     manifest builder). Two pool blocks $b$ and $b'$ on the same storage
-    therefore overlap in device HBM bytes only when $b = b'$.
-  - On the host staging side, `KVCacheManagerBase::AcquirePoolStagingLease`
-    allocates disjoint host arena slots to distinct concurrent `uuid`s
-    (`PoolStaging.no_slot_aliasing_between_distinct_uuids`).
+    therefore overlap in device HBM bytes only when $b = b'$. On a full-mirror
+    storage whose pools disagree on `block_stride_bytes`, device byte
+    disjointness is assumed of the caller's layout.
+  - On the host staging side, there are three configurations:
+    1. *Full host mirror (`!HostLayersBounded()`) with bounded `PoolStagingStorage`:*
+       `StaticHostLayer` places each pool on its own `storage_index`,
+       `KVCacheManagerBase::AcquirePoolStagingLease` allocates disjoint host arena
+       slots to distinct concurrent `uuid`s
+       (`PoolStaging.no_slot_aliasing_between_distinct_uuids`), and `CopyPoolBlocks`
+       maps each block's extent to `extent.offset_bytes + (slot - block_id) * stride`.
+    2. *Full host mirror (`!HostLayersBounded()`) with a full-mirror storage:*
+       nothing is leased, so a block's host staging bytes are its own bytes in
+       the mirror at `extent.offset_bytes`, disjoint between transfers whenever
+       their device bytes are (on both source and destination).
+    3. *Bounded host layers (`HostLayersBounded()`, `num_host_layers() < num_layers()`):*
+       each session constructs its own per-session `StagingLayerManager` over
+       `[0, num_host_layers())` (`staging_manager.h`, `ReshardSendSession`,
+       `ReshardReceiveSession`). Because there is no cross-session host-layer
+       lease or lock in `tpu_sync/kv_cache` or `tpu_sync/core`, two concurrent
+       sessions can lease the same physical `layers_[host_idx]` buffer even
+       across different storages or distinct `PoolStagingLease` slots. Multi-transfer
+       safety under `HostLayersBounded()` therefore additionally assumes that
+       concurrent sessions do not stage overlapping byte ranges into the same
+       host layer buffer (or are serialized externally across sessions).
   - Above `tpu_sync`, the serving engine's unified KV-cache block allocator
     draws block IDs from a single `[0, num_blocks)` free pool shared across all
     KV-cache groups (full-attention and state/linear-attention groups alike) and
     excludes shared prefix-cached blocks from `dst_device_block_ids`, so two
     concurrent transfers never target the same uncached destination `block_id` $b$.
+* **A2 — Within one transfer, disjoint host staging across pools and no same-rank
+  device overlap (`Pipeline.lean` A1):** each `Pipeline` holds one `srcStaging` /
+  `dstStaging` cell per pool, and `clobberHigherRanks` models H2D overwrite only
+  from strictly lower to higher `order_rank`. On a full host mirror
+  (`!HostLayersBounded()`), two pools on the same storage whose declared-live
+  regions overlap on the device also share host staging bytes (at device offsets
+  on a full-mirror storage, or at their shared `(uuid, storage)` slot offsets on
+  a bounded storage), which the model does not cover; and pools of the **same**
+  `order_rank` are assumed not to overlap on the device in any configuration
+  (neither disjointness property is checked by the C++). Consequently,
+  `system_data_correct`, `system_attention_safe` and their `multiSysUnarmed`
+  counterparts cover device-overlapping pools **of different `order_rank`s** only
+  when each concurrently staged pool gets an isolated host layer buffer
+  (`HostLayersBounded()`, subject to A1's cross-session caveat).
 
 ## Lock scopes
 
@@ -108,14 +155,15 @@ Generated by `tools/resolve_anchors.py`.
 <!-- source-map:begin -->
 | File | Symbol / anchor | Lines |
 |---|---|---|
-| `reshard_send.cc` | `ReshardSendSession::ReleaseLeasesLocked` | `:470-474` |
-| `reshard_send.cc` | `ReshardSendSession::SettleLocked` | `:476-481` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ReleaseStagingLocked` | `:463-467` |
-| `reshard_recv.cc` | `ReshardReceiveSession::FinishPoolH2d` | `:670-708` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardPush` | `:833-871` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardRegisterRecv` | `:873-910` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` | `:1151-1292` |
-| `coord.cc` | `ReshardCoordinator::RunSubPlan` (`const int64_t receiver_arm_start_ns = MonotonicNs();` .. `if (!status.ok()) return status;`) | `:741-877` |
+| `reshard_send.cc` | `ReshardSendSession::ReleaseLeasesLocked` | `:784-789` |
+| `reshard_send.cc` | `ReshardSendSession::SettleLocked` | `:791-798` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ReleaseStagingLocked` | `:645-650` |
+| `reshard_recv.cc` | `ReshardReceiveSession::FinishPoolH2d` | `:890-926` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardPush` | `:733-775` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardRegisterRecv` | `:777-826` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` | `:1076-1139` |
+| `coord.cc` | `ReshardCoordinator::RunSubPlan` (`const int64_t receiver_arm_start_ns = MonotonicNs();` .. `if (!status.ok()) return status;`) | `:744-880` |
+| `tpu_sync/kv_cache/staging_manager.h` | `StagingLayerManager` | `:39-74` |
 <!-- source-map:end -->
 -/
 
@@ -319,7 +367,13 @@ theorem multiInv_data_correct {ranks peerCounts : List Nat} {ms : MultiState}
 In any reachable multi-transfer state — across any number of concurrent,
 overlapped, succeeded, failed, or cancelled reshard transfers — whenever any
 transfer `r` at index `idx` publishes `done_recving`, its `dstHbm` holds
-`good ranks.length`. -/
+`good ranks.length`. Each transfer has one host staging cell per pool and
+clobbers strictly higher `order_rank`s only (assumption A2): for pools of
+different `order_rank`s whose declared-live regions overlap on a shared storage,
+the statement applies only when each concurrently staged pool has an isolated host
+layer buffer (`HostLayersBounded()`, subject to A1's caveat that concurrent
+sessions do not collide in shared host layer buffers); same-rank device overlap
+is outside the model. -/
 theorem system_data_correct {ranks peerCounts : List Nat} {ms : MultiState}
     {idx : Nat} {r : Pipeline}
     (hvalid : validConfig ranks peerCounts = true)
@@ -330,7 +384,8 @@ theorem system_data_correct {ranks peerCounts : List Nat} {ms : MultiState}
   multiInv_data_correct (reachable_multiInv hvalid h) hreq hp
 
 /-- **Publication correctness across unarmed transfers (`multiSysUnarmed`):**
-Same guarantee when every initial and recycled transfer starts unarmed before
+Same guarantee (under the same A1/A2 host-staging and distinct-`order_rank`
+overlap scope) when every initial and recycled transfer starts unarmed before
 Phase 1 of `ReshardCoordinator::RunSubPlan` (`initUnarmed`). -/
 theorem system_unarmed_data_correct {ranks peerCounts : List Nat} {ms : MultiState}
     {idx : Nat} {r : Pipeline}
@@ -428,11 +483,12 @@ theorem multiRunFrom_dstHbm_quiet {ranks peerCounts : List Nat} {idx : Nat} :
 
 /-- **Post-publication HBM safety across transfers (`multiSys`):**
 Once any transfer `r` at index `idx` publishes `done_recving`, its `dstHbm`
-holds `good ranks.length` (from within-transfer aliased-page rank-wave ordering
-and read-before-release) and stays equal to `good ranks.length` across any
-subsequent sequence of multi-transfer transitions `evs` (including steps of
-`idx`, steps of earlier or later concurrent transfers checked by
-`wroteReleased`, and buffer recycling via `recycleSrc` or `nextRequest`). -/
+holds `good ranks.length` (within A1/A2's disjoint-host-staging and
+distinct-`order_rank` device-overlap scope) and stays equal to
+`good ranks.length` across any subsequent sequence of multi-transfer transitions
+`evs` (including steps of `idx`, steps of earlier or later concurrent transfers
+checked by `wroteReleased`, and buffer recycling via `recycleSrc` or
+`nextRequest`). -/
 theorem system_attention_safe {ranks peerCounts : List Nat} {ms ms' : MultiState}
     {idx : Nat} {r : Pipeline}
     (hvalid : validConfig ranks peerCounts = true)
@@ -448,7 +504,8 @@ theorem system_attention_safe {ranks peerCounts : List Nat} {ms ms' : MultiState
   exact ⟨r', hreq', hd.trans (system_data_correct hvalid h hreq hp)⟩
 
 /-- **Post-publication HBM safety across unarmed transfers (`multiSysUnarmed`):**
-Same post-publication invariance when every transfer starts unarmed (`initUnarmed`). -/
+Same post-publication invariance (under the same A1/A2 scope) when every
+transfer starts unarmed (`initUnarmed`). -/
 theorem system_unarmed_attention_safe {ranks peerCounts : List Nat} {ms ms' : MultiState}
     {idx : Nat} {r : Pipeline}
     (hvalid : validConfig ranks peerCounts = true)
@@ -541,7 +598,7 @@ theorem system_unarmed_progress {ranks peerCounts : List Nat} {ms : MultiState}
 /-! ## Concrete multi-transfer traces and write-after-release mutant -/
 
 /-- Two-pool producer trace (`ranks = [0, 1]`, `peerCounts = [1, 2]`): issues D2H
-for pool 0 (1 peer) and pool 1 (2 peers), finishes `ExecutePush`, completes all
+for pool 0 (1 peer) and pool 1 (2 peers), finishes `ExecutePushPipeline`, completes all
 3 peer pushes onto the wire, and publishes `done_sending`. -/
 def sendProducer2 : List Ev :=
   [ .send (.d2hIssue 0 true), .send (.d2hIssue 1 true), .send .execFinish,

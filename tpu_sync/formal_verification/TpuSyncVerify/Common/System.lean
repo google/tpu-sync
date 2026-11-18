@@ -7,7 +7,8 @@ definition then serves three purposes:
 
 * **replay** — `run` checks a concrete trace, so a scenario can be confirmed
   or refuted by `decide`;
-* **search** — `TpuSyncVerify.ModelCheck` explores small instances exhaustively;
+* **search** — `TpuSyncVerify.ModelCheck` explores small instances breadth-first
+  over a given event list, exhaustively when the search closes;
 * **proof** — `Reachable` and `reachable_induction` give the induction
   principle for proving an invariant on every reachable state.
 

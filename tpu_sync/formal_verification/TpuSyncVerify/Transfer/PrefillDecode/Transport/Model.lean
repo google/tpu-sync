@@ -63,26 +63,37 @@ def Cfg.perLayer (c : Cfg) : Nat := c.numSenders * c.numStreams * c.blocksPerStr
 /-- `total_blocks_ * num_layers` (`RecordBlockShardsReceivedLocked`). -/
 def Cfg.target (c : Cfg) : Nat := c.perLayer * c.numLayers
 
-/-- The preconditions the C++ already enforces or the deployment guarantees:
-at least one layer-array sender, a positive declared stream count
-(`CompleteIncomingPush`: `if (num_streams == 0)`), and non-empty streams. -/
+/-- Preconditions of the configuration: at least one layer-array sender, a
+positive declared stream count (`CompleteIncomingPush`: `if (num_streams == 0)`),
+non-empty streams, and `chunkSingle`, which the C++ does not check and which is
+a caller obligation on two of the receiver kinds it covers (see the field). -/
 structure Cfg.WF (c : Cfg) : Prop where
   senders : 0 < c.numSenders
   streams : 0 < c.numStreams
   blocks : 0 < c.blocksPerStream
   /-- The chunk-count contract is single-sender. On the `StartRead` path no
   receiver plan is registered at all and the pull goes to one endpoint
-  (`StartRead(remote_endpoint)` → `ExecutePullRequest`), so there is one sender;
-  on the plan path a plan with several `shard_push_schedules` makes
+  (`StartRead(remote_endpoint)` → `TransferReceiveSession::Start`), so there is
+  one sender; on the plan path a plan with several `shard_push_schedules` makes
   `ExpectedPushSenders` return their count
-  (`plan_snapshot->request.shard_push_schedules_size()`), selecting the
-  sender-declared contract. `trace_chunk_two_senders` shows what the excluded
-  instance does. -/
+  (`TransferPlan::ExpectedPushSenders`: `request_.shard_push_schedules_size()`),
+  selecting the
+  sender-declared contract. Two receiver kinds run the chunk-count contract
+  with nothing in the C++ bounding the number of pushing senders: a receive
+  created by `KVCacheManagerWithTransfer::RegisterRecv` (no plan, so
+  `ExpectedPushSenders` is `nullopt`) and a receiver plan with
+  `shard_push_schedules_size() == 0`. For those, one sender per uuid is an
+  obligation on the caller that dispatches the pushes, not something this
+  model derives. `trace_chunk_two_senders` shows what the excluded instance
+  does. -/
   chunkSingle : c.declared = false → c.numSenders = 1
 
 def freshLayer (c : Cfg) : Layer :=
   { entry := none, sent := List.replicate c.numSenders 0, dispatched := 0, pending := 0 }
 
+/-- Initial state for a fresh `uuid` (**A5**): no prior `active_push_sessions_[uuid]`
+entry (`entry = none` on every layer) and no concurrent `ForgetPushProgress(uuid)`
+in flight from retiring an earlier session or plan on the same `uuid`. -/
 def init (c : Cfg) : S :=
   { layers := List.replicate c.numLayers (freshLayer c),
     blocks := 0, completedLayers := 0, life := {} }
@@ -106,7 +117,7 @@ def freshProgress (c : Cfg) : Progress :=
   { completedChunks := 0, landed := List.replicate c.numSenders 0,
     sendersComplete := 0, called := false }
 
-/-- `CompleteIncomingPush` on one table entry (`auto& progress = layer_progress_[{uuid, l}]` ..
+/-- `CompleteIncomingPush` on one table entry (`auto& progress = layer_progress_[l]` ..
 `trigger_completion = true;`). Returns the updated entry, whether this stream
 completed the layer (`trigger_completion`), and whether the push was rejected.
 In the sender-declared contract the `++streams.landed` increment persists even
@@ -137,7 +148,9 @@ def Layer.entryCalled (L : Layer) : Bool :=
   | none => false
 
 /-- Retirement (`if (all_layers_called)` in `CompleteIncomingPush`): once every
-layer's latch is set, the uuid's entries are erased. -/
+layer's latch is set the push session is done (`done_ = true`), and the next
+stream of the uuid gets a fresh session with a fresh table
+(`GetOrCreatePushSession`, `DeletePushSession`). -/
 def retire (layers : List Layer) : List Layer :=
   if layers.all Layer.entryCalled then layers.map (fun L => { L with entry := none })
   else layers
@@ -160,10 +173,11 @@ def nextLayer (L : Layer) (p' : Progress) (sent' : List Nat) (fire : Bool) : Lay
     (nextLayer L p' s' f).pending = if f then L.pending + 1 else L.pending := rfl
 
 /-- The session side of one stream, given the transport's verdict. Push lease
-`TryBeginRecvOp` (`beginOp`, `hooks.begin_incoming_push`); on completion `ExecuteLayerH2d`
-takes the copy's op (`++in_flight_`, `fire`); a rejection runs the cleanup's
-`EndIncomingPush(InternalError)` → `Finish(status)` (`hooks.end_incoming_push`); the
-lease is returned by `EndRecvOp` (`hooks.end_incoming_push`, or `EndIncomingPush` on success). -/
+`TransferReceiveSession::TryBeginOp` (`beginOp`, from `BeginIncomingPush`); on
+completion `ExecuteLayerH2d` takes the copy's op (`++in_flight_`, `fire`); a
+rejection runs the cleanup's `EndIncomingPush(session, InternalError)` →
+`Finish(status)`; the lease is returned by `TransferReceiveSession::EndOp`
+(`EndIncomingPush`, on either path). -/
 def streamLife (l : Lifecycle) (fire reject : Bool) : Lifecycle :=
   let l := if fire then { l with inFlight := l.inFlight + 1 } else l
   let l := if reject then l.finishLocked false else l
@@ -198,7 +212,7 @@ def Layer.copyDone (L : Layer) : Layer := { L with pending := L.pending - 1 }
 /-- The H2D `future.OnReady` callback in `ExecuteLayerH2d`: on success
 `num_completed_layers_++` and, at `num_layers()` while not draining, the
 success `FinishLocked()`; on failure `FinishLocked(status_or.status(), kH2dPhase)`;
-then `absl::Cleanup end_op`'s `EndRecvOp()`. -/
+then `absl::Cleanup end_op`'s `EndOp()`. -/
 def callbackLife (c : Cfg) (l : Lifecycle) (ok : Bool) (completed : Nat) : Lifecycle :=
   let l :=
     if ok then

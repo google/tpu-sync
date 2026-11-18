@@ -66,25 +66,31 @@ theorem trace_bounded_arena_leases_and_addressing :
       some ⟨1, some 0, some 1, some 2, none, true, true, 4, 2, some 2, some 1⟩ := by
   decide
 
-/-- Replay of `PoolStagingTest.SmallPoolIdentitySharedStorageAndStrideMismatch`:
-Two pools (`gdn.conv` and `gdn.ssm`) sharing storage 0 acquire leases under the
-same `uuid = 42` for overlapping block sets `[10, 20]` and `[10, 20]`. Because
-`AcquirePoolStagingLease` is idempotent per `uuid`, the second pool's call
-consumes 0 additional slots and shares the exact same page-slot mapping. -/
+/-- Replay of the shared-storage part of
+`PoolStagingTest.SmallPoolIdentitySharedStorageAndStrideMismatch`: two pools
+(`gdn.conv` and `gdn.ssm`) share storage 0, a 3-slot arena. One
+`AcquirePoolStagingLease(uuid = 5, {20})` leaves 2 free slots, and both pools
+then address block 20 through that lease's slot 0 (`GetBlockChunks`; the lease
+is per `(uuid, storage)`, so the model has one look-up for both pools).
+
+The last component is model-only, not in the test: a second acquisition of
+`[20]` under the same `uuid`, as a second pool of the storage would issue,
+leaves the arena unchanged. -/
 theorem trace_shared_storage_pools_share_lease :
-    ((Arena.init 3).acquireLease 42 [10, 20]).map
+    ((Arena.init 3).acquireLease 5 [20]).map
       (fun a1 =>
-        ( a1.acquireLease 42 [10, 20] == some a1
-        , a1.freeSlots.length
-        , a1.resolveBlockSlot 42 10
-        , a1.resolveBlockSlot 42 20 )) =
-      some (true, 1, some 0, some 1) := by
+        ( a1.freeSlots.length
+        , a1.resolveBlockSlot 5 20
+        , a1.acquireLease 5 [20] == some a1 )) =
+      some (2, some 0, true) := by
   decide
 
 /-- Bounded vs. full-mirror storage configuration
-(`KVCacheManagerBase::ConfigurePoolStaging` in `base.cc`):
-allocates a bounded arena of `blocksPerLease * leases` slots (`some numSlots`)
-if and only if `0 < blocksPerLease`, `0 < leases`, all pools sharing the
+(`KVCacheManagerBase::ConfigurePoolStaging` in `base.cc`): for a device-backed
+storage whose pools agree on `num_blocks > 0` (`maxPoolBlocks`) and all declare positive
+`staging_blocks_per_request` (`agg.hint_min > 0`, with `blocksPerLease =
+agg.hint_max`), allocates a bounded arena of `blocksPerLease * leases` slots
+(`some numSlots`) when `0 < blocksPerLease`, `0 < leases`, all pools sharing the
 storage have equal `block_stride_bytes` (`stridesEqual`), and
 `blocksPerLease * leases < maxPoolBlocks`; otherwise falls back to full-mirror
 identity addressing (`none`). -/
@@ -104,7 +110,7 @@ def poolStagingCapacity (maxPoolBlocks : Nat) (boundedSlots : Option Nat) : Nat 
   boundedSlots.getD maxPoolBlocks
 
 /-- Remote address (`raddr`) resolution on sender `KVCacheManagerBase::GetBlockChunks`
-(`RemoteAddress`) vs. receiver `KVCacheManagerBase::CopyPoolBlocks`
+(`RemoteAddress`) vs. receiver `KVCacheManagerBase::GetBlockChunks` (`block_host_base`)
 (`PoolStagingTest.SenderRaddrMatchesReceiverPointer`,
 `PoolStagingTest.SenderRaddrUsesReceiverLeaseSlot`):
 - On full-mirror storage (`arena = none`), `dstBlock < numBlocks` resolves to
@@ -123,21 +129,23 @@ def resolveRemoteAddr (baseAddr stride numBlocks : Nat) (arena : Option Arena)
 
 /-- Replay of `PoolStagingTest.FallsBackToFullMirrorWithoutHintsOrLeases` and
 `PoolStagingTest.SmallPoolIdentitySharedStorageAndStrideMismatch`:
-1. Zero hints (`blocks = 0, leases = 0, maxBlocks = 16`) or zero
+1. A zero hint (`blocks = 0, leases = 2, maxBlocks = 16`) or zero
    leases (`blocks = 2, leases = 0, maxBlocks = 16`) falls back to
    full mirror (`none`).
-2. Small pool (`blocks = 2, leases = 2, maxBlocks = 3`, `4 ≥ 3`)
+2. Small pool (`blocks = 2, leases = 2, maxBlocks = 4`, the boundary `4 ≥ 4`)
    falls back to full mirror (`none`).
-3. Shared storage with matching strides (`blocks = 3, leases = 1, maxBlocks = 64`)
+3. Shared storage with matching strides (`blocks = 1, leases = 3, maxBlocks = 32`)
    configures a bounded arena of `some 3` slots.
-4. Shared storage with mismatched strides (`stridesEqual = false`)
-   falls back to full mirror (`none`). -/
+4. Shared storage whose two pools disagree on stride (and on block count:
+   32 and 64; `blocks = 1, leases = 3`, `stridesEqual = false`) falls back to
+   full mirror (`none`). `maxBlocks = 32` is the first pool's count; the
+   result does not depend on it. -/
 theorem trace_fallback_to_full_mirror_and_stride_mismatch :
-    configureStorageBounded 0 0 16 true = none ∧
+    configureStorageBounded 0 2 16 true = none ∧
     configureStorageBounded 2 0 16 true = none ∧
-    configureStorageBounded 2 2 3 true = none ∧
-    configureStorageBounded 3 1 64 true = some 3 ∧
-    configureStorageBounded 2 2 64 false = none := by
+    configureStorageBounded 2 2 4 true = none ∧
+    configureStorageBounded 1 3 32 true = some 3 ∧
+    configureStorageBounded 1 3 32 false = none := by
   decide
 
 /-- Replay of `PoolStagingTest.SenderRaddrMatchesReceiverPointer`,

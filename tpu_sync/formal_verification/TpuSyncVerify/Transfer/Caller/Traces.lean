@@ -8,6 +8,8 @@ namespace TpuSyncVerify.Transfer.Caller
 
 /-! ## Replay and search -/
 
+/-- Every instance of every `Ev` constructor, so a `.safe` result of `search`
+on this list covers the whole of `sys c`. -/
 def allEvents : List Ev :=
   [.pOutcome true, .pOutcome false, .dOutcome true, .dOutcome false, .promote, .finish]
 
@@ -112,6 +114,8 @@ Each mutant omits one part of `Contract`:
 3. `connectorLoadErrorOnly` reports on the load-failure channel without
    `finished_recving`. D leaks its blocks under either policy. -/
 
+-- Restricted to `okEvents` on purpose: `.safe` here says the mutant has no
+-- violation in runs where no transfer fails, not that it is safe.
 #guard search (dropFailed .fail) okEvents = .safe
 #guard search (dropFailed .recompute) okEvents = .safe
 

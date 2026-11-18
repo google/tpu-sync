@@ -21,10 +21,11 @@ single worker (`Model.lean`, `Invariant.lean`, `Traces.lean`), across multiple
 workers aggregated by `KVOutputAggregator` (`MultiWorker.lean`, covering both
 its eager block-level `invalid_block_ids` channel and its latched request-level
 `_failed_recving_pending` channel), and across intra-worker NUMA sub-managers
-inside `NumaAwareKVCacheManager::CompleteReadRaw` (`NumaBarrier.lean`, comparing
-the baseline `NumaPolicy.eagerFailSet` against the settled-count barrier
-`NumaPolicy.settledCounts` across `req_id` reuse) — for the two production vLLM
-connectors that drive `tpu-sync`:
+inside `NumaAwareKVCacheManager::CompleteReadRaw` (`NumaBarrier.lean`, proving
+the settled-count barrier `NumaPolicy.settledCounts` of `process_completion`
+safe across `req_id` reuse and refuting the eager-failure-set mutant
+`NumaPolicy.eagerFailSet`) — for the two production vLLM connectors that drive
+`tpu-sync`:
 
 1. **Prefill-to-decode (`tpu-inference`):** vLLM's scheduler driving `tpu-sync`
    through `tpu_raiden_connector.py` (`TPUConnectorWorker.get_transfer_results`,
@@ -67,22 +68,31 @@ Citations: `conn.py` = `tpu_inference/distributed/tpu_raiden_connector.py`;
 <!-- source-map:begin -->
 | File | Symbol / anchor | Lines |
 |------|-----------------|-------|
-| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` | `:1151-1292` |
-| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`absl::MutexLock lock(mu_);`) | `:1157` |
-| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = send_sessions_.begin();` .. `send_sessions_.erase(it++);`) | `:1159-1177` |
-| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = active_pool_reshard_sends_.begin();` .. `active_pool_reshard_sends_.erase(it++);`) | `:1182-1198` |
-| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = active_recv_sessions_.begin();` .. `active_recv_sessions_.erase(it++);`) | `:1207-1234` |
-| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = active_pool_reshard_recvs_.begin();` .. `active_pool_reshard_recvs_.erase(it++);`) | `:1239-1263` |
-| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::RecordPoolReshardTerminalLocked` | `:177-227` |
-| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::SweepSubPlanChainsLocked` | `:229-288` |
-| `tpu_sync/frameworks/jax/kv_cache_manager.h` | `NumaAwareKVCacheManager` (`std::map<std::string, int> done_sending_counts_;` .. `std::set<std::string> failed_recving_set_;`) | `:287-290` |
-| `tpu_sync/frameworks/jax/kv_cache_manager.cc` | `NumaAwareKVCacheManager::NotifyForRead` | `:528-536` |
-| `tpu_sync/frameworks/jax/kv_cache_manager.cc` | `NumaAwareKVCacheManager::StartRead(remote_descriptors)` | `:574-618` |
-| `tpu_sync/frameworks/jax/kv_cache_manager.cc` | `NumaAwareKVCacheManager::StartRead(remote_endpoint)` | `:620-635` |
-| `tpu_sync/frameworks/jax/kv_cache_manager.cc` | `NumaAwareKVCacheManager::CompleteReadRaw` | `:638-678` |
-| `tpu_sync/frameworks/jax/kv_cache_manager_wrapper_test.cc` | `KVCacheManagerWrapperTest.VotingConsensusPromotesDoneRecvingOnlyWhenAllAgree` | `:169-196` |
-| `tpu_sync/frameworks/jax/kv_cache_manager_wrapper_test.cc` | `KVCacheManagerWrapperTest.AnyFailureImmediatelyTriggersFailedRecvingAndSuppressesFutureAcks` | `:198-225` |
-| `tpu_sync/frameworks/jax/kv_cache_manager_wrapper_test.cc` | `KVCacheManagerWrapperTest.VotingConsensusPromotesDoneSendingOnlyWhenAllAgree` | `:227-247` |
+| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` | `:1076-1139` |
+| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`absl::MutexLock lock(mu_);`) | `:1082` |
+| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = sessions_.begin(); it != sessions_.end();)` .. `failed_recving_.clear();`) | `:1084-1122` |
+| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::RetireSettledSessionLocked` | `:471-530` |
+| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::RetireSettledSessionLocked` (`(!recv->GetStatus().ok() ? failed_recving_ : done_recving_)`) | `:482-483` |
+| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::RetireSettledSessionLocked` (`(failed ? failed_recving_ : done_sending_).insert(req_id);`) | `:520` |
+| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.h` | `KVCacheManagerWithTransfer` (`struct SessionEntry {` .. `SessionRole role;`) | `:304-307` |
+| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::RecordPoolReshardTerminalLocked` | `:186-252` |
+| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::SweepSubPlanChainsLocked` | `:254-303` |
+| `tpu_sync/frameworks/jax/kv_cache_manager.h` | `NumaAwareKVCacheManager` (`std::map<std::string, int> done_sending_counts_;` .. `std::map<std::string, int> req_expected_counts_;`) | `:295-298` |
+| `tpu_sync/frameworks/jax/kv_cache_manager.cc` | `NumaAwareKVCacheManager::NotifyForRead` | `:532-540` |
+| `tpu_sync/frameworks/jax/kv_cache_manager.cc` | `NumaAwareKVCacheManager::StartRead(remote_descriptors)` | `:580-624` |
+| `tpu_sync/frameworks/jax/kv_cache_manager.cc` | `NumaAwareKVCacheManager::StartRead(remote_endpoint)` | `:626-641` |
+| `tpu_sync/frameworks/jax/kv_cache_manager.cc` | `NumaAwareKVCacheManager::CompleteReadRaw` | `:644-706` |
+| `tpu_sync/frameworks/jax/kv_cache_manager.cc` | `NumaAwareKVCacheManager::CompleteReadRaw` (`auto process_completion = [&](const std::string& req) {` .. `req_expected_counts_.erase(req);`) | `:650-685` |
+| `tpu_sync/frameworks/jax/kv_cache_manager_wrapper_test.cc` | `KVCacheManagerWrapperTest.VotingConsensusPromotesDoneRecvingOnlyWhenAllAgree` | `:194-221` |
+| `tpu_sync/frameworks/jax/kv_cache_manager_wrapper_test.cc` | `KVCacheManagerWrapperTest.FailureWaitsForSiblingSubManagersBeforeEmittingFailedRecving` | `:223-263` |
+| `tpu_sync/frameworks/jax/kv_cache_manager_wrapper_test.cc` | `KVCacheManagerWrapperTest.FailureWhenAllSubManagersFailEmitsFailedRecvingOnce` | `:265-298` |
+| `tpu_sync/frameworks/jax/kv_cache_manager_wrapper_test.cc` | `KVCacheManagerWrapperTest.RecvFirstThenFailureWaitsForSubManagersAndEmitsFailure` | `:300-327` |
+| `tpu_sync/frameworks/jax/kv_cache_manager_wrapper_test.cc` | `KVCacheManagerWrapperTest.SendFailureWaitsForSiblingSubManagersBeforeEmittingFailedRecving` | `:329-357` |
+| `tpu_sync/frameworks/jax/kv_cache_manager_wrapper_test.cc` | `KVCacheManagerWrapperTest.SingleSubManagerFailureEmitsImmediatelyAndCleansUp` | `:359-384` |
+| `tpu_sync/frameworks/jax/kv_cache_manager_wrapper_test.cc` | `KVCacheManagerWrapperTest.VotingConsensusPromotesDoneSendingOnlyWhenAllAgree` | `:386-406` |
+| `tpu_sync/frameworks/jax/kv_cache_manager_wrapper_test.cc` | `KVCacheManagerWrapperTest.StartReadUnifiedMultiEndpointMultiSubManager` | `:600-660` |
+| `tpu_sync/frameworks/jax/kv_cache_manager_wrapper_test.cc` | `KVCacheManagerWrapperTest.StartReadInputVectorValidation` | `:662-679` |
+| `tpu_sync/frameworks/jax/kv_cache_manager.cc` | `NumaAwareKVCacheManager::InitSubManagers` | `:305-471` |
 <!-- source-map:end -->
 
 ## Lock scopes
@@ -105,32 +115,42 @@ with the transfer issued (`TPUConnectorScheduler.update_state_after_alloc` and
 touches a transfer-held block, so the model starts there (`init`, `mwInit`).
 
 Below the engine sits tpu-sync, abstracted to the publications of
-`PrefillDecode/Pipeline.lean` and `Reshard/Pipeline.lean`: `sendPub` is
-`send.published` and `recvPub` is `recv.published`. In
-`KVCacheManagerWithTransfer::CompleteReadWithDetails` (`mgr.cc`), all four
-session loops — `for (auto it = send_sessions_.begin();` ..
-`send_sessions_.erase(it++);` and
-`for (auto it = active_pool_reshard_sends_.begin();` ..
-`active_pool_reshard_sends_.erase(it++);` on P, and
-`for (auto it = active_recv_sessions_.begin();` ..
-`active_recv_sessions_.erase(it++);` and
-`for (auto it = active_pool_reshard_recvs_.begin();` ..
-`active_pool_reshard_recvs_.erase(it++);` on D — write into the same three
-lists (`done_sending_`, `done_recving_`, `failed_recving_`); the two pool-reshard
-loops write through `KVCacheManagerWithTransfer::RecordPoolReshardTerminalLocked`,
-which for a single-plan request (`sub_plan_count <= 1`) is the same
-`(status.ok() ? done : failed_recving_).insert(req_id)` and for a request
-coordinated as a chain of sub-plans reports one terminal per request (when its
-last sub-plan settles, or at its first failed sub-plan — `SweepSubPlanChainsLocked`
-fails a chain whose next sub-plan never arrives). Each publication is
-set once, by `pOutcome ok` / `dOutcome ok` (or per worker by `pWorker w ok` /
-`dWorker w ok`), with `ok = false` covering a failed push or pull *and* a send
-nobody pulled before `timeout_s` (both `(failed ? failed_recving_ : done_sending_)`
-and timed-out sends go to `failed_recving_`; the connectors pass
-`TPU_P2P_WAIT_PULL_TIMEOUT`, 180 s, as `timeout_s` in
-`TPUConnectorWorker.register_kv_caches` and `tpu_connector.py`
-`get_p2p_wait_pull_timeout()`). Which value is published is
-nondeterministic here; the `Pipeline.lean` modules say when each is possible.
+`PrefillDecode/Pipeline.lean` and `Reshard/Pipeline.lean` (`sendPub` =
+`send.published`, `recvPub` = `recv.published`):
+
+* **Poll sweep (`KVCacheManagerWithTransfer::CompleteReadWithDetails`, `mgr.cc`):**
+  one loop over `sessions_` (`for (auto it = sessions_.begin(); it != sessions_.end();)`)
+  sweeps deadlines (`session->deadline() <= now` across every session kind) and
+  passes each settled session to
+  `KVCacheManagerWithTransfer::RetireSettledSessionLocked`, which erases it and
+  inserts its `SessionEntry`'s `req_id` into `done_sending_`, `done_recving_`,
+  or `failed_recving_` across three arms: `TransferReceiveSession` on D,
+  pool-reshard sessions distinguished by `SessionEntry::role`
+  (`kPoolReshardSend` on P, `kPoolReshardReceive` on D), and
+  `TransferSendSession` on P. A receive with `tracks_completion()` false is
+  erased unreported.
+* **Pool-reshard chains (`RecordPoolReshardTerminalLocked` / `SweepSubPlanChainsLocked`):**
+  a single-plan request (no `sub_plan_chains_` entry for `req_id`) writes
+  `(status.ok() ? done : failed_recving_).insert(req_id)` directly; a
+  multi-window sub-plan chain (`SubPlanChainProgress::sub_sessions`) reports one
+  terminal per request when its last sub-plan settles, at its first failure, or
+  when `SweepSubPlanChainsLocked` fails a stalled chain (see
+  `Reshard/SubPlanChain.lean` for the chain model and its caller assumptions).
+* **Other writers under `mu_`:** `RetireSettledSessionLocked` also runs inline
+  when `StartRead`, `EmplaceRecvSessionLocked`, `RegisterActivePlan` (sender or
+  receiver), `PoolReshardPush`, or `PoolReshardRegisterRecv` sees a settled
+  incumbent; `NotifyForRead` inserts into `done_sending_` if the ack for its
+  uuid already arrived; `StartRead` inserts into `failed_recving_` on duplicate
+  uuid, session-creation failure, or registration failure.
+* **Model abstraction:** all of these collapse to one nondeterministic
+  publication per side, set once by `pOutcome ok` / `dOutcome ok` (or per worker
+  by `pWorker w ok` / `dWorker w ok`). `ok = false` covers failed pushes/pulls
+  and unpulled sends expiring at `timeout_s` (both
+  `(failed ? failed_recving_ : done_sending_)` in `RetireSettledSessionLocked`
+  and timed-out sends land in `failed_recving_`; connectors pass
+  `TPU_P2P_WAIT_PULL_TIMEOUT`, 180 s, via `TPUConnectorWorker.register_kv_caches`
+  and `tpu_connector.py` `get_p2p_wait_pull_timeout()`). Which outcome occurs is
+  left to the `Pipeline.lean` models.
 
 Between tpu-sync and the scheduler sits the **connector**. Per request and per
 step it sees at most one of the three `poll_stats()` lists and produces a
@@ -212,25 +232,32 @@ withholds completion until all workers have reported (`pSentCount = expectedP`,
 
 Inside a single JAX worker, `NumaAwareKVCacheManager::CompleteReadRaw`
 (`tpu_sync/frameworks/jax/kv_cache_manager.cc`) sits between the per-NUMA
-`KVCacheManagerWithTransfer` sub-managers (`num_subs = 1` under
-`ENABLE_MULTI_NUMA=0`, `num_subs = 2` under `ENABLE_MULTI_NUMA=1`) and
-`TPUConnectorWorker.get_transfer_results` (`NumaBarrier.lean`). Two sub-manager
+`KVCacheManagerWithTransfer` sub-managers and
+`TPUConnectorWorker.get_transfer_results` (`NumaBarrier.lean`).
+`NumaAwareKVCacheManager::InitSubManagers` creates one sub-manager by default
+and, under `ENABLE_MULTI_NUMA=1`/`true`, one per device NUMA node (or
+`min(num_ext_nics, total_num_shards_)` when multiple shards share one node on a
+multi-NIC host); the model and its theorems instantiate 1 and 2 sub-managers
+(`twoSubs`). Two sub-manager
 barrier policies are compared across sequential transfers that reuse the same
 `req_id` (`recycle`):
-* `NumaPolicy.eagerFailSet` (shipping `kv_cache_manager.cc`): emits
-  `done_sending` at `done_sending_counts_[req] == num_subs`, emits `done_recving`
-  (unless suppressed by `failed_recving_set_`) and erases
-  `done_recving_counts_[req]`, `req_expected_counts_[req]`, and
-  `failed_recving_set_[req]` at `done_recving_counts_[req] >= expected`, and
-  emits `failed_recving` immediately on `failed_recving_set_.insert(req).second`
-  without waiting for sibling sub-managers or erasing any map entry
-  (`KVCacheManagerWrapperTest.AnyFailureImmediatelyTriggersFailedRecvingAndSuppressesFutureAcks`).
-* `NumaPolicy.settledCounts` (settled-count barrier, not in C++ at the baseline
-  commit): counts `done_sending_counts_`, `done_recving_counts_`, and
+* `NumaPolicy.settledCounts` (`process_completion` in `kv_cache_manager.cc`):
+  counts `done_sending_counts_`, `done_recving_counts_`, and
   `failed_recving_counts_`, withholds emission until
-  `done_sending_counts_ + done_recving_counts_ + failed_recving_counts_ >= expected`,
-  emits `failed_recving` if `failed_recving_counts_ > 0` (else `done_recving` or
-  `done_sending`), and erases all four per-request map entries.
+  `s_count + r_count + f_count >= expected`, emits `failed_recving` if
+  `f_count > 0` (else `done_recving` or `done_sending`), and erases all four
+  per-request map entries
+  (`KVCacheManagerWrapperTest.FailureWaitsForSiblingSubManagersBeforeEmittingFailedRecving`,
+  its six sibling barrier tests and
+  `KVCacheManagerWrapperTest.StartReadUnifiedMultiEndpointMultiSubManager`,
+  replayed in `NumaBarrier.lean`).
+* `NumaPolicy.eagerFailSet` (mutant): emits `done_sending` at
+  `done_sending_counts_[req] == num_subs`, emits `done_recving` (unless
+  suppressed by a per-request failure set) and erases `done_recving_counts_[req]`,
+  `req_expected_counts_[req]`, and the set entry at
+  `done_recving_counts_[req] >= expected`, and emits `failed_recving`
+  immediately on the first failing sub-manager without waiting for sibling
+  sub-managers or erasing any map entry.
 
 ## Properties
 
@@ -273,8 +300,10 @@ each has refutation traces: `trace_dropFailed_p`,
 `trace_loadErrorOnly_fail`, `trace_loadErrorOnly_recompute`, and
 `trace_mw_latched_loadErrorOnly_never_emits` (`connectorLoadErrorOnly`), plus
 `trace_mw_overcounted_expected_leaks` (why `get_finished_count()` must match the
-participating worker count). Bounded search (`search`, `mwSearch`) exhausts the
-state space for each configuration.
+participating worker count). The searches `search` and `mwSearch`, run over
+every event instance (`allEvents`, `mwAllEvents`), close with `.safe` for the
+`connectorTwoChannel` configurations; they are evaluated by `#guard` and
+cross-check `contract_safe` / `mw_contract_safe`, which are the proofs.
 
 On the Reshard path under `Policy.fail`, `vllm-torchtpu`'s
 `_stage3_fail_uncertain_loads_early` (`tpu_connector.py`
@@ -290,19 +319,20 @@ destination HBM is not freed while any receiver rank is still armed), and the
 subsequent terminal `dOutcome false` / `dWorker` publications on
 `connectorTwoChannel` free `dHeld = false`.
 
-On the intra-worker JAX wrapper (`NumaBarrier.lean`), `NumaPolicy.eagerFailSet`
-frees consumer or producer HBM while a sibling sub-manager's DMA is still in
-flight at `num_subs = 2` (`trace_eagerFailSet_recv_early_free`,
-`trace_eagerFailSet_send_early_free`) and, across `recycle` (`req_id` reuse),
-leaks blocks at `num_subs = 1` (`trace_eagerFailSet_single_sub_reuse_leaks`) and
-desynchronizes `done_recving_counts_` at `num_subs = 2` into premature
-`done_recving` on a later transfer
-(`trace_eagerFailSet_partial_fail_desync_premature_doneRecving`). Under
-`NumaPolicy.settledCounts`, `numa_settledCounts_safe` and
+On the intra-worker JAX wrapper (`NumaBarrier.lean`), the mutant
+`NumaPolicy.eagerFailSet` frees consumer or producer HBM while a sibling
+sub-manager's DMA is still in flight at `num_subs = 2`
+(`trace_eagerFailSet_recv_early_free`, `trace_eagerFailSet_send_early_free`)
+and, across `recycle` (`req_id` reuse), leaks blocks at `num_subs = 1`
+(`trace_eagerFailSet_single_sub_reuse_leaks`) and desynchronizes
+`done_recving_counts_` at `num_subs = 2` into premature `done_recving` on a
+later transfer (`trace_eagerFailSet_partial_fail_desync_premature_doneRecving`).
+Under `NumaPolicy.settledCounts` (`process_completion`), `numa_settledCounts_safe` and
 `numa_settledCounts_maps_clean` prove safety (`NumaSafe`) and full map cleanup
 across unbounded `recycle` rounds for both `num_subs = 1` and `num_subs = 2`,
-both failure policies, and both `StartRead` overloads (`numaSearch` exhausts the
-cyclic multi-round state space), while
+both failure policies, and both `StartRead` overloads (`numaSearch`, over
+every event instance, closes on the cyclic multi-round state space with
+`.safe` as a cross-check), while
 `numaProcessSettled_expected_numSubs_eq_none` shows that pre-setting
 `req_expected_counts_[req] = num_subs` in `StartRead(remote_descriptors)` is
 observationally redundant.
@@ -314,8 +344,8 @@ observationally redundant.
   terminal publication (`some true` or `some false`) after its local DMAs have
   drained, and `get_finished_count()` equals the number of participating workers
   (`expectedP = 2`, `expectedD = 2`). On both paths this is enforced for
-  single-round, single-plan transfers (`sub_plan_count <= 1`) on
-  single-sub-manager workers (`ENABLE_MULTI_NUMA=0`) by the 180 s native session
+  single-round, single-plan transfers (no `sub_plan_chains_` entry) on
+  single-sub-manager workers (`ENABLE_MULTI_NUMA` unset or `0`) by the 180 s native session
   deadline (`TPU_P2P_WAIT_PULL_TIMEOUT` in
   `TPUConnectorWorker.register_kv_caches` and `tpu_connector.py`
   `get_p2p_wait_pull_timeout()`) together with `_sync_stage3_tp_submit_states`
@@ -327,14 +357,14 @@ observationally redundant.
   below it, assuming one report per NUMA sub-manager per transfer (its **N1**,
   this assumption applied per sub-manager) and proving that
   `NumaPolicy.settledCounts` turns those reports into exactly one worker-level
-  publication, after every sub-manager has settled, also under
-  `ENABLE_MULTI_NUMA=1` and `req_id` reuse.
+  publication, after every sub-manager has settled, also with two
+  sub-managers and under `req_id` reuse.
 * **B2 (whole-transfer failure).** A failed pull invalidates every local
   block of the request, so recomputation starts from token 0 and the
   `num_computed_tokens ≠ 0` branch of `Scheduler._update_waiting_for_remote_kv`
   (cache the valid prefix) is not reached. tpu-sync
-  reports a receive as one outcome (`(!session->GetStatus().ok() ? failed_recving_ : done_recving_)`
-  in `KVCacheManagerWithTransfer::CompleteReadWithDetails`), so a connector has
+  reports a receive as one outcome (`(!recv->GetStatus().ok() ? failed_recving_ : done_recving_)`
+  in `KVCacheManagerWithTransfer::RetireSettledSessionLocked`), so a connector has
   no finer information to report.
 * **B3 (no preemption, prefix caching or chunking).** None of them changes
   which event frees a transfer-held block.

@@ -17,7 +17,19 @@ concurrently and recycle the four memories (`prefillHbm`, `prefillStaging`,
   (`hasStaging = false`).
 - **TPU HBM (`prefillHbm`, `decodeHbm`)** is owned by the serving engines and
   is handed back to the caller when `poll_stats()` publishes the session
-  outcome (`send.published ≠ none`, `recv.published ≠ none`).
+  outcome (`send.published ≠ none`, `recv.published ≠ none`):
+  `KVCacheManagerWithTransfer::CompleteReadWithDetails` walks the one
+  `sessions_` map (a `SessionEntry` per uuid: the session and the `req_id` its
+  terminal is reported under) and `RetireSettledSessionLocked` moves each
+  `Done()` session into `done_sending_` / `done_recving_` / `failed_recving_`
+  under that `req_id` and erases it.
+  A `StartRead` that reuses a uuid whose incumbent has settled retires it the
+  same way before `EmplaceRecvSessionLocked(uuid, req_id, session)` installs
+  the new session, so a
+  successor request under a reused uuid (`.nextRequest`) still follows the
+  incumbent's publication; an incumbent that is not `Done()` makes `StartRead`
+  reject the duplicate instead (idempotently when the entry's `req_id` is the
+  same request's, otherwise into `failed_recving_`).
 
 The multi-request transition system `multiSys` models both **read-after-release**
 and **write-after-release** across requests on all four buffers, as well as
@@ -54,16 +66,18 @@ request `idx`:
 <!-- source-map:begin -->
 | File | Symbol / anchor | Lines |
 |---|---|---|
-| `tpu_sync/core/staging_arena.cc` | `StagingBlockAllocator::Allocation::Reset` | `:387-398` |
-| `tpu_sync/core/staging_arena.cc` | `StagingBlockAllocator::AcquireLocked` | `:477-512` |
-| `tpu_sync/core/staging_arena.cc` | `StagingBlockAllocator::Acquire` | `:514-518` |
-| `tpu_sync/core/staging_arena.cc` | `StagingBlockAllocator::ReleaseSlot` | `:571-577` |
-| `tpu_sync/core/staging_arena.cc` | `StagingBlockAllocator::ReleaseDynamicBlocks` | `:579-587` |
-| `tpu_sync/kv_cache/transfer_send_session.cc` | `TransferSendSession::ReleaseStagingBlocksLocked` | `:186-190` |
-| `tpu_sync/kv_cache/transfer_receive_session.cc` | `TransferReceiveSession::ReleaseStagingLocked` | `:439-442` |
-| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::NotifyForRead` | `:654-701` |
-| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::StartRead(remote_endpoint)` | `:1045-1149` |
-| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` | `:1151-1292` |
+| `tpu_sync/core/staging_arena.cc` | `StagingBlockAllocator::Allocation::Reset` | `:389-400` |
+| `tpu_sync/core/staging_arena.cc` | `StagingBlockAllocator::AcquireLocked` | `:479-514` |
+| `tpu_sync/core/staging_arena.cc` | `StagingBlockAllocator::Acquire` | `:516-520` |
+| `tpu_sync/core/staging_arena.cc` | `StagingBlockAllocator::ReleaseSlot` | `:573-579` |
+| `tpu_sync/core/staging_arena.cc` | `StagingBlockAllocator::ReleaseDynamicBlocks` | `:581-589` |
+| `tpu_sync/kv_cache/transfer_send_session.cc` | `TransferSendSession::ReleaseStagingBlocksLocked` | `:225-229` |
+| `tpu_sync/kv_cache/transfer_receive_session.cc` | `TransferReceiveSession::ReleaseStagingLocked` | `:380-383` |
+| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::NotifyForRead` | `:532-603` |
+| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::StartRead(remote_endpoint)` | `:942-1074` |
+| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::StartRead(remote_endpoint)` (`auto incumbent = sessions_.find(uuid);` .. `absl::Status inserted = EmplaceRecvSessionLocked(uuid, req_id, session);`) | `:1002-1037` |
+| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::RetireSettledSessionLocked` | `:471-530` |
+| `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` | `:1076-1139` |
 <!-- source-map:end -->
 -/
 

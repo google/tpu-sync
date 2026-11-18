@@ -1612,8 +1612,9 @@ absl::StatusOr<KVTransferSpecConfig> HostOffloadBackend::ComposeKVTransferSpec(
         "no registered workers to derive a KVTransferSpec from");
   }
   const core::controller::WorkerRegistration& reference = workers[0];
-  std::vector<int64_t> node_ids;
-  node_ids.reserve(workers.size());
+  std::vector<const core::controller::WorkerRegistration*> by_node_id;
+  by_node_id.reserve(workers.size());
+  bool uniform = true;
   for (const core::controller::WorkerRegistration& worker : workers) {
     if (worker.block_array_bytes.empty() || worker.num_kv_shards <= 0) {
       return absl::FailedPreconditionError(absl::StrCat(
@@ -1622,16 +1623,22 @@ absl::StatusOr<KVTransferSpecConfig> HostOffloadBackend::ComposeKVTransferSpec(
           "num_kv_shards); every worker must report it for the deployment's "
           "KVTransferSpec"));
     }
-    if (worker.block_array_bytes != reference.block_array_bytes ||
-        worker.num_kv_shards != reference.num_kv_shards) {
+    if (worker.num_kv_shards != reference.num_kv_shards) {
       return absl::InvalidArgumentError(absl::StrCat(
           "workers ", reference.worker_id, " and ", worker.worker_id,
-          " registered different KV block geometry; one KVTransferSpec must "
+          " registered different num_kv_shards; one KVTransferSpec must "
           "describe every worker of the deployment"));
     }
-    node_ids.push_back(worker.node_id);
+    uniform =
+        uniform && worker.block_array_bytes == reference.block_array_bytes;
+    by_node_id.push_back(&worker);
   }
-  std::sort(node_ids.begin(), node_ids.end());
+  std::sort(
+      by_node_id.begin(), by_node_id.end(),
+      [](const auto* a, const auto* b) { return a->node_id < b->node_id; });
+  std::vector<int64_t> node_ids;
+  node_ids.reserve(by_node_id.size());
+  for (const auto* worker : by_node_id) node_ids.push_back(worker->node_id);
   for (size_t i = 0; i < node_ids.size(); ++i) {
     if (node_ids[i] != static_cast<int64_t>(i)) {
       return absl::InvalidArgumentError(absl::StrCat(
@@ -1644,7 +1651,13 @@ absl::StatusOr<KVTransferSpecConfig> HostOffloadBackend::ComposeKVTransferSpec(
     }
   }
   KVTransferSpecConfig spec;
-  spec.block_array_bytes = reference.block_array_bytes;
+  if (uniform) {
+    spec.block_array_bytes = reference.block_array_bytes;
+  } else {
+    for (const auto* worker : by_node_id) {
+      spec.worker_block_array_bytes.push_back(worker->block_array_bytes);
+    }
+  }
   spec.num_kv_shards = reference.num_kv_shards;
   spec.num_workers = static_cast<int>(workers.size());
   return spec;
@@ -1684,9 +1697,24 @@ absl::Status HostOffloadBackend::RegisterKVTransferSpec(
         "no KV pool group to register the KVTransferSpec under: set "
         "BackendConfig.kv_pool_group or a raiden_id with a job_name.");
   }
+  if (spec_config.block_array_bytes.empty() ==
+      spec_config.worker_block_array_bytes.empty()) {
+    return absl::InvalidArgumentError(
+        "KVTransferSpecConfig must set exactly one of block_array_bytes and "
+        "worker_block_array_bytes");
+  }
   global_registry::KVTransferSpec spec;
   for (uint64_t bytes : spec_config.block_array_bytes) {
     spec.add_block_arrays()->set_block_bytes(static_cast<int64_t>(bytes));
+  }
+  for (size_t node_id = 0;
+       node_id < spec_config.worker_block_array_bytes.size(); ++node_id) {
+    global_registry::KVTransferSpec::WorkerGeometry* worker =
+        spec.add_workers();
+    worker->set_node_id(static_cast<int64_t>(node_id));
+    for (uint64_t bytes : spec_config.worker_block_array_bytes[node_id]) {
+      worker->add_block_arrays()->set_block_bytes(static_cast<int64_t>(bytes));
+    }
   }
   spec.set_num_kv_shards(static_cast<int32_t>(spec_config.num_kv_shards));
   spec.set_num_workers(static_cast<int32_t>(spec_config.num_workers));

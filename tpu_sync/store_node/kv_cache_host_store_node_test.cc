@@ -81,6 +81,16 @@ KVTransferSpec TestSpec() {
                         /*num_kv_shards=*/1, /*num_workers=*/1};
 }
 
+// Two workers whose block arrays differ, as pipeline stages holding different
+// layers register: worker 0 has 256 bytes, worker 1 has 256 + 256.
+KVTransferSpec PerWorkerTestSpec() {
+  KVTransferSpec spec;
+  spec.worker_block_array_bytes = {{256}, {256, 256}};
+  spec.num_kv_shards = 1;
+  spec.num_workers = 2;
+  return spec;
+}
+
 KVCacheHostStoreNode::Options FastPollOptions() {
   KVCacheHostStoreNode::Options options;
   options.spec_poll_initial = absl::Milliseconds(1);
@@ -98,6 +108,22 @@ TEST(ValidateSpecTest, RejectsEmptyOrZeroQuantities) {
       ValidateSpec(KVTransferSpec{{256, 0}, 1, 1})));
   EXPECT_TRUE(absl::IsInvalidArgument(
       ValidateSpec(KVTransferSpec{{256, 256}, 1, 0})));
+}
+
+TEST(ValidateSpecTest, ChecksPerWorkerGeometry) {
+  EXPECT_TRUE(ValidateSpec(PerWorkerTestSpec()).ok());
+  KVTransferSpec both = PerWorkerTestSpec();
+  both.block_array_bytes = {256};
+  EXPECT_TRUE(absl::IsInvalidArgument(ValidateSpec(both)));
+  KVTransferSpec too_few = PerWorkerTestSpec();
+  too_few.worker_block_array_bytes.pop_back();
+  EXPECT_TRUE(absl::IsInvalidArgument(ValidateSpec(too_few)));
+  KVTransferSpec empty_worker = PerWorkerTestSpec();
+  empty_worker.worker_block_array_bytes[1].clear();
+  EXPECT_TRUE(absl::IsInvalidArgument(ValidateSpec(empty_worker)));
+  KVTransferSpec zero_bytes = PerWorkerTestSpec();
+  zero_bytes.worker_block_array_bytes[1][1] = 0;
+  EXPECT_TRUE(absl::IsInvalidArgument(ValidateSpec(zero_bytes)));
 }
 
 TEST(WaitForSpecTest, RetriesNotFoundUntilPublished) {
@@ -163,6 +189,15 @@ TEST(NumBlocksForBudgetTest, RejectsBudgetBelowOneBlock) {
       KVCacheHostStoreNode::NumBlocksForBudget(511, TestSpec());
   EXPECT_TRUE(absl::IsInvalidArgument(blocks.status()));
   EXPECT_THAT(blocks.status().message(), HasSubstr("single block"));
+}
+
+TEST(NumBlocksForBudgetTest, ChargesEachWorkerItsOwnArrays) {
+  // One block of PerWorkerTestSpec() is 256 + (256 + 256) = 768 bytes, not
+  // 2 workers x the widest worker's 512.
+  absl::StatusOr<size_t> blocks =
+      KVCacheHostStoreNode::NumBlocksForBudget(768 * 4, PerWorkerTestSpec());
+  ASSERT_TRUE(blocks.ok()) << blocks.status();
+  EXPECT_EQ(*blocks, 4u);
 }
 
 TEST(NumBlocksForBudgetTest, ChargesEveryWorkersPool) {
@@ -295,6 +330,23 @@ TEST_F(KVCacheHostStoreNodeBootTest, MirrorsSpecWorkerTopology) {
   ASSERT_FALSE(workers[1].raiden_transfer_endpoints.empty());
   EXPECT_NE(workers[0].raiden_transfer_endpoints[0].endpoint,
             workers[1].raiden_transfer_endpoints[0].endpoint);
+}
+
+TEST_F(KVCacheHostStoreNodeBootTest, GivesEachWorkerItsOwnBlockArrays) {
+  StaticKVTransferSpecSource source(PerWorkerTestSpec());
+  absl::StatusOr<std::unique_ptr<KVCacheHostStoreNode>> node =
+      KVCacheHostStoreNode::Create(BootOptions(), &source);
+  ASSERT_TRUE(node.ok()) << node.status();
+
+  // 8 * 512 bytes of budget at 768 bytes a block.
+  EXPECT_EQ((*node)->num_host_blocks(), 5u);
+  ASSERT_EQ((*node)->managers().size(), 2u);
+  const auto* worker0 = (*node)->managers()[0]->base();
+  const auto* worker1 = (*node)->managers()[1]->base();
+  ASSERT_EQ(worker0->num_block_arrays(), 1u);
+  EXPECT_EQ(worker0->block_bytes(0), 256u);
+  ASSERT_EQ(worker1->num_block_arrays(), 2u);
+  EXPECT_EQ(worker1->block_bytes(1), 256u);
 }
 
 TEST_F(KVCacheHostStoreNodeBootTest, BootsServesAndPublishesWithRegistry) {

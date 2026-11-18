@@ -290,6 +290,7 @@ message KVTransferSpec {
     // Bytes one block occupies in this array on one shard.
     int64 block_bytes = 1;
   }
+  // Empty when the workers' block arrays differ; see `workers`.
   repeated BlockArray block_arrays = 1;
 
   // Device shards each block array is split across on a serving host.
@@ -298,6 +299,18 @@ message KVTransferSpec {
   // Number of transfer workers on the serving hosts, with worker node ids
   // densely assigned [0, num_workers-1]).
   int32 num_workers = 3;
+
+  // One worker's block arrays. A peer pairs each worker with the worker of
+  // the same node id, so only paired workers must agree.
+  message WorkerGeometry {
+    // Equals the entry's index; it keeps a printed spec readable.
+    int64 node_id = 1;
+    repeated BlockArray block_arrays = 2;
+  }
+  // Set instead of `block_arrays` when the workers' block arrays differ (e.g.
+  // pipeline stages holding different layers): entry i is the worker with
+  // node id i, one per worker. Identical workers use `block_arrays`.
+  repeated WorkerGeometry workers = 4;
 }
 
 message RegisterKVTransferSpecRequest {

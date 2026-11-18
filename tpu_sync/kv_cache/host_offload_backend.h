@@ -161,11 +161,12 @@ class HostOffloadBackend : public KVCacheStoreBackend {
       std::string kv_pool_group = "");
 
   // Derives the deployment's KVTransferSpec from the given worker
-  // registrations: every worker must have reported the same KV block geometry
-  // (block_array_bytes, num_kv_shards), and the node ids must form the dense
-  // range [0, num_workers) -- peers pair transfers on node_id, so a gap or
-  // duplicate would break the pairing. Returns the composed config, or the
-  // violation as an error.
+  // registrations: every worker must have reported its KV block geometry
+  // with the same num_kv_shards, and the node ids must form the dense range
+  // [0, num_workers) -- peers pair transfers on node_id, so a gap or
+  // duplicate would break the pairing. Workers reporting different
+  // block_array_bytes give a spec with one geometry per worker. Returns the
+  // composed config, or the violation as an error.
   static absl::StatusOr<KVTransferSpecConfig> ComposeKVTransferSpec(
       absl::Span<const core::controller::WorkerRegistration> workers);
 

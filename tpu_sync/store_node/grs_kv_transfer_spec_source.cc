@@ -17,6 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
@@ -43,6 +44,14 @@ absl::StatusOr<KVTransferSpec> GrsKVTransferSpecSource::Get() {
   for (const auto& array : proto.block_arrays()) {
     spec.block_array_bytes.push_back(
         static_cast<uint64_t>(array.block_bytes()));
+  }
+  for (const auto& worker : proto.workers()) {
+    std::vector<uint64_t>& arrays =
+        spec.worker_block_array_bytes.emplace_back();
+    arrays.reserve(worker.block_arrays_size());
+    for (const auto& array : worker.block_arrays()) {
+      arrays.push_back(static_cast<uint64_t>(array.block_bytes()));
+    }
   }
   spec.num_kv_shards = static_cast<size_t>(proto.num_kv_shards());
   spec.num_workers = static_cast<size_t>(proto.num_workers());

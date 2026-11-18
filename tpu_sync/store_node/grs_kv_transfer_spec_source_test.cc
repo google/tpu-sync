@@ -91,6 +91,27 @@ TEST_F(GrsKVTransferSpecSourceTest, RoundTripsPublishedSpec) {
   EXPECT_EQ(spec->num_workers, 1u);
 }
 
+TEST_F(GrsKVTransferSpecSourceTest, RoundTripsPerWorkerSpec) {
+  ::tpu_raiden::kv_cache::global_registry::KVTransferSpec proto;
+  for (int w = 0; w < 2; ++w) {
+    auto* worker = proto.add_workers();
+    worker->set_node_id(w);
+    worker->add_block_arrays()->set_block_bytes(4096);
+    if (w == 1) worker->add_block_arrays()->set_block_bytes(512);
+  }
+  proto.set_num_kv_shards(2);
+  proto.set_num_workers(2);
+  Publish(proto);
+
+  GrsKVTransferSpecSource source(address_, "prefill_pool");
+  absl::StatusOr<KVTransferSpec> spec = source.Get();
+  ASSERT_TRUE(spec.ok()) << spec.status();
+  EXPECT_TRUE(spec->block_array_bytes.empty());
+  EXPECT_EQ(spec->worker_block_array_bytes,
+            (std::vector<std::vector<uint64_t>>{{4096}, {4096, 512}}));
+  EXPECT_EQ(spec->num_workers, 2u);
+}
+
 TEST_F(GrsKVTransferSpecSourceTest, OtherGroupsSpecIsNotFound) {
   ::tpu_raiden::kv_cache::global_registry::KVTransferSpec proto;
   proto.add_block_arrays()->set_block_bytes(4096);

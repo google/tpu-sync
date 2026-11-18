@@ -36,9 +36,11 @@
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/ascii.h"
+#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
+#include "absl/time/time.h"
 #include "tpu_sync/common/control_pipe/control_dispatcher.h"
 #include "tpu_sync/common/control_pipe/control_pipe_server.h"
 #include "tpu_sync/common/control_pipe/control_pipe_types.h"
@@ -52,6 +54,157 @@ namespace weight_sync {
 namespace {
 
 constexpr char kStoppingMessage[] = "WeightSynchronizerListener is stopping";
+
+// The longest request timeout (for example `receive_timeout_ms`) of
+// weight_transfer_worker_service.proto.
+constexpr absl::Duration kMaxTransferTimeout = absl::Hours(1);
+
+// Returns InvalidArgument unless `value_ms` milliseconds lie in [0, `max`].
+absl::Status CheckDurationMs(int64_t value_ms, absl::Duration max) {
+  if (value_ms >= 0 && absl::Milliseconds(value_ms) <= max) {
+    return absl::OkStatus();
+  }
+  return absl::InvalidArgumentError(absl::StrCat(
+      "must be in [0, ", absl::FormatDuration(max), "]; got ", value_ms));
+}
+
+// Returns an error `status` with the concatenated `prefix_parts` prepended to
+// its message, and an OK `status` unchanged without building the prefix. It
+// stands in for the status builder of ABSL_RETURN_IF_ERROR, which the
+// open-source Abseil backport (third_party/abseil/status_macros.patch) lacks.
+template <typename... Args>
+absl::Status Prepend(absl::Status status, const Args&... prefix_parts) {
+  if (status.ok()) return status;
+  return absl::Status(status.code(),
+                      absl::StrCat(prefix_parts..., status.message()));
+}
+
+// Prefix of the sender ids that Raiden reserves for its own senders.
+constexpr absl::string_view kReservedSenderPrefix = "raiden/";
+
+// Returns InvalidArgument if `req` names a sender with the reserved prefix.
+// Only the RPC handler applies this check: a puller prepares its own receive
+// as "raiden/pull" through WeightSynchronizerBase, so the check must not move
+// into code the engine shares when the coordinated prepare moves into
+// WeightSynchronizerBase.
+absl::Status RejectReservedSenders(
+    const ::tpu_sync::rpc::PrepareWeightReceiveRequest& req) {
+  std::vector<absl::string_view> senders(req.expected_senders().begin(),
+                                         req.expected_senders().end());
+  for (const ::tpu_sync::rpc::Chunks& chunks : req.chunks()) {
+    senders.push_back(chunks.sender());
+  }
+  for (absl::string_view sender : senders) {
+    if (absl::StartsWith(sender, kReservedSenderPrefix)) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "PrepareWeightReceive (uuid=", req.uuid(), ") names sender '", sender,
+          "'; ids starting with ", kReservedSenderPrefix, " are reserved"));
+    }
+  }
+  return absl::OkStatus();
+}
+
+// The most chunks a receive can expect, in total and from one sender per
+// layer: the transport counts a transfer's chunks in 32 bits.
+constexpr int64_t kMaxReceiveChunks = std::numeric_limits<uint32_t>::max();
+
+// Sets the expected chunk counts of `recv` from the chunks of `req`: per layer,
+// the sum of every expected sender's chunk counts, and their total. Validates
+// every sender's chunks before they are summed. A valid prepare that covers
+// only some expected senders is not supported yet.
+absl::Status SumChunkCounts(
+    const WeightSynchronizerBase& engine,
+    const ::tpu_sync::rpc::PrepareWeightReceiveRequest& req,
+    ::tpu_sync::rpc::StartTransferRequest& recv) {
+  // Expected sender -> whether `req.chunks()` has an entry of it.
+  absl::flat_hash_map<absl::string_view, bool> has_chunks;
+  for (const std::string& sender : req.expected_senders()) {
+    if (sender.empty()) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("PrepareWeightReceive (uuid=", req.uuid(),
+                       ") expects a sender with an empty id"));
+    }
+    if (!has_chunks.emplace(sender, false).second) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("PrepareWeightReceive (uuid=", req.uuid(),
+                       ") expects sender '", sender, "' twice"));
+    }
+  }
+  if (has_chunks.empty()) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "PrepareWeightReceive (uuid=", req.uuid(), ") expects no senders"));
+  }
+  if (req.chunks().empty()) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "PrepareWeightReceive (uuid=", req.uuid(), ") carries no chunks"));
+  }
+  // Bounds every partial sum, so no addition below can overflow.
+  int64_t total_chunks = 0;
+  for (const ::tpu_sync::rpc::Chunks& chunks : req.chunks()) {
+    const std::string& sender = chunks.sender();
+    auto it = has_chunks.find(sender);
+    if (it == has_chunks.end()) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("PrepareWeightReceive (uuid=", req.uuid(),
+                       ") carries chunks of sender '", sender,
+                       "', which is not in expected_senders"));
+    }
+    if (it->second) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("PrepareWeightReceive (uuid=", req.uuid(),
+                       ") carries chunks of sender '", sender, "' twice"));
+    }
+    it->second = true;
+    // Rejects `sender`'s count of `count` chunks of layer `layer_idx`.
+    auto invalid_count = [&req, &sender](int32_t layer_idx, int64_t count,
+                                         absl::string_view reason) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "PrepareWeightReceive (uuid=", req.uuid(), "): sender '", sender,
+          "' maps layer ", layer_idx, " to ", count, " chunks; ", reason));
+    };
+    int64_t sender_chunks = 0;
+    for (const auto& [layer_idx, count] : chunks.layer_chunk_counts()) {
+      if (layer_idx < 0 ||
+          static_cast<size_t>(layer_idx) >= engine.num_layers()) {
+        return invalid_count(
+            layer_idx, count,
+            absl::StrCat("layers lie in [0, ", engine.num_layers(), ")"));
+      }
+      if (count < 0 || count > kMaxReceiveChunks) {
+        return invalid_count(
+            layer_idx, count,
+            absl::StrCat("counts lie in [0, ", kMaxReceiveChunks, "]"));
+      }
+      sender_chunks += count;
+      total_chunks += count;
+      if (total_chunks > kMaxReceiveChunks) {
+        return invalid_count(layer_idx, count,
+                             absl::StrCat("the summed counts exceed ",
+                                          kMaxReceiveChunks, " chunks"));
+      }
+      (*recv.mutable_expected_layer_chunk_counts())[layer_idx] += count;
+    }
+    if (sender_chunks == 0) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("PrepareWeightReceive (uuid=", req.uuid(), "): sender '",
+                       sender, "' sends no chunks"));
+    }
+  }
+  std::vector<absl::string_view> missing;
+  for (const std::string& sender : req.expected_senders()) {
+    if (!has_chunks.at(sender)) missing.push_back(sender);
+  }
+  if (!missing.empty()) {
+    return absl::UnimplementedError(absl::StrCat(
+        "PrepareWeightReceive (uuid=", req.uuid(),
+        ") carries no chunks of expected sender(s) ",
+        absl::StrJoin(missing, ", "),
+        "; prepares that cover only some expected_senders are not implemented "
+        "yet"));
+  }
+  recv.set_expected_block_count(total_chunks);
+  return absl::OkStatus();
+}
 
 // Validates the expected chunk counts of the receiver-side `start_req` and
 // registers them, with the transfer's tiling settings, so that `engine` can
@@ -397,13 +550,21 @@ WeightSynchronizerListener::HandlePrepareWeightReceive(
   ABSL_RETURN_IF_ERROR(CheckTargetIncarnation(*engine_, "PrepareWeightReceive",
                                               req.uuid(),
                                               req.target_incarnation_id()));
+  ABSL_RETURN_IF_ERROR(RejectReservedSenders(req));
+  ABSL_RETURN_IF_ERROR(Prepend(
+      CheckDurationMs(req.receive_timeout_ms(), kMaxTransferTimeout),
+      "PrepareWeightReceive (uuid=", req.uuid(), ") receive_timeout_ms "));
 
   ::tpu_sync::rpc::StartTransferRequest recv;
   recv.set_is_sender(false);
   recv.set_uuid(req.uuid());
-  recv.set_expected_block_count(req.expected_block_count());
-  *recv.mutable_expected_layer_chunk_counts() =
-      req.expected_layer_chunk_counts();
+  ABSL_RETURN_IF_ERROR(SumChunkCounts(*engine_, req, recv));
+  if (req.receive_timeout_ms() != 0) {
+    return absl::UnimplementedError(
+        absl::StrCat("PrepareWeightReceive (uuid=", req.uuid(),
+                     ") sets receive_timeout_ms=", req.receive_timeout_ms(),
+                     "; receive deadlines are not implemented yet"));
+  }
   recv.set_host_tiling_mode(req.host_tiling_mode());
   *recv.mutable_skip_tiling() = req.skip_tiling();
   recv.set_req_id(req.req_id());

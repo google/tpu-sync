@@ -208,7 +208,6 @@ cc_test(
         "@peregrine//peregrine/src/internal/control:message_cc_proto",
         "@peregrine//peregrine/src/internal/control:message_internal_cc_proto",
         "@peregrine//peregrine/src/internal/control:service_cc_grpc_proto",
-        "@xla//xla/tsl/platform:statusor",
     ],
 )
 

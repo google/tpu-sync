@@ -128,11 +128,15 @@ class WeightSynchronizerListener final {
       const ::tpu_sync::rpc::ControlRequest& req);
 
   // Step 1 of the rendezvous on a destination worker: registers the incoming
-  // transfer like a receiver COMMAND_START_TRANSFER. Returns Unavailable once
-  // the listener is stopping, FailedPrecondition if a non-zero
-  // `req.target_incarnation_id` is not the engine's incarnation_id(), and
-  // InvalidArgument if `req.uuid` is not positive, `req.version` is unset, or
-  // the chunk counts are invalid. `req.version` is not recorded yet.
+  // transfer like a receiver COMMAND_START_TRANSFER, expecting per layer the
+  // sum of every sender's chunk counts. Returns Unavailable once the listener
+  // is stopping, FailedPrecondition if a non-zero `req.target_incarnation_id`
+  // is not the engine's incarnation_id(), InvalidArgument if `req.uuid` is not
+  // positive, `req.version` is empty or over 256 bytes,
+  // `req.receive_timeout_ms` is negative or over an hour, or the expected
+  // senders or chunk counts are invalid, and Unimplemented, stating what is not
+  // implemented yet, for a positive `req.receive_timeout_ms` and `req.chunks`
+  // that cover only some expected senders. `req.version` is not recorded yet.
   absl::StatusOr<::tpu_sync::rpc::PrepareWeightReceiveResponse>
   HandlePrepareWeightReceive(
       const ::tpu_sync::rpc::PrepareWeightReceiveRequest& req);

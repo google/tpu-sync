@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -50,7 +51,6 @@
 #include "peregrine/src/internal/control/message.pb.h"
 #include "peregrine/src/internal/control/message_internal.pb.h"
 #include "peregrine/src/internal/control/service.grpc.pb.h"
-#include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/common/control_pipe/control_pipe_client.h"
 #include "tpu_sync/common/control_pipe/control_pipe_types.h"
 #include "tpu_sync/common/control_pipe/grpc_control_pipe.h"
@@ -84,6 +84,7 @@ using ::testing::Pair;
 using ::testing::UnorderedElementsAre;
 using ::testing::status::IsOkAndHolds;
 using ::testing::status::StatusIs;
+using ::tpu_sync::rpc::Chunks;
 using ::tpu_sync::rpc::ControlRequest;
 using ::tpu_sync::rpc::ControlResponse;
 using ::tpu_sync::rpc::PrepareWeightReceiveRequest;
@@ -712,6 +713,7 @@ TEST(WeightSynchronizerListenerTest,
 // listener over the control pipe.
 constexpr size_t kSrcShardBytes = 8;
 constexpr int64_t kPushUuid = 4242;
+constexpr char kSender[] = "trainer/0";
 
 // A CPU-only synchronizer of the model without a listener of its own.
 absl::StatusOr<std::unique_ptr<WeightSynchronizerBase>> CreateShardedCpuEngine(
@@ -722,14 +724,24 @@ absl::StatusOr<std::unique_ptr<WeightSynchronizerBase>> CreateShardedCpuEngine(
       /*listener_port=*/std::nullopt);
 }
 
-// Phase 1 of push `uuid` on a destination that receives `num_chunks` chunks.
+// Adds `sender` to the expected senders of `req`, and its `num_chunks` chunks
+// of layer 0 to `req.chunks`.
+void AddSender(PrepareWeightReceiveRequest& req, const std::string& sender,
+               int64_t num_chunks) {
+  req.add_expected_senders(sender);
+  Chunks* chunks = req.add_chunks();
+  chunks->set_sender(sender);
+  (*chunks->mutable_layer_chunk_counts())[0] = num_chunks;
+}
+
+// Phase 1 of push `uuid` on a destination that receives `num_chunks` chunks,
+// all from kSender.
 PrepareWeightReceiveRequest MakePrepareRequest(int64_t uuid,
                                                int64_t num_chunks) {
   PrepareWeightReceiveRequest req;
   req.set_uuid(uuid);
   req.mutable_version()->set_tag("v7");
-  req.set_expected_block_count(num_chunks);
-  (*req.mutable_expected_layer_chunk_counts())[0] = num_chunks;
+  AddSender(req, kSender, num_chunks);
   return req;
 }
 
@@ -902,14 +914,16 @@ TEST(WeightSynchronizerListenerTest, RendezvousRequestsRejectInvalidFields) {
   EXPECT_THAT(
       SendPrepare(listener, no_version),
       StatusIs(absl::StatusCode::kInvalidArgument, HasSubstr("no version")));
-  PrepareWeightReceiveRequest miscounted = MakePrepareRequest(kPushUuid, 2);
-  (*miscounted.mutable_expected_layer_chunk_counts())[0] = 1;
-  EXPECT_THAT(
-      SendPrepare(listener, miscounted),
-      StatusIs(absl::StatusCode::kInvalidArgument, HasSubstr("summing to 1")));
+  // A negative count, which the other sender's counts would hide in the sum.
+  PrepareWeightReceiveRequest negative = MakePrepareRequest(kPushUuid, 3);
+  AddSender(negative, "trainer/1", -1);
+  EXPECT_THAT(SendPrepare(listener, negative),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       AllOf(HasSubstr("'trainer/1'"),
+                             HasSubstr("maps layer 0 to -1 chunks"))));
   PrepareWeightReceiveRequest unknown_layer = MakePrepareRequest(kPushUuid, 2);
-  unknown_layer.clear_expected_layer_chunk_counts();
-  (*unknown_layer.mutable_expected_layer_chunk_counts())[1] = 2;
+  unknown_layer.mutable_chunks(0)->clear_layer_chunk_counts();
+  (*unknown_layer.mutable_chunks(0)->mutable_layer_chunk_counts())[1] = 2;
   EXPECT_THAT(SendPrepare(listener, unknown_layer),
               StatusIs(absl::StatusCode::kInvalidArgument,
                        HasSubstr("maps layer 1 to 2 chunks")));
@@ -953,6 +967,201 @@ TEST(WeightSynchronizerListenerTest,
     valid.mutable_version()->set_tag(std::string(size, 'x'));
     ABSL_EXPECT_OK(SendPrepare(listener, valid)) << size << " bytes";
   }
+}
+
+TEST(WeightSynchronizerListenerTest,
+     PrepareWeightReceiveRejectsInvalidSendersAndChunks) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> engine,
+      CreateShardedCpuEngine(/*num_shards=*/1, 2 * kSrcShardBytes));
+  WeightSynchronizerListener listener(engine.get(), /*listener_port=*/0);
+  constexpr int64_t kMaxCount = std::numeric_limits<uint32_t>::max();
+
+  PrepareWeightReceiveRequest no_senders = MakePrepareRequest(kPushUuid, 2);
+  no_senders.clear_expected_senders();
+  no_senders.clear_chunks();
+  EXPECT_THAT(SendPrepare(listener, no_senders),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("(uuid=4242) expects no senders")));
+  PrepareWeightReceiveRequest no_chunks = MakePrepareRequest(kPushUuid, 2);
+  no_chunks.clear_chunks();
+  EXPECT_THAT(SendPrepare(listener, no_chunks),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("(uuid=4242) carries no chunks")));
+  PrepareWeightReceiveRequest empty_id = MakePrepareRequest(kPushUuid, 2);
+  AddSender(empty_id, "", 1);
+  EXPECT_THAT(SendPrepare(listener, empty_id),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("expects a sender with an empty id")));
+  PrepareWeightReceiveRequest repeated = MakePrepareRequest(kPushUuid, 2);
+  AddSender(repeated, kSender, 1);
+  EXPECT_THAT(SendPrepare(listener, repeated),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("expects sender 'trainer/0' twice")));
+  // A reserved id as an expected sender and as the sender of chunks.
+  PrepareWeightReceiveRequest reserved = MakePrepareRequest(kPushUuid, 2);
+  AddSender(reserved, "raiden/pull", 1);
+  EXPECT_THAT(SendPrepare(listener, reserved),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("names sender 'raiden/pull'; ids starting "
+                                 "with raiden/ are reserved")));
+  PrepareWeightReceiveRequest reserved_chunks =
+      MakePrepareRequest(kPushUuid, 2);
+  reserved_chunks.mutable_chunks(0)->set_sender("raiden/pull");
+  EXPECT_THAT(SendPrepare(listener, reserved_chunks),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("names sender 'raiden/pull'")));
+  PrepareWeightReceiveRequest unexpected = MakePrepareRequest(kPushUuid, 2);
+  unexpected.mutable_chunks(0)->set_sender("trainer/9");
+  EXPECT_THAT(SendPrepare(listener, unexpected),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("sender 'trainer/9', which is not in "
+                                 "expected_senders")));
+  PrepareWeightReceiveRequest twice = MakePrepareRequest(kPushUuid, 2);
+  twice.add_chunks()->set_sender(kSender);
+  EXPECT_THAT(SendPrepare(listener, twice),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("chunks of sender 'trainer/0' twice")));
+  PrepareWeightReceiveRequest empty_counts = MakePrepareRequest(kPushUuid, 2);
+  empty_counts.mutable_chunks(0)->clear_layer_chunk_counts();
+  EXPECT_THAT(SendPrepare(listener, empty_counts),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("sender 'trainer/0' sends no chunks")));
+  EXPECT_THAT(SendPrepare(listener, MakePrepareRequest(kPushUuid, 0)),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("sender 'trainer/0' sends no chunks")));
+  EXPECT_THAT(
+      SendPrepare(listener, MakePrepareRequest(kPushUuid, kMaxCount + 1)),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("maps layer 0 to 4294967296 chunks")));
+  PrepareWeightReceiveRequest overflowing =
+      MakePrepareRequest(kPushUuid, kMaxCount);
+  AddSender(overflowing, "trainer/1", kMaxCount);
+  EXPECT_THAT(SendPrepare(listener, overflowing),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("sender 'trainer/1' maps layer 0 to "
+                                 "4294967295 chunks; the summed counts "
+                                 "exceed 4294967295 chunks")));
+
+  ABSL_EXPECT_OK(SendPrepare(listener, MakePrepareRequest(kPushUuid, 2)));
+}
+
+TEST(WeightSynchronizerListenerTest,
+     PrepareWeightReceiveRejectsUnimplementedFields) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> engine,
+      CreateShardedCpuEngine(/*num_shards=*/1, 2 * kSrcShardBytes));
+  WeightSynchronizerListener listener(engine.get(), /*listener_port=*/0);
+
+  PrepareWeightReceiveRequest deadline = MakePrepareRequest(kPushUuid, 2);
+  deadline.set_receive_timeout_ms(1000);
+  EXPECT_THAT(
+      SendPrepare(listener, deadline),
+      StatusIs(absl::StatusCode::kUnimplemented,
+               AllOf(HasSubstr("receive_timeout_ms"),
+                     HasSubstr("receive deadlines are not implemented yet"))));
+  PrepareWeightReceiveRequest partial = MakePrepareRequest(kPushUuid, 1);
+  partial.add_expected_senders("trainer/1");
+  EXPECT_THAT(SendPrepare(listener, partial),
+              StatusIs(absl::StatusCode::kUnimplemented,
+                       AllOf(HasSubstr("trainer/1"),
+                             HasSubstr("not implemented yet"))));
+
+  // With the second sender's chunks, the prepare is accepted.
+  PrepareWeightReceiveRequest complete = MakePrepareRequest(kPushUuid, 1);
+  AddSender(complete, "trainer/1", 1);
+  ABSL_EXPECT_OK(SendPrepare(listener, complete));
+}
+
+TEST(WeightSynchronizerListenerTest,
+     PrepareWeightReceiveValidatesBeforeItsStubs) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> engine,
+      CreateShardedCpuEngine(/*num_shards=*/1, 2 * kSrcShardBytes));
+  WeightSynchronizerListener listener(engine.get(), /*listener_port=*/0);
+  constexpr int64_t kMaxCount = std::numeric_limits<uint32_t>::max();
+  constexpr int64_t kHourMs = 60 * 60 * 1000;
+
+  // Each request also sets an unimplemented field.
+  PrepareWeightReceiveRequest partial =
+      MakePrepareRequest(kPushUuid, kMaxCount);
+  AddSender(partial, "trainer/1", kMaxCount);
+  partial.add_expected_senders("trainer/2");
+  EXPECT_THAT(SendPrepare(listener, partial),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("exceed 4294967295 chunks")));
+  PrepareWeightReceiveRequest deadline = MakePrepareRequest(kPushUuid, 2);
+  deadline.set_receive_timeout_ms(1000);
+  deadline.mutable_chunks(0)->set_sender("trainer/9");
+  EXPECT_THAT(SendPrepare(listener, deadline),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("'trainer/9', which is not in")));
+  // Out-of-range deadlines are invalid, not merely unimplemented.
+  deadline = MakePrepareRequest(kPushUuid, 2);
+  deadline.set_receive_timeout_ms(-1);
+  EXPECT_THAT(SendPrepare(listener, deadline),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("(uuid=4242) receive_timeout_ms must be in "
+                                 "[0, 1h]; got -1")));
+  deadline.set_receive_timeout_ms(kHourMs + 1);
+  EXPECT_THAT(SendPrepare(listener, deadline),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("(uuid=4242) receive_timeout_ms must be in "
+                                 "[0, 1h]; got 3600001")));
+  deadline.set_receive_timeout_ms(kHourMs);
+  EXPECT_THAT(SendPrepare(listener, deadline),
+              StatusIs(absl::StatusCode::kUnimplemented,
+                       HasSubstr("receive_timeout_ms=3600000; receive "
+                                 "deadlines are not implemented yet")));
+}
+
+// Captures the transfer that PrepareWeightReceive registers, which it hands to
+// StoreSkipTiling(), on a 2-layer engine.
+class ReceiveCapturingEngine : public WeightSynchronizerBase {
+ public:
+  ReceiveCapturingEngine()
+      : WeightSynchronizerBase(
+            /*num_layers=*/2, /*num_shards=*/1,
+            /*slice_byte_sizes=*/{kSrcShardBytes, kSrcShardBytes},
+            /*local_port=*/0, /*parallelism=*/1, /*bind_ip=*/std::nullopt,
+            /*layer_names=*/{}, /*auto_h2d=*/false) {}
+
+  absl::Status Init() {
+    return InitHostBuffers({kSrcShardBytes, kSrcShardBytes},
+                           /*listener_port=*/std::nullopt);
+  }
+
+  void StoreSkipTiling(uint64_t /*uuid*/,
+                       const StartTransferRequest& request) override {
+    absl::MutexLock lock(mu_);
+    registered_ = request;
+  }
+
+  StartTransferRequest registered() const {
+    absl::MutexLock lock(mu_);
+    return registered_;
+  }
+
+ private:
+  mutable absl::Mutex mu_;
+  StartTransferRequest registered_ ABSL_GUARDED_BY(mu_);
+};
+
+TEST(WeightSynchronizerListenerTest,
+     PrepareWeightReceiveExpectsEverySendersChunksSummedPerLayer) {
+  ReceiveCapturingEngine engine;
+  ABSL_ASSERT_OK(engine.Init());
+  WeightSynchronizerListener listener(&engine, /*listener_port=*/0);
+  PrepareWeightReceiveRequest req = MakePrepareRequest(kPushUuid, 1);
+  (*req.mutable_chunks(0)->mutable_layer_chunk_counts())[1] = 2;
+  AddSender(req, "trainer/1", 3);
+
+  ABSL_ASSERT_OK(SendPrepare(listener, req));
+  const StartTransferRequest registered = engine.registered();
+  EXPECT_EQ(registered.uuid(), kPushUuid);
+  EXPECT_THAT(registered.expected_layer_chunk_counts(),
+              UnorderedElementsAre(Pair(0, 4), Pair(1, 2)));
+  EXPECT_EQ(registered.expected_block_count(), 6);
 }
 
 TEST(WeightSynchronizerListenerTest, RendezvousRequestsRejectedAfterShutdown) {

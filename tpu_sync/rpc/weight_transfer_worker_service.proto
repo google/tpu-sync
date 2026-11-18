@@ -22,63 +22,105 @@ import "tpu_sync/rpc/weight_transfer_common.proto";
 option java_multiple_files = true;
 option java_outer_classname = "WeightTransferWorkerServiceProto";
 
-// Worker-facing control-plane messages for versioned weight transfers.
+// Worker-facing control-plane messages for weight push transfers.
 //
-// Each request is dispatched over the control pipe by its full protobuf message
-// name (`ControlEnvelope.message_type`); errors are returned in
-// `ControlResponseEnvelope`.
+// Rendezvous protocol for a two-phase weight push from `S` sender workers to
+// `D` receiver workers (`D + S` control RPCs total), named by a `uuid` that
+// the client draws from [1, 2^63) and never reuses (a retry is a new uuid):
+//   1. Prepare (`D` parallel RPCs, coordinator -> each receiver worker):
+//      `PrepareWeightReceiveRequest` validates the request, verifies
+//      `target_incarnation_id`, registers the summed per-layer chunk counts
+//      from `chunks` and the receiver's tiling settings, and returns
+//      before any bytes move.
+//   2. Push (`S` parallel RPCs, coordinator -> each sender worker, issued only
+//      after all `D` receivers acknowledge step 1): `StartWeightPushRequest`
+//      verifies `target_incarnation_id`, stages source weights from HBM unless
+//      `skip_d2h` is set, streams the scheduled byte slices over TCP to the
+//      armed receivers, and returns once every TCP batch ACK arrives.
 //
-// Rendezvous protocol for a controller-driven resharded weight push from `S`
-// source workers to `D` destination workers (`D + S` control RPCs total):
-//   1. Prepare (`D` parallel RPCs, controller -> each destination worker):
-//      `PrepareWeightReceiveRequest` verifies `target_incarnation_id`, claims
-//      exclusive write ownership of the destination's staging buffer for
-//      `(uuid, version)` (draining any in-flight pull readers or claimed H2D
-//      copy, and dropping the buffer's previous complete version), registers
-//      expected per-layer chunk counts, and returns before any bytes move.
-//   2. Push (`S` parallel RPCs, controller -> each source worker, issued only
-//      after all `D` destinations acknowledge step 1):
-//      `StartWeightPushRequest` verifies `target_incarnation_id`, stages source
-//      weights from HBM unless `skip_d2h` is set, streams the resharded byte
-//      slices over TCP to the armed destinations, and returns once every TCP
-//      batch ACK arrives. Each destination commits `version` into its staging
-//      buffer once its last layer finishes on-arrival tiling.
-//
-// A push that fails midway commits no version, but it rolls back only the
-// staging buffer: on a worker that copies each layer to the device as soon as
-// it arrives (automatic H2D), layers already copied stay on the device.
-// Seed-and-pull receivers therefore copy a version to the device explicitly,
-// only after it commits.
+// Conventions:
+// - Each request is dispatched over the control pipe by its full protobuf
+//   message name (`ControlEnvelope.message_type`). Request-level errors are
+//   absl status codes in `ControlResponseEnvelope`, and every error names the
+//   offending value, ID or state.
+// - Incarnation IDs: each live worker (weight synchronizer, for example one
+//   host's worker in 1-process-per-host JAX or one rank's worker in
+//   1-process-per-device PyTorch) has a positive `incarnation_id` that changes
+//   across restarts; callers must not interpret it as a timestamp or order two
+//   incarnations. Every request names the incarnation it is meant for in
+//   `target_incarnation_id`: a non-zero value other than the worker's own is
+//   FAILED_PRECONDITION, so a restarted worker rejects requests meant for its
+//   predecessor, and 0 skips the check explicitly.
+// - Request timeouts (`receive_timeout_ms`) are in milliseconds: in
+//   (0, kMaxTransferTimeout = 1 h] once implemented, and 0 (no deadline) until
+//   then. A negative value or one over 1 h is INVALID_ARGUMENT naming it.
+// - Unimplemented fields (prepares that cover only some `expected_senders` and
+//   a positive `receive_timeout_ms`) fail with UNIMPLEMENTED stating what is
+//   not implemented yet, after the listener's validation; they are never
+//   ignored.
 
-// Phase 1 (controller -> destination worker): arms the destination's staging
-// buffer and chunk accounting for an incoming weight push.
+// The op-7 items (chunks) one sender sends to one receiver, per layer.
+message Chunks {
+  // One of `PrepareWeightReceiveRequest.expected_senders`, at most once per
+  // request; otherwise INVALID_ARGUMENT naming it.
+  string sender = 1;
+  // Layer index -> chunks of that layer. Layers lie in [0, num_layers),
+  // counts in [0, 2^32 - 1], and the counts have a positive sum; otherwise
+  // INVALID_ARGUMENT naming the sender, the layer and the count.
+  map<int32, int64> layer_chunk_counts = 2;
+}
+
+// Phase 1: prepares this worker (the receiver) to receive version `version` in
+// transfer `uuid`. Answers before any bytes move.
+//
+// The receiver validates the request, sums the per-layer chunk counts across
+// `chunks` (deriving the total chunk count), and registers the summed
+// counts and tiling settings of `uuid`. The receive completes once every
+// expected chunk has arrived and every layer was tiled (for ON_ARRIVAL).
+// `version` is validated now and recorded into the staging buffer once
+// versioned staging-buffer claims are implemented.
+//
+// Errors: UNAVAILABLE while the listener stops; FAILED_PRECONDITION for
+// another incarnation; INVALID_ARGUMENT naming an invalid field; UNIMPLEMENTED
+// stating what is not implemented yet for `chunks` that cover only some
+// `expected_senders` or a positive `receive_timeout_ms`.
 message PrepareWeightReceiveRequest {
-  // Unique transfer identifier shared with the matching
-  // `StartWeightPushRequest` calls. Required (> 0).
+  // The transfer attempt; positive. Every op-7 chunk header of the attempt
+  // carries it.
   int64 uuid = 1;
-  // Weight version this transfer delivers. Required; committed into the
-  // destination's staging buffer only once every expected chunk has arrived and
-  // been tiled.
+  // The version this transfer delivers. Required: an unset message or an
+  // empty tag is INVALID_ARGUMENT ("carries no version"), and so is a tag over
+  // 256 bytes.
   WeightVersion version = 2;
-  // Incarnation ID the controller expects of this destination work unit.
-  // Rejected with FAILED_PRECONDITION when non-zero and different from the
-  // worker's own incarnation ID, so a restarted worker rejects commands meant
-  // for its predecessor. 0 skips the check.
+  // See the file comment.
   int64 target_incarnation_id = 3;
-  // Total push chunks destined for this worker across all layers and shards;
-  // must equal the sum of `expected_layer_chunk_counts` values.
-  int64 expected_block_count = 4;
-  // Expected push chunks destined for this worker per layer index.
-  map<int32, int64> expected_layer_chunk_counts = 5;
-  // Layout in which the destination staging buffers are kept on arrival
-  // (for example, `HOST_TILING_MODE_ON_ARRIVAL` so peers can pull device-layout
-  // bytes directly).
-  HostTilingMode host_tiling_mode = 6;
-  // Per-layer flag skipping tiling when source and destination shards share an
-  // identical layout.
-  map<int32, bool> skip_tiling = 7;
-  // Optional correlation ID for logging and diagnostics.
-  string req_id = 8;
+  // What the receiver does with the bytes on arrival; unset behaves like
+  // DEFERRED. See HostTilingMode.
+  HostTilingMode host_tiling_mode = 4;
+  // Layer index -> true to skip tiling that layer, because the source and
+  // destination shards have identical layouts.
+  map<int32, bool> skip_tiling = 5;
+  // Optional correlation ID for logs.
+  string req_id = 6;
+  // Every sender of this receive: non-empty, without empty or repeated ids;
+  // otherwise INVALID_ARGUMENT naming the id. Ids starting with "raiden/" are
+  // reserved for Raiden's own internal receives: a request to the listener
+  // that names one, here or in `chunks`, is INVALID_ARGUMENT.
+  repeated string expected_senders = 7;
+  // Non-empty: each sender appears at most once and must be in
+  // `expected_senders`; otherwise INVALID_ARGUMENT naming it. Every
+  // entry is validated before the counts are summed per layer, and the
+  // sum must not exceed 2^32 - 1. Until multi-prepare joins are implemented, a
+  // prepare must carry every expected sender's chunks: an otherwise
+  // valid one that covers only some of them is UNIMPLEMENTED naming the
+  // missing senders and stating what is not implemented yet.
+  repeated Chunks chunks = 8;
+  // The receive's deadline in milliseconds. Required once receive deadlines
+  // are implemented: (0, 1 h], so 0 is INVALID_ARGUMENT then. Until then, only
+  // 0 (no deadline) is accepted: a value in (0, 1 h] is UNIMPLEMENTED stating
+  // that receive deadlines are not implemented yet, and a negative value or
+  // one over 1 h is INVALID_ARGUMENT already.
+  int64 receive_timeout_ms = 9;
 }
 
 message PrepareWeightReceiveResponse {}

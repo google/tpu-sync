@@ -64,6 +64,10 @@ class BlockTransport final {
   // node, push streams whose shards live on node N are sent by worker threads
   // pinned to N (see lib::SocketTransportAdapter). Otherwise every stream
   // uses the default (unpinned) send path exactly as before.
+  //
+  // Throws std::runtime_error if the listening socket cannot be created, or if
+  // TPU_RAIDEN_ENABLE_PEREGRINE selects Peregrine for any block op and the
+  // Peregrine transport fails to start.
   BlockTransport(BlockTransportDelegate* delegate, int local_port,
                  const std::vector<std::string>& local_ips = {},
                  int parallelism = 1, bool socket_only_transport = false);
@@ -262,7 +266,7 @@ class BlockTransport final {
   lib::TransportAdapter* AdapterFor(int numa_node);
 
   // Adapter `op` is configured to use (`Config::backend_for`): the socket
-  // adapter, or the Peregrine adapter when it is running.
+  // adapter or the Peregrine adapter.
   absl::StatusOr<lib::TransportAdapter*> AdapterForOp(lib::TransferOp op);
 
   // Projects `peers` into the backend-specific address list for `op`: `.data`
@@ -290,6 +294,10 @@ class BlockTransport final {
       const std::shared_ptr<BlockTransportServerPushSession>& session);
   // Erases the active pull session for |session_id| from active_pull_sessions_.
   void DeletePullSession(uint64_t session_id);
+  // Starts the Peregrine transport on the primary IP of `local_ips` when a
+  // block op selects it, and returns null otherwise.
+  std::unique_ptr<lib::PeregrineTransportAdapter> StartPeregrineIfConfigured(
+      const std::vector<std::string>& local_ips);
 
   absl::StatusOr<std::vector<int>> SyncPullInternal(
       absl::Span<const PeerEndpoint> peers,
@@ -319,6 +327,9 @@ class BlockTransport final {
   absl::Notification stop_metrics_thread_;
   std::thread metrics_thread_;
 
+  // Peregrine transport for the block ops whose backend is kPeregrine;
+  // non-null when `config_.uses_peregrine()`.
+  std::unique_ptr<lib::PeregrineTransportAdapter> peregrine_adapter_;
   lib::RawBufferTransport raw_transport_;
   std::unique_ptr<lib::PeregrineControlServiceImpl> peregrine_control_;
   std::unique_ptr<lib::TransportAdapter> transport_adapter_;
@@ -328,9 +339,6 @@ class BlockTransport final {
   // (pulls, single-group pushes) uses `transport_adapter_`.
   absl::flat_hash_map<int, std::unique_ptr<lib::SocketTransportAdapter>>
       numa_adapters_;
-  // Peregrine transport for the block ops whose backend is kPeregrine; null
-  // when no op selects it or it failed to start.
-  std::unique_ptr<lib::PeregrineTransportAdapter> peregrine_adapter_;
 };
 
 }  // namespace transport

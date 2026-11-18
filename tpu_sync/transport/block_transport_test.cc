@@ -27,6 +27,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>  // NOLINT
 #include <tuple>
@@ -89,6 +90,7 @@ using ::testing::Eq;
 using ::testing::HasSubstr;
 using ::testing::Not;
 using ::testing::Pointwise;
+using ::testing::ThrowsMessage;
 
 constexpr absl::Duration kMetricPollingTimeout = absl::Seconds(5);
 constexpr absl::Duration kMetricPollingInterval = absl::Milliseconds(10);
@@ -2405,6 +2407,31 @@ TEST(TransportBackendTest, SocketBackendStartsNoPeregrineTransport) {
   MockDelegate delegate(/*slice_size=*/64);
   BlockTransport transport(&delegate, /*local_port=*/0);
   EXPECT_FALSE(transport.config().uses_peregrine());
+}
+
+TEST(TransportBackendTest, PeregrineStartFailureThrows) {
+  auto cleanup =
+      absl::MakeCleanup([] { unsetenv("TPU_RAIDEN_ENABLE_PEREGRINE"); });
+  setenv("TPU_RAIDEN_ENABLE_PEREGRINE", "6", 1);
+  MockDelegate delegate(/*slice_size=*/64);
+  // Control: with the same env, the Peregrine transport starts on a local
+  // address, so the failure below is caused by the address and not the env.
+  {
+    BlockTransport transport(&delegate, /*local_port=*/0,
+                             /*local_ips=*/{"127.0.0.1"});
+    EXPECT_GT(transport.peregrine_local_port(), 0);
+  }
+  // The socket listener binds the wildcard address, so only the Peregrine
+  // transport fails on this non-local (TEST-NET-1) address. The message check
+  // tells that failure apart from a failed socket listener, which throws the
+  // same exception type.
+  EXPECT_THAT(
+      [&delegate] {
+        BlockTransport(&delegate, /*local_port=*/0,
+                       /*local_ips=*/{"192.0.2.1"});
+      },
+      ThrowsMessage<std::runtime_error>(
+          HasSubstr("Peregrine transport failed to start")));
 }
 
 TEST(TransportBackendTest, SocketOnlyTransportIgnoresEnv) {

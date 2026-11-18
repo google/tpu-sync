@@ -32,6 +32,7 @@
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>  // NOLINT
 #include <utility>
@@ -302,6 +303,7 @@ BlockTransport::BlockTransport(BlockTransportDelegate* delegate, int local_port,
     : block_delegate_(delegate),
       parallelism_(parallelism),
       config_(ReadConfigFromEnv(socket_only_transport)),
+      peregrine_adapter_(StartPeregrineIfConfigured(local_ips)),
       raw_transport_(
           delegate, local_port, local_ips,
           [this](int client_fd, const lib::ChunkHeader& header) {
@@ -328,32 +330,6 @@ BlockTransport::BlockTransport(BlockTransportDelegate* delegate, int local_port,
           &raw_transport_, parallelism_, node);
     }
   }
-  // The Peregrine transport is started only when a block op selects it; the
-  // default socket configuration never touches Peregrine.
-  if (config_.uses_peregrine()) {
-    absl::StatusOr<std::unique_ptr<lib::PeregrineTransportAdapter>> adapter =
-        lib::PeregrineTransportAdapter::Create(
-            raw_transport_.bound_ip(), /*port=*/0, parallelism_,
-            lib::PeregrineTransportAdapter::RecvHooks{
-                .on_post_complete =
-                    [this](const lib::PostMetadata& post,
-                           const absl::Status& post_status) {
-                      return OnRecvComplete(post, /*requests=*/{}, post_status);
-                    },
-                .resolve_addr =
-                    [this](const lib::PostMetadata& post,
-                           const lib::RequestMetadata& req) {
-                      return ResolveRecvBuffer(post, req);
-                    },
-            });
-    if (adapter.ok()) {
-      peregrine_adapter_ = *std::move(adapter);
-    } else {
-      LOG(ERROR) << "Peregrine transport backend requested but unavailable; "
-                    "block ops configured for it will fail: "
-                 << adapter.status();
-    }
-  }
   LOG(INFO) << "local_port=" << local_port
             << ", local_ips=" << absl::StrJoin(local_ips, ",")
             << ", parallelism=" << parallelism_
@@ -364,6 +340,37 @@ BlockTransport::BlockTransport(BlockTransportDelegate* delegate, int local_port,
       metrics_exporter_.Export(transport_adapter_->GetTransportMetrics());
     }
   });
+}
+
+std::unique_ptr<lib::PeregrineTransportAdapter>
+BlockTransport::StartPeregrineIfConfigured(
+    const std::vector<std::string>& local_ips) {
+  // The Peregrine transport is started only when a block op selects it; the
+  // default socket configuration never touches Peregrine.
+  if (!config_.uses_peregrine()) return nullptr;
+  const std::string bind_ip = local_ips.empty() ? "127.0.0.1" : local_ips[0];
+  absl::StatusOr<std::unique_ptr<lib::PeregrineTransportAdapter>> adapter =
+      lib::PeregrineTransportAdapter::Create(
+          bind_ip, /*port=*/0, parallelism_,
+          lib::PeregrineTransportAdapter::RecvHooks{
+              .on_post_complete =
+                  [this](const lib::PostMetadata& post,
+                         const absl::Status& post_status) {
+                    return OnRecvComplete(post, /*requests=*/{}, post_status);
+                  },
+              .resolve_addr =
+                  [this](const lib::PostMetadata& post,
+                         const lib::RequestMetadata& req) {
+                    return ResolveRecvBuffer(post, req);
+                  },
+          });
+  if (!adapter.ok()) {
+    throw std::runtime_error(absl::StrCat(
+        "TPU_RAIDEN_ENABLE_PEREGRINE is set but the Peregrine transport "
+        "failed to start: ",
+        adapter.status().ToString()));
+  }
+  return *std::move(adapter);
 }
 
 BlockTransport::~BlockTransport() {
@@ -905,12 +912,7 @@ absl::StatusOr<lib::TransportAdapter*> BlockTransport::AdapterForOp(
     case TransportBackend::kSocket:
       return transport_adapter_.get();
     case TransportBackend::kPeregrine:
-      if (peregrine_adapter_ == nullptr) {
-        return absl::FailedPreconditionError(absl::StrCat(
-            "Block op ", static_cast<int>(op),
-            " is configured for the Peregrine backend, which failed to start "
-            "(see the BlockTransport startup log)"));
-      }
+      ABSL_DCHECK(peregrine_adapter_ != nullptr);
       return peregrine_adapter_.get();
   }
   return absl::InternalError(absl::StrCat(

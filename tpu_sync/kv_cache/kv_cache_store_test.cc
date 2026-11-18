@@ -4363,14 +4363,22 @@ TEST_F(StoreDiscoveryTest, FailedLoadDropsTheCachedPeerClient) {
   // Port 1 is reserved and never listening, so this connect always fails.
   ABSL_ASSERT_OK(client_->RegisterStore(peer_rid, "127.0.0.1:1",
                                         /*controller_address=*/""));
-  // Load requires a destination for every hash. The device block is never written 
-  // as the loads below fail while resolving or querying the peer.
+  // Load requires a destination for every hash. The device block is never
+  // written as the loads below fail while resolving or querying the peer. A
+  // peer load also brings a staging block, which a failed load returns, so each
+  // attempt allocates its own.
   BlockTracker tracker;
-  auto first =
-      backend->Load({"h"}, {0}, &tracker, LoadOptions{.remote_id = peer_rid})
-          .Await();
+  const int free_blocks = store.raiden_controller()->num_free_blocks();
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<int> first_staging,
+                       store.raiden_controller()->AllocateBlockIds(1));
+  auto first = backend
+                   ->Load({"h"}, {0}, &tracker,
+                          LoadOptions{.remote_id = peer_rid,
+                                      .staging_host_block_ids = first_staging})
+                   .Await();
   ASSERT_FALSE(first.ok());
   ASSERT_TRUE(absl::IsUnavailable(first)) << first.ToString();
+  EXPECT_EQ(store.raiden_controller()->num_free_blocks(), free_blocks);
 
   // The peer comes back on a real port and republishes, replacing its entry.
   KVCacheStore peer(/*capacity=*/16, registry_address_, peer_rid,
@@ -4384,13 +4392,19 @@ TEST_F(StoreDiscoveryTest, FailedLoadDropsTheCachedPeerClient) {
   // be UNAVAILABLE. The answer itself is about the request rather than about
   // the hash, because Fetch validates its arguments before it looks anything
   // up, and this store registers no workers to name as endpoints.
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<int> second_staging,
+                       store.raiden_controller()->AllocateBlockIds(1));
   auto second =
-      backend->Load({"h"}, {0}, &tracker, LoadOptions{.remote_id = peer_rid})
+      backend
+          ->Load({"h"}, {0}, &tracker,
+                 LoadOptions{.remote_id = peer_rid,
+                             .staging_host_block_ids = second_staging})
           .Await();
   EXPECT_TRUE(absl::IsInvalidArgument(second))
       << "expected the restarted peer to answer; got " << second.ToString()
       << " -- the cached client still points at the address it had";
   EXPECT_FALSE(absl::IsUnavailable(second));
+  EXPECT_EQ(store.raiden_controller()->num_free_blocks(), free_blocks);
 }
 
 // ===========================================================================
@@ -7835,6 +7849,203 @@ TEST_F(ReadRemoteTest, StagingExhaustionStillLaunchesPeerGroup) {
       KVCacheStoreTest::GetController(*store_)->DeallocateBlockIds(held));
 }
 
+// A peer read allocates its staging the way a storage recall does: with no
+// free host block it evicts an unpinned entry, never a pinned one, and the
+// read completes. The evicted entry is dropped -- reported through the
+// eviction callback, with nothing written to the storage tier -- and the
+// staging block is free again once the read settles.
+TEST_F(ReadRemoteTest, PeerStagingEvictsOnlyUnpinned) {
+  constexpr int kHostBlocks = 3;
+  MakeStore({.num_host_blocks = kHostBlocks, .peer_hashes = {"r0"}});
+  // Shared with the callback, which stays registered on the fixture's store
+  // after this body returns.
+  auto evicted = std::make_shared<std::vector<std::string>>();
+  store_->SetEvictionCallback([evicted](absl::Span<const std::string> hashes) {
+    evicted->insert(evicted->end(), hashes.begin(), hashes.end());
+  });
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::vector<int> alloc_ids,
+      KVCacheStoreTest::GetController(*store_)->AllocateBlockIds(2));
+  ASSERT_TRUE(InsertResident(
+      *store_, {"unpinned0"},
+      {RaidenBlockId(local_id_, alloc_ids[0], -1, BlockStatus::HOST)},
+      /*on_host=*/true));
+  ASSERT_TRUE(InsertResident(
+      *store_, {"l0"},
+      {RaidenBlockId(local_id_, alloc_ids[1], -1, BlockStatus::HOST)},
+      /*on_host=*/true));
+  ABSL_ASSERT_OK(store_->Lookup({"l0"}));
+  ASSERT_EQ(store_->GetPinCount("l0"), 1);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::vector<int> held,
+      KVCacheStoreTest::AllocateBlockIds(*store_, FreeBlocks()));
+  ASSERT_EQ(FreeBlocks(), 0);
+
+  ABSL_ASSERT_OK(store_->ReadRemote({"r0"}, {PeerSlice(peer_a_, 0)}, {3}));
+
+  LoadOutcome outcome = WaitForLoadSettled(*store_, 1);
+  EXPECT_THAT(outcome.failed, ::testing::IsEmpty());
+  EXPECT_THAT(outcome.done, ::testing::ElementsAre("r0"));
+  EXPECT_THAT(mgr_.H2dDestinations(), ::testing::ElementsAre(3));
+  EXPECT_THAT(*evicted, ::testing::ElementsAre("unpinned0"));
+  EXPECT_FALSE(EntryOf("unpinned0").has_value());
+  EXPECT_EQ(store_->GetPinCount("l0"), 1);
+  EXPECT_TRUE(EntryOf("l0").has_value());
+  // Dropped, not written out: the storage tier, which does report a block
+  // that is on disk, has nothing for the evicted hash.
+  const auto in_storage = [&](const std::string& hash) {
+    absl::StatusOr<BlockSliceList> found = PeekLookup(*store_, {hash});
+    return found.ok() && !found->empty() &&
+           (*found)[0].second.status == BlockStatus::SHARED_STORAGE;
+  };
+  WriteStorageFile("s0");
+  EXPECT_TRUE(in_storage("s0"));
+  EXPECT_FALSE(in_storage("unpinned0"));
+  // The staging block was a hop: the block the eviction freed is free again.
+  EXPECT_EQ(FreeBlocks(), 1);
+  store_->Release({"l0"});
+  ABSL_ASSERT_OK(
+      KVCacheStoreTest::GetController(*store_)->DeallocateBlockIds(held));
+}
+
+// If no staging block can be made for a peer read -- every host block is
+// pinned or held -- the call still returns OK and the peer hashes are reported
+// failed by the poll, exactly once. Nothing is evicted, the pinned entry keeps
+// its pin, and nothing is copied to device.
+TEST_F(ReadRemoteTest, PeerStagingExhaustionFailsPeerGroup) {
+  constexpr int kHostBlocks = 3;
+  MakeStore({.num_host_blocks = kHostBlocks, .peer_hashes = {"r0"}});
+  // Shared with the callback, which stays registered on the fixture's store
+  // after this body returns.
+  auto evicted = std::make_shared<std::vector<std::string>>();
+  store_->SetEvictionCallback([evicted](absl::Span<const std::string> hashes) {
+    evicted->insert(evicted->end(), hashes.begin(), hashes.end());
+  });
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::vector<int> alloc_ids,
+      KVCacheStoreTest::GetController(*store_)->AllocateBlockIds(1));
+  ASSERT_TRUE(InsertResident(
+      *store_, {"l0"},
+      {RaidenBlockId(local_id_, alloc_ids[0], -1, BlockStatus::HOST)},
+      /*on_host=*/true));
+  ABSL_ASSERT_OK(store_->Lookup({"l0"}));
+  ASSERT_EQ(store_->GetPinCount("l0"), 1);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::vector<int> held,
+      KVCacheStoreTest::AllocateBlockIds(*store_, FreeBlocks()));
+  ASSERT_EQ(FreeBlocks(), 0);
+
+  ABSL_ASSERT_OK(store_->ReadRemote({"r0"}, {PeerSlice(peer_a_, 0)}, {3}));
+
+  LoadOutcome outcome = WaitForLoadSettled(*store_, 1);
+  EXPECT_THAT(outcome.done, ::testing::IsEmpty());
+  EXPECT_THAT(outcome.failed, ::testing::ElementsAre("r0"));
+  EXPECT_THAT(*evicted, ::testing::IsEmpty());
+  EXPECT_EQ(store_->GetPinCount("l0"), 1);
+  EXPECT_TRUE(EntryOf("l0").has_value());
+  EXPECT_THAT(mgr_.H2dDestinations(), ::testing::IsEmpty());
+  // Reported once: nothing is left for a later poll.
+  auto again = store_->PollLoadStatus();
+  EXPECT_THAT(again.failed, ::testing::IsEmpty());
+  EXPECT_THAT(again.pending, ::testing::IsEmpty());
+  EXPECT_EQ(FreeBlocks(), 0);
+  store_->Release({"l0"});
+  ABSL_ASSERT_OK(
+      KVCacheStoreTest::GetController(*store_)->DeallocateBlockIds(held));
+}
+
+// The staging blocks of a peer read are returned on every failure after they
+// were allocated: a peer that does not hold the hash, where the Fetch is
+// answered with an error, and a peer that resolves to an address nothing
+// listens on, where the Fetch cannot connect.
+TEST_F(ReadRemoteTest, PeerStagingReturnedOnFailure) {
+  MakeStore({.peer_hashes = {"r0"}});
+
+  ABSL_ASSERT_OK(
+      store_->ReadRemote({"r_missing"}, {PeerSlice(peer_a_, 99)}, {2}));
+  LoadOutcome missing = WaitForLoadSettled(*store_, 1);
+  EXPECT_THAT(missing.failed, ::testing::ElementsAre("r_missing"));
+  EXPECT_EQ(FreeBlocks(), initial_free_);
+
+  // Nothing listens on port 1 here, so the connect is refused.
+  ABSL_ASSERT_OK(registry_->client->RegisterStore(peer_b_, "127.0.0.1:1"));
+  ABSL_ASSERT_OK(
+      store_->ReadRemote({"r_dead_peer"}, {PeerSlice(peer_b_, 0)}, {2}));
+  LoadOutcome dead = WaitForLoadSettled(*store_, 1);
+  EXPECT_THAT(dead.failed, ::testing::ElementsAre("r_dead_peer"));
+  EXPECT_EQ(FreeBlocks(), initial_free_);
+}
+
+// The peer is resolved before any staging is allocated, so a read from a peer
+// the registry does not know evicts nothing, even with no free host block: the
+// call returns OK and the poll reports the hash failed, once. The same pool
+// does evict for a peer that resolves, which shows the first read had an
+// entry to lose.
+TEST_F(ReadRemoteTest, UnresolvablePeerEvictsNothing) {
+  constexpr int kHostBlocks = 3;
+  MakeStore({.num_host_blocks = kHostBlocks, .peer_hashes = {"r0"}});
+  // Shared with the callback, which stays registered on the fixture's store
+  // after this body returns.
+  auto evicted = std::make_shared<std::vector<std::string>>();
+  store_->SetEvictionCallback([evicted](absl::Span<const std::string> hashes) {
+    evicted->insert(evicted->end(), hashes.begin(), hashes.end());
+  });
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::vector<int> alloc_ids,
+      KVCacheStoreTest::GetController(*store_)->AllocateBlockIds(1));
+  ASSERT_TRUE(InsertResident(
+      *store_, {"unpinned0"},
+      {RaidenBlockId(local_id_, alloc_ids[0], -1, BlockStatus::HOST)},
+      /*on_host=*/true));
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::vector<int> held,
+      KVCacheStoreTest::AllocateBlockIds(*store_, FreeBlocks()));
+  ASSERT_EQ(FreeBlocks(), 0);
+
+  ABSL_ASSERT_OK(
+      store_->ReadRemote({"r_unknown_peer"}, {PeerSlice(peer_b_, 0)}, {3}));
+
+  LoadOutcome unknown = WaitForLoadSettled(*store_, 1);
+  EXPECT_THAT(unknown.done, ::testing::IsEmpty());
+  EXPECT_THAT(unknown.failed, ::testing::ElementsAre("r_unknown_peer"));
+  EXPECT_THAT(*evicted, ::testing::IsEmpty());
+  EXPECT_TRUE(EntryOf("unpinned0").has_value());
+  EXPECT_EQ(FreeBlocks(), 0);
+  EXPECT_THAT(mgr_.H2dDestinations(), ::testing::IsEmpty());
+  // Reported once: nothing is left for a later poll.
+  auto again = store_->PollLoadStatus();
+  EXPECT_THAT(again.failed, ::testing::IsEmpty());
+  EXPECT_THAT(again.pending, ::testing::IsEmpty());
+
+  ABSL_ASSERT_OK(store_->ReadRemote({"r0"}, {PeerSlice(peer_a_, 0)}, {3}));
+
+  LoadOutcome resolved = WaitForLoadSettled(*store_, 1);
+  EXPECT_THAT(resolved.done, ::testing::ElementsAre("r0"));
+  EXPECT_THAT(*evicted, ::testing::ElementsAre("unpinned0"));
+  ABSL_ASSERT_OK(
+      KVCacheStoreTest::GetController(*store_)->DeallocateBlockIds(held));
+}
+
+// An unresolvable peer fails only the peer group: the storage group of the
+// same call still launches and completes.
+TEST_F(ReadRemoteTest, UnresolvablePeerDoesNotFailStorageGroup) {
+  MakeStore({.peer_hashes = {"r0"}});
+
+  ABSL_ASSERT_OK(store_->ReadRemote({"r_unknown_peer", "s0"},
+                                    {PeerSlice(peer_b_, 0), StorageSlice()},
+                                    {3, 4}));
+
+  LoadOutcome outcome = WaitForLoadSettled(*store_, 2);
+  EXPECT_THAT(outcome.done, ::testing::ElementsAre("s0"));
+  EXPECT_THAT(outcome.failed, ::testing::ElementsAre("r_unknown_peer"));
+  EXPECT_THAT(mgr_.last_backend_dst_block_ids, ::testing::ElementsAre(4));
+  EXPECT_THAT(mgr_.H2dDestinations(), ::testing::IsEmpty());
+  ASSERT_TRUE(EntryOf("s0").has_value());
+  EXPECT_EQ(EntryOf("s0")->status, BlockStatus::HOST_AND_HBM);
+  // Only the storage block's staging stays allocated, published in the LRU.
+  EXPECT_EQ(FreeBlocks(), initial_free_ - 1);
+}
+
 // Load(slices) forwards a storage batch to ReadRemote(), so staging
 // exhaustion there is also reported once, by the poll, and Load() returns OK
 // rather than an error on top of it.
@@ -8449,8 +8660,8 @@ TEST_F(KVRecallBlocksMetricsTest, RemoteDramRecallOutcomes) {
 
 TEST_F(KVRecallBlocksMetricsTest, RemoteDramRecallFailuresLogTheOutcome) {
   MakeStore({.peer_hashes = {"r0", "r1"}});
-  // An unpinned local host entry. An evicting allocation could free its
-  // block; the peer read staging allocation does not evict.
+  // An unpinned local host entry: one evictable block, short of the two the
+  // read below needs, so its staging allocation fails without evicting it.
   ASSERT_TRUE(
       InsertResident(*store_, {"l0"}, {LocalSlice(0)}, /*on_host=*/true));
   absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);

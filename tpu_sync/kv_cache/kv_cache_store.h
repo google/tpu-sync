@@ -469,16 +469,23 @@ class KVCacheStore {
   // storage hits.
   //
   // STAGING BEHAVIOR: host staging blocks are allocated internally; the caller
-  // never sees them. While in flight they are not in the LRU, so eviction and
-  // the sweep cannot reclaim them.
-  //   REMOTE peer    -- allocated from free blocks only (never evicts). Freed
-  //                     on success and on failure.
-  //   SHARED_STORAGE -- allocated via AllocateBlockIds, which may evict
-  //                     UNPINNED entries if short, never pinned ones. On
-  //                     success each block is published into the host LRU as
-  //                     an unpinned HOST_AND_HBM entry owned by this store (a
-  //                     refused publish frees its block); on failure all are
-  //                     freed.
+  // never sees them. Both sources allocate via AllocateBlockIds, which may
+  // evict UNPINNED entries if short, never pinned ones; an entry evicted this
+  // way is dropped locally, not demoted to another tier. An allocation that
+  // takes the pool below the evict sweep's low watermark also wakes the sweep.
+  // The peer is resolved through the global registry first: for a peer with
+  // no store registered there, or with no registry at all, nothing is
+  // allocated or evicted and the peer hashes are reported failed. A client
+  // resolved earlier is reused without asking the registry. A peer that is
+  // registered but unreachable is found out only by the read itself, after
+  // the allocation.
+  // While in flight the staging blocks are not in the LRU, so eviction and the
+  // sweep cannot reclaim them.
+  //   REMOTE peer    -- freed on success and on failure.
+  //   SHARED_STORAGE -- on success each block is published into the host LRU
+  //                     as an unpinned HOST_AND_HBM entry owned by this store
+  //                     (a refused publish frees its block); on failure all
+  //                     are freed.
   //
   // SUBSEQUENT LOOKUPS:
   //   REMOTE peer    -- nothing is recorded: a local Lookup() still misses,
@@ -494,16 +501,13 @@ class KVCacheStore {
   // validation error (bad status, two peers, a duplicate hash, a REMOTE slice
   // naming this store, a hash already loading, or SHARED_STORAGE with no
   // secondary backend) has no side effects. After launch (peer group, then
-  // storage group), every failure -- including no host staging blocks for
-  // either group -- is reported once, per hash, by PollLoadStatus(); the call
-  // still returns OK and the other group continues. On failure the
-  // destination device blocks are undefined.
+  // storage group), every failure -- including an unresolvable peer and no
+  // host staging blocks for either group -- is reported once, per hash, by
+  // PollLoadStatus(); the call still returns OK and the other group
+  // continues. On failure the destination device blocks are undefined.
   //
   // Load(slices) forwards any all-non-local batch here, so both entry points
   // behave identically for REMOTE and SHARED_STORAGE blocks.
-  //
-  // A peer read needs a global registry to resolve the peer; without one the
-  // peer hashes are reported failed.
   absl::Status ReadRemote(const std::vector<std::string>& block_hashes,
                           const std::vector<RaidenBlockId>& slices,
                           const std::vector<int32_t>& device_block_ids);

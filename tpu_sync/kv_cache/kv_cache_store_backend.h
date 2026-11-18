@@ -201,6 +201,13 @@ struct LoadOptions {
   // must match block_hashes in size, and blocks must already be pinned
   // externally. Ignored for remote peer loads.
   absl::Span<const RaidenBlockId> slices = {};
+
+  // Remote peer loads only: the local host blocks the peer's bytes land in
+  // before the copy to device, one per hash. The caller allocates them; the
+  // backend owns them from the call on and returns them to the controller
+  // when the load settles, whether it succeeds or fails. Passing them to a
+  // local load is InvalidArgument.
+  absl::Span<const int32_t> staging_host_block_ids = {};
 };
 
 // Abstract interface for KV cache index storage backends.
@@ -231,7 +238,10 @@ class KVCacheStoreBackend {
       const LookupOptions& options = {}) = 0;
 
   // Asynchronously loads KV cache blocks from host DRAM or a remote peer to
-  // device (HBM) according to `options` (see LoadOptions).
+  // device (HBM) according to `options` (see LoadOptions). An override that
+  // serves peer loads takes over `options.staging_host_block_ids` as described
+  // there. This default serves no load, and must not be given staging blocks:
+  // it does not return them.
   virtual tsl::Future<> Load(absl::Span<const std::string> block_hashes,
                              absl::Span<const int32_t> device_block_ids,
                              BlockTracker* absl_nonnull load_tracker,
@@ -239,6 +249,15 @@ class KVCacheStoreBackend {
     CHECK(load_tracker != nullptr);
     load_tracker->MarkFailed(block_hashes);
     return tsl::Future<>(absl::UnimplementedError("Load not implemented."));
+  }
+
+  // Checks that a peer Load() from `remote_id` can be attempted, without
+  // moving any data: an override resolves the peer, and may block on that. An
+  // error means a Load() from this peer would fail before it reads anything,
+  // so the caller can skip allocating staging blocks for it. OK does not mean
+  // the peer is reachable. This default serves no peer load, like Load().
+  virtual absl::Status PreparePeerLoad(const RaidenId& remote_id) {
+    return absl::UnimplementedError("PreparePeerLoad not implemented.");
   }
 
   // Asynchronously saves KV cache blocks from device (HBM) to host DRAM
@@ -295,6 +314,10 @@ class KVCacheStoreBackend {
   // Entries without a host block, such as HBM-only entries, are not returned.
   // Backends without a host DRAM tier return none.
   virtual std::vector<std::string> GetEvictableKeys(size_t count) { return {}; }
+
+  // Number of keys GetEvictableKeys() could return: unpinned entries that hold
+  // a host DRAM block. Backends without a host DRAM tier have none.
+  virtual size_t NumEvictableHostBlocks() const { return 0; }
 
   // --- Remote write (WriteRemote) & registry helpers -----------------------
   //

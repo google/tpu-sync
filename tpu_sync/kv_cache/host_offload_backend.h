@@ -90,7 +90,7 @@ class HostOffloadBackend : public KVCacheStoreBackend {
 
   // Number of unpinned LRU entries (incl. eviction candidates) that hold a
   // host DRAM block.
-  size_t NumEvictableHostBlocks() const ABSL_LOCKS_EXCLUDED(mutex_);
+  size_t NumEvictableHostBlocks() const override ABSL_LOCKS_EXCLUDED(mutex_);
 
   // Must be called with no HostOffloadBackend lock held: it takes
   // `metrics_mu_`, then `mutex_`, then the controller mutex. Methods of this
@@ -111,6 +111,11 @@ class HostOffloadBackend : public KVCacheStoreBackend {
                      absl::Span<const int32_t> device_block_ids,
                      BlockTracker* absl_nonnull load_tracker,
                      const LoadOptions& options = {}) override;
+
+  // Resolves the peer's store client through the registry, or finds it cached,
+  // so a following peer Load() looks it up without another registry call.
+  absl::Status PreparePeerLoad(const RaidenId& remote_id) override
+      ABSL_LOCKS_EXCLUDED(mutex_);
 
   tsl::Future<> Save(absl::Span<const std::string> block_hashes,
                      absl::Span<const int64_t> src_device_block_ids,
@@ -185,12 +190,22 @@ class HostOffloadBackend : public KVCacheStoreBackend {
       int64_t wait_ms = 0);
 
   // Pulls blocks held by the peer `remote_id` into `device_block_ids`, in two
-  // hops: a Fetch RPC that lands the bytes in host blocks allocated here, then
-  // a DRAM->HBM copy chained off it. Takes `metrics_mu_` and `mutex_` itself.
-  tsl::Future<> LoadRemoteBlocks(const RaidenId& remote_id,
-                                 absl::Span<const std::string> block_hashes,
-                                 absl::Span<const int32_t> device_block_ids,
-                                 BlockTracker* absl_nonnull load_tracker)
+  // hops: a Fetch RPC that lands the bytes in `staging_host_block_ids`, then a
+  // DRAM->HBM copy chained off it. The caller allocated the staging blocks,
+  // one per hash; they are returned to the controller on every way out. Takes
+  // `metrics_mu_` and `mutex_` itself.
+  tsl::Future<> LoadRemoteBlocks(
+      const RaidenId& remote_id, absl::Span<const std::string> block_hashes,
+      absl::Span<const int32_t> device_block_ids,
+      absl::Span<const int32_t> staging_host_block_ids,
+      BlockTracker* absl_nonnull load_tracker)
+      ABSL_LOCKS_EXCLUDED(metrics_mu_, mutex_);
+
+  // Returns a peer load's staging host blocks to the controller and refreshes
+  // the host pool gauge. A block that cannot be returned was leaked or freed
+  // twice, so a failure is logged. Like RecordHostPoolMetrics(), this must be
+  // called with no HostOffloadBackend lock held.
+  void ReturnStagingBlocks(absl::Span<const int32_t> host_block_ids)
       ABSL_LOCKS_EXCLUDED(metrics_mu_, mutex_);
 
   // Copies blocks already resident in this node's host DRAM into

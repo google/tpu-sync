@@ -548,12 +548,15 @@ class KVCacheStore:
     PIN CONTRACT: none. No pin is required, taken or consumed; do not release()
     these hashes.
 
-    STAGING BEHAVIOR: the store allocates host staging blocks internally.
-      REMOTE peer    -- uses free host blocks only (never evicts); they are
-                        freed on success and on failure.
-      SHARED_STORAGE -- may evict UNPINNED cached blocks to make room, never
-                        pinned ones (your lookup() pins for load() are safe).
-                        On success each block is kept in this store's host
+    STAGING BEHAVIOR: the store allocates host staging blocks internally. For
+    both sources it may evict UNPINNED cached blocks to make room, never
+    pinned ones (your lookup() pins for load() are safe); a block evicted this
+    way is dropped from this store's host cache, not moved to another tier.
+    A read from a peer with no store registered in the global registry fails
+    without evicting; a registered but unreachable peer may still evict.
+      REMOTE peer    -- the staging blocks are freed on success and on
+                        failure.
+      SHARED_STORAGE -- on success each block is kept in this store's host
                         cache as an unpinned HOST_AND_HBM entry; on failure
                         the staging blocks are freed.
 

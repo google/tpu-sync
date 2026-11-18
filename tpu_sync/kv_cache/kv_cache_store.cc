@@ -1827,15 +1827,60 @@ absl::Status KVCacheStore::ReadRemote(
     load_tracker_.AddPending(block_hashes);
   }
 
-  // Launched outside mutex_ (AllocateBlockIds takes it). Peers first, then
-  // storage. From here on every failure -- staging exhaustion included, for
+  // Launched outside mutex_ (AllocateBlockIds takes it, and resolving a peer
+  // may call the registry). Peers first, then storage. From here on every
+  // failure -- an unresolvable peer and staging exhaustion included, for
   // either group -- is reported once, per hash, through load_tracker_, and
   // does not affect the other group. The call itself returns OK.
   if (!peer_hashes.empty()) {
-    // The future is ignored, as in Load(slices): failures reach the tracker.
-    backend()->Load(peer_hashes, dest_device_ids_for_loads_from_peer,
-                    &load_tracker_,
-                    LoadOptions{.remote_id = *peer_id, .slices = peer_slices});
+    const RecallClock::time_point start_ts = RecallClock::now();
+    // Resolve the peer before allocating: the allocation below may evict, and
+    // a read from a peer that cannot be resolved would drop those entries for
+    // nothing.
+    absl::Status prepared = backend()->PreparePeerLoad(*peer_id);
+    if (!prepared.ok()) {
+      // The two failures caught here are logged like the ones the backend
+      // catches during the load: one line per failed batch, not rate limited.
+      LOG(WARNING) << "Peer KV read failed ("
+                   << telemetry::metric_labels::kOutcomeTransferFailed
+                   << "): " << peer_hashes.size() << " block(s) from "
+                   << *peer_id << ", no client: " << prepared;
+      absl::MutexLock lock(mutex_);
+      MarkRecallFailed(load_tracker_, dp_rank_str_,
+                       telemetry::metric_labels::kTierRemoteDram,
+                       telemetry::metric_labels::kOutcomeTransferFailed,
+                       peer_hashes, start_ts);
+    } else {
+      // Host staging blocks for the peer read, allocated like a storage
+      // recall's: may evict UNPINNED entries if short, never pinned ones. The
+      // backend returns them once the read settles.
+      absl::StatusOr<std::vector<int>> staging =
+          AllocateBlockIds(peer_hashes.size());
+      if (staging.ok()) {
+        // The future is ignored, as in Load(slices): failures reach the
+        // tracker.
+        backend()->Load(peer_hashes, dest_device_ids_for_loads_from_peer,
+                        &load_tracker_,
+                        LoadOptions{.remote_id = *peer_id,
+                                    .slices = peer_slices,
+                                    .staging_host_block_ids = *staging});
+      } else {
+        LOG(WARNING) << "Peer KV read failed ("
+                     << telemetry::metric_labels::kOutcomeStagingExhausted
+                     << "): " << peer_hashes.size() << " block(s) from "
+                     << *peer_id << ", host pool free "
+                     << raiden_controller_->num_free_blocks() << "/"
+                     << raiden_controller_->total_blocks()
+                     << ", unpinned host LRU entries "
+                     << backend()->NumEvictableHostBlocks() << ": "
+                     << staging.status();
+        absl::MutexLock lock(mutex_);
+        MarkRecallFailed(load_tracker_, dp_rank_str_,
+                         telemetry::metric_labels::kTierRemoteDram,
+                         telemetry::metric_labels::kOutcomeStagingExhausted,
+                         peer_hashes, start_ts);
+      }
+    }
   }
   if (!storage_hashes.empty()) {
     LoadFromSecondaryBackend(storage_hashes,

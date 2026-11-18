@@ -298,6 +298,12 @@ TEST(KVCacheStoreBackendFactoryTest, CustomBackendDefaultHostOffloadHooks) {
   auto load_future = backend->Load({"h1"}, {0}, &load_tracker);
   EXPECT_THAT(load_future.Await(), StatusIs(absl::StatusCode::kUnimplemented));
   EXPECT_THAT(load_tracker.Poll().failed, testing::UnorderedElementsAre("h1"));
+
+  // A backend that serves no peer load says so before the caller allocates
+  // staging for one, and has no host block to evict for it.
+  EXPECT_THAT(backend->PreparePeerLoad(RaidenId{"peer", "0", "kv", 0}),
+              StatusIs(absl::StatusCode::kUnimplemented));
+  EXPECT_EQ(backend->NumEvictableHostBlocks(), 0);
 }
 
 TEST(KVCacheStoreBackendFactoryTest,

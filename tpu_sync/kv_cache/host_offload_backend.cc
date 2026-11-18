@@ -1161,12 +1161,21 @@ tsl::Future<> HostOffloadBackend::Load(
     absl::Span<const int32_t> device_block_ids,
     BlockTracker* absl_nonnull load_tracker, const LoadOptions& options) {
   CHECK(load_tracker != nullptr);
+  // The staging blocks of a peer load are this backend's to return (see
+  // LoadOptions). LoadRemoteBlocks() takes them over; every other way out of
+  // here returns them. A rejected load returns them before it reports the
+  // failure, as LoadRemoteBlocks() does: once a poll sees the hashes failed,
+  // their staging is free again.
+  absl::Cleanup return_staging = [&] {
+    ReturnStagingBlocks(options.staging_host_block_ids);
+  };
   if (block_hashes.empty()) {
     return tsl::Future<>(absl::OkStatus());
   }
 
   // Every hash needs a destination device block.
   if (device_block_ids.size() != block_hashes.size()) {
+    std::move(return_staging).Invoke();
     load_tracker->MarkFailed(block_hashes);
     return tsl::Future<>(absl::InvalidArgumentError(absl::StrCat(
         "Mismatched device_block_ids count (", device_block_ids.size(),
@@ -1180,26 +1189,67 @@ tsl::Future<> HostOffloadBackend::Load(
   }
 
   if (is_remote) {
+    std::move(return_staging).Cancel();
     return LoadRemoteBlocks(options.remote_id, block_hashes, device_block_ids,
-                            load_tracker);
+                            options.staging_host_block_ids, load_tracker);
+  }
+  if (!options.staging_host_block_ids.empty()) {
+    std::move(return_staging).Invoke();
+    load_tracker->MarkFailed(block_hashes);
+    return tsl::Future<>(absl::InvalidArgumentError(
+        absl::StrCat("staging_host_block_ids is for peer loads only, but ",
+                     options.staging_host_block_ids.size(),
+                     " were passed to a local load.")));
   }
   return LoadLocalHostBlocks(block_hashes, device_block_ids, options.slices,
                              load_tracker);
 }
 
+absl::Status HostOffloadBackend::PreparePeerLoad(const RaidenId& remote_id) {
+  return GetKVCacheStoreClient(remote_id).status();
+}
+
+void HostOffloadBackend::ReturnStagingBlocks(
+    absl::Span<const int32_t> host_block_ids) {
+  if (host_block_ids.empty()) {
+    return;
+  }
+  absl::Status status = raiden_controller_->DeallocateBlockIds(host_block_ids);
+  if (!status.ok()) {
+    LOG(ERROR) << "Failed to return " << host_block_ids.size()
+               << " staging host blocks: " << status;
+  }
+  RecordHostPoolMetrics();
+}
+
 tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
     const RaidenId& remote_id, absl::Span<const std::string> block_hashes,
     absl::Span<const int32_t> device_block_ids,
+    absl::Span<const int32_t> staging_host_block_ids,
     BlockTracker* absl_nonnull load_tracker) {
   CHECK(load_tracker != nullptr);
   const RecallClock::time_point start_ts = RecallClock::now();
+  std::vector<int32_t> dst_host_block_ids(staging_host_block_ids.begin(),
+                                          staging_host_block_ids.end());
+  // The staging blocks go back before the failure is reported, as on the
+  // asynchronous paths below: once a poll sees the hashes settled, their
+  // staging is free again.
   const auto fail_transfer = [&](absl::string_view outcome,
                                  absl::Status status) {
+    ReturnStagingBlocks(dst_host_block_ids);
     MarkRecallFailed(load_tracker, dp_rank_str_,
                      telemetry::metric_labels::kTierRemoteDram, outcome,
                      block_hashes, start_ts);
     return tsl::Future<>(std::move(status));
   };
+  if (dst_host_block_ids.size() != block_hashes.size()) {
+    return fail_transfer(
+        telemetry::metric_labels::kOutcomeTransferFailed,
+        absl::InvalidArgumentError(absl::StrCat(
+            "A peer load needs one staging host block per hash: got ",
+            dst_host_block_ids.size(), " staging_host_block_ids for ",
+            block_hashes.size(), " block_hashes.")));
+  }
   auto client = GetKVCacheStoreClient(remote_id);
   if (!client.ok()) {
     LOG(WARNING) << "Peer KV read failed ("
@@ -1210,23 +1260,6 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
                          client.status());
   }
   std::shared_ptr<KVCacheStoreClient> client_ptr = *std::move(client);
-
-  auto host_blocks = raiden_controller_->AllocateBlockIds(block_hashes.size());
-  if (!host_blocks.ok()) {
-    LOG(WARNING) << "Peer KV read failed ("
-                 << telemetry::metric_labels::kOutcomeStagingExhausted
-                 << "): " << block_hashes.size() << " block(s) from "
-                 << remote_id << ", host pool free "
-                 << raiden_controller_->num_free_blocks() << "/"
-                 << raiden_controller_->total_blocks()
-                 << ", unpinned host LRU entries " << NumEvictableHostBlocks()
-                 << ": " << host_blocks.status();
-    return fail_transfer(telemetry::metric_labels::kOutcomeStagingExhausted,
-                         host_blocks.status());
-  }
-  RecordHostPoolMetrics();
-  std::vector<int32_t> dst_host_block_ids(host_blocks->begin(),
-                                          host_blocks->end());
 
   auto [load_promise, load_future] = tsl::MakePromise<>();
 
@@ -1254,8 +1287,7 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
             return;
           }
           if (!fetch_response.ok()) {
-            (void)raiden_controller_->DeallocateBlockIds(dst_host_block_ids);
-            RecordHostPoolMetrics();
+            ReturnStagingBlocks(dst_host_block_ids);
             // The peer may have restarted on a new port; drop the cached client
             // so the next attempt re-resolves instead of redialling a dead one.
             InvalidateStoreClient(remote_id);
@@ -1281,8 +1313,7 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
 
           const auto& response = *fetch_response;
           if (!response.failed_block_hashes().empty()) {
-            (void)raiden_controller_->DeallocateBlockIds(dst_host_block_ids);
-            RecordHostPoolMetrics();
+            ReturnStagingBlocks(dst_host_block_ids);
             std::string err_msg = response.error_message().empty()
                                       ? "Fetch RPC returned failed blocks"
                                       : response.error_message();
@@ -1333,8 +1364,7 @@ tsl::Future<> HostOffloadBackend::LoadRemoteBlocks(
             load_promise.Set(absl::CancelledError("Backend destroyed"));
             return;
           }
-          (void)raiden_controller_->DeallocateBlockIds(dst_host_block_ids);
-          RecordHostPoolMetrics();
+          ReturnStagingBlocks(dst_host_block_ids);
           if (status.ok()) {
             MarkRecallDone(load_tracker, dp_rank_str_,
                            telemetry::metric_labels::kTierRemoteDram, hashes,

@@ -1021,15 +1021,303 @@ TEST(HostOffloadBackendTest, LoadSuccess) {
       "worker_0", test_worker_server->server_address,
       {{test_worker_server->server_address, {}}}));
 
-  // Perform Load
+  // Perform Load. A peer load brings its own staging block, and the backend
+  // returns it to the controller once the load settles.
   std::vector<std::string> hashes = {"load_hash_1"};
   std::vector<int32_t> dev_ids = {5};
+  const int free_blocks = controller->num_free_blocks();
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<int> staging,
+                       controller->AllocateBlockIds(1));
   BlockTracker tracker;
-  auto load_future = backend->Load(hashes, dev_ids, &tracker,
-                                   LoadOptions{.remote_id = remote_node_id});
+  auto load_future =
+      backend->Load(hashes, dev_ids, &tracker,
+                    LoadOptions{.remote_id = remote_node_id,
+                                .staging_host_block_ids = staging});
   ABSL_EXPECT_OK(load_future.Await());
+  EXPECT_EQ(controller->num_free_blocks(), free_blocks);
 
   remote_server->Shutdown();
+}
+
+// A peer load lands in staging blocks the caller allocates, one per hash.
+// Without them the load is rejected before the peer is contacted, the hashes
+// are reported failed, and whatever staging was passed goes back to the
+// controller -- also when the load is rejected for another argument.
+TEST(HostOffloadBackendTest, LoadFromPeerRequiresStagingPerHash) {
+  auto reg_server = global_registry::CreateTestGlobalRegistryServer();
+  RaidenId node_id{"node_job", "0", "data", 0};
+  RaidenId peer_id{"peer_job", "0", "data", 0};
+
+  ::tpu_sync::rpc::RaidenIdProto unit_proto;
+  unit_proto.set_job_name(node_id.job_name);
+  unit_proto.set_job_replica_id(node_id.job_replica_id);
+  unit_proto.set_data_name(node_id.data_name);
+  unit_proto.set_data_replica_idx(node_id.data_replica_idx);
+
+  TF_ASSERT_OK_AND_ASSIGN(auto controller, controller::RaidenController::Create(
+                                            unit_proto, /*num_blocks=*/100,
+                                            /*num_shards=*/1,
+                                            /*shard_size_bytes=*/1024));
+  BackendConfig config;
+  config.type = "HostOffloadBackend";
+  config.capacity = 100;
+  config.global_registry_address = reg_server->server_address;
+  config.raiden_id = node_id;
+
+  TF_ASSERT_OK_AND_ASSIGN(auto backend_base,
+                       HostOffloadBackend::Create(config, controller.get()));
+  auto backend = std::dynamic_pointer_cast<HostOffloadBackend>(backend_base);
+  ASSERT_NE(backend, nullptr);
+
+  const std::vector<std::string> hashes = {"hash1", "hash2"};
+  const std::vector<int32_t> dev_ids = {10, 11};
+  const int free_blocks = controller->num_free_blocks();
+
+  // No staging at all.
+  BlockTracker no_staging;
+  no_staging.AddPending(hashes);
+  EXPECT_THAT(backend
+                  ->Load(hashes, dev_ids, &no_staging,
+                         LoadOptions{.remote_id = peer_id})
+                  .Await(),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                     ::testing::HasSubstr("staging")));
+  EXPECT_THAT(no_staging.Poll().failed, UnorderedElementsAre("hash1", "hash2"));
+
+  // One staging block for two hashes: rejected, and the block is returned.
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<int> short_staging,
+                       controller->AllocateBlockIds(1));
+  BlockTracker too_few;
+  too_few.AddPending(hashes);
+  EXPECT_THAT(backend
+                  ->Load(hashes, dev_ids, &too_few,
+                         LoadOptions{.remote_id = peer_id,
+                                     .staging_host_block_ids = short_staging})
+                  .Await(),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                     ::testing::HasSubstr("staging")));
+  EXPECT_THAT(too_few.Poll().failed, UnorderedElementsAre("hash1", "hash2"));
+  EXPECT_EQ(controller->num_free_blocks(), free_blocks);
+
+  // Rejected for its device blocks, before the peer path: returned as well.
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<int> staging,
+                       controller->AllocateBlockIds(2));
+  BlockTracker bad_device_ids;
+  bad_device_ids.AddPending(hashes);
+  EXPECT_THAT(backend
+                  ->Load(hashes, {10}, &bad_device_ids,
+                         LoadOptions{.remote_id = peer_id,
+                                     .staging_host_block_ids = staging})
+                  .Await(),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                     ::testing::HasSubstr("device_block_ids")));
+  EXPECT_EQ(controller->num_free_blocks(), free_blocks);
+
+  // Staging is for peer loads only: a local load given some is rejected, and
+  // the blocks are returned.
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<int> local_staging,
+                       controller->AllocateBlockIds(2));
+  BlockTracker local_load;
+  local_load.AddPending(hashes);
+  EXPECT_THAT(backend
+                  ->Load(hashes, dev_ids, &local_load,
+                         LoadOptions{.staging_host_block_ids = local_staging})
+                  .Await(),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                     ::testing::HasSubstr("peer loads only")));
+  EXPECT_THAT(local_load.Poll().failed, UnorderedElementsAre("hash1", "hash2"));
+  EXPECT_EQ(controller->num_free_blocks(), free_blocks);
+
+  // Nothing to load: the call succeeds and still returns the blocks.
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<int> unused_staging,
+                       controller->AllocateBlockIds(1));
+  const std::vector<std::string> no_hashes;
+  const std::vector<int32_t> no_dev_ids;
+  BlockTracker nothing;
+  ABSL_EXPECT_OK(
+      backend
+          ->Load(no_hashes, no_dev_ids, &nothing,
+                 LoadOptions{.remote_id = peer_id,
+                             .staging_host_block_ids = unused_staging})
+          .Await());
+  EXPECT_EQ(controller->num_free_blocks(), free_blocks);
+}
+
+// PreparePeerLoad reports whether the peer's store can be resolved, without
+// touching the host pool, and keeps the client it resolved.
+TEST(HostOffloadBackendTest, PreparePeerLoadResolvesThePeer) {
+  auto reg_server = global_registry::CreateTestGlobalRegistryServer();
+  RaidenId node_id{"node_job", "0", "data", 0};
+  RaidenId peer_id{"peer_job", "0", "data", 0};
+  RaidenId unknown_id{"unknown_job", "0", "data", 0};
+
+  ::tpu_sync::rpc::RaidenIdProto unit_proto;
+  unit_proto.set_job_name(node_id.job_name);
+  unit_proto.set_job_replica_id(node_id.job_replica_id);
+  unit_proto.set_data_name(node_id.data_name);
+  unit_proto.set_data_replica_idx(node_id.data_replica_idx);
+
+  TF_ASSERT_OK_AND_ASSIGN(auto controller, controller::RaidenController::Create(
+                                            unit_proto, /*num_blocks=*/100,
+                                            /*num_shards=*/1,
+                                            /*shard_size_bytes=*/1024));
+  BackendConfig config;
+  config.type = "HostOffloadBackend";
+  config.capacity = 100;
+  config.global_registry_address = reg_server->server_address;
+  config.raiden_id = node_id;
+
+  TF_ASSERT_OK_AND_ASSIGN(auto backend,
+                       HostOffloadBackend::Create(config, controller.get()));
+  const int free_blocks = controller->num_free_blocks();
+
+  // No store is registered under this id.
+  EXPECT_THAT(backend->PreparePeerLoad(unknown_id),
+              absl_testing::StatusIs(absl::StatusCode::kNotFound));
+
+  // Resolving does not connect, so the address needs no listener.
+  ABSL_ASSERT_OK(reg_server->client->RegisterStore(peer_id, "127.0.0.1:1"));
+  ABSL_EXPECT_OK(backend->PreparePeerLoad(peer_id));
+
+  // The client was kept: the peer still resolves once the registry has
+  // forgotten it, which a second registry call would report as NotFound.
+  ABSL_ASSERT_OK(reg_server->client->UnregisterStore(peer_id));
+  ABSL_EXPECT_OK(backend->PreparePeerLoad(peer_id));
+  EXPECT_EQ(controller->num_free_blocks(), free_blocks);
+
+  // A backend with no registry cannot resolve any peer.
+  config.global_registry_address = "";
+  TF_ASSERT_OK_AND_ASSIGN(auto no_registry,
+                       HostOffloadBackend::Create(config, controller.get()));
+  EXPECT_THAT(no_registry->PreparePeerLoad(peer_id),
+              absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition));
+}
+
+// A peer Load() that is given staging for a peer the registry does not know
+// fails while resolving it, reports the hashes failed and returns the staging.
+// A caller that skips PreparePeerLoad, or whose peer unregisters after it,
+// lands here.
+TEST(HostOffloadBackendTest, LoadFromUnresolvablePeerReturnsStaging) {
+  auto reg_server = global_registry::CreateTestGlobalRegistryServer();
+  RaidenId node_id{"node_job", "0", "data", 0};
+  RaidenId unknown_id{"unknown_job", "0", "data", 0};
+
+  ::tpu_sync::rpc::RaidenIdProto unit_proto;
+  unit_proto.set_job_name(node_id.job_name);
+  unit_proto.set_job_replica_id(node_id.job_replica_id);
+  unit_proto.set_data_name(node_id.data_name);
+  unit_proto.set_data_replica_idx(node_id.data_replica_idx);
+
+  TF_ASSERT_OK_AND_ASSIGN(auto controller, controller::RaidenController::Create(
+                                            unit_proto, /*num_blocks=*/100,
+                                            /*num_shards=*/1,
+                                            /*shard_size_bytes=*/1024));
+  BackendConfig config;
+  config.type = "HostOffloadBackend";
+  config.capacity = 100;
+  config.global_registry_address = reg_server->server_address;
+  config.raiden_id = node_id;
+
+  TF_ASSERT_OK_AND_ASSIGN(auto backend,
+                       HostOffloadBackend::Create(config, controller.get()));
+
+  const std::vector<std::string> hashes = {"hash1", "hash2"};
+  const int free_blocks = controller->num_free_blocks();
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<int> staging,
+                       controller->AllocateBlockIds(2));
+  BlockTracker tracker;
+  tracker.AddPending(hashes);
+  EXPECT_THAT(backend
+                  ->Load(hashes, {10, 11}, &tracker,
+                         LoadOptions{.remote_id = unknown_id,
+                                     .staging_host_block_ids = staging})
+                  .Await(),
+              absl_testing::StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_THAT(tracker.Poll().failed, UnorderedElementsAre("hash1", "hash2"));
+  EXPECT_EQ(controller->num_free_blocks(), free_blocks);
+}
+
+// A load rejected before it starts returns its staging blocks before it
+// reports the hashes failed, so a poll that sees the failure also finds the
+// blocks free. Returning them refreshes the host pool gauge, and the gauge
+// callback observes the order: the hashes are still pending when it runs.
+TEST(HostOffloadBackendTest, RejectedLoadReturnsStagingBeforeReportingFailure) {
+  RaidenId node_id{"node_job", "0", "data", 0};
+  RaidenId peer_id{"peer_job", "0", "data", 0};
+
+  ::tpu_sync::rpc::RaidenIdProto unit_proto;
+  unit_proto.set_job_name(node_id.job_name);
+  unit_proto.set_job_replica_id(node_id.job_replica_id);
+  unit_proto.set_data_name(node_id.data_name);
+  unit_proto.set_data_replica_idx(node_id.data_replica_idx);
+
+  TF_ASSERT_OK_AND_ASSIGN(auto controller, controller::RaidenController::Create(
+                                            unit_proto, /*num_blocks=*/100,
+                                            /*num_shards=*/1,
+                                            /*shard_size_bytes=*/1024));
+  BackendConfig config;
+  config.type = "HostOffloadBackend";
+  config.capacity = 100;
+  config.raiden_id = node_id;
+  TF_ASSERT_OK_AND_ASSIGN(auto backend,
+                       HostOffloadBackend::Create(config, controller.get()));
+
+  // Both rejects run on the calling thread, so the probe needs no lock.
+  const BlockTracker* observed = nullptr;
+  std::vector<bool> pending_when_returned;
+  auto mock =
+      std::make_unique<::testing::NiceMock<telemetry::MockMetricsBackend>>();
+  ON_CALL(*mock, SetGauge(::testing::_, ::testing::_, ::testing::_))
+      .WillByDefault([&](absl::string_view name, telemetry::LabelSpan, double) {
+        if (name == telemetry::metric_names::kHostPoolBlocks &&
+            observed != nullptr) {
+          pending_when_returned.push_back(observed->IsPending("hash1"));
+        }
+      });
+  telemetry::ScopedMetricsBackendReset metrics(std::move(mock));
+
+  const std::vector<std::string> hashes = {"hash1", "hash2"};
+  const int free_blocks = controller->num_free_blocks();
+
+  // Rejected for its device blocks.
+  {
+    TF_ASSERT_OK_AND_ASSIGN(std::vector<int> staging,
+                         controller->AllocateBlockIds(2));
+    BlockTracker tracker;
+    tracker.AddPending(hashes);
+    observed = &tracker;
+    EXPECT_THAT(backend
+                    ->Load(hashes, {10}, &tracker,
+                           LoadOptions{.remote_id = peer_id,
+                                       .staging_host_block_ids = staging})
+                    .Await(),
+                absl_testing::StatusIs(absl::StatusCode::kInvalidArgument));
+    observed = nullptr;
+    EXPECT_THAT(pending_when_returned, ::testing::Not(::testing::IsEmpty()));
+    EXPECT_THAT(pending_when_returned, ::testing::Each(true));
+    EXPECT_THAT(tracker.Poll().failed, UnorderedElementsAre("hash1", "hash2"));
+    EXPECT_EQ(controller->num_free_blocks(), free_blocks);
+  }
+
+  // A local load given staging.
+  pending_when_returned.clear();
+  {
+    TF_ASSERT_OK_AND_ASSIGN(std::vector<int> staging,
+                         controller->AllocateBlockIds(2));
+    BlockTracker tracker;
+    tracker.AddPending(hashes);
+    observed = &tracker;
+    EXPECT_THAT(backend
+                    ->Load(hashes, {10, 11}, &tracker,
+                           LoadOptions{.staging_host_block_ids = staging})
+                    .Await(),
+                absl_testing::StatusIs(absl::StatusCode::kInvalidArgument));
+    observed = nullptr;
+    EXPECT_THAT(pending_when_returned, ::testing::Not(::testing::IsEmpty()));
+    EXPECT_THAT(pending_when_returned, ::testing::Each(true));
+    EXPECT_THAT(tracker.Poll().failed, UnorderedElementsAre("hash1", "hash2"));
+    EXPECT_EQ(controller->num_free_blocks(), free_blocks);
+  }
 }
 
 TEST(HostOffloadBackendTest, LoadLocalSuccess) {
@@ -1249,11 +1537,15 @@ TEST(HostOffloadBackendTest, LoadWithOptionsOverload) {
   ABSL_EXPECT_OK(load_future2.Await());
   EXPECT_THAT(tracker2.Poll().done, UnorderedElementsAre("local_hash_1"));
 
-  // 3. Exercise 4-arg Load with explicit remote_id.
+  // 3. Exercise 4-arg Load with explicit remote_id and its staging block.
+  TF_ASSERT_OK_AND_ASSIGN(std::vector<int> staging,
+                       controller->AllocateBlockIds(1));
   BlockTracker tracker3;
   tracker3.AddPending("remote_hash_1");
-  auto load_future3 = backend->Load({"remote_hash_1"}, {7}, &tracker3,
-                                    LoadOptions{.remote_id = remote_node_id});
+  auto load_future3 =
+      backend->Load({"remote_hash_1"}, {7}, &tracker3,
+                    LoadOptions{.remote_id = remote_node_id,
+                                .staging_host_block_ids = staging});
   ABSL_EXPECT_OK(load_future3.Await());
   EXPECT_THAT(tracker3.Poll().done, UnorderedElementsAre("remote_hash_1"));
 

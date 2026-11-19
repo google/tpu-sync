@@ -152,6 +152,7 @@ inline constexpr int kAxisUndeclared = -1;
 
 // Serving parallelism coordinates. Grouped so that adding a dimension later
 // does not change the layout of every struct that carries topology.
+// LINT.IfChange(parallelism_config)
 struct ParallelismConfig {
   // Tensor parallelism. Partitions KV heads: H_rank = H_total / tp_size.
   int tp_size = kAxisUndeclared;  // -1 = not declared by the caller
@@ -163,6 +164,11 @@ struct ParallelismConfig {
   int pp_size = kAxisUndeclared;  // -1 = not declared by the caller
   int pp_rank = kAxisUndeclared;  // -1 = not declared by the caller
 };
+// LINT.ThenChange(
+//     plugin/raiden_storage_plugin_abi.h:parallelism_config,
+//     plugin/plugin_kv_backend.cc:to_c_parallelism,
+//     plugin/plugin_kv_backend.cc:effective_parallelism
+// )
 
 // Options for mapping a cache block hash to a backend key/path.
 struct KeyMappingOptions {

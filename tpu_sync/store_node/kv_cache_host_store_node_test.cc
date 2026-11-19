@@ -192,10 +192,39 @@ TEST(NumBlocksForBudgetTest, RejectsBudgetBelowOneBlock) {
   EXPECT_THAT(blocks.status().message(), HasSubstr("single block"));
 }
 
-TEST(NumBlocksForBudgetTest, RejectsPerWorkerSpecUntilSupported) {
-  EXPECT_TRUE(absl::IsUnimplemented(
-      KVCacheHostStoreNode::NumBlocksForBudget(1 << 20, PerWorkerTestSpec())
-          .status()));
+TEST(NumBlocksForBudgetTest, ChargesEachWorkerItsOwnArrays) {
+  // One block of PerWorkerTestSpec() is 256 + (256 + 128) = 640 bytes, not
+  // 2 workers x the widest worker's 384.
+  EXPECT_THAT(
+      KVCacheHostStoreNode::NumBlocksForBudget(640 * 4, PerWorkerTestSpec()),
+      ::absl_testing::IsOkAndHolds(4u));
+}
+
+TEST(NumBlocksForBudgetTest, RejectsBlockSizesThatOverflow) {
+  // The per-worker sum wraps to 0 in 64 bits.
+  KVTransferSpec per_worker;
+  per_worker.worker_block_array_bytes = {
+      {uint64_t{1} << 63}, {uint64_t{1} << 62, uint64_t{1} << 62}};
+  per_worker.num_kv_shards = 1;
+  per_worker.num_workers = 2;
+  EXPECT_THAT(KVCacheHostStoreNode::NumBlocksForBudget(1 << 20, per_worker),
+              ::absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                       HasSubstr("overflows")));
+
+  // The sum fits, but not times num_kv_shards.
+  KVTransferSpec shards = per_worker;
+  shards.worker_block_array_bytes = {{uint64_t{1} << 62}, {uint64_t{1} << 61}};
+  shards.num_kv_shards = 4;
+  EXPECT_THAT(KVCacheHostStoreNode::NumBlocksForBudget(1 << 20, shards),
+              ::absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                       HasSubstr("overflows")));
+
+  // A uniform spec multiplies by num_workers instead of looping over them.
+  KVTransferSpec uniform{/*block_array_bytes=*/{uint64_t{1} << 40},
+                         /*num_kv_shards=*/1, /*num_workers=*/1 << 30};
+  EXPECT_THAT(KVCacheHostStoreNode::NumBlocksForBudget(1 << 20, uniform),
+              ::absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                       HasSubstr("overflows")));
 }
 
 TEST(NumBlocksForBudgetTest, ChargesEveryWorkersPool) {
@@ -328,6 +357,23 @@ TEST_F(KVCacheHostStoreNodeBootTest, MirrorsSpecWorkerTopology) {
   ASSERT_FALSE(workers[1].raiden_transfer_endpoints.empty());
   EXPECT_NE(workers[0].raiden_transfer_endpoints[0].endpoint,
             workers[1].raiden_transfer_endpoints[0].endpoint);
+}
+
+TEST_F(KVCacheHostStoreNodeBootTest, GivesEachWorkerItsOwnBlockArrays) {
+  StaticKVTransferSpecSource source(PerWorkerTestSpec());
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<KVCacheHostStoreNode> node,
+                       KVCacheHostStoreNode::Create(BootOptions(), &source));
+
+  // 8 * 512 bytes of budget at 640 bytes a block (padded, 768: 5 blocks).
+  EXPECT_EQ(node->num_host_blocks(), 6u);
+  ASSERT_EQ(node->managers().size(), 2u);
+  const auto* worker0 = node->managers()[0]->base();
+  const auto* worker1 = node->managers()[1]->base();
+  ASSERT_EQ(worker0->num_block_arrays(), 1u);
+  EXPECT_EQ(worker0->block_bytes(0), 256u);
+  ASSERT_EQ(worker1->num_block_arrays(), 2u);
+  EXPECT_EQ(worker1->block_bytes(0), 256u);
+  EXPECT_EQ(worker1->block_bytes(1), 128u);
 }
 
 TEST_F(KVCacheHostStoreNodeBootTest, BootsServesAndPublishesWithRegistry) {

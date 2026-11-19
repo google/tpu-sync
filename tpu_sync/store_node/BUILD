@@ -155,6 +155,7 @@ cc_test(
     ],
     features = ["-use_header_modules"],
     deps = [
+        ":grs_kv_transfer_spec_source",
         ":kv_cache_host_store_node",
         ":kv_transfer_spec_source",
         "//tpu_sync/common:raiden_id",
@@ -167,6 +168,7 @@ cc_test(
         "//tpu_sync/kv_cache:kv_cache_store_backend_factory",
         "//tpu_sync/kv_cache/global_registry:test_util",
         "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/time",

@@ -736,13 +736,31 @@ TEST(HostOffloadBackendTest, ComposeKVTransferSpecRejectsMissingGeometry) {
               ::absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition));
 }
 
-TEST(HostOffloadBackendTest, ComposeKVTransferSpecRejectsMismatchedGeometry) {
+// Pipeline stages hold different layers, so their workers register different
+// block arrays: the spec then carries one geometry per worker, by node id.
+TEST(HostOffloadBackendTest, ComposeKVTransferSpecGivesEachWorkerItsGeometry) {
+  std::vector<core::controller::WorkerRegistration> workers;
+  workers.push_back(GeometryWorker("w1", /*node_id=*/1, {4096, 1024, 512}, 2));
+  workers.push_back(GeometryWorker("w0", /*node_id=*/0, {4096, 512}, 2));
+
+  auto spec = HostOffloadBackendTest::ComposeKVTransferSpec(workers);
+  ABSL_ASSERT_OK(spec.status());
+  EXPECT_TRUE(spec->block_array_bytes.empty());
+  EXPECT_EQ(
+      spec->worker_block_array_bytes,
+      (std::vector<std::vector<uint64_t>>{{4096, 512}, {4096, 1024, 512}}));
+  EXPECT_EQ(spec->num_kv_shards, 2);
+  EXPECT_EQ(spec->num_workers, 2);
+}
+
+TEST(HostOffloadBackendTest, ComposeKVTransferSpecRejectsMismatchedShards) {
   std::vector<core::controller::WorkerRegistration> workers;
   workers.push_back(GeometryWorker("w0", /*node_id=*/0, {4096, 512}, 2));
-  workers.push_back(GeometryWorker("w1", /*node_id=*/1, {4096, 1024}, 2));
+  workers.push_back(GeometryWorker("w1", /*node_id=*/1, {4096, 512}, 1));
 
   EXPECT_THAT(HostOffloadBackendTest::ComposeKVTransferSpec(workers).status(),
-              ::absl_testing::StatusIs(absl::StatusCode::kInvalidArgument));
+              ::absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                       ::testing::HasSubstr("num_kv_shards")));
 }
 
 TEST(HostOffloadBackendTest, ComposeKVTransferSpecRejectsSparseNodeIds) {

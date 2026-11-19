@@ -18,19 +18,19 @@
 #include <cstring>
 #include <memory>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/status/status_macros.h"
+#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
-#include "xla/tsl/platform/statusor.h"
+#include "xla/tsl/platform/statusor.h"  // IWYU pragma: keep
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/core/controller/controller_client.h"
 #include "tpu_sync/core/controller/worker_service_server.h"
@@ -40,6 +40,7 @@
 #include "tpu_sync/kv_cache/kv_cache_store.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
+#include "tpu_sync/store_node/grs_kv_transfer_spec_source.h"
 #include "tpu_sync/store_node/kv_cache_host_store_node.h"
 #include "tpu_sync/store_node/kv_transfer_spec_source.h"
 
@@ -273,6 +274,148 @@ TEST_F(EvictE2ETest, SweepDemotesToTheStoreNodeAndReadsBack) {
     // Hand the landing block back so every iteration sees the same pool.
     ASSERT_TRUE(
         src.store->raiden_controller()->DeallocateBlockIds({dst_block}).ok());
+  }
+  EXPECT_EQ(demoted, 4);
+}
+
+// Pipeline stages register different block arrays: worker 0 holds one array,
+// worker 1 two of different sizes. The serving host composes a per-worker
+// spec from the worker registrations and publishes it; the store node reads
+// it from the registry, gives each worker its own pool, and a demoted block
+// round-trips every worker's arrays byte for byte.
+TEST_F(EvictE2ETest, PerWorkerGeometryFromRegistrationsDemotesAndReadsBack) {
+  const kv_cache::RaidenId src_id{"e2e_pp_serving", "0", "kv_pool", 0};
+  const std::vector<std::vector<uint64_t>> worker_arrays = {
+      {kArrayBytes}, {kArrayBytes, kArrayBytes / 2}};
+  std::vector<std::unique_ptr<KVCacheManagerWithTransfer>> managers;
+  for (size_t w = 0; w < worker_arrays.size(); ++w) {
+    managers.push_back(std::make_unique<KVCacheManagerWithTransfer>(
+        worker_arrays[w].size(), /*num_shards=*/1,
+        std::vector<size_t>(worker_arrays[w].begin(), worker_arrays[w].end()),
+        /*local_port=*/0, /*host_blocks_to_allocate=*/kSourceCapacity,
+        /*parallelism=*/1, /*node_id=*/static_cast<int64_t>(w),
+        /*local_control_port=*/-1));
+  }
+  kv_cache::BackendConfig config;
+  config.type = "HostOffloadBackend";
+  config.capacity = kSourceCapacity;
+  config.raiden_id = src_id;
+  config.global_registry_address = registry_->server_address;
+  config.kv_pool_group = "e2e_pp_pool";
+  config.monitor_config.enable = true;
+  config.monitor_config.enable_evict_sweep = true;
+  config.monitor_config.evict_sweep_period = absl::Milliseconds(200);
+  config.monitor_config.evict_low_watermark = 0.5;
+  config.monitor_config.evict_high_watermark = 0.75;
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<kv_cache::KVCacheStore> store,
+      kv_cache::KVCacheStore::Create(
+          config, kSourceCapacity, registry_->server_address, src_id,
+          /*num_shards=*/1, /*shard_size_bytes=*/kArrayBytes,
+          /*store_server_ip=*/"localhost", /*raiden_controller_port=*/0));
+  std::vector<std::unique_ptr<controller::WorkerServiceServer>> servers;
+  core::controller::RaidenControllerClient controller_client(
+      store->raiden_controller_address());
+  for (size_t w = 0; w < managers.size(); ++w) {
+    servers.push_back(controller::WorkerServiceServer::Create());
+    ABSL_ASSERT_OK(servers[w]->StartServer(/*host_allocator=*/nullptr,
+                                           KVManagerHolder(managers[w].get()),
+                                           /*port=*/0));
+    ABSL_ASSERT_OK(controller_client.RegisterWorker(
+        absl::StrCat("worker_", w),
+        absl::StrCat("localhost:", servers[w]->GetRaidenWorkerPort()),
+        managers[w]->get_local_data_endpoints(),
+        /*node_id=*/static_cast<int64_t>(w),
+        /*block_array_bytes=*/worker_arrays[w], /*num_kv_shards=*/1));
+  }
+  // What a serving host does once its expected workers have registered.
+  ABSL_ASSERT_OK(store->backend()->RegisterKVTransferSpecFromWorkers());
+
+  KVCacheHostStoreNode::Options options;
+  options.raiden_id =
+      kv_cache::RaidenId{"e2e_pp_store_node", "0", "kv_pool", 0};
+  options.store_server_ip = "localhost";
+  options.global_registry_address = registry_->server_address;
+  options.kv_pool_group = "e2e_pp_pool";
+  // 16 blocks of 256 + (256 + 128) bytes; padding both workers to the wider
+  // one would fit only 10.
+  options.dram_budget_bytes = 16 * (kArrayBytes * 2 + kArrayBytes / 2);
+  GrsKVTransferSpecSource source(registry_->server_address, "e2e_pp_pool");
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<KVCacheHostStoreNode> node,
+                       KVCacheHostStoreNode::Create(options, &source));
+  ASSERT_EQ(node->num_host_blocks(), 16u);
+  EXPECT_EQ(node->spec().worker_block_array_bytes, worker_arrays);
+
+  // Worker w's array a of the block hashed i holds PatternByte(i, 10 * w + a).
+  const auto fill_or_check = [&](int block_id, int hash_idx, bool check) {
+    for (size_t w = 0; w < managers.size(); ++w) {
+      for (size_t a = 0; a < worker_arrays[w].size(); ++a) {
+        const size_t array_bytes = worker_arrays[w][a];
+        TF_ASSERT_OK_AND_ASSIGN(
+            absl::Span<uint8_t> base,
+            managers[w]->base()->GetHostBuffer(a, /*shard_idx=*/0));
+        for (size_t b = 0; b < array_bytes; ++b) {
+          uint8_t& byte = base[block_id * array_bytes + b];
+          const uint8_t want = PatternByte(hash_idx, 10 * w + a, b);
+          if (check) {
+            ASSERT_EQ(byte, want) << "worker " << w << " array " << a;
+          } else {
+            byte = want;
+          }
+        }
+      }
+    }
+  };
+
+  // 6 of 8 blocks in use, below the 0.5 low watermark: the sweep demotes 4.
+  constexpr int kNumBlocks = 6;
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::vector<int> ids,
+      store->raiden_controller()->AllocateBlockIds(kNumBlocks));
+  std::vector<std::string> hashes;
+  std::vector<kv_cache::RaidenBlockId> slices;
+  for (int i = 0; i < kNumBlocks; ++i) {
+    hashes.push_back(absl::StrCat("e2e_pp_blk_", i));
+    slices.push_back(
+        kv_cache::RaidenBlockId(src_id, ids[i], kv_cache::BlockStatus::HOST));
+    fill_or_check(ids[i], i, /*check=*/false);
+  }
+  ABSL_ASSERT_OK(store->Insert(hashes, slices, /*on_host=*/true));
+  store->Release(hashes);
+  auto* controller = store->raiden_controller();
+  for (int i = 0; i < 1000 && controller->num_free_blocks() != 6; ++i) {
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  ASSERT_EQ(controller->num_free_blocks(), 6);
+
+  const kv_cache::LookupOptions local_only{.enable_global = false};
+  int demoted = 0;
+  for (int i = 0; i < kNumBlocks; ++i) {
+    auto local = store->backend()->Lookup({hashes[i]}, local_only);
+    if (local.ok() && local->size() == 1) continue;
+    ++demoted;
+    TF_ASSERT_OK_AND_ASSIGN(auto resolved,
+                         store->Lookup({hashes[i]}, /*enable_global=*/true));
+    ASSERT_EQ(resolved.size(), 1u);
+    const kv_cache::RaidenBlockId& remote = resolved[0].second;
+    ASSERT_EQ(remote.raiden_id, options.raiden_id);
+    TF_ASSERT_OK_AND_ASSIGN(std::vector<int> dst, controller->AllocateBlockIds(1));
+    for (size_t w = 0; w < managers.size(); ++w) {
+      for (size_t a = 0; a < worker_arrays[w].size(); ++a) {
+        TF_ASSERT_OK_AND_ASSIGN(
+            absl::Span<uint8_t> base,
+            managers[w]->base()->GetHostBuffer(a, /*shard_idx=*/0));
+        std::memset(base.data() + dst[0] * worker_arrays[w][a], 0xEE,
+                    worker_arrays[w][a]);
+      }
+    }
+    ABSL_ASSERT_OK(controller
+                       ->ReadRemote(node->raiden_controller_address(),
+                                    {remote.host_block_id}, {dst[0]},
+                                    {hashes[i]})
+                       .Await());
+    fill_or_check(dst[0], i, /*check=*/true);
+    ABSL_ASSERT_OK(controller->DeallocateBlockIds(dst));
   }
   EXPECT_EQ(demoted, 4);
 }

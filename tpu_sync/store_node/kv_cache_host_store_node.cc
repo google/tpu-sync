@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -66,6 +67,49 @@ std::string ComposeEndpoint(absl::string_view ip, int port) {
                                     : absl::StrCat(ip, ":", port);
 }
 
+// Bytes one block occupies on one shard, across every worker's arrays.
+// InvalidArgument if that overflows size_t. Requires a spec that passed
+// ValidateSpec.
+absl::StatusOr<size_t> BlockBytesPerShard(const KVTransferSpec& spec) {
+  constexpr size_t kMax = std::numeric_limits<size_t>::max();
+  const absl::Status overflow =
+      absl::InvalidArgumentError("KVTransferSpec block size overflows size_t");
+  size_t bytes = 0;
+  const auto add = [&bytes](const std::vector<uint64_t>& arrays) {
+    for (uint64_t array_bytes : arrays) {
+      if (array_bytes > kMax - bytes) return false;
+      bytes += array_bytes;
+    }
+    return true;
+  };
+  if (spec.worker_block_array_bytes.empty()) {
+    // Every worker holds the same arrays.
+    if (!add(spec.block_array_bytes) || bytes > kMax / spec.num_workers) {
+      return overflow;
+    }
+    return bytes * spec.num_workers;
+  }
+  for (const std::vector<uint64_t>& arrays : spec.worker_block_array_bytes) {
+    if (!add(arrays)) return overflow;
+  }
+  return bytes;
+}
+
+// The spec's block arrays: "[4096,512]", or one such list per worker.
+std::string BlockArraysDebugString(const KVTransferSpec& spec) {
+  const auto join = [](const std::vector<uint64_t>& arrays) {
+    return absl::StrCat("[", absl::StrJoin(arrays, ","), "]");
+  };
+  if (spec.worker_block_array_bytes.empty()) {
+    return join(spec.block_array_bytes);
+  }
+  std::string out;
+  for (const std::vector<uint64_t>& arrays : spec.worker_block_array_bytes) {
+    absl::StrAppend(&out, join(arrays));
+  }
+  return out;
+}
+
 }  // namespace
 
 absl::StatusOr<KVTransferSpec> KVCacheHostStoreNode::WaitForSpec(
@@ -97,23 +141,21 @@ absl::StatusOr<KVTransferSpec> KVCacheHostStoreNode::WaitForSpec(
 absl::StatusOr<size_t> KVCacheHostStoreNode::NumBlocksForBudget(
     size_t dram_budget_bytes, const KVTransferSpec& spec) {
   ABSL_RETURN_IF_ERROR(ValidateSpec(spec));
-  if (!spec.worker_block_array_bytes.empty()) {
-    return absl::UnimplementedError(
-        "KVCacheHostStoreNode does not build per-worker block pools yet");
+  // One block spans every worker's arrays.
+  ABSL_ASSIGN_OR_RETURN(const size_t bytes_per_shard, BlockBytesPerShard(spec));
+  if (bytes_per_shard >
+      std::numeric_limits<size_t>::max() / spec.num_kv_shards) {
+    return absl::InvalidArgumentError(
+        "KVTransferSpec block size overflows size_t");
   }
-  size_t bytes_per_shard = 0;
-  for (uint64_t array_bytes : spec.block_array_bytes) {
-    bytes_per_shard += array_bytes;
-  }
-  const size_t block_bytes =
-      spec.num_workers * spec.num_kv_shards * bytes_per_shard;
+  // Positive: every array and num_kv_shards are, and nothing overflowed.
+  const size_t block_bytes = spec.num_kv_shards * bytes_per_shard;
   if (dram_budget_bytes < block_bytes) {
     return absl::InvalidArgumentError(absl::StrCat(
         "dram_budget_bytes=", dram_budget_bytes,
         " does not cover a single block of ", block_bytes,
-        " bytes (num_workers=", spec.num_workers,
-        " x num_kv_shards=", spec.num_kv_shards, " x ", bytes_per_shard,
-        " bytes across ", spec.block_array_bytes.size(), " block arrays)"));
+        " bytes (num_kv_shards=", spec.num_kv_shards, " x ", bytes_per_shard,
+        " bytes across the block arrays of ", spec.num_workers, " workers)"));
   }
   return dram_budget_bytes / block_bytes;
 }
@@ -132,12 +174,16 @@ KVCacheHostStoreNode::Create(const Options& options,
                         WaitForSpec(*kv_transfer_spec_source, options));
   ABSL_ASSIGN_OR_RETURN(const size_t num_host_blocks,
                         NumBlocksForBudget(options.dram_budget_bytes, spec));
+  ABSL_ASSIGN_OR_RETURN(const size_t block_bytes_per_shard,
+                        BlockBytesPerShard(spec));
 
-  // One stride per block array, in the spec's order.  Hybrid models register
-  // arrays of differing block_bytes (a DeepSeek-V4 rank registers four).
-  const size_t num_block_arrays = spec.block_array_bytes.size();
-  const std::vector<size_t> block_bytes_per_array(
-      spec.block_array_bytes.begin(), spec.block_array_bytes.end());
+  // One stride per block array, in the spec's order, per worker. Hybrid
+  // models register arrays of differing block_bytes (a DeepSeek-V4 rank
+  // registers four); pipeline stages register different arrays.
+  const auto block_bytes_per_array = [&spec](size_t rank) {
+    const std::vector<uint64_t>& arrays = WorkerBlockArrayBytes(spec, rank);
+    return std::vector<size_t>(arrays.begin(), arrays.end());
+  };
 
   // Phase B: the same assembly a serving host deployment runs, CPU-backed.
   std::vector<std::unique_ptr<KVCacheManagerWithTransfer>> managers;
@@ -149,8 +195,8 @@ KVCacheHostStoreNode::Create(const Options& options,
     // failure), so this node must field the same dense [0, num_workers)
     // roster. Block ids are one flat space -- every worker holds its own
     // shards of every block -- so each manager allocates and zeroes its
-    // full num_host_blocks x num_block_arrays x num_kv_shards x
-    // block_bytes_per_array pool here, at boot, never on a request path.
+    // full num_host_blocks x num_kv_shards x (that worker's arrays) pool
+    // here, at boot, never on a request path.
     // The constructor's first and third parameters are named num_layers and
     // slice_byte_size for historical reasons; they are the array count and
     // the per-array block stride (see KVTransferSpec).
@@ -158,8 +204,9 @@ KVCacheHostStoreNode::Create(const Options& options,
     // coordination and has no role on a host store node.
     managers.reserve(spec.num_workers);
     for (size_t rank = 0; rank < spec.num_workers; ++rank) {
+      const std::vector<size_t> arrays = block_bytes_per_array(rank);
       managers.push_back(std::make_unique<KVCacheManagerWithTransfer>(
-          num_block_arrays, spec.num_kv_shards, block_bytes_per_array,
+          arrays.size(), spec.num_kv_shards, arrays,
           /*local_port=*/0,
           /*host_blocks_to_allocate=*/num_host_blocks, options.parallelism,
           /*node_id=*/static_cast<int64_t>(rank),
@@ -202,12 +249,14 @@ KVCacheHostStoreNode::Create(const Options& options,
         options.evict_low_watermark;
     backend_config.monitor_config.evict_high_watermark =
         options.evict_high_watermark;
+    // shard_size_bytes only sizes preprovisioned controller buffers, which a
+    // store does not use; any worker's array serves.
     ABSL_ASSIGN_OR_RETURN(
         store, kv_cache::KVCacheStore::Create(
                    backend_config, /*capacity=*/num_host_blocks,
                    options.global_registry_address, options.raiden_id,
                    static_cast<int>(spec.num_kv_shards),
-                   static_cast<int64_t>(block_bytes_per_array[0]),
+                   static_cast<int64_t>(block_bytes_per_array(0)[0]),
                    options.store_server_ip, options.raiden_controller_port));
   } catch (const std::exception& e) {
     return absl::UnavailableError(
@@ -250,10 +299,9 @@ KVCacheHostStoreNode::Create(const Options& options,
       std::move(store)));
   LOG(INFO) << "KVCacheHostStoreNode up: " << node->num_host_blocks()
             << " host blocks x " << node->managers().size()
-            << " workers (num_block_arrays=" << num_block_arrays
-            << " num_kv_shards=" << spec.num_kv_shards
-            << " block_bytes_per_array=["
-            << absl::StrJoin(block_bytes_per_array, ",") << "]"
+            << " workers (num_kv_shards=" << spec.num_kv_shards
+            << " block_bytes_per_shard=" << block_bytes_per_shard
+            << " block_bytes_per_array=" << BlockArraysDebugString(spec)
             << "), store server " << node->store_server_address()
             << ", controller " << node->raiden_controller_address();
   return node;

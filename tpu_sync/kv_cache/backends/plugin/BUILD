@@ -48,6 +48,31 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "plugin_kv_cache_store_backend",
+    srcs = ["plugin_kv_cache_store_backend.cc"],
+    hdrs = ["plugin_kv_cache_store_backend.h"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = [
+        "-use_header_modules",
+        "-layering_check",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":plugin_kv_backend",
+        "//tpu_sync/kv_cache:kv_cache_store_backend",
+        "//tpu_sync/kv_cache/backends:backend",
+        "//tpu_sync/kv_cache/backends/storage:storage_lookup_helper",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
 cc_binary(
     name = "libmock_storage_plugin.so",
     testonly = True,
@@ -97,6 +122,35 @@ cc_test(
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+        "@xla//xla/tsl/platform:statusor",
+    ],
+)
+
+cc_test(
+    name = "plugin_kv_cache_store_backend_test",
+    srcs = ["plugin_kv_cache_store_backend_test.cc"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = [
+        "-use_header_modules",
+        "-layering_check",
+    ],
+    deps = [
+        ":mock_storage_plugin_loader",
+        ":plugin_kv_backend",
+        ":plugin_kv_cache_store_backend",
+        ":raiden_storage_plugin_abi",
+        "//tpu_sync/kv_cache:kv_cache_store_backend",
+        "//tpu_sync/kv_cache/backends:backend",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
         "@xla//xla/tsl/platform:statusor",

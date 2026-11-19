@@ -59,6 +59,7 @@
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/backends/storage/posix_backend.h"
+#include "tpu_sync/kv_cache/kv_backend_factory.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
@@ -4284,6 +4285,124 @@ TEST(KVCacheManagerTest, EnsureHostMirrorCoversUpdatesShmFdAndForwardsDevice) {
   EXPECT_EQ(slices[0].fd, 51);
   EXPECT_EQ(slices[0].offset, 4096 + 16384 + 5 * 128);
   EXPECT_EQ(slices[0].size, 128);
+}
+
+class HostMemoryRecordingKVBackend : public CapturingSliceKVBackend {
+ public:
+  absl::Status OnHostMemoryInitialized(
+      absl::Span<const backends::HostBufferDescriptor> shard_regions) override {
+    regions_.assign(shard_regions.begin(), shard_regions.end());
+    return absl::OkStatus();
+  }
+
+  const std::vector<backends::HostBufferDescriptor>& regions() const {
+    return regions_;
+  }
+
+ private:
+  std::vector<backends::HostBufferDescriptor> regions_;
+};
+
+TEST(KVCacheManagerTest, RegisterKVBackendsInvokesOnHostMemoryInitialized) {
+  auto recording_backend = std::make_shared<HostMemoryRecordingKVBackend>();
+  ABSL_ASSERT_OK(KVBackendFactory::Instance().RegisterBackend(
+      "host_mem_recording_backend",
+      [recording_backend](const BackendConfig& /*config*/)
+          -> absl::StatusOr<std::shared_ptr<backends::KVBackend>> {
+        return recording_backend;
+      }));
+
+  int region_idx = 0;
+  HostBufferAllocator fake_shm_allocator = [&](size_t size_bytes,
+                                               const xla::PjRtDevice* /*dev*/)
+      -> absl::StatusOr<HostBufferAllocation> {
+    auto buf = std::make_shared<std::vector<uint8_t>>(size_bytes, 0);
+    HostBufferAllocation alloc;
+    alloc.ptr = buf->data();
+    alloc.size = size_bytes;
+    alloc.fd = 90 + region_idx;
+    alloc.fd_offset = 4096 * (region_idx + 1);
+    alloc.owner = buf;
+    ++region_idx;
+    return alloc;
+  };
+
+  AllocatorTestKVCacheManager manager(
+      /*num_layers=*/2, /*num_shards=*/1, /*slice_byte_size=*/128,
+      /*host_blocks=*/2, fake_shm_allocator);
+
+  BackendConfig cfg;
+  cfg.type = "host_mem_recording_backend";
+  cfg.parallelism.tp_rank = 0;
+  cfg.parallelism.tp_size = 1;
+  manager.RegisterKVBackends({cfg});
+
+  ASSERT_EQ(recording_backend->regions().size(), 2);
+  EXPECT_EQ(recording_backend->regions()[0].size, 256);
+  EXPECT_EQ(recording_backend->regions()[0].fd, 90);
+  EXPECT_EQ(recording_backend->regions()[0].offset, 4096);
+  EXPECT_EQ(recording_backend->regions()[1].size, 256);
+  EXPECT_EQ(recording_backend->regions()[1].fd, 91);
+  EXPECT_EQ(recording_backend->regions()[1].offset, 8192);
+}
+
+TEST(KVCacheManagerTest,
+     RegisterPoolsRejectsHostMirrorGrowthAfterBackendRegistration) {
+  const std::string scratch_dir =
+      absl::StrCat(testing::TempDir(), "/pool_mirror_after_backend_", getpid());
+  std::filesystem::create_directories(scratch_dir);
+  auto cleanup = absl::MakeCleanup([&] {
+    std::error_code ec;
+    std::filesystem::remove_all(scratch_dir, ec);
+  });
+
+  int alloc_calls = 0;
+  HostBufferAllocator fake_shm_allocator = [&](size_t size_bytes,
+                                               const xla::PjRtDevice* /*dev*/)
+      -> absl::StatusOr<HostBufferAllocation> {
+    auto buf = std::make_shared<std::vector<uint8_t>>(size_bytes, 0);
+    HostBufferAllocation alloc;
+    alloc.ptr = buf->data();
+    alloc.size = size_bytes;
+    alloc.fd = 60 + alloc_calls;
+    alloc.fd_offset = 4096;
+    alloc.owner = buf;
+    ++alloc_calls;
+    return alloc;
+  };
+
+  AllocatorTestKVCacheManager manager(
+      /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+      /*host_blocks=*/2, fake_shm_allocator);
+  const auto* fake_device = reinterpret_cast<const xla::PjRtDevice*>(0x5678);
+  manager.SetDeviceAndPhysicalSize(/*layer_idx=*/0, fake_device, 8 * 128);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> initial_buf,
+                       manager.GetHostBuffer(0, 0));
+  const uint8_t* initial_ptr = initial_buf.data();
+
+  BackendConfig cfg;
+  cfg.type = "posix";
+  cfg.parallelism.tp_rank = 0;
+  cfg.parallelism.tp_size = 1;
+  cfg.SetProperty("root_dir", scratch_dir);
+  cfg.SetProperty("model_name", "test_pool_mirror_guard");
+  manager.RegisterKVBackends({cfg});
+
+  // Pools that fit inside the already-registered 256 B host mirror succeed.
+  ABSL_ASSERT_OK(manager.RegisterPools({DensePool("kind_a", 0, 0, 128, 2)}));
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> fit_buf,
+                       manager.GetHostBuffer(0, 0));
+  EXPECT_EQ(fit_buf.data(), initial_ptr);
+
+  // Growing the mirror after OnHostMemoryInitialized ran is rejected so
+  // backends never hold stale pointers or fds to freed host buffers.
+  EXPECT_THAT(manager.RegisterPools({DensePool("kind_a", 0, 0, 128, 8)}),
+              ::absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition));
+  EXPECT_EQ(alloc_calls, 1);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> unchanged_buf,
+                       manager.GetHostBuffer(0, 0));
+  EXPECT_EQ(unchanged_buf.data(), initial_ptr);
+  EXPECT_EQ(manager.GetHostFd(0, 0), 60);
 }
 
 }  // namespace

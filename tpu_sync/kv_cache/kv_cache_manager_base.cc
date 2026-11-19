@@ -2367,6 +2367,24 @@ absl::Status KVCacheManagerBase::EnsureHostMirrorCovers(size_t storage_idx,
   if (storage_idx >= layers_.size() || needed_bytes <= 0) {
     return absl::OkStatus();
   }
+  bool needs_reallocation = false;
+  for (const auto& shard_info : layers_[storage_idx].shards) {
+    if (static_cast<int64_t>(shard_info.host_size) < needed_bytes) {
+      needs_reallocation = true;
+      break;
+    }
+  }
+  if (!needs_reallocation) {
+    return absl::OkStatus();
+  }
+  {
+    absl::MutexLock lock(backends_mu_);
+    if (!backends_.empty()) {
+      return absl::FailedPreconditionError(
+          "Cannot reallocate host mirror after secondary KV backends are "
+          "registered");
+    }
+  }
   size_t old_total = 0;
   size_t new_total = 0;
   auto update_bytes_on_exit = absl::MakeCleanup([this, &old_total, &new_total] {
@@ -3781,9 +3799,29 @@ bool KVCacheManagerBase::InitializeSingleSecondaryBackend(
                << " backend config (received topology: " << received
                << "): " << backend_or.status().message();
   }
+  std::shared_ptr<backends::KVBackend> backend = *std::move(backend_or);
+  std::vector<backends::HostBufferDescriptor> shard_regions;
+  shard_regions.reserve(layers_.size() * num_shards_);
+  for (size_t l = 0; l < layers_.size(); ++l) {
+    for (size_t s = 0; s < num_shards_; ++s) {
+      absl::StatusOr<absl::Span<uint8_t>> host_buf = GetHostBuffer(l, s);
+      if (!host_buf.ok() || host_buf->empty()) continue;
+      backends::HostBufferDescriptor region;
+      region.ptr = host_buf->data();
+      region.size = host_buf->size();
+      region.fd = GetHostFd(l, s);
+      region.offset = GetHostFdOffset(l, s);
+      shard_regions.push_back(region);
+    }
+  }
+  if (absl::Status status = backend->OnHostMemoryInitialized(shard_regions);
+      !status.ok()) {
+    LOG(FATAL) << "[Worker] failed to initialize host memory on " << config.type
+               << " backend: " << status.message();
+  }
   {
     absl::MutexLock lock(backends_mu_);
-    backends_[canonical_name] = *std::move(backend_or);
+    backends_[canonical_name] = std::move(backend);
   }
   LOG(INFO) << "[Worker] Initialized secondary backend " << canonical_name
             << " with topology " << received;

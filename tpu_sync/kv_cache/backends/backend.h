@@ -112,6 +112,15 @@ class KVBackend : public std::enable_shared_from_this<KVBackend> {
   // Returns the canonical backend name (e.g. "posix", "lustre").
   virtual std::string name() const = 0;
 
+  // Optional hook invoked once when the worker's host staging memory regions
+  // are attached to this backend, allowing backends to pre-register `/dev/shm`
+  // arenas. Registered regions remain valid and are never reallocated while
+  // the backend is attached.
+  virtual absl::Status OnHostMemoryInitialized(
+      absl::Span<const HostBufferDescriptor> shard_regions) {
+    return absl::OkStatus();
+  }
+
   // Asynchronously writes a sequence of host DRAM buffer slices into the target
   // key. Works uniformly for a single slice (passed as `{slice}`) or
   // multi-slice blocks.

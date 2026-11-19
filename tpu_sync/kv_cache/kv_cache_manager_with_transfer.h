@@ -250,6 +250,11 @@ class KVCacheManagerWithTransfer {
       const ::tpu_sync::rpc::StartTransferRequest& plan,
       absl::Span<const int64_t> chip_block_ids);
 
+  // Cancels the receive prepared for plan |uuid|. Returns true when nothing of
+  // it is still running, false while a push or copy is in flight. A prepare
+  // for |uuid| that is running or arrives later is refused.
+  virtual bool CancelPoolReshardRecv(uint64_t uuid);
+
   virtual absl::Status WaitForPendingWork();
 
   virtual std::vector<RaidenTransferEndpoint> get_local_endpoints() const;
@@ -340,6 +345,14 @@ class KVCacheManagerWithTransfer {
 
   absl::flat_hash_set<uint64_t> pending_pool_reshard_recvs_
       ABSL_GUARDED_BY(mu_);
+
+  // Cancelled plans, each with the time until which its prepare is refused.
+  absl::flat_hash_map<uint64_t, std::chrono::steady_clock::time_point>
+      cancelled_pool_reshard_recvs_ ABSL_GUARDED_BY(mu_);
+
+  // True while a cancel of |uuid| is remembered.
+  bool PoolReshardRecvCancelledLocked(uint64_t uuid)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   std::chrono::steady_clock::time_point DeadlineFromNow() const;
 

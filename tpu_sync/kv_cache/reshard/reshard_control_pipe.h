@@ -84,11 +84,13 @@ absl::StatusOr<RespProto> CallReshardControlPipe(
       return absl::UnavailableError(absl::StrCat(
           "Control RPC connection failed before sending request to ", address));
     }
-    return absl::DeadlineExceededError(absl::StrCat(
+    absl::Status timed_out = absl::DeadlineExceededError(absl::StrCat(
         "Timeout (",
         absl::ToInt64Seconds(bounded ? connect_retry_budget : timeout),
         "s) failed to connect to robust endpoint ", address, ": ",
         resp.status().message()));
+    // Tell the caller when no attempt reached the peer.
+    return maybe_sent ? timed_out : MarkControlPipeNotSent(timed_out);
   }
   return resp;
 }

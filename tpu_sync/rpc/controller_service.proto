@@ -239,4 +239,7 @@ message ControllerResponse {
   // Command-specific scalar result (e.g. cancellation verdict, retire count).
   string response_data = 4;
   GetRequestBlockStatusResponse get_request_block_status_response = 5;
+  // A failed COMMAND_COORDINATE_TRANSFER left no receive on any destination
+  // unit, so the caller can free its destination blocks.
+  bool transfer_released = 6;
 }

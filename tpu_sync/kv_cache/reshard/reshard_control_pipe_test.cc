@@ -102,7 +102,20 @@ TEST(CallReshardControlPipeTest, PossiblyDeliveredIsNeverReportedNotSent) {
   EXPECT_THAT(resp.status().message(),
               ::testing::StartsWith("Timeout (0s) failed to connect to robust "
                                     "endpoint 10.0.0.1:27000: "));
+  EXPECT_FALSE(IsControlPipeNotSent(resp.status()));
   EXPECT_GT(transport.calls(), 2);
+}
+
+TEST(CallReshardControlPipeTest, UnreachablePeerWithoutBudgetIsNotSent) {
+  // Every attempt is refused until the timeout: nothing reached the peer.
+  ScriptedTransport transport({Refused()}, /*repeat_last=*/true);
+  auto resp = Call(transport, absl::Milliseconds(300), absl::ZeroDuration());
+  ASSERT_TRUE(absl::IsDeadlineExceeded(resp.status())) << resp.status();
+  EXPECT_THAT(resp.status().message(),
+              ::testing::StartsWith("Timeout (0s) failed to connect to robust "
+                                    "endpoint 10.0.0.1:27000: "));
+  EXPECT_TRUE(IsControlPipeNotSent(resp.status()));
+  EXPECT_GT(transport.calls(), 1);
 }
 
 TEST(CallReshardControlPipeTest, WithoutBudgetEveryUnavailableIsRetried) {

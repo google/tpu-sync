@@ -785,6 +785,11 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardRegisterRecv(
   bool retired_pool_staging = false;
   {
     absl::MutexLock lock(mu_);
+    // The cancel can arrive before a delayed prepare.
+    if (PoolReshardRecvCancelledLocked(plan.uuid())) {
+      return absl::CancelledError(
+          absl::StrCat("pool reshard recv UUID was cancelled: ", plan.uuid()));
+    }
     auto existing = sessions_.find(plan.uuid());
     if (existing != sessions_.end() &&
         !RetireSettledSessionLocked(existing, &retired_push_progress,
@@ -814,15 +819,57 @@ absl::Status KVCacheManagerWithTransfer::PoolReshardRegisterRecv(
       std::shared_ptr<TransferSession> recv_session,
       CreateReshardReceiveSession(base_.get(), staging_allocator_.get(), plan,
                                   chip_block_ids, DeadlineFromNow()));
+  bool cancelled = false;
   {
     absl::MutexLock lock(mu_);
-    pending_pool_reshard_recvs_.erase(plan.uuid());
-    sessions_[plan.uuid()] = SessionEntry{recv_session, plan.req_id(),
-                                          SessionRole::kPoolReshardReceive};
-    NoteSubPlanRegisteredLocked(plan.req_id(), recv_session,
-                                plan.sub_plan_index(), plan.sub_plan_count());
+    cancelled = PoolReshardRecvCancelledLocked(plan.uuid());
+    if (!cancelled) {
+      pending_pool_reshard_recvs_.erase(plan.uuid());
+      sessions_[plan.uuid()] = SessionEntry{recv_session, plan.req_id(),
+                                            SessionRole::kPoolReshardReceive};
+      NoteSubPlanRegisteredLocked(plan.req_id(), recv_session,
+                                  plan.sub_plan_index(),
+                                  plan.sub_plan_count());
+    }
   }
+  if (cancelled) {
+    // Cancelled during the prepare. The uuid stays pending until this returns.
+    absl::Status status = absl::CancelledError(
+        "pool reshard receive cancelled while it was being prepared");
+    recv_session->Finish(status);
+    return status;
+  }
+  // The session owns the uuid now.
+  std::move(clear_pending).Cancel();
   return recv_session->Start();
+}
+
+bool KVCacheManagerWithTransfer::CancelPoolReshardRecv(uint64_t uuid) {
+  std::shared_ptr<TransferSession> session;
+  {
+    absl::MutexLock lock(mu_);
+    // Remember the cancel, so a running or late prepare for |uuid| is dropped.
+    const auto now = std::chrono::steady_clock::now();
+    absl::erase_if(cancelled_pool_reshard_recvs_,
+                   [now](const auto& entry) { return entry.second <= now; });
+    cancelled_pool_reshard_recvs_[uuid] = DeadlineFromNow();
+    auto it = sessions_.find(uuid);
+    if (it == sessions_.end() ||
+        it->second.role != SessionRole::kPoolReshardReceive) {
+      return true;
+    }
+    session = it->second.session;
+  }
+  session->Finish(absl::CancelledError(
+      "pool reshard receive cancelled by the coordinator"));
+  return session->Done();
+}
+
+bool KVCacheManagerWithTransfer::PoolReshardRecvCancelledLocked(
+    uint64_t uuid) {
+  auto it = cancelled_pool_reshard_recvs_.find(uuid);
+  return it != cancelled_pool_reshard_recvs_.end() &&
+         std::chrono::steady_clock::now() < it->second;
 }
 
 absl::Status KVCacheManagerWithTransfer::UnregisterActivePlan(uint64_t uuid) {

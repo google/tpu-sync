@@ -152,7 +152,10 @@ class ReshardCoordinator {
     kFailed = 4,
   };
 
-  absl::Status StartPoolReshard(const PoolReshardArgs& args);
+  // With TPU_RAIDEN_ROLLBACK_FAILED_TRANSFERS set, a failed call cancels the
+  // receivers it prepared. `*released` is then true when the failed call left
+  // no receive on any destination unit.
+  absl::Status StartPoolReshard(const PoolReshardArgs& args, bool* released);
 
   Status GetTransferStatus(const std::string& req_id) const;
 
@@ -165,16 +168,23 @@ class ReshardCoordinator {
 
   // Sets `*chain_started` when the request continues as a sub-transfer
   // chain on a coordinator thread; that thread then owns the request's
-  // final transfer status.
+  // final transfer status. `released`: see RunSubPlan.
   absl::Status ExecutePoolReshard(const PoolReshardArgs& args,
-                                  bool* chain_started);
+                                  bool* chain_started, bool* released);
 
   // Plans, arms and dispatches sub-transfer `index` of `ctx`'s request and
   // emits its milestone event. Sub-transfer 0 abandons the request's claim
   // on a planning or arm failure (nothing was dispatched yet); later ones
-  // leave the claim to the dispatched senders' terminals.
+  // leave the claim to the dispatched senders' terminals. With a non-null
+  // `released`, a failure cancels the receivers it prepared and reports
+  // whether none is left.
   absl::Status RunSubPlan(const std::shared_ptr<ChainContext>& ctx,
-                          int32_t index);
+                          int32_t index, bool* released = nullptr);
+
+  // Cancels the receives of `plan` on `units`. Returns true when every unit
+  // confirms that nothing of its receive is still running.
+  bool CancelReceivers(const PoolReshardPlan& plan,
+                       const std::vector<RaidenId>& units);
 
   // Runs sub-transfers 1..count-1 of `ctx` on a coordinator thread, which
   // sets the request's transfer status to kCompleted once every sub-transfer

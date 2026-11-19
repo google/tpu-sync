@@ -115,6 +115,10 @@ struct RegisterWorkUnitArgs {
   std::vector<std::string> variables;
 };
 
+// True for a StartTransfer failure that left no receive on any destination
+// unit (ControllerResponse.transfer_released).
+bool IsTransferReleased(const absl::Status& status);
+
 struct StartTransferArgs {
   std::vector<RaidenId> src_units;
   std::vector<RaidenId> dst_units;

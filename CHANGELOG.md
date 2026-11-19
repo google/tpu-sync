@@ -18,5 +18,11 @@
   count per push when the consumer requests none. A positive integer, clamped
   to the admitted transfer parallelism; unset, empty or `0` keeps one stream
   per source rank; any other value fails the plan with `InvalidArgument`.
+- `TPU_RAIDEN_ROLLBACK_FAILED_TRANSFERS=1` (set on the source controller):
+  when a pool-reshard coordination fails, the controller cancels the receivers
+  it prepared (new `COMMAND_CANCEL_TRANSFER`, at most 5 s) and sets
+  `ControllerResponse.transfer_released` when no receive is left on any
+  destination unit. The torch client then raises `TransferReleasedError`, a
+  `RuntimeError` with the unchanged text. Off by default.
 
 [Unreleased]: https://github.com/tpu-raiden/tpu_raiden/compare/v0.1.0...HEAD

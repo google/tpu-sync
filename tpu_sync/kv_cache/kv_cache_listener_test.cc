@@ -97,6 +97,13 @@ class RoutingKVCacheManager final : public KVCacheManagerBase {
   // KVCacheListener drains pending work on shutdown; this stub has none.
   absl::Status WaitForPendingWork() { return absl::OkStatus(); }
 
+  bool CancelPoolReshardRecv(uint64_t uuid) {
+    cancelled_uuid_ = uuid;
+    return cancel_settled_;
+  }
+  void set_cancel_settled(bool settled) { cancel_settled_ = settled; }
+  uint64_t cancelled_uuid() const { return cancelled_uuid_; }
+
   Route route() const { return route_.load(std::memory_order_acquire); }
   const StartTransferRequest& request() const { return request_; }
   const std::vector<int64_t>& local_block_ids() const {
@@ -113,6 +120,8 @@ class RoutingKVCacheManager final : public KVCacheManagerBase {
   int recorded_parallelism_ = 0;
   uint64_t registered_uuid_ = 0;
   bool registered_is_sender_ = true;
+  bool cancel_settled_ = true;
+  uint64_t cancelled_uuid_ = 0;
 };
 
 bool WriteAll(int fd, const void* data, size_t size) {
@@ -222,6 +231,27 @@ TEST(KVCacheListenerTest, PoolReceiverRoutesToPoolReshardRegisterRecv) {
   EXPECT_EQ(manager.route(), Route::kPoolReshardRegisterRecv);
   EXPECT_EQ(manager.request().uuid(), 1234);
   EXPECT_EQ(manager.local_block_ids(), (std::vector<int64_t>{5, 3}));
+}
+
+TEST(KVCacheListenerTest, CancelTransferCancelsTheReceive) {
+  RoutingKVCacheManager manager;
+  KVCacheListener listener(&manager, /*listener_port=*/0);
+
+  ControlRequest request;
+  request.set_command(ControlRequest::COMMAND_CANCEL_TRANSFER);
+  request.mutable_cancel_transfer_request()->set_uuid(1234);
+
+  ControlResponse response = SendRequest(listener.listener_port(), request);
+  EXPECT_TRUE(response.success()) << response.message();
+  EXPECT_TRUE(response.cancel_settled());
+  EXPECT_EQ(manager.cancelled_uuid(), 1234u);
+  EXPECT_EQ(manager.route(), Route::kNone);
+
+  // A push or copy is still in flight.
+  manager.set_cancel_settled(false);
+  response = SendRequest(listener.listener_port(), request);
+  EXPECT_TRUE(response.success()) << response.message();
+  EXPECT_FALSE(response.cancel_settled());
 }
 
 TEST(KVCacheListenerTest, PoolReceiverArmReplyCarriesHostBaseAddrs) {

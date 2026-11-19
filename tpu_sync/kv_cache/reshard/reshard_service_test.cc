@@ -106,6 +106,18 @@ class FakeTransport final : public ControlPipeClient {
       absl::string_view endpoint,
       const control_pipe::proto::ControlEnvelope& envelope,
       absl::Duration /*timeout*/) override {
+    // Cancels are recorded and answered apart from the other worker calls.
+    if (tpu_sync::rpc::ControlRequest worker_req;
+        worker_req.ParseFromString(envelope.payload()) &&
+        worker_req.command() ==
+            tpu_sync::rpc::ControlRequest::COMMAND_CANCEL_TRANSFER) {
+      return AnswerCancel(std::string(endpoint), envelope.request_id(),
+                          worker_req.cancel_transfer_request().uuid());
+    }
+    if (unreachable_addr_ == endpoint) {
+      return MarkControlPipeNotSent(
+          absl::DeadlineExceededError("injected connect deadline"));
+    }
     absl::Notification* hold = nullptr;
     {
       absl::MutexLock lock(mu_);
@@ -195,6 +207,27 @@ class FakeTransport final : public ControlPipeClient {
     hold_release_ = release;
   }
 
+  // `addr` answers its next `times` cancels with "a push is still in
+  // flight". A negative `times` never settles.
+  void KeepInFlight(const std::string& addr, int times) {
+    absl::MutexLock lock(mu_);
+    in_flight_[addr] = times;
+  }
+  // Every cancel sent to `addr` fails.
+  void FailCancelFor(const std::string& addr) { cancel_fail_addr_ = addr; }
+  // Calls to `addr`, cancels aside, never reach it.
+  void MakeUnreachable(const std::string& addr) { unreachable_addr_ = addr; }
+
+  // Plan uuids of the cancels sent to `addr`.
+  std::vector<int64_t> CancelsTo(const std::string& addr) {
+    absl::MutexLock lock(mu_);
+    std::vector<int64_t> uuids;
+    for (const auto& [address, uuid] : cancel_calls_) {
+      if (address == addr) uuids.push_back(uuid);
+    }
+    return uuids;
+  }
+
   absl::Mutex mu_;
   std::vector<std::pair<std::string, std::string>> calls_;
   std::string fail_addr_;
@@ -208,6 +241,34 @@ class FakeTransport final : public ControlPipeClient {
   absl::Notification* hold_release_ = nullptr;
   // Reply returned for an endpoint instead of a bare success.
   std::map<std::string, tpu_sync::rpc::ControlResponse> replies_;
+  std::vector<std::pair<std::string, int64_t>> cancel_calls_;
+  std::map<std::string, int> in_flight_;
+  std::string cancel_fail_addr_;
+  std::string unreachable_addr_;
+
+ private:
+  absl::StatusOr<control_pipe::proto::ControlResponseEnvelope> AnswerCancel(
+      const std::string& endpoint, uint64_t request_id, int64_t uuid) {
+    tpu_sync::rpc::ControlResponse reply;
+    {
+      absl::MutexLock lock(mu_);
+      cancel_calls_.emplace_back(endpoint, uuid);
+      if (cancel_fail_addr_ == endpoint) {
+        reply.set_success(false);
+        reply.set_message("injected cancel failure");
+      } else {
+        int& in_flight = in_flight_[endpoint];
+        reply.set_success(true);
+        reply.set_cancel_settled(in_flight == 0);
+        if (in_flight > 0) --in_flight;
+      }
+    }
+    control_pipe::proto::ControlResponseEnvelope resp_env;
+    resp_env.set_request_id(request_id);
+    resp_env.set_status_code(0);
+    resp_env.set_payload(reply.SerializeAsString());
+    return resp_env;
+  }
 };
 
 class ReshardStackTest : public ::testing::Test {
@@ -2803,6 +2864,217 @@ TEST_F(ReshardStackTest, FailedClaimDoesNotRefreshPartialRegistrationTtl) {
   now_ += 201.0;
   EXPECT_EQ(RequestBlockStatuses("req-partial-ttl", 94),
             std::vector<int>{ProtoStatus::STATUS_UNKNOWN});
+}
+
+// Rollback of a failed coordination (TPU_RAIDEN_ROLLBACK_FAILED_TRANSFERS).
+
+class ReshardRollbackTest : public ReshardStackTest {
+ protected:
+  ReshardRollbackTest() {
+    setenv("TPU_RAIDEN_ROLLBACK_FAILED_TRANSFERS", "1", 1);
+  }
+  ~ReshardRollbackTest() override {
+    unsetenv("TPU_RAIDEN_ROLLBACK_FAILED_TRANSFERS");
+  }
+};
+
+TEST_F(ReshardStackTest, FailedTransferIsNotReleasedWithoutTheFlag) {
+  RegisterAllUnits(/*num_src=*/1, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16);
+  RegisterSpans(0, "req-rb-off", 95, 1024, 3, 0, 0, 1024);
+  transport_.FailFor("10.0.0.2:9600");
+  tpu_sync::rpc::ControllerResponse resp = Coordinate("req-rb-off", 95, 1, {7});
+  ASSERT_FALSE(resp.success());
+  EXPECT_FALSE(resp.transfer_released());
+  EXPECT_TRUE(transport_.cancel_calls_.empty());
+}
+
+TEST_F(ReshardRollbackTest, FailureBeforeAnyPrepareIsReleased) {
+  RegisterAllUnits(/*num_src=*/1, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16);
+
+  // No producer registration: planning fails before any prepare is sent.
+  tpu_sync::rpc::ControllerResponse resp =
+      Coordinate("req-rb-plan", 96, 1, {7});
+  ASSERT_FALSE(resp.success());
+  EXPECT_THAT(resp.message(), HasSubstr("Missing producer block registration"));
+  EXPECT_TRUE(resp.transfer_released());
+  EXPECT_TRUE(transport_.calls_.empty());
+  EXPECT_TRUE(transport_.cancel_calls_.empty());
+}
+
+TEST_F(ReshardRollbackTest, PrepareFailureCancelsThePreparedReceivers) {
+  using ProtoStatus = tpu_sync::rpc::GetRequestBlockStatusResponse;
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16, /*num_dst=*/2);
+  RegisterSpans(0, "req-rb-arm", 97, 1024, 3, 0, 0, 1024);
+  RegisterSpans(1, "req-rb-arm", 97, 1024, 5, 1, 0, 512);
+
+  // Destination 0 is prepared, destination 1 refuses.
+  transport_.FailFor("10.0.0.2:9601");
+  tpu_sync::rpc::ControllerResponse resp = Coordinate(
+      "req-rb-arm", 97, 2, {7, 9}, /*dst_skip=*/{}, /*num_dst=*/2);
+  ASSERT_FALSE(resp.success());
+  EXPECT_THAT(resp.message(), HasSubstr("injected arm refusal"));
+  EXPECT_TRUE(resp.transfer_released());
+
+  // Both receivers got one cancel for the plan. No sender was contacted.
+  EXPECT_EQ(transport_.CancelsTo("10.0.0.2:9600"), std::vector<int64_t>{97});
+  EXPECT_EQ(transport_.CancelsTo("10.0.0.2:9601"), std::vector<int64_t>{97});
+  EXPECT_EQ(transport_.calls_.size(), 2u);
+  // The claim is abandoned, as without the flag.
+  EXPECT_EQ(RequestBlockStatuses("req-rb-arm", 97),
+            std::vector<int>{ProtoStatus::STATUS_REGISTERED});
+}
+
+TEST_F(ReshardRollbackTest, ReceiverThePrepareNeverReachedIsNotCancelled) {
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16, /*num_dst=*/2);
+  RegisterSpans(0, "req-rb-unsent", 98, 1024, 3, 0, 0, 1024);
+  RegisterSpans(1, "req-rb-unsent", 98, 1024, 5, 1, 0, 512);
+
+  transport_.MakeUnreachable("10.0.0.2:9601");
+  tpu_sync::rpc::ControllerResponse resp = Coordinate(
+      "req-rb-unsent", 98, 2, {7, 9}, /*dst_skip=*/{}, /*num_dst=*/2);
+  ASSERT_FALSE(resp.success());
+  EXPECT_TRUE(resp.transfer_released());
+  EXPECT_EQ(transport_.CancelsTo("10.0.0.2:9600").size(), 1u);
+  EXPECT_TRUE(transport_.CancelsTo("10.0.0.2:9601").empty());
+}
+
+TEST_F(ReshardRollbackTest, FailedCancelIsNotReleased) {
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16, /*num_dst=*/2);
+  RegisterSpans(0, "req-rb-unconfirmed", 99, 1024, 3, 0, 0, 1024);
+  RegisterSpans(1, "req-rb-unconfirmed", 99, 1024, 5, 1, 0, 512);
+
+  // Destination 0 is prepared but its cancel fails: it may still be prepared.
+  transport_.FailFor("10.0.0.2:9601");
+  transport_.FailCancelFor("10.0.0.2:9600");
+  tpu_sync::rpc::ControllerResponse resp = Coordinate(
+      "req-rb-unconfirmed", 99, 2, {7, 9}, /*dst_skip=*/{}, /*num_dst=*/2);
+  ASSERT_FALSE(resp.success());
+  EXPECT_THAT(resp.message(), HasSubstr("injected arm refusal"));
+  EXPECT_FALSE(resp.transfer_released());
+}
+
+TEST_F(ReshardRollbackTest, SecondCoordinationLeavesTheFirstOnesReceive) {
+  using ProtoStatus = tpu_sync::rpc::GetRequestBlockStatusResponse;
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16, /*num_dst=*/2);
+  RegisterSpans(0, "req-rb-twice", 104, 1024, 3, 0, 0, 1024);
+  RegisterSpans(1, "req-rb-twice", 104, 1024, 5, 1, 0, 512);
+
+  // The first coordination succeeds and keeps its claim.
+  ASSERT_TRUE(Coordinate("req-rb-twice", 104, 2, {7, 9}, /*dst_skip=*/{},
+                         /*num_dst=*/2)
+                  .success());
+  ASSERT_TRUE(transport_.cancel_calls_.empty());
+
+  // Coordinated again: destination 1 refuses (the first receive is there).
+  transport_.FailAfterCalls("10.0.0.2:9601", 1);
+  tpu_sync::rpc::ControllerResponse resp = Coordinate(
+      "req-rb-twice", 104, 2, {7, 9}, /*dst_skip=*/{}, /*num_dst=*/2);
+  ASSERT_FALSE(resp.success());
+
+  // The first transfer may be running: no cancel there, and not released.
+  EXPECT_TRUE(transport_.CancelsTo("10.0.0.2:9601").empty());
+  EXPECT_FALSE(resp.transfer_released());
+  // What this coordination prepared itself is cancelled.
+  EXPECT_EQ(transport_.CancelsTo("10.0.0.2:9600"), std::vector<int64_t>{104});
+  // The first coordination's claim stays.
+  EXPECT_EQ(RequestBlockStatuses("req-rb-twice", 104),
+            std::vector<int>{ProtoStatus::STATUS_CLAIMED});
+}
+
+TEST_F(ReshardRollbackTest, SenderFailureCancelsTheReceivers) {
+  using ProtoStatus = tpu_sync::rpc::GetRequestBlockStatusResponse;
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16);
+  RegisterSpans(0, "req-rb-send", 100, 1024, 3, 0, 0, 1024);
+  RegisterSpans(1, "req-rb-send", 100, 1024, 5, 1, 0, 512);
+
+  // Sender 0 fails to start. The receiver has a push from sender 1 in flight
+  // when it is first cancelled.
+  tpu_sync::rpc::ControlResponse sender_failure;
+  sender_failure.set_success(false);
+  sender_failure.set_message("injected sender failure");
+  transport_.replies_["10.0.0.1:9100"] = sender_failure;
+  transport_.KeepInFlight("10.0.0.2:9600", 1);
+
+  tpu_sync::rpc::ControllerResponse resp =
+      Coordinate("req-rb-send", 100, 2, {7, 9});
+  ASSERT_FALSE(resp.success());
+  EXPECT_THAT(resp.message(), HasSubstr("injected sender failure"));
+  EXPECT_TRUE(resp.transfer_released());
+
+  // The receiver was asked again until the push had ended. Senders are not
+  // cancelled and the claim stays, as without the flag.
+  EXPECT_EQ(transport_.CancelsTo("10.0.0.2:9600"),
+            (std::vector<int64_t>{100, 100}));
+  EXPECT_TRUE(transport_.CancelsTo("10.0.0.1:9100").empty());
+  EXPECT_TRUE(transport_.CancelsTo("10.0.0.1:9102").empty());
+  EXPECT_EQ(RequestBlockStatuses("req-rb-send", 100),
+            std::vector<int>{ProtoStatus::STATUS_CLAIMED});
+}
+
+TEST_F(ReshardRollbackTest, ReceiverStillInFlightIsNotReleased) {
+  RegisterAllUnits(/*num_src=*/2, /*live=*/1024, /*stride=*/1024,
+                   /*num_blocks=*/16);
+  RegisterSpans(0, "req-rb-drain", 101, 1024, 3, 0, 0, 1024);
+  RegisterSpans(1, "req-rb-drain", 101, 1024, 5, 1, 0, 512);
+
+  // The receiver's push never ends within the rollback timeout.
+  tpu_sync::rpc::ControlResponse sender_failure;
+  sender_failure.set_success(false);
+  sender_failure.set_message("injected sender failure");
+  transport_.replies_["10.0.0.1:9100"] = sender_failure;
+  transport_.KeepInFlight("10.0.0.2:9600", -1);
+
+  tpu_sync::rpc::ControllerResponse resp =
+      Coordinate("req-rb-drain", 101, 2, {7, 9});
+  ASSERT_FALSE(resp.success());
+  EXPECT_FALSE(resp.transfer_released());
+  EXPECT_GT(transport_.CancelsTo("10.0.0.2:9600").size(), 1u);
+}
+
+TEST(ReshardControlPipeTest, ClientSeesAReleasedTransfer) {
+  for (const bool rollback : {false, true}) {
+    if (rollback) setenv("TPU_RAIDEN_ROLLBACK_FAILED_TRANSFERS", "1", 1);
+    auto env_cleanup = absl::MakeCleanup(
+        [] { unsetenv("TPU_RAIDEN_ROLLBACK_FAILED_TRANSFERS"); });
+    ReshardService::Options options;
+    options.port = 0;
+    options.backend_type = ControlPipeBackendType::kTcp;
+    ReshardService service(options);
+    ASSERT_TRUE(service.StartServer().ok());
+
+    const std::string addr = absl::StrCat("127.0.0.1:", service.port());
+    std::unique_ptr<ControlPipeClient> client =
+        CreateReshardControlPipeClient(ControlPipeBackendType::kTcp);
+    ReshardClient reshard_client(addr, client.get());
+
+    // No unit is registered, so the call fails before any prepare.
+    StartTransferArgs args;
+    args.src_units = {Unit(0)};
+    args.dst_units = {DstUnit()};
+    args.req_id = "req-client";
+    args.uuid = 7;
+    args.use_block_chunks = true;
+    args.dst_mem_type = tpu_sync::rpc::MEMORY_TYPE_HBM;
+    args.has_dst_device_block_ids = true;
+    args.dst_device_block_ids = {7};
+    args.has_transfer_pool_tags = true;
+    args.transfer_pool_tags = {"fa"};
+    absl::StatusOr<bool> started = reshard_client.StartTransfer(args);
+    ASSERT_FALSE(started.ok());
+    EXPECT_THAT(
+        started.status().message(),
+        ::testing::StartsWith("Remote Controller Server execution failed: "));
+    EXPECT_EQ(IsTransferReleased(started.status()), rollback);
+
+    service.StopServer();
+  }
 }
 
 }  // namespace

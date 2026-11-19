@@ -25,8 +25,10 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/cord.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "absl/time/time.h"
 #include "tpu_sync/common/control_pipe/control_pipe_client.h"
 #include "tpu_sync/common/raiden_id.h"
@@ -68,7 +70,14 @@ tpu_sync::rpc::RaidenIdProto RaidenIdProtoOf(const RaidenId& unit) {
   return proto;
 }
 
+constexpr absl::string_view kTransferReleasedPayloadUrl =
+    "tpu_raiden.reshard.transfer_released";
+
 }  // namespace
+
+bool IsTransferReleased(const absl::Status& status) {
+  return status.GetPayload(kTransferReleasedPayloadUrl).has_value();
+}
 
 ReshardClient::ReshardClient(std::string address, ControlPipeClient* client)
     : address_(std::move(address)) {
@@ -313,8 +322,12 @@ absl::StatusOr<tpu_sync::rpc::ControllerResponse> ReshardClient::CallController(
   if (!response->success()) {
     // Verbatim facade text: the connector's bounded retry substring-matches
     // the embedded server message.
-    return absl::InternalError(absl::StrCat(
+    absl::Status failed = absl::InternalError(absl::StrCat(
         "Remote Controller Server execution failed: ", response->message()));
+    if (response->transfer_released()) {
+      failed.SetPayload(kTransferReleasedPayloadUrl, absl::Cord());
+    }
+    return failed;
   }
   return response;
 }

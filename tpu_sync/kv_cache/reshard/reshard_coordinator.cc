@@ -40,6 +40,7 @@
 #include "absl/time/time.h"
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/common/control_pipe/control_pipe_client.h"
+#include "tpu_sync/common/control_pipe/control_pipe_types.h"
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/core/controller/raiden_controller.h"
 #include "tpu_sync/core/transfer_program_reshard.h"
@@ -70,6 +71,22 @@ bool ForwardReceiverAddrsEnabled() {
   return v == "1" || absl::EqualsIgnoreCase(v, "true") ||
          absl::EqualsIgnoreCase(v, "yes") || absl::EqualsIgnoreCase(v, "on");
 }
+
+// Rollout flag TPU_RAIDEN_ROLLBACK_FAILED_TRANSFERS, off by default: a failed
+// coordination cancels the receivers it prepared and reports whether none is
+// left.
+bool RollbackFailedTransfersEnabled() {
+  const char* value = std::getenv("TPU_RAIDEN_ROLLBACK_FAILED_TRANSFERS");
+  if (value == nullptr) return false;
+  const absl::string_view v(value);
+  return v == "1" || absl::EqualsIgnoreCase(v, "true") ||
+         absl::EqualsIgnoreCase(v, "yes") || absl::EqualsIgnoreCase(v, "on");
+}
+
+// Longest time a rollback takes: the cancel RPCs plus the wait for pushes or
+// copies that are still in flight.
+constexpr absl::Duration kRollbackTimeout = absl::Seconds(5);
+constexpr absl::Duration kRollbackPollInterval = absl::Milliseconds(50);
 
 int64_t MonotonicNs() { return absl::GetCurrentTimeNanos(); }
 
@@ -474,7 +491,11 @@ absl::StatusOr<SubTransferChain> PlanSubTransfers(const PoolReshardArgs& args) {
   return chain;
 }
 
-absl::Status ReshardCoordinator::StartPoolReshard(const PoolReshardArgs& args) {
+absl::Status ReshardCoordinator::StartPoolReshard(const PoolReshardArgs& args,
+                                                  bool* released) {
+  const bool rollback = RollbackFailedTransfersEnabled();
+  // No receiver is prepared yet, so a failure leaves nothing behind.
+  *released = rollback;
   // _start_pool_reshard_transfer's synchronous validation.
   if (args.src_units.empty()) {
     return absl::InvalidArgumentError("src_units must not be empty");
@@ -517,7 +538,8 @@ absl::Status ReshardCoordinator::StartPoolReshard(const PoolReshardArgs& args) {
     transfer_status_[args.req_id] = Status::kInProgress;
   }
   bool chain_started = false;
-  absl::Status status = ExecutePoolReshard(args, &chain_started);
+  absl::Status status =
+      ExecutePoolReshard(args, &chain_started, rollback ? released : nullptr);
   // A chained request stays kInProgress until its chain thread has run the
   // remaining sub-transfers; that thread records the final status.
   if (!chain_started) {
@@ -525,11 +547,13 @@ absl::Status ReshardCoordinator::StartPoolReshard(const PoolReshardArgs& args) {
     transfer_status_[args.req_id] =
         status.ok() ? Status::kCompleted : Status::kFailed;
   }
+  if (status.ok()) *released = false;
   return status;
 }
 
 absl::Status ReshardCoordinator::ExecutePoolReshard(const PoolReshardArgs& args,
-                                                    bool* chain_started) {
+                                                    bool* chain_started,
+                                                    bool* released) {
   *chain_started = false;
   if (!args.is_sender) {
     return absl::InvalidArgumentError(
@@ -592,7 +616,7 @@ absl::Status ReshardCoordinator::ExecutePoolReshard(const PoolReshardArgs& args,
     }
   }
 
-  absl::Status first = RunSubPlan(ctx, 0);
+  absl::Status first = RunSubPlan(ctx, 0, released);
   if (!first.ok()) return first;
   if (ctx->chain.count > 1) {
     *chain_started = true;
@@ -678,8 +702,60 @@ constexpr int kChainArmAttempts = 12;
 
 }  // namespace
 
+bool ReshardCoordinator::CancelReceivers(const PoolReshardPlan& plan,
+                                         const std::vector<RaidenId>& units) {
+  tpu_sync::rpc::ControlRequest request;
+  request.set_command(tpu_sync::rpc::ControlRequest::COMMAND_CANCEL_TRANSFER);
+  request.mutable_cancel_transfer_request()->set_uuid(plan.uuid);
+
+  const absl::Time deadline = absl::Now() + kRollbackTimeout;
+  // One byte per unit: each thread writes its own slot.
+  std::vector<char> settled(units.size(), 0);
+  std::vector<std::thread> cancellers;
+  cancellers.reserve(units.size());
+  for (size_t i = 0; i < units.size(); ++i) {
+    cancellers.emplace_back([this, &plan, &units, &request, &settled, i,
+                             deadline]() {
+      auto addr_it = plan.worker_rpc_addresses.find(units[i]);
+      if (addr_it == plan.worker_rpc_addresses.end()) {
+        // No address: the prepare was never sent to this unit.
+        settled[i] = 1;
+        return;
+      }
+      while (true) {
+        const absl::Duration budget =
+            std::max(deadline - absl::Now(), absl::Seconds(1));
+        auto reply = CallReshardControlPipe<tpu_sync::rpc::ControlRequest,
+                                            tpu_sync::rpc::ControlResponse>(
+            client_, addr_it->second, request, budget, budget);
+        const bool answered = reply.ok() && reply->success();
+        if (answered && reply->cancel_settled()) {
+          settled[i] = 1;
+          return;
+        }
+        // Answered but not settled: a push or copy is still in flight, so
+        // ask again until the deadline.
+        if (!answered || absl::Now() >= deadline) {
+          const std::string why =
+              answered ? "still in flight"
+                       : reply.ok() ? reply->message()
+                                    : std::string(reply.status().message());
+          LOG(ERROR) << "Pool reshard rollback for req_id=" << plan.req_id
+                     << " uuid=" << plan.uuid << ": receiver "
+                     << PythonRepr(units[i]) << " is not confirmed: " << why;
+          return;
+        }
+        absl::SleepFor(kRollbackPollInterval);
+      }
+    });
+  }
+  for (std::thread& t : cancellers) t.join();
+  return std::all_of(settled.begin(), settled.end(),
+                     [](char unit_settled) { return unit_settled != 0; });
+}
+
 absl::Status ReshardCoordinator::RunSubPlan(
-    const std::shared_ptr<ChainContext>& ctx, int32_t index) {
+    const std::shared_ptr<ChainContext>& ctx, int32_t index, bool* released) {
   const PoolReshardArgs& args = ctx->args;
   const int64_t uuid = ctx->uuid;
   const bool chained = ctx->chain.count > 1;
@@ -742,6 +818,8 @@ absl::Status ReshardCoordinator::RunSubPlan(
   // receiver's staging arena still held by its predecessors; such a
   // refusal is retried per destination until the arena drains.
   const int64_t receiver_arm_start_ns = MonotonicNs();
+  // Receivers may be prepared from here on.
+  if (released != nullptr) *released = false;
   {
     std::vector<absl::Status> arm_status(plan.dst_units.size());
     // One byte per destination (std::vector<bool> packs bits, which the
@@ -787,6 +865,23 @@ absl::Status ReshardCoordinator::RunSubPlan(
         }
         if (index == 0) {
           registry_->AbandonClaim(args.req_id, uuid, ctx->claim_owner);
+        }
+        if (released != nullptr) {
+          // Still claimed without this coordination's claim: the request is
+          // coordinated twice, and a worker may hold the other one's receive.
+          const bool coordinated_twice =
+              registry_->Status({{args.req_id, uuid}})[0] ==
+              RequestBlockRegistry::RequestBlockStatus::kClaimed;
+          // Cancel what this prepare may have reached; when coordinated twice,
+          // only what it prepared itself.
+          std::vector<RaidenId> contacted;
+          for (size_t j = 0; j < plan.dst_units.size(); ++j) {
+            if (armed[j] || (!coordinated_twice &&
+                             !IsControlPipeNotSent(arm_status[j]))) {
+              contacted.push_back(plan.dst_units[j]);
+            }
+          }
+          *released = CancelReceivers(plan, contacted) && !coordinated_twice;
         }
         return arm_status[i];
       }
@@ -877,7 +972,12 @@ absl::Status ReshardCoordinator::RunSubPlan(
   }
   const int64_t sender_dispatch_end_ns = MonotonicNs();
   for (const absl::Status& status : sender_status) {
-    if (!status.ok()) return status;
+    if (!status.ok()) {
+      if (released != nullptr) {
+        *released = CancelReceivers(plan, plan.dst_units);
+      }
+      return status;
+    }
   }
 
   // Milestone event (D5): schema-identical JSON line on stderr,

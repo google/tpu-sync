@@ -899,6 +899,133 @@ TEST(PoolReshardRecvTest,
   EXPECT_THAT(failed_recving, Contains("pool_reshard_req_3003"));
 }
 
+TEST(PoolReshardRecvTest, CancelFreesTheStagingOfAnIdleReceive) {
+  constexpr int64_t kStride = 128;
+  constexpr int64_t kNumBlocks = 16;
+  BoundedPoolTestManager manager(/*slice_byte_size=*/kStride, /*host_blocks=*/1,
+                                 /*physical_size=*/kStride * kNumBlocks);
+
+  kv_cache::PoolSpec pool = DensePool("fa", kStride, "bf16");
+  pool.num_blocks = kNumBlocks;
+  pool.staging_blocks_per_request = 1;
+  ABSL_ASSERT_OK(manager.base()->RegisterPools({pool}, /*staging_leases=*/2));
+  ASSERT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 2);
+
+  // No receive under this uuid: nothing to cancel.
+  EXPECT_TRUE(manager.CancelPoolReshardRecv(/*uuid=*/3104));
+
+  const StartTransferRequest plan = ValidPlan(/*uuid=*/3004);
+  ABSL_ASSERT_OK(
+      manager.PoolReshardRegisterRecv(plan, std::vector<int64_t>{0}));
+  EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 1);
+
+  // No push arrived, so the cancel frees the staging at once.
+  EXPECT_TRUE(manager.CancelPoolReshardRecv(/*uuid=*/3004));
+  EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 2);
+  EXPECT_FALSE(manager.base()->HasActivePlan(3004));
+
+  // The next poll reports the cancelled receive as failed.
+  const auto [done_sending, done_recving, failed_recving] =
+      manager.CompleteReadRaw();
+  EXPECT_THAT(done_recving, IsEmpty());
+  EXPECT_THAT(failed_recving, Contains("pool_reshard_req_3004"));
+}
+
+TEST(PoolReshardRecvTest, CancelWaitsForAPushInFlight) {
+  constexpr int64_t kStride = 128;
+  constexpr int64_t kNumBlocks = 16;
+  BoundedPoolTestManager manager(/*slice_byte_size=*/kStride, /*host_blocks=*/1,
+                                 /*physical_size=*/kStride * kNumBlocks);
+
+  kv_cache::PoolSpec pool = DensePool("fa", kStride, "bf16");
+  pool.num_blocks = kNumBlocks;
+  pool.staging_blocks_per_request = 1;
+  ABSL_ASSERT_OK(manager.base()->RegisterPools({pool}, /*staging_leases=*/2));
+
+  const StartTransferRequest plan = ValidPlan(/*uuid=*/3005);
+  ABSL_ASSERT_OK(
+      manager.PoolReshardRegisterRecv(plan, std::vector<int64_t>{0}));
+  TF_ASSERT_OK_AND_ASSIGN(auto session, manager.base()->GetSession(/*uuid=*/3005));
+
+  // A push is in flight: the staging stays until it ends.
+  ASSERT_TRUE(session->TryBeginOp());
+  EXPECT_FALSE(manager.CancelPoolReshardRecv(/*uuid=*/3005));
+  EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 1);
+  // No new push is accepted.
+  EXPECT_FALSE(session->TryBeginOp());
+
+  session->EndOp();
+  EXPECT_TRUE(manager.CancelPoolReshardRecv(/*uuid=*/3005));
+  EXPECT_THAT(session->GetStatus(), StatusIs(absl::StatusCode::kCancelled));
+  EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 2);
+}
+
+TEST(PoolReshardRecvTest, CancelWhileTheReceiveIsBeingPrepared) {
+  constexpr int64_t kStride = 128;
+  constexpr int64_t kNumBlocks = 16;
+  BoundedPoolTestManager manager(/*slice_byte_size=*/kStride, /*host_blocks=*/1,
+                                 /*physical_size=*/kStride * kNumBlocks);
+
+  kv_cache::PoolSpec pool = DensePool("fa", kStride, "bf16");
+  pool.num_blocks = kNumBlocks;
+  pool.staging_blocks_per_request = 1;
+  ABSL_ASSERT_OK(manager.base()->RegisterPools({pool}, /*staging_leases=*/1));
+  ASSERT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 1);
+
+  // Receive A holds the only staging slot.
+  ABSL_ASSERT_OK(manager.PoolReshardRegisterRecv(ValidPlan(/*uuid=*/5001),
+                                                 std::vector<int64_t>{0}));
+  ASSERT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 0);
+
+  // Receive B is being prepared: it waits for a staging slot.
+  absl::Status b_status;
+  std::thread preparing([&manager, &b_status] {
+    b_status = manager.PoolReshardRegisterRecv(ValidPlan(/*uuid=*/5002),
+                                               std::vector<int64_t>{0});
+  });
+  absl::SleepFor(absl::Milliseconds(500));
+
+  // B is cancelled while it waits.
+  const bool settled = manager.CancelPoolReshardRecv(/*uuid=*/5002);
+
+  // A ends, so B can get the slot.
+  EXPECT_TRUE(manager.CancelPoolReshardRecv(/*uuid=*/5001));
+  preparing.join();
+
+  // The cancel answered "nothing is running", so no receive may be left.
+  EXPECT_TRUE(settled);
+  EXPECT_THAT(b_status, StatusIs(absl::StatusCode::kCancelled));
+  EXPECT_FALSE(manager.base()->GetSession(/*uuid=*/5002).ok());
+  EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 1);
+}
+
+TEST(PoolReshardRecvTest, PrepareThatArrivesAfterItsCancelIsRefused) {
+  constexpr int64_t kStride = 128;
+  constexpr int64_t kNumBlocks = 16;
+  BoundedPoolTestManager manager(/*slice_byte_size=*/kStride, /*host_blocks=*/1,
+                                 /*physical_size=*/kStride * kNumBlocks);
+
+  kv_cache::PoolSpec pool = DensePool("fa", kStride, "bf16");
+  pool.num_blocks = kNumBlocks;
+  pool.staging_blocks_per_request = 1;
+  ABSL_ASSERT_OK(manager.base()->RegisterPools({pool}, /*staging_leases=*/1));
+
+  // The cancel overtakes the prepare: nothing is there yet.
+  EXPECT_TRUE(manager.CancelPoolReshardRecv(/*uuid=*/6001));
+
+  // The late prepare is refused and takes no staging.
+  EXPECT_THAT(manager.PoolReshardRegisterRecv(ValidPlan(/*uuid=*/6001),
+                                              std::vector<int64_t>{0}),
+              StatusIs(absl::StatusCode::kCancelled));
+  EXPECT_FALSE(manager.base()->GetSession(/*uuid=*/6001).ok());
+  EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 1);
+
+  // Other plans are not affected.
+  ABSL_EXPECT_OK(manager.PoolReshardRegisterRecv(ValidPlan(/*uuid=*/6002),
+                                                 std::vector<int64_t>{0}));
+  EXPECT_TRUE(manager.CancelPoolReshardRecv(/*uuid=*/6002));
+}
+
 
 // ---------------------------------------------------------------------------
 // Sub-plan chains: a request coordinated as several pool-reshard plans

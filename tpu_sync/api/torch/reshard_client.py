@@ -60,6 +60,11 @@ SUPPORTS_REQUEST_BLOCK_STATUS = bool(
     getattr(_impl, "reshard_client_supports_request_block_status", False)
 )
 
+# RuntimeError subclass raised by coordinate_transfer when the failed transfer
+# left no receive on the destination, so the caller can free its destination
+# blocks. None on an older extension.
+TransferReleasedError = getattr(_impl, "TransferReleasedError", None)
+
 # GetRequestBlockStatusResponse.Status values returned by
 # get_request_block_status.
 REQUEST_BLOCK_STATUS_UNKNOWN = 1

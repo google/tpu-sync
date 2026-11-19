@@ -216,9 +216,11 @@ tpu_sync::rpc::ControllerResponse ReshardService::HandleControllerCommand(
       // Wire carries no parallelism (planner derives it from admission);
       // dst_device_block_ids emptiness surfaces in the coordinator as the
       // Python path would report it.
-      absl::Status status = coordinator_->StartPoolReshard(args);
+      bool released = false;
+      absl::Status status = coordinator_->StartPoolReshard(args, &released);
       if (!status.ok()) {
         resp.set_message(StatusMessage(status));
+        resp.set_transfer_released(released);
         break;
       }
       resp.set_success(true);

@@ -184,6 +184,13 @@ void ThrowIfError(const absl::Status& status) {
   }
 }
 
+// start_transfer failure that left no receive on the destination. Python sees
+// it as TransferReleasedError, a RuntimeError with the same text.
+class TransferReleasedError : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
 struct ClientHandle {
   std::unique_ptr<reshard::ReshardClient> client;
 };
@@ -1316,6 +1323,9 @@ NB_MODULE(_tpu_raiden_torch, m) {
   // workers register different block arrays.
   m.attr("kv_cache_store_supports_per_worker_kv_transfer_spec") = true;
 
+  nb::exception<::tpu_raiden::kv_cache::reshardpb2::TransferReleasedError>(
+      m, "TransferReleasedError", PyExc_RuntimeError);
+
   // C++-owned reshard client. The facade-compatible surface is provided by
   // tpu_raiden/api/torch/reshard_client.py on top of this binding.
   nb::class_<::tpu_raiden::kv_cache::reshardpb2::ClientHandle>(m,
@@ -1464,6 +1474,11 @@ NB_MODULE(_tpu_raiden_torch, m) {
              args.dst_window_blocks = dst_window_blocks;
              nb::gil_scoped_release release;
              absl::StatusOr<bool> result = self.client->StartTransfer(args);
+             if (tpu_raiden::kv_cache::reshard::IsTransferReleased(
+                     result.status())) {
+               throw ::tpu_raiden::kv_cache::reshardpb2::TransferReleasedError(
+                   std::string(result.status().message()));
+             }
              ::tpu_raiden::kv_cache::reshardpb2::ThrowIfError(result.status());
              return *result;
            })

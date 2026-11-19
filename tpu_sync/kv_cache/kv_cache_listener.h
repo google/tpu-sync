@@ -72,6 +72,10 @@ class KVCacheListener final {
                     },
                 .wait_for_pending_work =
                     [engine]() { return engine->WaitForPendingWork(); },
+                .cancel_pool_reshard_recv =
+                    [engine](uint64_t uuid) {
+                      return engine->CancelPoolReshardRecv(uuid);
+                    },
                 .pool_host_addrs = [engine](uint64_t uuid, size_t pool_idx)
                     -> absl::StatusOr<tpu_sync::rpc::PoolHostAddrsProto> {
                   if constexpr (requires {
@@ -113,6 +117,8 @@ class KVCacheListener final {
         uint64_t, const tpu_sync::rpc::StartTransferRequest&, bool)>
         register_active_plan;
     std::function<absl::Status()> wait_for_pending_work;
+    // Cancels a prepared receive. True when nothing of it is still running.
+    std::function<bool(uint64_t)> cancel_pool_reshard_recv;
     // Pool base address per local shard (KVCacheManagerBase::
     // PoolHostBaseAddrs) and the pool layout, reported in the pool-reshard
     // receiver arm reply.

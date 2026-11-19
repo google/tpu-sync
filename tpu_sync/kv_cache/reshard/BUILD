@@ -126,6 +126,7 @@ cc_library(
         ":work_unit_directory",
         "//tpu_sync/common:raiden_id",
         "//tpu_sync/common/control_pipe:control_pipe_interfaces",
+        "//tpu_sync/common/control_pipe:control_pipe_types",
         "//tpu_sync/core:transfer_program_reshard",
         "//tpu_sync/core/controller:raiden_controller",
         "//tpu_sync/proto:transfer_program_cc_proto",
@@ -275,6 +276,7 @@ cc_library(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:cord",
         "@com_google_absl//absl/time",
     ],
 )

@@ -73,6 +73,34 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "plugin_registry",
+    srcs = ["plugin_registry.cc"],
+    hdrs = ["plugin_registry.h"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = [
+        "-use_header_modules",
+        "-layering_check",
+    ],
+    linkopts = ["-ldl"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":raiden_storage_plugin_abi",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/base:no_destructor",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/synchronization",
+    ],
+)
+
 cc_binary(
     name = "libmock_storage_plugin.so",
     testonly = True,
@@ -151,6 +179,31 @@ cc_test(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+        "@xla//xla/tsl/platform:statusor",
+    ],
+)
+
+cc_test(
+    name = "plugin_registry_test",
+    srcs = ["plugin_registry_test.cc"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = [
+        "-use_header_modules",
+        "-layering_check",
+    ],
+    deps = [
+        ":mock_storage_plugin_loader",
+        ":plugin_registry",
+        ":raiden_storage_plugin_abi",
+        "@com_google_absl//absl/cleanup",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/strings",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
         "@xla//xla/tsl/platform:statusor",

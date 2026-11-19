@@ -217,6 +217,34 @@ class StubReceiveSession : public TransferSession {
   absl::Status status_ ABSL_GUARDED_BY(mu_);
 };
 
+// Receive session that records every landed-blocks report of a push stream.
+class LandedBlocksRecordingSession : public StubReceiveSession {
+ public:
+  // One OnBlocksLanded() call: unit, destination blocks and shards.
+  using Landed = std::tuple<size_t, std::vector<int>, std::vector<int>>;
+  using StubReceiveSession::StubReceiveSession;
+
+  absl::Status OnBlocksLanded(size_t major_dimension_idx,
+                              absl::Span<const int> minor_dimension_indices,
+                              absl::Span<const int> shard_ids) override {
+    absl::MutexLock lock(landed_mu_);
+    landed_.emplace_back(major_dimension_idx,
+                         std::vector<int>(minor_dimension_indices.begin(),
+                                          minor_dimension_indices.end()),
+                         std::vector<int>(shard_ids.begin(), shard_ids.end()));
+    return absl::OkStatus();
+  }
+
+  std::vector<Landed> landed() const {
+    absl::MutexLock lock(landed_mu_);
+    return landed_;
+  }
+
+ private:
+  mutable absl::Mutex landed_mu_;
+  std::vector<Landed> landed_ ABSL_GUARDED_BY(landed_mu_);
+};
+
 class MockDelegate : public BlockTransportDelegate {
  public:
   MockDelegate(size_t slice_size, int max_blocks = 1, size_t num_layers = 1,
@@ -1276,6 +1304,144 @@ TEST_P(BlockTransportTest, SenderChangingDeclaredStreamCountIsRejected) {
                    .Await()
                    .ok());
   EXPECT_EQ(receiver.layer_completion_count(), 0);
+}
+
+// A block array pushed in several block groups completes once, on the last
+// stream of the last group: every stream declares the streams of all groups.
+// Each stream reports the blocks it landed before it counts.
+TEST_P(BlockTransportTest, BlockGroupPushesCompleteTheirArrayOnce) {
+  constexpr uint64_t kUuid = 910;
+  constexpr size_t kSliceSize = 32;
+  MockDelegate sender(kSliceSize, /*max_blocks=*/3, /*num_layers=*/1);
+  MockDelegate receiver(kSliceSize, /*max_blocks=*/3, /*num_layers=*/1);
+  auto session = std::make_shared<LandedBlocksRecordingSession>();
+  receiver.RegisterSession(kUuid, session);
+
+  BlockTransport sender_transport(&sender, 0);
+  BlockTransport receiver_transport(&receiver, 0);
+  BindControlChannels(&sender_transport, &sender, &receiver_transport,
+                      &receiver);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  const std::string peer =
+      absl::StrCat("localhost:", receiver_transport.local_port());
+  // Groups {0, 1} and {2} at parallelism 2 open 2 + 1 streams.
+  auto push_group = [&](const std::vector<int>& blocks) {
+    return sender_transport
+        .AsyncPush({peer}, /*src_block_ids=*/blocks, /*dst_block_ids=*/blocks,
+                   /*parallelism=*/2, MajorOrder::kLayerMajor, kUuid,
+                   /*layer_idx=*/0, /*wire_layer_idx=*/std::nullopt,
+                   /*layer_streams=*/3)
+        .Await();
+  };
+
+  ASSERT_TRUE(push_group({0, 1}).ok());
+  EXPECT_EQ(receiver.layer_completion_count(), 0);
+  ASSERT_TRUE(push_group({2}).ok());
+  EXPECT_EQ(receiver.layer_completion_count(), 1);
+  EXPECT_THAT(session->landed(),
+              ::testing::UnorderedElementsAre(
+                  ::testing::FieldsAre(0, ElementsAre(0), ElementsAre(0)),
+                  ::testing::FieldsAre(0, ElementsAre(1), ElementsAre(0)),
+                  ::testing::FieldsAre(0, ElementsAre(2), ElementsAre(0))));
+}
+
+TEST_P(BlockTransportTest, DeclaredSenderMayPushItsArrayInBlockGroups) {
+  constexpr uint64_t kUuid = 911;
+  constexpr size_t kSliceSize = 32;
+  NodeDelegate sender_a(/*node_id=*/0, kSliceSize, /*max_blocks=*/2,
+                        /*num_layers=*/1);
+  NodeDelegate sender_b(/*node_id=*/1, kSliceSize, /*max_blocks=*/2,
+                        /*num_layers=*/1);
+  MultiSenderReceiverDelegate receiver(kSliceSize, /*max_blocks=*/2,
+                                       /*num_layers=*/1);
+  receiver.ExpectSenders(kUuid, /*senders=*/2);
+
+  BlockTransport a_transport(&sender_a, 0);
+  BlockTransport b_transport(&sender_b, 0);
+  BlockTransport receiver_transport(&receiver, 0);
+  const std::string peer =
+      absl::StrCat("localhost:", receiver_transport.local_port());
+  auto ch_recv = StartControlServer(&receiver_transport);
+  sender_a.SetPeerChannel(peer, ch_recv);
+  sender_b.SetPeerChannel(peer, ch_recv);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  // Sender A pushes its two blocks as two groups of one stream each.
+  auto push_a_group = [&](int block) {
+    return a_transport
+        .AsyncPush({peer}, /*src_block_ids=*/{block},
+                   /*dst_block_ids=*/{block}, /*parallelism=*/1,
+                   MajorOrder::kLayerMajor, kUuid, /*layer_idx=*/0,
+                   /*wire_layer_idx=*/std::nullopt, /*layer_streams=*/2)
+        .Await();
+  };
+
+  ASSERT_TRUE(push_a_group(0).ok());
+  ASSERT_TRUE(push_a_group(1).ok());
+  EXPECT_EQ(receiver.layer_completion_count(), 0);
+  ASSERT_TRUE(b_transport
+                  .AsyncPush({peer}, /*src_block_ids=*/{0, 1},
+                             /*dst_block_ids=*/{0, 1}, /*parallelism=*/1,
+                             MajorOrder::kLayerMajor, kUuid, /*layer_idx=*/0)
+                  .Await()
+                  .ok());
+  EXPECT_EQ(receiver.layer_completion_count(), 1);
+}
+
+TEST_P(BlockTransportTest, PushDeclaringFewerStreamsThanItOpensIsRejected) {
+  constexpr size_t kSliceSize = 32;
+  MockDelegate sender(kSliceSize, /*max_blocks=*/2);
+  MockDelegate receiver(kSliceSize, /*max_blocks=*/2);
+  BlockTransport sender_transport(&sender, 0);
+  BlockTransport receiver_transport(&receiver, 0);
+
+  EXPECT_THAT(sender_transport
+                  .AsyncPush({absl::StrCat("localhost:",
+                                           receiver_transport.local_port())},
+                             /*src_block_ids=*/{0, 1},
+                             /*dst_block_ids=*/{0, 1}, /*parallelism=*/2,
+                             MajorOrder::kLayerMajor, /*uuid=*/912,
+                             /*layer_idx=*/0, /*wire_layer_idx=*/std::nullopt,
+                             /*layer_streams=*/1)
+                  .Await(),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_EQ(receiver.layer_completion_count(), 0);
+}
+
+// Block groups are a header-declared contract. A plan-declared pool counts
+// each stream as one of the pushes its plan expects, whatever the header
+// declares, so a pool pushed in groups over-delivers.
+TEST_P(BlockTransportTest, PlanDeclaredPoolRejectsBlockGroupPushes) {
+  constexpr uint64_t kUuid = 913;
+  MockDelegate sender(/*slice_size=*/32, /*max_blocks=*/2, /*num_layers=*/2);
+  MockDelegate receiver(/*slice_size=*/32, /*max_blocks=*/2,
+                        /*num_layers=*/2);
+  receiver.SetPoolPushProgress(kUuid, /*expected_pushes_per_pool=*/1,
+                               /*transfer_pool_indices=*/{0, 1});
+  std::atomic<int> pool_completions = 0;
+  auto session = std::make_shared<LandedBlocksRecordingSession>(
+      [&pool_completions]() { ++pool_completions; });
+  receiver.RegisterSession(kUuid, session);
+  BlockTransport sender_transport(&sender, 0);
+  BlockTransport receiver_transport(&receiver, 0);
+  BindControlChannels(&sender_transport, &sender, &receiver_transport,
+                      &receiver);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  auto push_group = [&](int block) {
+    return sender_transport
+        .AsyncPush(
+            {absl::StrCat("localhost:", receiver_transport.local_port())},
+            /*src_block_ids=*/{block}, /*dst_block_ids=*/{block},
+            /*parallelism=*/1, MajorOrder::kLayerMajor, kUuid,
+            /*layer_idx=*/0, /*wire_layer_idx=*/std::nullopt,
+            /*layer_streams=*/2)
+        .Await();
+  };
+
+  ASSERT_TRUE(push_group(0).ok());
+  EXPECT_EQ(pool_completions.load(), 1);
+  EXPECT_FALSE(push_group(1).ok());
+  EXPECT_EQ(pool_completions.load(), 1);
+  EXPECT_THAT(session->landed(), ::testing::IsEmpty());
 }
 
 TEST_P(BlockTransportTest, UndeclaredUuidKeepsHeaderDeclaredCompletion) {
@@ -2457,6 +2623,26 @@ TEST(TransportBackendTest, PeregrineReceiverAllocatedPushIsUnimplemented) {
                   .AsyncPush({PeerEndpoint{"127.0.0.1:1", "127.0.0.1:2"}},
                              /*src_block_ids=*/{0},
                              /*dst_block_ids=*/{})
+                  .Await(),
+              StatusIs(absl::StatusCode::kUnimplemented));
+}
+
+TEST(TransportBackendTest, PeregrineBlockGroupPushIsUnimplemented) {
+  // A Peregrine receiver completes a block array on one Post per sender, so
+  // the sender rejects a block-group push before contacting the peer.
+  auto cleanup =
+      absl::MakeCleanup([] { unsetenv("TPU_RAIDEN_ENABLE_PEREGRINE"); });
+  setenv("TPU_RAIDEN_ENABLE_PEREGRINE", "6", 1);
+  MockDelegate delegate(/*slice_size=*/64);
+  BlockTransport sender(&delegate, 0);
+
+  EXPECT_THAT(sender
+                  .AsyncPush({PeerEndpoint{"127.0.0.1:1", "127.0.0.1:2"}},
+                             /*src_block_ids=*/{0}, /*dst_block_ids=*/{0},
+                             /*parallelism=*/1, MajorOrder::kLayerMajor,
+                             /*uuid=*/1, /*layer_idx=*/0,
+                             /*wire_layer_idx=*/std::nullopt,
+                             /*layer_streams=*/2)
                   .Await(),
               StatusIs(absl::StatusCode::kUnimplemented));
 }

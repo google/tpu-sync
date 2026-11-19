@@ -41,6 +41,7 @@
 #include "absl/log/check.h"
 #include "absl/log/scoped_mock_log.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/numbers.h"
@@ -297,6 +298,7 @@ class TestManager : private TestManagerH2hState,
         const std::vector<transport::PeerEndpoint>& peers,
         const std::vector<int>& src_block_ids,
         const std::vector<int>& dst_block_ids, uint64_t uuid, int layer_idx,
+        std::optional<size_t> layer_streams,
         std::function<void(absl::StatusOr<std::vector<int>>)> on_complete)
         override {
       {
@@ -322,7 +324,7 @@ class TestManager : private TestManagerH2hState,
         }
       }
       kv_cache::KVCacheManagerBase::H2hWriteDirectAsync(
-          peers, src_block_ids, dst_block_ids, uuid, layer_idx,
+          peers, src_block_ids, dst_block_ids, uuid, layer_idx, layer_streams,
           std::move(on_complete));
     }
 
@@ -385,6 +387,74 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
     std::vector<int> all_shards(base()->num_shards());
     std::iota(all_shards.begin(), all_shards.end(), 0);
     return base()->OnBlockShardsReceived(blocks, all_shards, uuid);
+  }
+
+  // Seats a pulled receive of |remote_blocks| into device blocks
+  // |device_blocks| through host blocks |host_blocks|, as StartRead does,
+  // with its pull already accepted.
+  void AddLoadRecv(const std::string& req_id, uint64_t uuid,
+                   const std::vector<int64_t>& remote_blocks,
+                   const std::vector<int64_t>& device_blocks,
+                   const std::vector<int64_t>& host_blocks) {
+    std::shared_ptr<TransferReceiveSession> session =
+        *TransferReceiveSession::Create(
+            base(), this, staging_allocator_.get(), uuid,
+            /*remote_endpoint=*/"unused:1", remote_blocks, device_blocks,
+            host_blocks, DeadlineFromNow());
+    session->EndOp();  // the pull handshake, accepted
+    absl::MutexLock lock(mu_);
+    sessions_[uuid] = SessionEntry{session, req_id, SessionRole::kTransfer};
+  }
+
+  // One push stream landed |host_blocks| of |layer| on every shard, as
+  // BlockTransportServerPushSession::StartStream reports it before the stream
+  // counts toward the layer.
+  absl::Status LandBlocks(size_t layer, const std::vector<int>& host_blocks,
+                          uint64_t uuid) {
+    std::vector<int> all_shards(base()->num_shards());
+    std::iota(all_shards.begin(), all_shards.end(), 0);
+    ABSL_ASSIGN_OR_RETURN(std::shared_ptr<TransferSession> session,
+                          GetSession(uuid));
+    return session->OnBlocksLanded(layer, host_blocks, all_shards);
+  }
+
+  // Takes the op an incoming push stream holds while it lands and reports;
+  // the caller ends it with EndOp().
+  absl::StatusOr<std::shared_ptr<TransferSession>> BeginStream(uint64_t uuid) {
+    ABSL_ASSIGN_OR_RETURN(std::shared_ptr<TransferSession> session,
+                          GetSession(uuid));
+    if (!session->TryBeginOp()) {
+      return absl::CancelledError("receive is not accepting pushes");
+    }
+    return session;
+  }
+
+  // One push stream of |layer| carrying |host_blocks| on every shard,
+  // reported in StartStream's order under the stream's op: the landed
+  // blocks, then for the layer's |last| stream the layer, then the block
+  // report.
+  absl::Status LandStream(size_t layer, const std::vector<int>& host_blocks,
+                          uint64_t uuid, bool last = false) {
+    ABSL_ASSIGN_OR_RETURN(std::shared_ptr<TransferSession> stream,
+                          BeginStream(uuid));
+    absl::Cleanup end_stream = [&stream]() { stream->EndOp(); };
+    ABSL_RETURN_IF_ERROR(LandBlocks(layer, host_blocks, uuid));
+    if (last) {
+      ABSL_RETURN_IF_ERROR(ReceiveLayer(layer, uuid));
+    }
+    return ReceiveBlocks(host_blocks, uuid);
+  }
+
+  // One H2D copy issued: host block offsets, device block offsets and sizes.
+  struct H2dCopy {
+    std::vector<int64_t> src_offsets;
+    std::vector<int64_t> dst_offsets;
+    std::vector<int64_t> sizes;
+  };
+
+  std::vector<H2dCopy> copy_specs() {
+    absl::MutexLock lock(copies_mu_);
+    return copy_specs_;
   }
 
   void FinishCopy(size_t index, absl::Status status) {
@@ -466,6 +536,8 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
       owner_->copy_sources_.push_back(
           host_layer_idx.has_value() ? static_cast<int64_t>(*host_layer_idx)
                                      : -1);
+      owner_->copy_specs_.push_back(
+          {src_offsets_major_dim, dst_offsets_major_dim, copy_sizes_major_dim});
       return raiden::PjRtCopyFuture(std::move(future), raiden::BufferHolders{});
     }
 
@@ -476,6 +548,7 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
   absl::Mutex copies_mu_;
   std::vector<xla::Promise<>> copies_;
   std::vector<int64_t> copy_sources_;
+  std::vector<H2dCopy> copy_specs_;
   std::atomic<bool> block_dispatch_{false};
   absl::Notification dispatch_entered_;
   absl::Notification release_dispatch_;
@@ -875,6 +948,136 @@ TEST(RecvLifecycleTest, EmptyBlockReportIssuesNoH2d) {
   Reports after = consumer.CompleteReadRaw();
   EXPECT_THAT(DoneReceiving(after), Contains("req"));
   EXPECT_FALSE(consumer.has_recv(24));
+}
+
+// With push groups, a receive copies a layer's landed blocks to the device
+// once a group's worth waits, and the rest when the layer's last stream lands;
+// the receive completes when every copy has, in whatever order they finish.
+TEST(RecvLifecycleTest, PushGroupsCopyLandedBlocksBeforeTheirLayerLands) {
+  RecvTestManager consumer(/*num_layers=*/1);
+  consumer.base()->SetPushGroups(
+      /*group_bytes=*/2 * consumer.base()->block_bytes(0), /*window=*/0);
+  consumer.AddLoadRecv("req", /*uuid=*/40, /*remote_blocks=*/{0, 1, 2, 3, 4},
+                       /*device_blocks=*/{20, 21, 22, 23, 24},
+                       /*host_blocks=*/{3, 4, 5, 6, 7});
+
+  ABSL_ASSERT_OK(consumer.LandStream(0, {3}, /*uuid=*/40));
+  EXPECT_EQ(consumer.copies_issued(), 0);
+  ABSL_ASSERT_OK(consumer.LandStream(0, {4}, /*uuid=*/40));
+  ABSL_ASSERT_OK(consumer.LandStream(0, {5, 6}, /*uuid=*/40));
+  ASSERT_EQ(consumer.copies_issued(), 2);
+  ABSL_ASSERT_OK(consumer.LandStream(0, {7}, /*uuid=*/40, /*last=*/true));
+
+  // Host blocks [3, 5) to device [20, 22), [5, 7) to [22, 24), then 7 to 24.
+  const std::vector<RecvTestManager::H2dCopy> copies = consumer.copy_specs();
+  ASSERT_EQ(copies.size(), 3);
+  EXPECT_THAT(copies[0].src_offsets, ElementsAre(3));
+  EXPECT_THAT(copies[0].dst_offsets, ElementsAre(20));
+  EXPECT_THAT(copies[0].sizes, ElementsAre(2));
+  EXPECT_THAT(copies[1].src_offsets, ElementsAre(5));
+  EXPECT_THAT(copies[1].dst_offsets, ElementsAre(22));
+  EXPECT_THAT(copies[1].sizes, ElementsAre(2));
+  EXPECT_THAT(copies[2].src_offsets, ElementsAre(7));
+  EXPECT_THAT(copies[2].dst_offsets, ElementsAre(24));
+  EXPECT_THAT(copies[2].sizes, ElementsAre(1));
+
+  consumer.FinishCopy(2, absl::OkStatus());
+  consumer.FinishCopy(0, absl::OkStatus());
+  EXPECT_THAT(DoneReceiving(consumer.CompleteReadRaw()), IsEmpty());
+  EXPECT_TRUE(consumer.has_recv(40));
+  consumer.FinishCopy(1, absl::OkStatus());
+  Reports after = consumer.CompleteReadRaw();
+  EXPECT_THAT(DoneReceiving(after), Contains("req"));
+  EXPECT_THAT(FailedRecving(after), IsEmpty());
+  EXPECT_FALSE(consumer.has_recv(40));
+}
+
+// When the group copies took every block of a layer and finished before its
+// last stream counted, that stream's layer report completes the receive.
+TEST(RecvLifecycleTest, PushGroupsCompleteALayerWhoseCopiesAlreadyFinished) {
+  RecvTestManager consumer(/*num_layers=*/1);
+  consumer.base()->SetPushGroups(
+      /*group_bytes=*/consumer.base()->block_bytes(0), /*window=*/0);
+  consumer.AddLoadRecv("req", /*uuid=*/41, /*remote_blocks=*/{0, 1},
+                       /*device_blocks=*/{10, 11}, /*host_blocks=*/{0, 1});
+
+  ABSL_ASSERT_OK(consumer.LandStream(0, {0}, /*uuid=*/41));
+  absl::StatusOr<std::shared_ptr<TransferSession>> last_stream =
+      consumer.BeginStream(/*uuid=*/41);
+  ABSL_ASSERT_OK(last_stream);
+  ABSL_ASSERT_OK(consumer.LandBlocks(0, {1}, /*uuid=*/41));
+  ASSERT_EQ(consumer.copies_issued(), 2);
+  consumer.FinishCopy(0, absl::OkStatus());
+  consumer.FinishCopy(1, absl::OkStatus());
+  EXPECT_TRUE(consumer.has_recv(41));
+
+  // The last stream counts toward the layer: nothing is left to copy.
+  ABSL_ASSERT_OK(consumer.ReceiveLayer(0, /*uuid=*/41));
+  ABSL_ASSERT_OK(consumer.ReceiveBlocks({1}, /*uuid=*/41));
+  (*last_stream)->EndOp();
+  EXPECT_EQ(consumer.copies_issued(), 2);
+  EXPECT_THAT(DoneReceiving(consumer.CompleteReadRaw()), Contains("req"));
+  EXPECT_FALSE(consumer.has_recv(41));
+}
+
+// Without push groups a landed stream copies nothing: the layer is copied
+// whole when its last stream lands.
+TEST(RecvLifecycleTest, WithoutPushGroupsALayerIsCopiedWhenItLands) {
+  RecvTestManager consumer(/*num_layers=*/1);
+  consumer.AddLoadRecv("req", /*uuid=*/42, /*remote_blocks=*/{0, 1, 2},
+                       /*device_blocks=*/{10, 11, 12},
+                       /*host_blocks=*/{0, 1, 2});
+
+  ABSL_ASSERT_OK(consumer.LandStream(0, {0, 1}, /*uuid=*/42));
+  EXPECT_EQ(consumer.copies_issued(), 0);
+  ABSL_ASSERT_OK(consumer.LandStream(0, {2}, /*uuid=*/42, /*last=*/true));
+  const std::vector<RecvTestManager::H2dCopy> copies = consumer.copy_specs();
+  ASSERT_EQ(copies.size(), 1);
+  EXPECT_THAT(copies[0].sizes, ElementsAre(3));
+  consumer.FinishCopy(0, absl::OkStatus());
+  EXPECT_THAT(DoneReceiving(consumer.CompleteReadRaw()), Contains("req"));
+}
+
+// Under bounded host layer staging a layer has no buffer of its own to copy
+// from early, so push groups leave each layer to be copied whole.
+TEST(RecvLifecycleTest, PushGroupsCopyWholeLayersUnderBoundedHostStaging) {
+  RecvTestManager consumer(/*num_layers=*/2, /*timeout_s=*/5.0,
+                           /*num_staging_layers=*/1);
+  consumer.base()->SetPushGroups(
+      /*group_bytes=*/consumer.base()->block_bytes(0), /*window=*/0);
+  consumer.AddLoadRecv("req", /*uuid=*/44, /*remote_blocks=*/{0, 1},
+                       /*device_blocks=*/{10, 11}, /*host_blocks=*/{0, 1});
+
+  for (size_t layer = 0; layer < 2; ++layer) {
+    ABSL_ASSERT_OK(consumer.LandStream(layer, {0}, /*uuid=*/44));
+    EXPECT_EQ(consumer.copies_issued(), layer);
+    ABSL_ASSERT_OK(consumer.LandStream(layer, {1}, /*uuid=*/44,
+                                       /*last=*/true));
+    ASSERT_EQ(consumer.copies_issued(), layer + 1);
+    EXPECT_THAT(consumer.copy_specs()[layer].sizes, ElementsAre(2));
+    consumer.FinishCopy(layer, absl::OkStatus());
+  }
+  EXPECT_THAT(DoneReceiving(consumer.CompleteReadRaw()), Contains("req"));
+}
+
+// A failed group copy fails the receive, which then waits for the copies
+// still running before it reports.
+TEST(RecvLifecycleTest, FailedPushGroupCopyFailsTheReceiveAfterTheOthersEnd) {
+  RecvTestManager consumer(/*num_layers=*/1);
+  consumer.base()->SetPushGroups(
+      /*group_bytes=*/consumer.base()->block_bytes(0), /*window=*/0);
+  consumer.AddLoadRecv("req", /*uuid=*/43, /*remote_blocks=*/{0, 1},
+                       /*device_blocks=*/{10, 11}, /*host_blocks=*/{0, 1});
+
+  ABSL_ASSERT_OK(consumer.LandStream(0, {0}, /*uuid=*/43));
+  ABSL_ASSERT_OK(consumer.LandStream(0, {1}, /*uuid=*/43));
+  ASSERT_EQ(consumer.copies_issued(), 2);
+  consumer.FinishCopy(0, absl::InternalError("DMA failed"));
+  EXPECT_THAT(FailedRecving(consumer.CompleteReadRaw()), IsEmpty());
+  consumer.FinishCopy(1, absl::OkStatus());
+  Reports after = consumer.CompleteReadRaw();
+  EXPECT_THAT(FailedRecving(after), Contains("req"));
+  EXPECT_THAT(DoneReceiving(after), IsEmpty());
 }
 
 TEST(RecvLifecycleTest, DetailsReportWhenTheLastH2dLanded) {

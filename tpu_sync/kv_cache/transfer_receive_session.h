@@ -151,6 +151,16 @@ class TransferReceiveSession
                               absl::Span<const int> minor_dimension_indices,
                               absl::Span<const int> shard_ids) override;
 
+  // With push groups (KVCacheManagerBase::SetPushGroups), records that a
+  // stream landed |minor_dimension_indices| of layer |major_dimension_idx|
+  // and, once the layer's landed blocks that no copy has taken reach the
+  // group size, issues their H2D copy ahead of the layer's last stream. A
+  // stream that carries only some shards leaves its blocks to the layer's
+  // final copy (see ExecuteLayerH2d()).
+  absl::Status OnBlocksLanded(size_t major_dimension_idx,
+                              absl::Span<const int> minor_dimension_indices,
+                              absl::Span<const int> shard_ids) override;
+
   // A receive session stages no outgoing data, so the future is already OK.
   tsl::Future<> GetDataReadyFuture(size_t major_dimension_idx) override {
     return tsl::Future<>(absl::OkStatus());
@@ -188,12 +198,39 @@ class TransferReceiveSession
                                  absl::Span<const int> shard_ids);
 
   // Issues H2D copy for |layer_idx| using |base_| and registers the completion
-  // callback. When fewer host layer buffers exist than layers, the copy reads
-  // the host layer buffer leased to |layer_idx| and the callback releases the
+  // callback: of the whole layer, or with push groups of the blocks no group
+  // copy took. The layer completes once all its copies have finished. When
+  // fewer host layer buffers exist than layers, the copy reads the host layer
+  // buffer leased to |layer_idx| and the layer's completion releases the
   // lease. Once copies have been issued for every distinct layer, marks the
   // network phase complete and records last-packet timing, unless a block
   // report already did or the receive is draining.
   absl::Status ExecuteLayerH2d(size_t layer_idx);
+
+  // Builds the H2D copy of |host_blocks| to the device blocks the load plan
+  // maps them to, coalesced in device block order.
+  CopySpec BuildGroupCopySpecLocked(const std::vector<int64_t>& host_blocks)
+      const ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  // Issues one H2D copy into |layer_idx| that the caller has counted in
+  // |in_flight_| and in the layer's outstanding copies.
+  absl::Status DispatchLayerH2d(size_t layer_idx, size_t host_layer_idx,
+                                const CopySpec& copy_spec);
+  // Settles one H2D copy of |layer_idx|: the layer completes when its last
+  // stream has landed and no other copy of it is outstanding.
+  void OnLayerH2dDone(size_t layer_idx, absl::Status status);
+  // Counts one more completed layer and finishes the receive on the last.
+  // Returns true, with the receive's start time in |session_start_time|, if
+  // that finished it.
+  bool CompleteLayerLocked(
+      std::chrono::steady_clock::time_point* session_start_time)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  // Records that every copy of |layer_idx| has been issued, and completes the
+  // network phase once that holds for every layer.
+  void RecordLayerDispatchedLocked(size_t layer_idx)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  // End-of-transfer telemetry for a receive whose last H2D copy finished.
+  void RecordAllLayersCopied(
+      std::chrono::steady_clock::time_point session_start_time);
 
   // Returns the host layer buffer leased to |layer_idx|, leasing one when it
   // has none and blocking while every buffer is in use. A timeout fails the
@@ -218,6 +255,7 @@ class TransferReceiveSession
         transfer_plan_(std::move(plan)),
         destination_(destination),
         blocks_received_per_shard_(base != nullptr ? base->num_shards() : 0, 0),
+        layer_h2d_(base != nullptr ? base->num_layers() : 0),
         staging_layer_manager_(base != nullptr && base->num_host_layers() <
                                                       base->num_layers()
                                    ? base->num_host_layers()
@@ -234,6 +272,7 @@ class TransferReceiveSession
         metrics_collector_(std::move(metrics_collector)),
         total_blocks_(total_blocks),
         blocks_received_per_shard_(base != nullptr ? base->num_shards() : 0, 0),
+        layer_h2d_(base != nullptr ? base->num_layers() : 0),
         deadline_(deadline),
         start_time_(std::chrono::steady_clock::now()),
         staging_layer_manager_(base != nullptr && base->num_host_layers() <
@@ -333,9 +372,30 @@ class TransferReceiveSession
   // admits, or by the first RecordBlockShards() report if no push came first.
   bool any_blocks_received_ ABSL_GUARDED_BY(mu_) = false;
   int32_t num_completed_layers_ ABSL_GUARDED_BY(mu_) = 0;
-  // Distinct layers whose H2D copy has been issued; the network phase is
-  // complete once it holds every layer.
+  // Distinct layers whose H2D copies have all been issued; the network phase
+  // is complete once it holds every layer.
   absl::flat_hash_set<size_t> dispatched_layers_ ABSL_GUARDED_BY(mu_);
+  // A layer's H2D copies: one when it lands whole, or with push groups one
+  // per group of landed blocks plus one of the rest when its last stream
+  // lands.
+  struct LayerH2d {
+    // Landed host blocks no copy has taken yet (push groups only).
+    std::vector<int64_t> pending;
+    // Host blocks in |pending| or taken by an issued copy (push groups only).
+    absl::flat_hash_set<int64_t> taken;
+    // Copies issued and not yet finished.
+    size_t outstanding = 0;
+    // The layer's last stream has landed (ExecuteLayerH2d).
+    bool landed = false;
+  };
+  std::vector<LayerH2d> layer_h2d_ ABSL_GUARDED_BY(mu_);
+  // Push groups: copy a layer's landed blocks once this many bytes of them
+  // wait; 0 copies each layer when it has landed whole. Set from the
+  // manager's push group size for a load plan on a full host mirror.
+  size_t h2d_group_bytes_ ABSL_GUARDED_BY(mu_) = 0;
+  // Push groups: the device block of each host block of the load plan.
+  absl::flat_hash_map<int64_t, int64_t> h2d_device_of_host_
+      ABSL_GUARDED_BY(mu_);
   bool network_completed_ ABSL_GUARDED_BY(mu_) = false;
   bool h2d_started_ ABSL_GUARDED_BY(mu_) = false;
   int in_flight_ ABSL_GUARDED_BY(mu_) = 0;

@@ -21,15 +21,40 @@
 
 #include "absl/base/no_destructor.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/ascii.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "tpu_sync/kv_cache/backends/backend.h"
+#include "tpu_sync/kv_cache/backends/plugin/plugin_kv_backend.h"
+#include "tpu_sync/kv_cache/backends/plugin/plugin_registry.h"
+#include "tpu_sync/kv_cache/backends/plugin/raiden_storage_plugin_abi.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
+
+namespace {
+
+KVBackendFactory::BackendCreator MakePluginWorkerCreator(
+    const RaidenStorageOutofTreePluginV1* vtable) {
+  return [vtable](const BackendConfig& config)
+             -> absl::StatusOr<std::shared_ptr<backends::KVBackend>> {
+    ABSL_RETURN_IF_ERROR(ValidateWorkerParallelism(config.parallelism));
+    BackendConfig resolved = config;
+    if (HasDeclaredAxis(config.parallelism)) {
+      ApplyParallelismToProperties(config.parallelism, &resolved);
+    }
+    resolved.SetProperty(RAIDEN_PLUGIN_PROPERTY_ROLE,
+                         RAIDEN_PLUGIN_ROLE_WORKER);
+    return backends::PluginKVBackend::Create(vtable, resolved.properties,
+                                             resolved.parallelism);
+  };
+}
+
+}  // namespace
 
 KVBackendFactory& KVBackendFactory::Instance() {
   static absl::NoDestructor<KVBackendFactory> instance;
@@ -49,15 +74,32 @@ absl::Status KVBackendFactory::RegisterBackend(absl::string_view type_name,
 }
 
 absl::StatusOr<std::shared_ptr<backends::KVBackend>>
-KVBackendFactory::CreateBackend(const BackendConfig& config) const {
+KVBackendFactory::CreateBackend(const BackendConfig& config) {
   BackendCreator creator;
   {
     absl::MutexLock lock(mutex_);
-    auto it = creators_.find(config.type);
-    if (it == creators_.end()) {
-      return absl::NotFoundError(
-          absl::StrCat("Unknown KVBackend type '", config.type,
-                       "'. Ensure it is registered in KVBackendFactory."));
+    if (auto it = creators_.find(config.type); it != creators_.end()) {
+      creator = it->second;
+    }
+  }
+  if (!creator) {
+    absl::StatusOr<const RaidenStorageOutofTreePluginV1*> vtable_or =
+        backends::PluginRegistry::Instance().LoadPlugin(
+            config.type, config.ResolveDynamicallyLoadedBackendPath());
+    if (!vtable_or.ok()) {
+      if (absl::IsNotFound(vtable_or.status())) {
+        return absl::NotFoundError(
+            absl::StrCat("Unknown KVBackend type '", config.type,
+                         "'. Ensure it is registered in KVBackendFactory."));
+      }
+      return vtable_or.status();
+    }
+    BackendCreator plugin_creator = MakePluginWorkerCreator(*vtable_or);
+    absl::MutexLock lock(mutex_);
+    auto [it, _] = creators_.try_emplace(config.type, plugin_creator);
+    const std::string canonical_type = absl::AsciiStrToLower(config.type);
+    if (canonical_type != config.type) {
+      creators_.try_emplace(canonical_type, plugin_creator);
     }
     creator = it->second;
   }

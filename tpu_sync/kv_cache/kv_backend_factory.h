@@ -50,9 +50,11 @@ class KVBackendFactory {
   absl::Status RegisterBackend(absl::string_view type_name,
                                BackendCreator creator);
 
-  // Constructs a worker KVBackend instance from `config`.
+  // Constructs a worker KVBackend instance from `config`. If `config.type` is
+  // not yet registered, attempts to load and register a storage plugin via
+  // `PluginRegistry`.
   absl::StatusOr<std::shared_ptr<backends::KVBackend>> CreateBackend(
-      const BackendConfig& config) const;
+      const BackendConfig& config);
 
   bool IsRegistered(absl::string_view type_name) const;
 

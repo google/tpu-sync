@@ -58,6 +58,7 @@
 #include "tpu_sync/core/raiden_manager_base.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/kv_cache/backends/backend.h"
+#include "tpu_sync/kv_cache/backends/plugin/mock_storage_plugin_loader.h"
 #include "tpu_sync/kv_cache/backends/storage/posix_backend.h"
 #include "tpu_sync/kv_cache/kv_backend_factory.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
@@ -2938,6 +2939,34 @@ TEST_F(RegisterKVBackendsTopologyDeathTest, DiesOnUnsupportedBackendType) {
                "received topology: pp=undeclared pcp=undeclared tp=1/r0");
 }
 
+// The worker loads the storage plugin of an unregistered backend type through
+// `KVBackendFactory::CreateBackend`.
+TEST_F(RegisterKVBackendsTopologyTest, LoadsStoragePluginOfUnregisteredType) {
+  BackendConfig cfg;
+  cfg.type = "mock_plugin";
+  cfg.dynamically_loaded_backend_path = backends::GetMockPluginSoPath();
+  cfg.parallelism.tp_rank = 0;
+  cfg.parallelism.tp_size = 1;
+  auto manager = MakeManager();
+  manager->RegisterKVBackends({cfg});
+  std::shared_ptr<backends::KVBackend> backend =
+      manager->GetKVBackend("mock_plugin");
+  ASSERT_NE(backend, nullptr);
+  EXPECT_EQ(backend->name(), "mock_plugin");
+}
+
+TEST_F(RegisterKVBackendsTopologyDeathTest, DiesWhenStoragePluginDoesNotLoad) {
+  BackendConfig cfg;
+  cfg.type = "plugin_without_library";
+  cfg.dynamically_loaded_backend_path = "/nonexistent/libmissing_plugin.so";
+  cfg.parallelism.tp_rank = 0;
+  cfg.parallelism.tp_size = 1;
+  auto manager = MakeManager();
+  EXPECT_DEATH(manager->RegisterKVBackends({cfg}),
+               "invalid plugin_without_library backend config.*Failed to "
+               "dlopen");
+}
+
 TEST_F(RegisterKVBackendsTopologyDeathTest, DiesOnPcpRankOutOfRange) {
   auto manager = MakeManager();
   BackendConfig cfg = PosixConfig(/*tp_rank=*/0, /*tp_size=*/1);
@@ -4403,6 +4432,37 @@ TEST(KVCacheManagerTest,
                        manager.GetHostBuffer(0, 0));
   EXPECT_EQ(unchanged_buf.data(), initial_ptr);
   EXPECT_EQ(manager.GetHostFd(0, 0), 60);
+}
+
+// A worker whose host memory is not shared memory registers a storage plugin.
+// The mock plugin rejects an arena without a file descriptor, so registration
+// succeeds only because `PluginKVBackend` skips buffers with `fd < 0`.
+TEST(KVCacheManagerTest, RegistersStoragePluginOnHostMemoryThatIsNotShared) {
+  HostBufferAllocator heap_allocator = [](size_t size_bytes,
+                                          const xla::PjRtDevice* /*dev*/)
+      -> absl::StatusOr<HostBufferAllocation> {
+    auto buf = std::make_shared<std::vector<uint8_t>>(size_bytes, 0);
+    HostBufferAllocation alloc;
+    alloc.ptr = buf->data();
+    alloc.size = size_bytes;
+    alloc.owner = buf;
+    return alloc;
+  };
+  AllocatorTestKVCacheManager manager(
+      /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+      /*host_blocks=*/2, heap_allocator);
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> host_buf,
+                       manager.GetHostBuffer(0, 0));
+  ASSERT_FALSE(host_buf.empty());
+  ASSERT_EQ(manager.GetHostFd(0, 0), -1);
+
+  BackendConfig cfg;
+  cfg.type = "mock_plugin";
+  cfg.dynamically_loaded_backend_path = backends::GetMockPluginSoPath();
+  cfg.parallelism.tp_rank = 0;
+  cfg.parallelism.tp_size = 1;
+  manager.RegisterKVBackends({cfg});
+  EXPECT_NE(manager.GetKVBackend("mock_plugin"), nullptr);
 }
 
 }  // namespace

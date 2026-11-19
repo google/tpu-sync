@@ -14,6 +14,7 @@
 
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -27,12 +28,18 @@
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/ascii.h"
 #include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "tpu_sync/kv_cache/backends/backend.h"
+#include "tpu_sync/kv_cache/backends/plugin/plugin_kv_backend.h"
+#include "tpu_sync/kv_cache/backends/plugin/plugin_kv_cache_store_backend.h"
+#include "tpu_sync/kv_cache/backends/plugin/plugin_registry.h"
+#include "tpu_sync/kv_cache/backends/plugin/raiden_storage_plugin_abi.h"
+#include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
@@ -81,6 +88,17 @@ bool BackendConfig::HasProperty(absl::string_view key) const {
   return properties.contains(key);
 }
 
+std::string BackendConfig::ResolveDynamicallyLoadedBackendPath() const {
+  if (!dynamically_loaded_backend_path.empty()) {
+    return dynamically_loaded_backend_path;
+  }
+  if (std::string path = GetProperty("dynamically_loaded_backend_path");
+      !path.empty()) {
+    return path;
+  }
+  return GetProperty("plugin_path");
+}
+
 void ApplyParallelismToProperties(
     const backends::ParallelismConfig& parallelism, BackendConfig* config) {
   auto apply = [config](absl::string_view key, int value) {
@@ -118,6 +136,48 @@ absl::Status ValidateWorkerAxis(absl::string_view axis, int size, int rank) {
                      "_size ", size, "; got ", rank));
   }
   return absl::OkStatus();
+}
+
+// Reads the coordinator-side options of a plugin backend from `config`.
+// `capacity_bytes` and `lookup_batch_size` follow the built-in storage
+// backends. `metadata_cache_*` properties are not read because
+// `DynamicLinkedKVCacheStoreBackend` keeps no existence cache.
+backends::DynamicLinkedKVCacheStoreBackend::Options ParsePluginStoreOptions(
+    const BackendConfig& config) {
+  backends::DynamicLinkedKVCacheStoreBackend::Options options;
+  options.capacity_bytes = static_cast<size_t>(std::max<int64_t>(
+      0, config.GetIntProperty("capacity_bytes",
+                               static_cast<int64_t>(config.capacity))));
+  options.lookup_batch_size = static_cast<size_t>(
+      std::max<int64_t>(0, config.GetIntProperty("lookup_batch_size", 0)));
+  options.dp_rank = absl::StrCat(config.raiden_id.data_replica_idx);
+  return options;
+}
+
+KVCacheStoreBackendFactory::BackendCreator MakePluginStoreCreator(
+    const RaidenStorageOutofTreePluginV1* vtable) {
+  return [vtable](const BackendConfig& config,
+                  controller::RaidenController* /*controller*/)
+             -> absl::StatusOr<std::shared_ptr<KVCacheStoreBackend>> {
+    ABSL_ASSIGN_OR_RETURN(const backends::ParallelismConfig coordinator,
+                          ResolveCoordinatorParallelism(config.parallelism));
+    ABSL_RETURN_IF_ERROR(RequireDeclaredAxis(config.parallelism, coordinator));
+    BackendConfig resolved = config;
+    ApplyParallelismToProperties(coordinator, &resolved);
+    // Pinned ranks make the coordinator instance look like the rank 0 worker,
+    // so `raiden_role` distinguishes coordinator lookup instances from workers.
+    resolved.SetProperty(RAIDEN_PLUGIN_PROPERTY_ROLE,
+                         RAIDEN_PLUGIN_ROLE_COORDINATOR);
+
+    ABSL_ASSIGN_OR_RETURN(
+        std::shared_ptr<backends::PluginKVBackend> plugin_backend,
+        backends::PluginKVBackend::Create(vtable, resolved.properties,
+                                          coordinator));
+
+    return std::make_shared<backends::DynamicLinkedKVCacheStoreBackend>(
+        std::move(plugin_backend), absl::AsciiStrToLower(config.type),
+        ParsePluginStoreOptions(resolved));
+  };
 }
 
 }  // namespace
@@ -221,16 +281,32 @@ absl::Status KVCacheStoreBackendFactory::RegisterBackend(
 
 absl::StatusOr<std::shared_ptr<KVCacheStoreBackend>>
 KVCacheStoreBackendFactory::CreateBackend(
-    const BackendConfig& config,
-    controller::RaidenController* controller) const {
+    const BackendConfig& config, controller::RaidenController* controller) {
   BackendCreator creator;
   {
     absl::MutexLock lock(mutex_);
-    auto it = creators_.find(config.type);
-    if (it == creators_.end()) {
-      return absl::NotFoundError(absl::StrCat(
-          "Unknown backend type '", config.type,
-          "'. Ensure it is registered in KVCacheStoreBackendFactory."));
+    if (auto it = creators_.find(config.type); it != creators_.end()) {
+      creator = it->second;
+    }
+  }
+  if (!creator) {
+    absl::StatusOr<const RaidenStorageOutofTreePluginV1*> vtable_or =
+        backends::PluginRegistry::Instance().LoadPlugin(
+            config.type, config.ResolveDynamicallyLoadedBackendPath());
+    if (!vtable_or.ok()) {
+      if (absl::IsNotFound(vtable_or.status())) {
+        return absl::NotFoundError(absl::StrCat(
+            "Unknown backend type '", config.type,
+            "'. Ensure it is registered in KVCacheStoreBackendFactory."));
+      }
+      return vtable_or.status();
+    }
+    BackendCreator plugin_creator = MakePluginStoreCreator(*vtable_or);
+    absl::MutexLock lock(mutex_);
+    auto [it, _] = creators_.try_emplace(config.type, plugin_creator);
+    const std::string canonical_type = absl::AsciiStrToLower(config.type);
+    if (canonical_type != config.type) {
+      creators_.try_emplace(canonical_type, plugin_creator);
     }
     creator = it->second;
   }

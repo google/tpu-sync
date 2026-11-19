@@ -73,6 +73,7 @@
 #include "tpu_sync/core/kv_manager_holder.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/kv_cache/backends/backend.h"
+#include "tpu_sync/kv_cache/backends/plugin/mock_storage_plugin_loader.h"
 #include "tpu_sync/kv_cache/block_tracker.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry.grpc.pb.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
@@ -8214,6 +8215,20 @@ class SecondaryBackendTopologyTest : public ::testing::Test {
     return cfg;
   }
 
+  // Creates a store with tier 1 built from `secondary_cfg`.
+  absl::StatusOr<std::unique_ptr<KVCacheStore>> CreateStoreWithSecondaryTier(
+      const BackendConfig& secondary_cfg) {
+    BackendConfig host_cfg;
+    host_cfg.type = "HostOffloadBackend";
+    host_cfg.capacity = 16;
+    const BackendConfig configs[] = {host_cfg, secondary_cfg};
+    return KVCacheStore::Create(absl::MakeConstSpan(configs), /*capacity=*/16,
+                                /*global_registry_address=*/"",
+                                RaidenId{"topology_job", "0", "kv", 0},
+                                /*num_shards=*/4, /*shard_size_bytes=*/512,
+                                /*store_server_ip=*/"127.0.0.1");
+  }
+
   // Creates a store with tier 1 built from `posix_cfg` and returns the
   // coordinator-side posix backend.
   absl::StatusOr<std::shared_ptr<backends::storage::PosixKVCacheStoreBackend>>
@@ -8364,6 +8379,30 @@ TEST_F(SecondaryBackendTopologyTest, RejectsRankWithoutSize) {
       ::absl_testing::StatusIs(
           absl::StatusCode::kInvalidArgument,
           ::testing::HasSubstr("pcp_rank 3 was given without pcp_size")));
+}
+
+// The store loads the storage plugin of an unregistered backend type through
+// `KVCacheStoreBackendFactory::CreateBackend`.
+TEST_F(SecondaryBackendTopologyTest, LoadsStoragePluginOfUnregisteredType) {
+  BackendConfig cfg;
+  cfg.type = "mock_plugin";
+  cfg.dynamically_loaded_backend_path = backends::GetMockPluginSoPath();
+  cfg.parallelism.tp_size = 2;
+  TF_ASSERT_OK_AND_ASSIGN(store_, CreateStoreWithSecondaryTier(cfg));
+  ASSERT_EQ(store_->backends().size(), 2);
+  EXPECT_EQ(store_->backends()[1]->name(), "mock_plugin");
+}
+
+TEST_F(SecondaryBackendTopologyTest,
+       ReturnsErrorOfStoragePluginThatDoesNotLoad) {
+  BackendConfig cfg;
+  cfg.type = "plugin_without_library";
+  cfg.dynamically_loaded_backend_path = "/nonexistent/libmissing_plugin.so";
+  cfg.parallelism.tp_size = 2;
+  EXPECT_THAT(
+      CreateStoreWithSecondaryTier(cfg),
+      ::absl_testing::StatusIs(absl::StatusCode::kFailedPrecondition,
+                               ::testing::HasSubstr("Failed to dlopen")));
 }
 
 TEST_F(SecondaryBackendTopologyTest, PinsPpRankToZero) {

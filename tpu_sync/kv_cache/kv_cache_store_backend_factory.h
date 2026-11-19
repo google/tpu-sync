@@ -88,6 +88,11 @@ struct StoreMonitorConfig {
 
 struct BackendConfig {
   std::string type;
+  // Optional filesystem path to a dynamically loaded
+  // `RaidenStorageOutofTreePluginV1` shared library (`.so`). When empty,
+  // `PluginRegistry` falls back to `RAIDEN_STORAGE_PLUGIN_PATH_<TYPE>` or
+  // `RAIDEN_STORAGE_PLUGIN_DIR`.
+  std::string dynamically_loaded_backend_path;
   size_t capacity = 0;
   std::string global_registry_address;
   // Serving topology this backend instance participates in.
@@ -110,6 +115,11 @@ struct BackendConfig {
   int64_t GetIntProperty(absl::string_view key, int64_t default_val = 0) const;
   void SetProperty(absl::string_view key, absl::string_view value);
   bool HasProperty(absl::string_view key) const;
+
+  // Returns `dynamically_loaded_backend_path` when set, or falls back to the
+  // `dynamically_loaded_backend_path` and `plugin_path` entries in
+  // `properties`.
+  std::string ResolveDynamicallyLoadedBackendPath() const;
 };
 
 // Writes the storage topology in `parallelism` into config->properties as
@@ -170,10 +180,12 @@ class KVCacheStoreBackendFactory {
   absl::Status RegisterBackend(absl::string_view type_name,
                                BackendCreator creator);
 
-  // Constructs a backend instance based on the provided configuration.
+  // Constructs a backend instance based on `config`. If `config.type` is not
+  // yet registered, attempts to load and register a storage plugin via
+  // `PluginRegistry`.
   absl::StatusOr<std::shared_ptr<KVCacheStoreBackend>> CreateBackend(
       const BackendConfig& config,
-      controller::RaidenController* controller = nullptr) const;
+      controller::RaidenController* controller = nullptr);
 
   // Returns whether a backend type is registered.
   bool IsRegistered(absl::string_view type_name) const;

@@ -16,6 +16,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <utility>
@@ -29,15 +30,21 @@
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "absl/synchronization/notification.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "xla/tsl/concurrency/future.h"
-#include "xla/tsl/platform/statusor.h"
+#include "xla/tsl/platform/statusor.h"  // IWYU pragma: keep
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/core/controller/raiden_controller.h"
 #include "tpu_sync/kv_cache/backends/backend.h"
+#include "tpu_sync/kv_cache/backends/plugin/mock_storage_plugin_loader.h"
+#include "tpu_sync/kv_cache/backends/plugin/plugin_kv_cache_store_backend.h"
+#include "tpu_sync/kv_cache/backends/plugin/plugin_registry.h"
+#include "tpu_sync/kv_cache/backends/plugin/raiden_storage_plugin_abi.h"
 #include "tpu_sync/kv_cache/block_tracker.h"
 #include "tpu_sync/kv_cache/host_offload_backend.h"
+#include "tpu_sync/kv_cache/kv_backend_factory.h"
 #include "tpu_sync/kv_cache/kv_cache_store.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
@@ -566,6 +573,193 @@ TEST(RequireDeclaredAxisTest, RejectsNoAxisAndNamesReceivedTopology) {
               ::testing::HasSubstr("no parallelism axis is declared"),
               ::testing::HasSubstr("received topology: pp=undeclared "
                                    "pcp=undeclared tp=undeclared/r2"))));
+}
+
+TEST(KVCacheStoreBackendFactoryTest,
+     LoadsDynamicPluginOnDemandAndRoundTripsShardKeyMode) {
+  const std::string so_path = backends::GetMockPluginSoPath();
+
+  BackendConfig store_cfg;
+  store_cfg.type = "mock_plugin";
+  store_cfg.dynamically_loaded_backend_path = so_path;
+  store_cfg.parallelism.tp_size = 2;
+  store_cfg.SetProperty("prefix", "gcs_test");
+  store_cfg.SetProperty("clear_store_on_create", "true");
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<KVCacheStoreBackend> store_backend,
+      KVCacheStoreBackendFactory::Instance().CreateBackend(store_cfg));
+  ASSERT_NE(store_backend, nullptr);
+  EXPECT_NE(
+      std::dynamic_pointer_cast<backends::DynamicLinkedKVCacheStoreBackend>(
+          store_backend),
+      nullptr);
+  EXPECT_EQ(store_backend->name(), "mock_plugin");
+
+  BackendConfig worker0_cfg;
+  worker0_cfg.type = "mock_plugin";
+  worker0_cfg.dynamically_loaded_backend_path = so_path;
+  worker0_cfg.parallelism.tp_size = 2;
+  worker0_cfg.parallelism.tp_rank = 0;
+  worker0_cfg.SetProperty("prefix", "gcs_test");
+
+  BackendConfig worker1_cfg = worker0_cfg;
+  worker1_cfg.parallelism.tp_rank = 1;
+
+  TF_ASSERT_OK_AND_ASSIGN(std::shared_ptr<backends::KVBackend> worker0,
+                       KVBackendFactory::Instance().CreateBackend(worker0_cfg));
+  TF_ASSERT_OK_AND_ASSIGN(std::shared_ptr<backends::KVBackend> worker1,
+                       KVBackendFactory::Instance().CreateBackend(worker1_cfg));
+
+  const std::string hash_a = "block_hash_alpha";
+  const std::string hash_b = "block_hash_beta";
+
+  TF_ASSERT_OK_AND_ASSIGN(auto initial_found,
+                       store_backend->Lookup({hash_a, hash_b}));
+  EXPECT_THAT(initial_found, ::testing::IsEmpty());
+
+  TF_ASSERT_OK_AND_ASSIGN(backends::BlockKey key_a0,
+                       worker0->mapper()->MapKey(hash_a));
+  std::string payload_0 = "rank0_kv_payload";
+  backends::HostBufferDescriptor slice0{payload_0.data(), payload_0.size(), -1,
+                                        0};
+  absl::Notification write0_done;
+  absl::Status write0_status;
+  worker0->WriteAsync(key_a0, {slice0}, payload_0.size(), [&](absl::Status s) {
+    write0_status = std::move(s);
+    write0_done.Notify();
+  });
+  write0_done.WaitForNotification();
+  ABSL_ASSERT_OK(write0_status);
+
+  TF_ASSERT_OK_AND_ASSIGN(auto partial_found,
+                       store_backend->Lookup({hash_a, hash_b}));
+  EXPECT_THAT(partial_found, ::testing::IsEmpty());
+
+  TF_ASSERT_OK_AND_ASSIGN(backends::BlockKey key_a1,
+                       worker1->mapper()->MapKey(hash_a));
+  std::string payload_1 = "rank1_kv_payload";
+  backends::HostBufferDescriptor slice1{payload_1.data(), payload_1.size(), -1,
+                                        0};
+  absl::Notification write1_done;
+  absl::Status write1_status;
+  worker1->WriteAsync(key_a1, {slice1}, payload_1.size(), [&](absl::Status s) {
+    write1_status = std::move(s);
+    write1_done.Notify();
+  });
+  write1_done.WaitForNotification();
+  ABSL_ASSERT_OK(write1_status);
+
+  TF_ASSERT_OK_AND_ASSIGN(auto full_found,
+                       store_backend->Lookup({hash_a, hash_b}));
+  ASSERT_EQ(full_found.size(), 1u);
+  EXPECT_EQ(full_found[0].first, hash_a);
+}
+
+TEST(KVCacheStoreBackendFactoryTest, BlockLevelProbeModeWhenMapKeyIsNull) {
+  const RaidenStorageOutofTreePluginV1* base_vtable =
+      backends::LoadMockPlugin();
+  ASSERT_NE(base_vtable, nullptr);
+
+  static RaidenStorageOutofTreePluginV1 k5_vtable = *base_vtable;
+  k5_vtable.type_name = "mock_k5_plugin";
+  k5_vtable.map_key = nullptr;
+  ABSL_ASSERT_OK(
+      backends::PluginRegistry::Instance().RegisterStaticPlugin(&k5_vtable));
+
+  BackendConfig store_cfg;
+  store_cfg.type = "mock_k5_plugin";
+  store_cfg.parallelism.tp_size = 4;
+  store_cfg.SetProperty("clear_store_on_create", "true");
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<KVCacheStoreBackend> store_backend,
+      KVCacheStoreBackendFactory::Instance().CreateBackend(store_cfg));
+
+  BackendConfig worker_cfg;
+  worker_cfg.type = "mock_k5_plugin";
+  worker_cfg.parallelism.tp_size = 4;
+  worker_cfg.parallelism.tp_rank = 0;
+
+  TF_ASSERT_OK_AND_ASSIGN(std::shared_ptr<backends::KVBackend> worker,
+                       KVBackendFactory::Instance().CreateBackend(worker_cfg));
+
+  const std::string k5_hash = "k5_logical_block_hash_1";
+  TF_ASSERT_OK_AND_ASSIGN(backends::BlockKey mapped,
+                       worker->mapper()->MapKey(k5_hash));
+  EXPECT_EQ(mapped.block_hash, k5_hash);
+  EXPECT_EQ(mapped.resolved_key, k5_hash);
+
+  std::string payload = "k5_block_bytes";
+  backends::HostBufferDescriptor slice{payload.data(), payload.size(), -1, 0};
+  absl::Notification write_done;
+  absl::Status write_status;
+  worker->WriteAsync(mapped, {slice}, payload.size(), [&](absl::Status s) {
+    write_status = std::move(s);
+    write_done.Notify();
+  });
+  write_done.WaitForNotification();
+  ABSL_ASSERT_OK(write_status);
+
+  TF_ASSERT_OK_AND_ASSIGN(auto found,
+                       store_backend->Lookup({k5_hash, "missing_hash"}));
+  ASSERT_EQ(found.size(), 1u);
+  EXPECT_EQ(found[0].first, k5_hash);
+}
+
+std::vector<std::string>& RecordedCoordinatorRoles() {
+  static auto* roles = new std::vector<std::string>();
+  return *roles;
+}
+
+RaidenStatusCode RecordCoordinatorRoleAndCreate(
+    const RaidenPluginConfig* config,
+    const RaidenParallelismConfig* parallelism, void** out_ctx, char* err_buf,
+    size_t err_buf_len) {
+  std::string role = "<not set>";
+  for (size_t i = 0; i < config->num_properties; ++i) {
+    if (std::strcmp(config->properties[i].key, "raiden_role") == 0) {
+      role = config->properties[i].value;
+    }
+  }
+  RecordedCoordinatorRoles().push_back(role);
+  return backends::LoadMockPlugin()->create(config, parallelism, out_ctx,
+                                            err_buf, err_buf_len);
+}
+
+TEST(KVCacheStoreBackendFactoryTest,
+     StampsCoordinatorRoleAndPropagatesDlopenError) {
+  const RaidenStorageOutofTreePluginV1* base_vtable =
+      backends::LoadMockPlugin();
+  ASSERT_NE(base_vtable, nullptr);
+
+  static RaidenStorageOutofTreePluginV1 role_vtable = *base_vtable;
+  role_vtable.type_name = "mock_coordinator_role_plugin";
+  role_vtable.create = &RecordCoordinatorRoleAndCreate;
+  ABSL_ASSERT_OK(
+      backends::PluginRegistry::Instance().RegisterStaticPlugin(&role_vtable));
+  RecordedCoordinatorRoles().clear();
+
+  BackendConfig store_cfg;
+  store_cfg.type = "mock_coordinator_role_plugin";
+  store_cfg.parallelism.tp_size = 2;
+  store_cfg.SetProperty(RAIDEN_PLUGIN_PROPERTY_ROLE, RAIDEN_PLUGIN_ROLE_WORKER);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<KVCacheStoreBackend> store_backend,
+      KVCacheStoreBackendFactory::Instance().CreateBackend(store_cfg));
+  EXPECT_NE(store_backend, nullptr);
+  EXPECT_THAT(RecordedCoordinatorRoles(),
+              ::testing::ElementsAre("coordinator"));
+
+  BackendConfig bad_path_cfg;
+  bad_path_cfg.type = "nonexistent_store_plugin";
+  bad_path_cfg.dynamically_loaded_backend_path =
+      "/nonexistent/path/libmissing_plugin.so";
+  bad_path_cfg.parallelism.tp_size = 2;
+  EXPECT_THAT(
+      KVCacheStoreBackendFactory::Instance().CreateBackend(bad_path_cfg),
+      StatusIs(absl::StatusCode::kFailedPrecondition,
+               ::testing::HasSubstr("Failed to dlopen")));
 }
 
 }  // namespace

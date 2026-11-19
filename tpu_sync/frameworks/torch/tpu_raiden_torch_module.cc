@@ -1012,6 +1012,10 @@ NB_MODULE(_tpu_raiden_torch, m) {
               &tpu_raiden::kv_cache::RaidenBlockId::device_block_id)
       .def_rw("status", &tpu_raiden::kv_cache::RaidenBlockId::status);
 
+  // Capability marker for connectors' version-skew probe: present and true
+  // iff the KV cache store composes a per-worker KVTransferSpec when its
+  // workers register different block arrays.
+  m.attr("kv_cache_store_supports_per_worker_kv_transfer_spec") = true;
   nb::class_<tpu_raiden::kv_cache::KVCacheStoreWrapper>(m, "KVCacheStore")
       .def(nb::init<size_t, std::string, tpu_raiden::kv_cache::RaidenId, int,
                     int64_t, std::string, int, int, std::string,

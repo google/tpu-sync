@@ -27,9 +27,11 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/strings/escaping.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "absl/types/span.h"
 #include "grpcpp/server_context.h"
 #include "grpcpp/support/status.h"
 #include "tpu_sync/common/raiden_id.h"
@@ -529,22 +531,94 @@ grpc::Status GlobalRegistryServiceImpl::GetPlacementTargets(
 
 namespace {
 
+// Bytes one block occupies in each of the spec's uniform block arrays.
+std::vector<int64_t> BlockBytes(const KVTransferSpec& spec) {
+  std::vector<int64_t> bytes;
+  for (const KVTransferSpec::BlockArray& array : spec.block_arrays()) {
+    bytes.push_back(array.block_bytes());
+  }
+  return bytes;
+}
+
+// Bytes one block occupies in each of one worker's block arrays.
+std::vector<int64_t> BlockBytes(const KVTransferSpec::WorkerGeometry& worker) {
+  std::vector<int64_t> bytes;
+  for (const KVTransferSpec::BlockArray& array : worker.block_arrays()) {
+    bytes.push_back(array.block_bytes());
+  }
+  return bytes;
+}
+
+// Returns an empty string when `block_bytes` describe valid block arrays,
+// else the reason they do not, naming them `what`.
+std::string BlockArraysError(absl::Span<const int64_t> block_bytes,
+                             absl::string_view what) {
+  if (block_bytes.empty()) {
+    return absl::StrCat(what, " must declare at least one block array");
+  }
+  for (size_t i = 0; i < block_bytes.size(); ++i) {
+    if (block_bytes[i] <= 0) {
+      return absl::StrCat(what, "[", i, "].block_bytes must be positive");
+    }
+  }
+  return "";
+}
+
+// Returns an empty string when the two lists match, else the first
+// difference, naming them `what`, from `incoming`'s perspective.
+std::string BlockArraysDifference(absl::Span<const int64_t> registered,
+                                  absl::Span<const int64_t> incoming,
+                                  absl::string_view what) {
+  if (incoming.size() != registered.size()) {
+    return absl::StrCat(what, " has ", incoming.size(),
+                        " entries, registered spec has ", registered.size());
+  }
+  for (size_t i = 0; i < incoming.size(); ++i) {
+    if (incoming[i] != registered[i]) {
+      return absl::StrCat(what, "[", i, "].block_bytes is ", incoming[i],
+                          ", registered spec has ", registered[i]);
+    }
+  }
+  return "";
+}
+
 // Returns an empty string when `spec` is structurally valid, else the reason
 // it is not.
 std::string SpecValidationError(const KVTransferSpec& spec) {
-  if (spec.block_arrays().empty()) {
-    return "spec must declare at least one block array";
-  }
-  for (int i = 0; i < spec.block_arrays_size(); ++i) {
-    if (spec.block_arrays(i).block_bytes() <= 0) {
-      return absl::StrCat("block_arrays[", i, "].block_bytes must be positive");
-    }
-  }
   if (spec.num_kv_shards() <= 0) {
     return "num_kv_shards must be positive";
   }
   if (spec.num_workers() <= 0) {
     return "num_workers must be positive";
+  }
+  if (spec.workers().empty()) {
+    return BlockArraysError(BlockBytes(spec), "block_arrays");
+  }
+  if (!spec.block_arrays().empty()) {
+    return "a spec with per-worker geometry must leave block_arrays empty";
+  }
+  if (spec.workers_size() != spec.num_workers()) {
+    return absl::StrCat("workers has ", spec.workers_size(), " entries for ",
+                        spec.num_workers(), " workers");
+  }
+  for (int w = 0; w < spec.workers_size(); ++w) {
+    if (spec.workers(w).node_id() != w) {
+      return absl::StrCat("workers[", w, "].node_id is ",
+                          spec.workers(w).node_id(), ", expected ", w);
+    }
+    std::string invalid =
+        BlockArraysError(BlockBytes(spec.workers(w)),
+                         absl::StrCat("workers[", w, "].block_arrays"));
+    if (!invalid.empty()) return invalid;
+  }
+  // One form per geometry, so republishing a spec always compares equal.
+  const std::vector<int64_t> first = BlockBytes(spec.workers(0));
+  const auto same_as_first = [&first](const KVTransferSpec::WorkerGeometry& w) {
+    return BlockBytes(w) == first;
+  };
+  if (std::all_of(spec.workers().begin(), spec.workers().end(),
+                  same_as_first)) {
+    return "workers all have the same block arrays; use block_arrays";
   }
   return "";
 }
@@ -553,19 +627,25 @@ std::string SpecValidationError(const KVTransferSpec& spec) {
 // description of the first difference, named from `incoming`'s perspective.
 std::string SpecDifference(const KVTransferSpec& registered,
                            const KVTransferSpec& incoming) {
-  if (incoming.block_arrays_size() != registered.block_arrays_size()) {
-    return absl::StrCat("block_arrays has ", incoming.block_arrays_size(),
-                        " entries, registered spec has ",
-                        registered.block_arrays_size());
+  if (incoming.workers().empty() != registered.workers().empty()) {
+    return absl::StrCat(
+        "spec uses the ", incoming.workers().empty() ? "uniform" : "per-worker",
+        " form, registered spec the ",
+        registered.workers().empty() ? "uniform" : "per-worker", " form");
   }
-  for (int i = 0; i < incoming.block_arrays_size(); ++i) {
-    if (incoming.block_arrays(i).block_bytes() !=
-        registered.block_arrays(i).block_bytes()) {
-      return absl::StrCat("block_arrays[", i, "].block_bytes is ",
-                          incoming.block_arrays(i).block_bytes(),
-                          ", registered spec has ",
-                          registered.block_arrays(i).block_bytes());
-    }
+  std::string diff = BlockArraysDifference(
+      BlockBytes(registered), BlockBytes(incoming), "block_arrays");
+  if (!diff.empty()) return diff;
+  if (incoming.workers_size() != registered.workers_size()) {
+    return absl::StrCat("workers has ", incoming.workers_size(),
+                        " entries, registered spec has ",
+                        registered.workers_size());
+  }
+  for (int w = 0; w < incoming.workers_size(); ++w) {
+    diff = BlockArraysDifference(BlockBytes(registered.workers(w)),
+                                 BlockBytes(incoming.workers(w)),
+                                 absl::StrCat("workers[", w, "].block_arrays"));
+    if (!diff.empty()) return diff;
   }
   if (incoming.num_kv_shards() != registered.num_kv_shards()) {
     return absl::StrCat("num_kv_shards is ", incoming.num_kv_shards(),

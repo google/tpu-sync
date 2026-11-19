@@ -17,10 +17,13 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "grpcpp/create_channel.h"
@@ -28,9 +31,13 @@
 #include "grpcpp/security/server_credentials.h"
 #include "grpcpp/server.h"
 #include "grpcpp/server_builder.h"
+#include "grpcpp/server_context.h"
+#include "grpcpp/support/status.h"
+#include "tpu_sync/kv_cache/global_registry/global_registry.grpc.pb.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry.pb.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry_server.h"
+#include "tpu_sync/kv_cache/global_registry/test_util.h"
 #include "tpu_sync/store_node/kv_transfer_spec_source.h"
 
 namespace tpu_raiden {
@@ -91,6 +98,27 @@ TEST_F(GrsKVTransferSpecSourceTest, RoundTripsPublishedSpec) {
   EXPECT_EQ(spec->num_workers, 1u);
 }
 
+TEST_F(GrsKVTransferSpecSourceTest, RoundTripsPerWorkerSpec) {
+  ::tpu_raiden::kv_cache::global_registry::KVTransferSpec proto;
+  for (int w = 0; w < 2; ++w) {
+    auto* worker = proto.add_workers();
+    worker->set_node_id(w);
+    worker->add_block_arrays()->set_block_bytes(4096);
+    if (w == 1) worker->add_block_arrays()->set_block_bytes(512);
+  }
+  proto.set_num_kv_shards(2);
+  proto.set_num_workers(2);
+  Publish(proto);
+
+  GrsKVTransferSpecSource source(address_, "prefill_pool");
+  absl::StatusOr<KVTransferSpec> spec = source.Get();
+  ABSL_ASSERT_OK(spec);
+  EXPECT_TRUE(spec->block_array_bytes.empty());
+  EXPECT_EQ(spec->worker_block_array_bytes,
+            (std::vector<std::vector<uint64_t>>{{4096}, {4096, 512}}));
+  EXPECT_EQ(spec->num_workers, 2u);
+}
+
 TEST_F(GrsKVTransferSpecSourceTest, OtherGroupsSpecIsNotFound) {
   ::tpu_raiden::kv_cache::global_registry::KVTransferSpec proto;
   proto.add_block_arrays()->set_block_bytes(4096);
@@ -109,6 +137,66 @@ TEST_F(GrsKVTransferSpecSourceTest, UnavailableWhenRegistryUnreachable) {
   server_->Shutdown();
   GrsKVTransferSpecSource source(address_, "prefill_pool");
   EXPECT_TRUE(absl::IsUnavailable(source.Get().status()));
+}
+
+// Serves one fixed spec without validating it, as a faulty registry might.
+class FixedSpecRegistry final : public ::tpu_raiden::kv_cache::global_registry::
+                                    GlobalRegistryService::Service {
+ public:
+  explicit FixedSpecRegistry(
+      ::tpu_raiden::kv_cache::global_registry::KVTransferSpec spec)
+      : spec_(std::move(spec)) {}
+
+  grpc::Status GetKVTransferSpec(
+      grpc::ServerContext* context,
+      const ::tpu_raiden::kv_cache::global_registry::GetKVTransferSpecRequest*
+          request,
+      ::tpu_raiden::kv_cache::global_registry::GetKVTransferSpecResponse*
+          response) override {
+    response->set_found(true);
+    *response->mutable_spec() = spec_;
+    return grpc::Status::OK;
+  }
+
+ private:
+  const ::tpu_raiden::kv_cache::global_registry::KVTransferSpec spec_;
+};
+
+absl::Status GetFromFixedRegistry(
+    ::tpu_raiden::kv_cache::global_registry::KVTransferSpec spec) {
+  auto registry = ::tpu_raiden::kv_cache::global_registry::
+      CreateTestGlobalRegistryServerWithService(
+          std::make_unique<FixedSpecRegistry>(std::move(spec)));
+  return GrsKVTransferSpecSource(registry->server_address, "prefill_pool")
+      .Get()
+      .status();
+}
+
+TEST(GrsKVTransferSpecSourceUnvalidatedTest, RejectsNegativeBlockBytes) {
+  // A negative size would otherwise wrap into a huge uint64_t.
+  ::tpu_raiden::kv_cache::global_registry::KVTransferSpec uniform;
+  uniform.add_block_arrays()->set_block_bytes(-4096);
+  uniform.set_num_kv_shards(1);
+  uniform.set_num_workers(1);
+  EXPECT_TRUE(absl::IsInvalidArgument(GetFromFixedRegistry(uniform)));
+
+  ::tpu_raiden::kv_cache::global_registry::KVTransferSpec per_worker;
+  per_worker.add_workers()->add_block_arrays()->set_block_bytes(-4096);
+  per_worker.set_num_kv_shards(1);
+  per_worker.set_num_workers(1);
+  EXPECT_TRUE(absl::IsInvalidArgument(GetFromFixedRegistry(per_worker)));
+}
+
+TEST(GrsKVTransferSpecSourceUnvalidatedTest, RejectsMisnumberedWorkers) {
+  ::tpu_raiden::kv_cache::global_registry::KVTransferSpec spec;
+  for (int node_id : {1, 0}) {
+    auto* worker = spec.add_workers();
+    worker->set_node_id(node_id);
+    worker->add_block_arrays()->set_block_bytes(4096 >> node_id);
+  }
+  spec.set_num_kv_shards(1);
+  spec.set_num_workers(2);
+  EXPECT_TRUE(absl::IsInvalidArgument(GetFromFixedRegistry(spec)));
 }
 
 }  // namespace

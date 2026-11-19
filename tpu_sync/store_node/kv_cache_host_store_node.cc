@@ -97,6 +97,10 @@ absl::StatusOr<KVTransferSpec> KVCacheHostStoreNode::WaitForSpec(
 absl::StatusOr<size_t> KVCacheHostStoreNode::NumBlocksForBudget(
     size_t dram_budget_bytes, const KVTransferSpec& spec) {
   ABSL_RETURN_IF_ERROR(ValidateSpec(spec));
+  if (!spec.worker_block_array_bytes.empty()) {
+    return absl::UnimplementedError(
+        "KVCacheHostStoreNode does not build per-worker block pools yet");
+  }
   size_t bytes_per_shard = 0;
   for (uint64_t array_bytes : spec.block_array_bytes) {
     bytes_per_shard += array_bytes;

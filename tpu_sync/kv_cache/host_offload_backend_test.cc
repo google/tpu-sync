@@ -625,6 +625,56 @@ TEST(HostOffloadBackendTest, CreateRegistersKVTransferSpecFromConfig) {
       HostOffloadBackend::Create(config, controller.get()).status()));
 }
 
+TEST(HostOffloadBackendTest, CreateRegistersPerWorkerKVTransferSpec) {
+  auto reg_server = global_registry::CreateTestGlobalRegistryServer();
+  RaidenId node_id{"node_job", "0", "data", 0};
+  ::tpu_sync::rpc::RaidenIdProto unit_proto;
+  unit_proto.set_job_name(node_id.job_name);
+  unit_proto.set_job_replica_id(node_id.job_replica_id);
+  unit_proto.set_data_name(node_id.data_name);
+  unit_proto.set_data_replica_idx(node_id.data_replica_idx);
+  TF_ASSERT_OK_AND_ASSIGN(auto controller, controller::RaidenController::Create(
+                                            unit_proto, /*num_blocks=*/100,
+                                            /*num_shards=*/1,
+                                            /*shard_size_bytes=*/1024));
+
+  BackendConfig config;
+  config.type = "HostOffloadBackend";
+  config.capacity = 100;
+  config.global_registry_address = reg_server->server_address;
+  config.raiden_id = node_id;
+  config.kv_transfer_spec =
+      KVTransferSpecConfig{.num_kv_shards = 1,
+                           .num_workers = 2,
+                           .worker_block_array_bytes = {{4096}, {4096, 512}}};
+  config.kv_pool_group = "node_group";
+  TF_ASSERT_OK_AND_ASSIGN(auto backend,
+                       HostOffloadBackend::Create(config, controller.get()));
+
+  TF_ASSERT_OK_AND_ASSIGN(auto spec,
+                       reg_server->client->GetKVTransferSpec("node_group"));
+  EXPECT_EQ(spec.block_arrays_size(), 0);
+  ASSERT_EQ(spec.workers_size(), 2);
+  EXPECT_EQ(spec.workers(0).node_id(), 0);
+  ASSERT_EQ(spec.workers(0).block_arrays_size(), 1);
+  EXPECT_EQ(spec.workers(0).block_arrays(0).block_bytes(), 4096);
+  EXPECT_EQ(spec.workers(1).node_id(), 1);
+  ASSERT_EQ(spec.workers(1).block_arrays_size(), 2);
+  EXPECT_EQ(spec.workers(1).block_arrays(1).block_bytes(), 512);
+
+  // A config sets exactly one of the two forms.
+  config.kv_pool_group = "other_group";
+  config.kv_transfer_spec->block_array_bytes = {4096};
+  EXPECT_THAT(HostOffloadBackend::Create(config, controller.get()).status(),
+              ::absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                       ::testing::HasSubstr("exactly one of")));
+  config.kv_transfer_spec =
+      KVTransferSpecConfig{.num_kv_shards = 1, .num_workers = 1};
+  EXPECT_THAT(HostOffloadBackend::Create(config, controller.get()).status(),
+              ::absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                       ::testing::HasSubstr("exactly one of")));
+}
+
 TEST(HostOffloadBackendTest, KVTransferSpecWithoutRegistryFailsCreation) {
   RaidenId node_id{"node_job", "0", "data", 0};
   ::tpu_sync::rpc::RaidenIdProto unit_proto;
@@ -1553,19 +1603,6 @@ TEST(HostOffloadBackendTest, LoadWithOptionsOverload) {
 }
 
 // --- Remote write backend primitives ---------------------------------------
-
-namespace {
-
-::tpu_sync::rpc::RaidenIdProto ToProto(const RaidenId& id) {
-  ::tpu_sync::rpc::RaidenIdProto proto;
-  proto.set_job_name(id.job_name);
-  proto.set_job_replica_id(id.job_replica_id);
-  proto.set_data_name(id.data_name);
-  proto.set_data_replica_idx(id.data_replica_idx);
-  return proto;
-}
-
-}  // namespace
 
 // Prefix Lookup stops at the first miss, whereas
 // LookupOptions::HostResidentSubset reports a scattered subset of host-resident

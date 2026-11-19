@@ -24,6 +24,8 @@
 
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/notification.h"
@@ -1035,6 +1037,75 @@ TEST_F(GlobalRegistryTest, RegisterKVTransferSpecRejectsInvalidSpecs) {
       client_->RegisterKVTransferSpec(zero_workers, kGroup)));
 
   // A rejected spec registered nothing.
+  EXPECT_TRUE(absl::IsNotFound(client_->GetKVTransferSpec(kGroup).status()));
+}
+
+// Two workers whose block arrays differ, e.g. pipeline stages holding
+// different layers.
+KVTransferSpec MakePerWorkerTransferSpec() {
+  KVTransferSpec spec;
+  for (int w = 0; w < 2; ++w) {
+    KVTransferSpec::WorkerGeometry* worker = spec.add_workers();
+    worker->set_node_id(w);
+    worker->add_block_arrays()->set_block_bytes(4096);
+    if (w == 1) worker->add_block_arrays()->set_block_bytes(512);
+  }
+  spec.set_num_kv_shards(2);
+  spec.set_num_workers(2);
+  return spec;
+}
+
+TEST_F(GlobalRegistryTest, PerWorkerKVTransferSpecRoundTripsAndIsCompared) {
+  ABSL_ASSERT_OK(
+      client_->RegisterKVTransferSpec(MakePerWorkerTransferSpec(), kGroup));
+  absl::StatusOr<KVTransferSpec> spec = client_->GetKVTransferSpec(kGroup);
+  ABSL_ASSERT_OK(spec);
+  ASSERT_EQ(spec->workers_size(), 2);
+  EXPECT_EQ(spec->workers(1).block_arrays(1).block_bytes(), 512);
+  ABSL_EXPECT_OK(
+      client_->RegisterKVTransferSpec(MakePerWorkerTransferSpec(), kGroup));
+
+  KVTransferSpec other = MakePerWorkerTransferSpec();
+  other.mutable_workers(1)->mutable_block_arrays(1)->set_block_bytes(1024);
+  absl::Status status = client_->RegisterKVTransferSpec(other, kGroup);
+  EXPECT_TRUE(absl::IsInvalidArgument(status)) << status.ToString();
+  EXPECT_TRUE(absl::StrContains(status.message(), "workers[1].block_arrays[1]"))
+      << status.ToString();
+
+  // The uniform form of a different geometry does not match either.
+  status = client_->RegisterKVTransferSpec(MakeTransferSpec(), kGroup);
+  EXPECT_TRUE(absl::IsInvalidArgument(status)) << status.ToString();
+  EXPECT_TRUE(absl::StrContains(status.message(), "uniform form"))
+      << status.ToString();
+}
+
+TEST_F(GlobalRegistryTest, RegisterKVTransferSpecRejectsInvalidPerWorkerSpecs) {
+  KVTransferSpec both = MakePerWorkerTransferSpec();
+  both.add_block_arrays()->set_block_bytes(4096);
+  EXPECT_TRUE(
+      absl::IsInvalidArgument(client_->RegisterKVTransferSpec(both, kGroup)));
+
+  KVTransferSpec too_few = MakePerWorkerTransferSpec();
+  too_few.mutable_workers()->RemoveLast();
+  EXPECT_TRUE(absl::IsInvalidArgument(
+      client_->RegisterKVTransferSpec(too_few, kGroup)));
+
+  KVTransferSpec out_of_order = MakePerWorkerTransferSpec();
+  out_of_order.mutable_workers(0)->set_node_id(1);
+  out_of_order.mutable_workers(1)->set_node_id(0);
+  EXPECT_TRUE(absl::IsInvalidArgument(
+      client_->RegisterKVTransferSpec(out_of_order, kGroup)));
+
+  KVTransferSpec no_arrays = MakePerWorkerTransferSpec();
+  no_arrays.mutable_workers(1)->clear_block_arrays();
+  EXPECT_TRUE(absl::IsInvalidArgument(
+      client_->RegisterKVTransferSpec(no_arrays, kGroup)));
+
+  KVTransferSpec identical = MakePerWorkerTransferSpec();
+  identical.mutable_workers(1)->mutable_block_arrays()->RemoveLast();
+  EXPECT_TRUE(absl::IsInvalidArgument(
+      client_->RegisterKVTransferSpec(identical, kGroup)));
+
   EXPECT_TRUE(absl::IsNotFound(client_->GetKVTransferSpec(kGroup).status()));
 }
 

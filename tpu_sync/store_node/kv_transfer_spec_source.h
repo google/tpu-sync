@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
@@ -32,25 +33,56 @@ namespace store_node {
 // receives them, it never derives them.
 struct KVTransferSpec {
   // Bytes one block occupies in each block array on one shard, in
-  // registration order.
+  // registration order. Empty when the workers' block arrays differ.
   std::vector<uint64_t> block_array_bytes;
   // Device shards each block array is split across.
   size_t num_kv_shards = 0;
   // Transfer workers on the serving hosts, node ids densely [0, num_workers).
   size_t num_workers = 0;
+  // Set instead of block_array_bytes when the workers' block arrays differ:
+  // entry i is the block_array_bytes of the worker with node id i.
+  std::vector<std::vector<uint64_t>> worker_block_array_bytes;
 };
 
+// The block arrays of the worker with node id `node_id`. Requires a spec that
+// passed ValidateSpec and node_id < spec.num_workers.
+inline const std::vector<uint64_t>& WorkerBlockArrayBytes(
+    const KVTransferSpec& spec, size_t node_id) {
+  if (spec.worker_block_array_bytes.empty()) return spec.block_array_bytes;
+  CHECK_LT(node_id, spec.worker_block_array_bytes.size());
+  return spec.worker_block_array_bytes[node_id];
+}
+
 // Returns InvalidArgument unless the spec describes at least one block array
-// and every quantity is positive.
+// for every worker, in exactly one of its two forms, and every quantity is
+// positive.
 inline absl::Status ValidateSpec(const KVTransferSpec& spec) {
-  if (spec.block_array_bytes.empty()) {
+  if (spec.block_array_bytes.empty() == spec.worker_block_array_bytes.empty()) {
     return absl::InvalidArgumentError(
-        "KVTransferSpec must describe at least one block array");
+        "KVTransferSpec must set exactly one of block_array_bytes and "
+        "worker_block_array_bytes");
   }
-  for (size_t i = 0; i < spec.block_array_bytes.size(); ++i) {
-    if (spec.block_array_bytes[i] == 0) {
-      return absl::InvalidArgumentError(absl::StrCat(
-          "KVTransferSpec block_array_bytes[", i, "] must be positive"));
+  if (!spec.worker_block_array_bytes.empty() &&
+      spec.worker_block_array_bytes.size() != spec.num_workers) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "KVTransferSpec has ", spec.worker_block_array_bytes.size(),
+        " worker geometries for ", spec.num_workers, " workers"));
+  }
+  const size_t geometries = spec.worker_block_array_bytes.empty()
+                                ? 1
+                                : spec.worker_block_array_bytes.size();
+  for (size_t w = 0; w < geometries; ++w) {
+    const std::vector<uint64_t>& arrays = WorkerBlockArrayBytes(spec, w);
+    if (arrays.empty()) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("KVTransferSpec worker ", w, " has no block arrays"));
+    }
+    for (size_t i = 0; i < arrays.size(); ++i) {
+      if (arrays[i] == 0) {
+        return absl::InvalidArgumentError(
+            absl::StrCat("KVTransferSpec worker ", w, " block_array_bytes[", i,
+                         "] must be positive"));
+      }
     }
   }
   if (spec.num_kv_shards == 0) {

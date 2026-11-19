@@ -26,6 +26,7 @@
 #include "absl/base/log_severity.h"
 #include "absl/log/scoped_mock_log.h"
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/time/time.h"
@@ -34,7 +35,7 @@
 #include "grpcpp/security/server_credentials.h"
 #include "grpcpp/server.h"
 #include "grpcpp/server_builder.h"
-#include "xla/tsl/platform/statusor.h"
+#include "xla/tsl/platform/statusor.h"  // IWYU pragma: keep
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry.pb.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
@@ -81,6 +82,16 @@ KVTransferSpec TestSpec() {
                         /*num_kv_shards=*/1, /*num_workers=*/1};
 }
 
+// Two workers whose block arrays differ, as pipeline stages holding different
+// layers register: worker 0 has 256 bytes, worker 1 has 256 + 128.
+KVTransferSpec PerWorkerTestSpec() {
+  KVTransferSpec spec;
+  spec.worker_block_array_bytes = {{256}, {256, 128}};
+  spec.num_kv_shards = 1;
+  spec.num_workers = 2;
+  return spec;
+}
+
 KVCacheHostStoreNode::Options FastPollOptions() {
   KVCacheHostStoreNode::Options options;
   options.spec_poll_initial = absl::Milliseconds(1);
@@ -98,6 +109,22 @@ TEST(ValidateSpecTest, RejectsEmptyOrZeroQuantities) {
       ValidateSpec(KVTransferSpec{{256, 0}, 1, 1})));
   EXPECT_TRUE(absl::IsInvalidArgument(
       ValidateSpec(KVTransferSpec{{256, 256}, 1, 0})));
+}
+
+TEST(ValidateSpecTest, ChecksPerWorkerGeometry) {
+  ABSL_EXPECT_OK(ValidateSpec(PerWorkerTestSpec()));
+  KVTransferSpec both = PerWorkerTestSpec();
+  both.block_array_bytes = {256};
+  EXPECT_TRUE(absl::IsInvalidArgument(ValidateSpec(both)));
+  KVTransferSpec too_few = PerWorkerTestSpec();
+  too_few.worker_block_array_bytes.pop_back();
+  EXPECT_TRUE(absl::IsInvalidArgument(ValidateSpec(too_few)));
+  KVTransferSpec empty_worker = PerWorkerTestSpec();
+  empty_worker.worker_block_array_bytes[1].clear();
+  EXPECT_TRUE(absl::IsInvalidArgument(ValidateSpec(empty_worker)));
+  KVTransferSpec zero_bytes = PerWorkerTestSpec();
+  zero_bytes.worker_block_array_bytes[1][1] = 0;
+  EXPECT_TRUE(absl::IsInvalidArgument(ValidateSpec(zero_bytes)));
 }
 
 TEST(WaitForSpecTest, RetriesNotFoundUntilPublished) {
@@ -163,6 +190,12 @@ TEST(NumBlocksForBudgetTest, RejectsBudgetBelowOneBlock) {
       KVCacheHostStoreNode::NumBlocksForBudget(511, TestSpec());
   EXPECT_TRUE(absl::IsInvalidArgument(blocks.status()));
   EXPECT_THAT(blocks.status().message(), HasSubstr("single block"));
+}
+
+TEST(NumBlocksForBudgetTest, RejectsPerWorkerSpecUntilSupported) {
+  EXPECT_TRUE(absl::IsUnimplemented(
+      KVCacheHostStoreNode::NumBlocksForBudget(1 << 20, PerWorkerTestSpec())
+          .status()));
 }
 
 TEST(NumBlocksForBudgetTest, ChargesEveryWorkersPool) {

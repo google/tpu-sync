@@ -17,9 +17,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
+#include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "grpcpp/create_channel.h"
 #include "grpcpp/security/credentials.h"
@@ -27,6 +30,24 @@
 #include "tpu_sync/store_node/kv_transfer_spec_source.h"
 namespace tpu_raiden {
 namespace store_node {
+namespace {
+
+using KVTransferSpecProto =
+    ::tpu_raiden::kv_cache::global_registry::KVTransferSpec;
+
+// The registry rejects non-positive block_bytes when a spec is registered;
+// check again so a bad value never wraps into a huge uint64_t.
+absl::StatusOr<uint64_t> PositiveBlockBytes(
+    const KVTransferSpecProto::BlockArray& array) {
+  if (array.block_bytes() <= 0) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("registry returned a KVTransferSpec with block_bytes ",
+                     array.block_bytes()));
+  }
+  return static_cast<uint64_t>(array.block_bytes());
+}
+
+}  // namespace
 
 GrsKVTransferSpecSource::GrsKVTransferSpecSource(
     absl::string_view global_registry_address, absl::string_view kv_pool_group)
@@ -35,14 +56,28 @@ GrsKVTransferSpecSource::GrsKVTransferSpecSource(
       kv_pool_group_(kv_pool_group) {}
 
 absl::StatusOr<KVTransferSpec> GrsKVTransferSpecSource::Get() {
-  ABSL_ASSIGN_OR_RETURN(
-      const ::tpu_raiden::kv_cache::global_registry::KVTransferSpec proto,
-      client_.GetKVTransferSpec(kv_pool_group_));
+  ABSL_ASSIGN_OR_RETURN(const KVTransferSpecProto proto,
+                        client_.GetKVTransferSpec(kv_pool_group_));
   KVTransferSpec spec;
   spec.block_array_bytes.reserve(proto.block_arrays_size());
   for (const auto& array : proto.block_arrays()) {
-    spec.block_array_bytes.push_back(
-        static_cast<uint64_t>(array.block_bytes()));
+    ABSL_ASSIGN_OR_RETURN(const uint64_t bytes, PositiveBlockBytes(array));
+    spec.block_array_bytes.push_back(bytes);
+  }
+  for (int w = 0; w < proto.workers_size(); ++w) {
+    const auto& worker = proto.workers(w);
+    if (worker.node_id() != w) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("registry returned a KVTransferSpec whose workers[", w,
+                       "] has node_id ", worker.node_id()));
+    }
+    std::vector<uint64_t>& arrays =
+        spec.worker_block_array_bytes.emplace_back();
+    arrays.reserve(worker.block_arrays_size());
+    for (const auto& array : worker.block_arrays()) {
+      ABSL_ASSIGN_OR_RETURN(const uint64_t bytes, PositiveBlockBytes(array));
+      arrays.push_back(bytes);
+    }
   }
   spec.num_kv_shards = static_cast<size_t>(proto.num_kv_shards());
   spec.num_workers = static_cast<size_t>(proto.num_workers());

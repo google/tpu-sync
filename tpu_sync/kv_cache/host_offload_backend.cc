@@ -1684,9 +1684,24 @@ absl::Status HostOffloadBackend::RegisterKVTransferSpec(
         "no KV pool group to register the KVTransferSpec under: set "
         "BackendConfig.kv_pool_group or a raiden_id with a job_name.");
   }
+  if (spec_config.block_array_bytes.empty() ==
+      spec_config.worker_block_array_bytes.empty()) {
+    return absl::InvalidArgumentError(
+        "KVTransferSpecConfig must set exactly one of block_array_bytes and "
+        "worker_block_array_bytes");
+  }
   global_registry::KVTransferSpec spec;
   for (uint64_t bytes : spec_config.block_array_bytes) {
     spec.add_block_arrays()->set_block_bytes(static_cast<int64_t>(bytes));
+  }
+  for (size_t node_id = 0;
+       node_id < spec_config.worker_block_array_bytes.size(); ++node_id) {
+    global_registry::KVTransferSpec::WorkerGeometry* worker =
+        spec.add_workers();
+    worker->set_node_id(static_cast<int64_t>(node_id));
+    for (uint64_t bytes : spec_config.worker_block_array_bytes[node_id]) {
+      worker->add_block_arrays()->set_block_bytes(static_cast<int64_t>(bytes));
+    }
   }
   spec.set_num_kv_shards(static_cast<int32_t>(spec_config.num_kv_shards));
   spec.set_num_workers(static_cast<int32_t>(spec_config.num_workers));

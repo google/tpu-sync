@@ -918,5 +918,10 @@ NB_MODULE(_tpu_raiden_jax, m) {
              return std::make_tuple(py_done, py_failed, py_pending);
            });
 
+  // Capability marker for connectors' version-skew probe: present and true
+  // iff the KV cache store composes a per-worker KVTransferSpec when its
+  // workers register different block arrays.
+  m.attr("kv_cache_store_supports_per_worker_kv_transfer_spec") = true;
+
   tpu_raiden::telemetry::BindTelemetryApi(m);
 }

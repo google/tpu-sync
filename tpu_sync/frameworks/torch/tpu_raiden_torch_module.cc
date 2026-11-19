@@ -1311,6 +1311,11 @@ NB_MODULE(_tpu_raiden_torch, m) {
           },
           nb::arg("callback").none());
 
+  // Capability marker for connectors' version-skew probe: present and true
+  // iff the KV cache store composes a per-worker KVTransferSpec when its
+  // workers register different block arrays.
+  m.attr("kv_cache_store_supports_per_worker_kv_transfer_spec") = true;
+
   // C++-owned reshard client. The facade-compatible surface is provided by
   // tpu_raiden/api/torch/reshard_client.py on top of this binding.
   nb::class_<::tpu_raiden::kv_cache::reshardpb2::ClientHandle>(m,

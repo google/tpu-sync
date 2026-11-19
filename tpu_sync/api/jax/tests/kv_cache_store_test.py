@@ -138,6 +138,11 @@ class KVCacheStoreTest(absltest.TestCase):
       sharding = self.sharding
     return jax.device_put(jnp.array(np_array), sharding).block_until_ready()
 
+  def test_supports_per_worker_kv_transfer_spec(self):
+    # Connectors probe the extension attribute behind this constant to decide
+    # whether pipeline stages may register their own block arrays.
+    self.assertTrue(kv_cache_store.SUPPORTS_PER_WORKER_KV_TRANSFER_SPEC)
+
   def test_basic_tests(self):
     print("TEST_BASIC_DEVICES:", jax.devices())
     print("TEST_BASIC_DEVICE_COUNT:", jax.device_count())

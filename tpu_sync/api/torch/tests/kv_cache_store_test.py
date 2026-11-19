@@ -90,6 +90,11 @@ def tearDownModule():
 
 class KVCacheStoreTest(absltest.TestCase):
 
+  def test_supports_per_worker_kv_transfer_spec(self):
+    # Connectors probe the extension attribute behind this constant to decide
+    # whether pipeline stages may register their own block arrays.
+    self.assertTrue(kv_cache_store.SUPPORTS_PER_WORKER_KV_TRANSFER_SPEC)
+
   def test_raiden_block_id_creation_and_equality(self):
     id_ = kv_cache_store.RaidenId("test_job", "0", "test_cache", 0)
     block_1 = kv_cache_store.RaidenBlockId(

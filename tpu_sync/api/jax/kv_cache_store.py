@@ -24,10 +24,12 @@ from tpu_sync.api import common
 BlockStatus = common.BlockStatus
 RaidenId = getattr(_impl, "RaidenId", common.RaidenId)
 
-# The store composes a per-worker KVTransferSpec when its workers register
-# different block arrays (e.g. pipeline stages). Without it, workers must
-# register identical arrays.
-SUPPORTS_PER_WORKER_KV_TRANSFER_SPEC = True
+# Mirrors the extension's capability marker, which out-of-tree connectors
+# probe directly: True when the store composes a per-worker KVTransferSpec
+# for workers that register different block arrays (e.g. pipeline stages).
+SUPPORTS_PER_WORKER_KV_TRANSFER_SPEC = bool(
+    _impl.kv_cache_store_supports_per_worker_kv_transfer_spec
+)
 
 
 class RaidenBlockId:

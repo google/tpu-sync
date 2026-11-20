@@ -641,6 +641,27 @@ void RecordStorageIoTimeMs(absl::Span<const std::string> shard_local_ranks,
                            io_time_ms);
   }
 }
+
+void RecordStorageIoError(absl::Span<const std::string> shard_local_ranks,
+                          absl::string_view direction, absl::StatusCode code) {
+  if (shard_local_ranks.empty()) {
+    return;
+  }
+  telemetry::RaidenMetricStore& store =
+      telemetry::RaidenMetricStore::GetGlobalMetricStore();
+  if (!store.HasBackends()) {
+    return;
+  }
+  const absl::string_view error_code = absl::StatusCodeToStringView(code);
+  for (absl::string_view local_rank : shard_local_ranks) {
+    const telemetry::MetricLabel labels[] = {
+        {telemetry::metric_labels::kLocalRank, local_rank},
+        {telemetry::metric_labels::kDirection, direction},
+        {telemetry::metric_labels::kErrorCode, error_code}};
+    store.IncrementCounter(telemetry::metric_names::kStorageIoErrorsTotal,
+                           labels, 1);
+  }
+}
 // Joins the given PjRtCopyFutures and records transfer latency and per-device
 // bytes transferred if telemetry is enabled.
 raiden::PjRtCopyFuture JoinAndRecordTelemetry(
@@ -3920,6 +3941,9 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hWriteToBackend(
               key, slices, total_bytes,
               [state, bytes_per_shard](absl::Status s) {
                 if (!s.ok()) {
+                  RecordStorageIoError(
+                      state->shard_local_ranks,
+                      telemetry::metric_labels::kDirectionWrite, s.code());
                   state->SetError(s);
                 } else {
                   state->completed_bytes_per_shard.fetch_add(
@@ -3999,6 +4023,9 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dReadFromBackend(
         [this, state, staging_block_idx, device_block_idx,
          bytes_per_shard](absl::Status read_status) {
           if (!read_status.ok()) {
+            RecordStorageIoError(state->shard_local_ranks,
+                                 telemetry::metric_labels::kDirectionRead,
+                                 read_status.code());
             state->SetError(read_status);
             state->MarkChunkComplete();
             return;

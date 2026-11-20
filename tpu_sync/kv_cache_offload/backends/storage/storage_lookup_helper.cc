@@ -15,9 +15,11 @@
 #include "tpu_sync/kv_cache_offload/backends/storage/storage_lookup_helper.h"
 
 #include <algorithm>
+#include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <cstdint>
 #include <future>  // NOLINT(build/c++11)
+#include <ratio>  // NOLINT(build/c++11)
 #include <string>
 #include <utility>
 #include <vector>
@@ -204,6 +206,13 @@ absl::StatusOr<BlockSliceList> StorageLookupHelper::Lookup(
       }
     }
   }
+  telemetry::RaidenMetricStore& metric_store =
+      telemetry::RaidenMetricStore::GetGlobalMetricStore();
+  const bool record_metrics = metric_store.HasBackends();
+  const bool record_probe_duration = record_metrics && !misses.empty();
+  const std::chrono::steady_clock::time_point probe_start =
+      record_probe_duration ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
   uint64_t stat_hits = 0;
   uint64_t stat_misses = 0;
   std::vector<const BlockKey*> confirmed;
@@ -236,11 +245,20 @@ absl::StatusOr<BlockSliceList> StorageLookupHelper::Lookup(
       break;  // Early exit; see Phase 2 above.
     }
   }
+  if (record_probe_duration) {
+    const double probe_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - probe_start)
+            .count();
+    const telemetry::MetricLabel labels[] = {
+        {telemetry::metric_labels::kDpRank, dp_rank_},
+    };
+    metric_store.ObserveHistogram(
+        telemetry::metric_names::kStorageLookupDurationMs, labels, probe_ms);
+  }
   cache_insert(confirmed);
 
-  telemetry::RaidenMetricStore& metric_store =
-      telemetry::RaidenMetricStore::GetGlobalMetricStore();
-  if (metric_store.HasBackends()) {
+  if (record_metrics) {
     auto record = [&](absl::string_view result, uint64_t count) {
       if (count == 0) return;
       const telemetry::MetricLabel labels[] = {

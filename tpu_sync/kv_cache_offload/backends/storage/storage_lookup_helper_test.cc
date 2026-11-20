@@ -463,6 +463,12 @@ auto MetadataCheckLabels(absl::string_view dp_rank, absl::string_view result) {
                          std::string(result)));
 }
 
+auto LookupDurationLabels(absl::string_view dp_rank) {
+  return testing::ElementsAre(
+      testing::FieldsAre(telemetry::metric_labels::kDpRank,
+                         std::string(dp_rank)));
+}
+
 // Expects `times` increments by 1 of the counter with the given result label.
 void ExpectMetadataCheck(telemetry::MockMetricsBackend& backend,
                          absl::string_view result, int times) {
@@ -487,6 +493,11 @@ TEST(StorageLookupHelperTest, CountsCacheHitsStatHitsAndStatMisses) {
                       1);
   ExpectMetadataCheck(*mock_backend, telemetry::metric_labels::kResultStatMiss,
                       1);
+  EXPECT_CALL(*mock_backend,
+              ObserveHistogram(
+                  telemetry::metric_names::kStorageLookupDurationMs,
+                  LookupDurationLabels("7"), testing::Ge(0.0)))
+      .Times(1);
   telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
 
   // "a" is cached, "b" is on storage, "c" is absent.
@@ -508,11 +519,39 @@ TEST(StorageLookupHelperTest, CountsNoCacheHitWithoutACache) {
                       1);
   ExpectMetadataCheck(*mock_backend, telemetry::metric_labels::kResultStatMiss,
                       1);
+  EXPECT_CALL(*mock_backend,
+              ObserveHistogram(
+                  telemetry::metric_names::kStorageLookupDurationMs,
+                  LookupDurationLabels("7"), testing::Ge(0.0)))
+      .Times(1);
   telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
 
   // "a" was found before, but it is probed again. "c" is absent.
   EXPECT_THAT(FakeStorage::Hashes(storage.Lookup({"a", "c"}, SubsetOptions())),
               ElementsAre("a"));
+}
+
+TEST(StorageLookupHelperTest,
+     SkipsLookupDurationHistogramWhenAllKeysHitMetadataCache) {
+  FakeStorage storage({.tp_size = 1});
+  storage.StoreBlock("a");
+  ASSERT_THAT(
+      FakeStorage::Hashes(storage.LookupWithCache({"a"}, PrefixOptions())),
+      ElementsAre("a"));
+
+  auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+  ExpectMetadataCheck(*mock_backend, telemetry::metric_labels::kResultCacheHit,
+                      1);
+  EXPECT_CALL(*mock_backend,
+              ObserveHistogram(
+                  telemetry::metric_names::kStorageLookupDurationMs,
+                  testing::_, testing::_))
+      .Times(0);
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+  EXPECT_THAT(
+      FakeStorage::Hashes(storage.LookupWithCache({"a"}, PrefixOptions())),
+      ElementsAre("a"));
 }
 
 }  // namespace

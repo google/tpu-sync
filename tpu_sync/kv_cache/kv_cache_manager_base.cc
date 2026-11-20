@@ -641,6 +641,27 @@ void RecordStorageIoTimeMs(absl::Span<const std::string> shard_local_ranks,
                            io_time_ms);
   }
 }
+
+void RecordStorageIoError(absl::Span<const std::string> shard_local_ranks,
+                          absl::string_view direction, absl::StatusCode code) {
+  if (shard_local_ranks.empty()) {
+    return;
+  }
+  telemetry::RaidenMetricStore& store =
+      telemetry::RaidenMetricStore::GetGlobalMetricStore();
+  if (!store.HasBackends()) {
+    return;
+  }
+  const absl::string_view error_code = absl::StatusCodeToStringView(code);
+  for (absl::string_view local_rank : shard_local_ranks) {
+    const telemetry::MetricLabel labels[] = {
+        {telemetry::metric_labels::kLocalRank, local_rank},
+        {telemetry::metric_labels::kDirection, direction},
+        {telemetry::metric_labels::kErrorCode, error_code}};
+    store.IncrementCounter(telemetry::metric_names::kStorageIoErrorsTotal,
+                           labels, 1);
+  }
+}
 // Joins the given PjRtCopyFutures and records transfer latency and per-device
 // bytes transferred if telemetry is enabled.
 raiden::PjRtCopyFuture JoinAndRecordTelemetry(
@@ -661,14 +682,14 @@ raiden::PjRtCopyFuture JoinAndRecordTelemetry(
   const size_t end_shard = std::min(num_shards, single_shard_idx.has_value()
                                                     ? (*single_shard_idx + 1)
                                                     : num_shards);
-  absl::Span<const std::string> active_local_ranks;
+  std::vector<std::string> active_local_ranks;
   if (bytes_per_shard > 0 && end_shard > start_shard) {
     const absl::Span<const std::string> shard_ranks =
         manager.shard_local_ranks();
     const size_t clamped_start = std::min(start_shard, shard_ranks.size());
     const size_t clamped_end = std::min(end_shard, shard_ranks.size());
-    active_local_ranks =
-        shard_ranks.subspan(clamped_start, clamped_end - clamped_start);
+    active_local_ranks.assign(shard_ranks.begin() + clamped_start,
+                              shard_ranks.begin() + clamped_end);
   }
   const absl::string_view dma_time_metric =
       (time_metric_name == telemetry::metric_names::kH2dTransferTimeMs)
@@ -677,7 +698,8 @@ raiden::PjRtCopyFuture JoinAndRecordTelemetry(
   joined_future.OnReady(
       [start_time, time_metric = time_metric_name, dma_metric = dma_time_metric,
        bytes_metric = bytes_metric_name, bytes = bytes_per_shard,
-       host_ip = manager.local_ip(), local_ranks = active_local_ranks](
+       host_ip = manager.local_ip(),
+       local_ranks = std::move(active_local_ranks)](
           const absl::StatusOr<raiden::BufferHolders>& result) {
         if (result.ok()) {
           auto& store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
@@ -3876,15 +3898,36 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hWriteToBackend(
   chunks.reserve(num_chunks);
   raiden::BufferHolders all_holds;
 
+  const bool record_d2h_telemetry =
+      telemetry::RaidenMetricStore::GetGlobalMetricStore().HasBackends();
   for (size_t i = 0; i < num_chunks; ++i) {
     int64_t src_block_idx = src_device_block_ids[i];
     int64_t dst_block_idx = dst_host_block_ids[i];
+
+    const absl::Time d2h_start_time =
+        record_d2h_telemetry ? absl::Now() : absl::Time();
+    uint64_t chunk_bytes_per_shard = 0;
+    if (record_d2h_telemetry && num_shards_ > 0) {
+      size_t chunk_total_bytes = 0;
+      for (const auto& s :
+           ResolveBlockSlices(static_cast<int>(dst_block_idx))) {
+        chunk_total_bytes += s.size;
+      }
+      chunk_bytes_per_shard =
+          static_cast<uint64_t>(chunk_total_bytes / num_shards_);
+    }
 
     TF_ASSIGN_OR_RETURN(
         auto chunk_futures,
         DispatchD2hChunks({src_block_idx}, {dst_block_idx}, {1}));
     raiden::PjRtCopyFuture d2h_fut =
-        raiden::JoinPjRtCopyFutures(absl::MakeSpan(chunk_futures));
+        record_d2h_telemetry
+            ? JoinAndRecordTelemetry(
+                  *this, absl::MakeSpan(chunk_futures), d2h_start_time,
+                  telemetry::metric_names::kD2hTransferTimeMs,
+                  telemetry::metric_names::kD2hBytesTotal,
+                  chunk_bytes_per_shard)
+            : raiden::JoinPjRtCopyFutures(absl::MakeSpan(chunk_futures));
     for (const auto& h : d2h_fut.holds) {
       all_holds.push_back(h);
     }
@@ -3920,6 +3963,9 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hWriteToBackend(
               key, slices, total_bytes,
               [state, bytes_per_shard](absl::Status s) {
                 if (!s.ok()) {
+                  RecordStorageIoError(
+                      state->shard_local_ranks,
+                      telemetry::metric_labels::kDirectionWrite, s.code());
                   state->SetError(s);
                 } else {
                   state->completed_bytes_per_shard.fetch_add(
@@ -3999,6 +4045,9 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dReadFromBackend(
         [this, state, staging_block_idx, device_block_idx,
          bytes_per_shard](absl::Status read_status) {
           if (!read_status.ok()) {
+            RecordStorageIoError(state->shard_local_ranks,
+                                 telemetry::metric_labels::kDirectionRead,
+                                 read_status.code());
             state->SetError(read_status);
             state->MarkChunkComplete();
             return;

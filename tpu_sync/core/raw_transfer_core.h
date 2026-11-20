@@ -651,6 +651,34 @@ struct H2dCopy {
   int64_t size;
 };
 
+// A shard that fails partway has copies in flight for every entry already in
+// `events`. Wait for them and release their events before the error is
+// returned: the caller treats a failed shard as "nothing ran" and releases the
+// buffers, so returning early would let a DMA write into memory that has been
+// freed or handed to the next transfer.
+inline void DrainIssuedEvents(const PJRT_Api* c_api,
+                              std::vector<PJRT_Event*>& events) {
+  if (c_api == nullptr) {
+    events.clear();
+    return;
+  }
+  for (PJRT_Event* e : events) {
+    if (e == nullptr) continue;
+    PJRT_Event_Await_Args await_args;
+    await_args.struct_size = PJRT_Event_Await_Args_STRUCT_SIZE;
+    await_args.extension_start = nullptr;
+    await_args.event = e;
+    (void)PjrtErrorToStatusLocal(c_api, c_api->PJRT_Event_Await(&await_args));
+    PJRT_Event_Destroy_Args destroy_args;
+    destroy_args.struct_size = PJRT_Event_Destroy_Args_STRUCT_SIZE;
+    destroy_args.extension_start = nullptr;
+    destroy_args.event = e;
+    CHECK_OK(PjrtErrorToStatusLocal(
+        c_api, c_api->PJRT_Event_Destroy(&destroy_args)));
+  }
+  events.clear();
+}
+
 // Issue a shard's copies and return one completion future. Uses the PJRT
 // C-API event path when the buffer supports it (TPU); otherwise the legacy
 // xla::Future path. `copies` offsets are already in bytes.
@@ -669,7 +697,11 @@ inline absl::StatusOr<PjRtCopyFuture> IssueD2hShard(
     evs.reserve(copies.size());
     for (const auto& c : copies) {
       auto ev = hold.CopyRawDeviceToHostEvent(c.dst, c.src_off, c.size);
-      if (!ev.ok()) return ev.status();
+      if (!ev.ok()) {
+        const absl::Status status = ev.status();
+        DrainIssuedEvents(hold.c_api(), evs);
+        return status;
+      }
       evs.push_back(ev.value());
     }
     return PjRtCopyFuture::FromEvents(hold.c_api(), std::move(evs),
@@ -699,7 +731,11 @@ inline absl::StatusOr<PjRtCopyFuture> IssueH2dShard(
     evs.reserve(copies.size());
     for (const auto& c : copies) {
       auto ev = hold.CopyRawHostToDeviceEvent(c.src, c.dst_off, c.size);
-      if (!ev.ok()) return ev.status();
+      if (!ev.ok()) {
+        const absl::Status status = ev.status();
+        DrainIssuedEvents(hold.c_api(), evs);
+        return status;
+      }
       evs.push_back(ev.value());
     }
     return PjRtCopyFuture::FromEvents(hold.c_api(), std::move(evs),

@@ -47,10 +47,10 @@
 #include "tpu_sync/frameworks/jax/nb_statusor.h"  // IWYU pragma: keep
 #include "tpu_sync/frameworks/jax/raw_transfer_internal.h"
 #include "tpu_sync/frameworks/jax/weight_synchronizer.h"
-#include "tpu_sync/kv_cache/kv_cache_store.h"
-#include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
-#include "tpu_sync/kv_cache/kv_cache_store_wrapper.h"
 #include "tpu_sync/kv_cache_offload/backends/backend.h"
+#include "tpu_sync/kv_cache_offload/kv_cache_store.h"
+#include "tpu_sync/kv_cache_offload/kv_cache_store_backend_factory.h"
+#include "tpu_sync/kv_cache_offload/kv_cache_store_wrapper.h"
 #include "tpu_sync/telemetry/python/telemetry_binding.h"
 
 namespace nb = nanobind;

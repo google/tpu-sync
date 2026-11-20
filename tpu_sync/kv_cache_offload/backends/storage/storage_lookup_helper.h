@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_OFFLOAD_BACKENDS_STORAGE_STORAGE_LOOKUP_HELPER_H_
-#define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_OFFLOAD_BACKENDS_STORAGE_STORAGE_LOOKUP_HELPER_H_
+#ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_OFFLOAD_OFFLOAD_BACKENDS_STORAGE_STORAGE_LOOKUP_HELPER_H_
+#define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_OFFLOAD_OFFLOAD_BACKENDS_STORAGE_STORAGE_LOOKUP_HELPER_H_
 
 #include <cstddef>
 #include <string>
@@ -23,8 +23,8 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
-#include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/kv_cache_offload/backends/backend.h"
+#include "tpu_sync/kv_cache_offload/kv_cache_store_backend.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
@@ -117,4 +117,4 @@ class StorageLookupHelper {
 }  // namespace kv_cache
 }  // namespace tpu_raiden
 
-#endif  // THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_OFFLOAD_BACKENDS_STORAGE_STORAGE_LOOKUP_HELPER_H_
+#endif  // THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_OFFLOAD_OFFLOAD_BACKENDS_STORAGE_STORAGE_LOOKUP_HELPER_H_

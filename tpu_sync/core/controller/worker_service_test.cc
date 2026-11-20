@@ -34,7 +34,7 @@
 #include "tpu_sync/core/controller/worker_service_impl.h"
 #include "tpu_sync/core/kv_manager_holder.h"
 #include "tpu_sync/core/raw_transfer_core.h"
-#include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
+#include "tpu_sync/kv_cache_offload/kv_cache_store_backend_factory.h"
 #include "tpu_sync/proto/worker_service.grpc.pb.h"
 #include "tpu_sync/proto/worker_service.pb.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"

@@ -25,8 +25,8 @@
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/core/controller/worker_service_server.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
-#include "tpu_sync/kv_cache/kv_cache_store.h"
-#include "tpu_sync/kv_cache/store_monitor.h"
+#include "tpu_sync/kv_cache_offload/kv_cache_store.h"
+#include "tpu_sync/kv_cache_offload/store_monitor.h"
 #include "tpu_sync/store_node/kv_transfer_spec_source.h"
 namespace tpu_raiden {
 namespace store_node {

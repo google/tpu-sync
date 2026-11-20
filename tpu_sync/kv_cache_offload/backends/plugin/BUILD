@@ -63,7 +63,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":plugin_kv_backend",
-        "//tpu_sync/kv_cache:kv_cache_store_backend",
+        "//tpu_sync/kv_cache_offload:kv_cache_store_backend",
         "//tpu_sync/kv_cache_offload/backends:backend",
         "//tpu_sync/kv_cache_offload/backends/storage:storage_lookup_helper",
         "@com_google_absl//absl/log:check",
@@ -172,7 +172,7 @@ cc_test(
         ":plugin_kv_backend",
         ":plugin_kv_cache_store_backend",
         ":raiden_storage_plugin_abi",
-        "//tpu_sync/kv_cache:kv_cache_store_backend",
+        "//tpu_sync/kv_cache_offload:kv_cache_store_backend",
         "//tpu_sync/kv_cache_offload/backends:backend",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",

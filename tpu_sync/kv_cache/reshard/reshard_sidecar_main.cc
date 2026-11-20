@@ -39,8 +39,8 @@
 #include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
-#include "tpu_sync/kv_cache/kv_cache_store.h"
 #include "tpu_sync/kv_cache/reshard/reshard_service.h"
+#include "tpu_sync/kv_cache_offload/kv_cache_store.h"
 
 ABSL_FLAG(int, port, -1, "Framed-TCP listener port (0 = ephemeral).");
 ABSL_FLAG(std::string, advertise_host, "",

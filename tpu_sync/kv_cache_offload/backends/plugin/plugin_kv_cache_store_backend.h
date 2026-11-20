@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_OFFLOAD_BACKENDS_PLUGIN_PLUGIN_KV_CACHE_STORE_BACKEND_H_
-#define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_OFFLOAD_BACKENDS_PLUGIN_PLUGIN_KV_CACHE_STORE_BACKEND_H_
+#ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_OFFLOAD_OFFLOAD_BACKENDS_PLUGIN_PLUGIN_KV_CACHE_STORE_BACKEND_H_
+#define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_OFFLOAD_OFFLOAD_BACKENDS_PLUGIN_PLUGIN_KV_CACHE_STORE_BACKEND_H_
 
 #include <cstddef>
 #include <memory>
@@ -22,10 +22,10 @@
 
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
-#include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/kv_cache_offload/backends/backend.h"
 #include "tpu_sync/kv_cache_offload/backends/plugin/plugin_kv_backend.h"
 #include "tpu_sync/kv_cache_offload/backends/storage/storage_lookup_helper.h"
+#include "tpu_sync/kv_cache_offload/kv_cache_store_backend.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
@@ -110,4 +110,4 @@ class DynamicLinkedKVCacheStoreBackend : public KVCacheStoreBackend {
 }  // namespace kv_cache
 }  // namespace tpu_raiden
 
-#endif  // THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_OFFLOAD_BACKENDS_PLUGIN_PLUGIN_KV_CACHE_STORE_BACKEND_H_
+#endif  // THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_OFFLOAD_OFFLOAD_BACKENDS_PLUGIN_PLUGIN_KV_CACHE_STORE_BACKEND_H_

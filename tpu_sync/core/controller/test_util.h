@@ -44,9 +44,9 @@
 #include "tpu_sync/core/controller/worker_service_impl.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
-#include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/kv_cache_offload/backends/backend.h"
 #include "tpu_sync/kv_cache_offload/backends/storage/posix_backend.h"
+#include "tpu_sync/kv_cache_offload/kv_cache_store_backend_factory.h"
 #include "tpu_sync/transport/peer_endpoint.h"
 
 namespace tpu_raiden {

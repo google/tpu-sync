@@ -180,7 +180,7 @@ cc_binary(
     features = ["-use_header_modules"],
     deps = [
         ":reshard_service",
-        "//tpu_sync/kv_cache:kv_cache_store",
+        "//tpu_sync/kv_cache_offload:kv_cache_store",
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/flags:parse",
         "@com_google_absl//absl/strings",

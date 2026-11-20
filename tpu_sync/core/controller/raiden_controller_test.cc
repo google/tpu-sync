@@ -48,8 +48,8 @@
 #include "tpu_sync/core/controller/test_util.h"
 #include "tpu_sync/core/kv_manager_holder.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
-#include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
 #include "tpu_sync/kv_cache_offload/backends/backend.h"
+#include "tpu_sync/kv_cache_offload/kv_cache_store_backend_factory.h"
 #include "tpu_sync/proto/worker_service.pb.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 

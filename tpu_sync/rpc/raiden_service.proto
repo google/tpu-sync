@@ -322,7 +322,8 @@ message ControlRequest {
     COMMAND_REGISTER_WORK_UNIT = 3;
     COMMAND_GET_METADATA = 4;
     COMMAND_REGISTER_TRANSFER_SCHEDULE = 5;
-    // Cancels the receive a worker prepared for a transfer plan.
+    // Cancels the receive a worker prepared for a transfer plan, or the send
+    // it started.
     COMMAND_CANCEL_TRANSFER = 7;
   }
   Command command = 1;
@@ -334,8 +335,10 @@ message ControlRequest {
 }
 
 message CancelTransferRequest {
-  // Plan uuid of the receive to cancel.
+  // Plan uuid of the receive or send to cancel.
   int64 uuid = 1;
+  // Cancel the plan's send instead of its receive.
+  bool is_sender = 2;
 }
 
 // Pool base address per local shard of the receiving worker.
@@ -359,7 +362,7 @@ message ControlResponse {
   string response_data = 3;
   GetMetadataResponse get_metadata_response = 4;
   map<int32, PoolHostAddrsProto> receiver_pool_addrs = 5;
-  // COMMAND_CANCEL_TRANSFER: nothing of the receive is still running.
+  // COMMAND_CANCEL_TRANSFER: nothing of the receive or send is still running.
   // False while a push or copy is in flight.
   bool cancel_settled = 6;
 }

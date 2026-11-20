@@ -103,6 +103,16 @@ class RequestBlockRegistry {
   bool AbandonClaim(const std::string& req_id, int64_t uuid,
                     const void* claim_owner);
 
+  // Claim rollback after dispatch, once every sender has stopped. With no
+  // other owner left, the request's registrations are removed and it reads
+  // kCancelled. Returns true when the request was cancelled.
+  bool CancelClaim(const std::string& req_id, int64_t uuid,
+                   const void* claim_owner);
+
+  // True when an owner other than `claim_owner` also holds the claim.
+  bool ClaimIsShared(const std::string& req_id, int64_t uuid,
+                     const void* claim_owner);
+
   // Worker-restart invalidation (register_work_unit's locked half calls
   // this under the shared mutex).
   void InvalidateUnitLocked(const RaidenId& unit)

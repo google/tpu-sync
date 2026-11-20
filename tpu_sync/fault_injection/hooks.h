@@ -62,6 +62,11 @@ inline constexpr std::string_view kKvCacheManagerPullRegisterWait =
 inline constexpr std::string_view kKvCacheManagerPullSpawn =
     "kv_cache_manager.pull.spawn";
 
+// KV cache manager, pool reshard: a send between its start check and the
+// point where it is installed.
+inline constexpr std::string_view kKvCacheManagerPoolReshardSendSetup =
+    "kv_cache_manager.pool_reshard.send_setup";
+
 // gRPC control plane.
 inline constexpr std::string_view kGrpcControlPlanePullStreamSendRequest =
     "grpc_control_plane.pull_stream.send_request";
@@ -164,6 +169,7 @@ inline constexpr std::string_view kDelayHooks[] = {
     kBlockTransportRecvSendAck,
     kTransferRecvSessionPullRequest,
     kKvCacheManagerPullRegisterWait,
+    kKvCacheManagerPoolReshardSendSetup,
     kGrpcControlPlanePullStreamRecvRequest,
     kGrpcControlPlanePullStreamSendReply,
     kTcpControlPlanePullReply,

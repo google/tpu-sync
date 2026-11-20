@@ -211,9 +211,12 @@ void KVCacheListener::HandleControlRequest(const ControlRequest& req,
   } else if (req.command() == ControlRequest::COMMAND_CANCEL_TRANSFER) {
     const uint64_t uuid =
         static_cast<uint64_t>(req.cancel_transfer_request().uuid());
-    const bool settled = callbacks_.cancel_pool_reshard_recv(uuid);
+    const bool is_sender = req.cancel_transfer_request().is_sender();
+    const bool settled = is_sender ? callbacks_.cancel_pool_reshard_send(uuid)
+                                   : callbacks_.cancel_pool_reshard_recv(uuid);
     resp->set_cancel_settled(settled);
-    LOG(INFO) << "C++ KVCacheListener cancelled the receive for uuid " << uuid
+    LOG(INFO) << "C++ KVCacheListener cancelled the "
+              << (is_sender ? "send" : "receive") << " for uuid " << uuid
               << (settled ? "" : " (a push or copy is still in flight)");
   } else if (req.command() == ControlRequest::COMMAND_SHUTDOWN) {
     LOG(INFO) << "C++ KVCacheListener received SHUTDOWN command. Initiating "

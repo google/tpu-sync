@@ -517,6 +517,7 @@ cc_test(
         ":kv_cache_manager_with_transfer",
         ":pool_layout",
         "//tpu_sync/core:raw_transfer_core",
+        "//tpu_sync/fault_injection:hooks",
         "//tpu_sync/rpc:raiden_service_cc_proto",
         "//tpu_sync/telemetry:metrics_backend",
         "//tpu_sync/telemetry:mock_metrics_backend",

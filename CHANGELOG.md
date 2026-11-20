@@ -23,6 +23,9 @@
   it prepared (new `COMMAND_CANCEL_TRANSFER`, at most 5 s) and sets
   `ControllerResponse.transfer_released` when no receive is left on any
   destination unit. The torch client then raises `TransferReleasedError`, a
-  `RuntimeError` with the unchanged text. Off by default.
+  `RuntimeError` with the unchanged text. When a sender fails to start, the
+  controller also stops the senders that did start (at most 5 s more) and then
+  cancels the registry claim instead of leaving it until its TTL. Off by
+  default.
 
 [Unreleased]: https://github.com/tpu-raiden/tpu_raiden/compare/v0.1.0...HEAD

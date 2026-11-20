@@ -83,8 +83,9 @@ bool RollbackFailedTransfersEnabled() {
          absl::EqualsIgnoreCase(v, "yes") || absl::EqualsIgnoreCase(v, "on");
 }
 
-// Longest time a rollback takes: the cancel RPCs plus the wait for pushes or
-// copies that are still in flight.
+// Longest time one round of cancels takes: the cancel RPCs plus the wait for
+// pushes or copies that are still in flight. A sender failure runs two
+// rounds, the receivers and then the senders.
 constexpr absl::Duration kRollbackTimeout = absl::Seconds(5);
 constexpr absl::Duration kRollbackPollInterval = absl::Milliseconds(50);
 
@@ -702,11 +703,13 @@ constexpr int kChainArmAttempts = 12;
 
 }  // namespace
 
-bool ReshardCoordinator::CancelReceivers(const PoolReshardPlan& plan,
-                                         const std::vector<RaidenId>& units) {
+bool ReshardCoordinator::CancelUnits(const PoolReshardPlan& plan,
+                                     const std::vector<RaidenId>& units,
+                                     bool is_sender) {
   tpu_sync::rpc::ControlRequest request;
   request.set_command(tpu_sync::rpc::ControlRequest::COMMAND_CANCEL_TRANSFER);
   request.mutable_cancel_transfer_request()->set_uuid(plan.uuid);
+  request.mutable_cancel_transfer_request()->set_is_sender(is_sender);
 
   const absl::Time deadline = absl::Now() + kRollbackTimeout;
   // One byte per unit: each thread writes its own slot.
@@ -715,7 +718,7 @@ bool ReshardCoordinator::CancelReceivers(const PoolReshardPlan& plan,
   cancellers.reserve(units.size());
   for (size_t i = 0; i < units.size(); ++i) {
     cancellers.emplace_back([this, &plan, &units, &request, &settled, i,
-                             deadline]() {
+                             is_sender, deadline]() {
       auto addr_it = plan.worker_rpc_addresses.find(units[i]);
       if (addr_it == plan.worker_rpc_addresses.end()) {
         // No address: the prepare was never sent to this unit.
@@ -741,7 +744,8 @@ bool ReshardCoordinator::CancelReceivers(const PoolReshardPlan& plan,
                        : reply.ok() ? reply->message()
                                     : std::string(reply.status().message());
           LOG(ERROR) << "Pool reshard rollback for req_id=" << plan.req_id
-                     << " uuid=" << plan.uuid << ": receiver "
+                     << " uuid=" << plan.uuid
+                     << (is_sender ? ": sender " : ": receiver ")
                      << PythonRepr(units[i]) << " is not confirmed: " << why;
           return;
         }
@@ -881,7 +885,8 @@ absl::Status ReshardCoordinator::RunSubPlan(
               contacted.push_back(plan.dst_units[j]);
             }
           }
-          *released = CancelReceivers(plan, contacted) && !coordinated_twice;
+          *released = CancelUnits(plan, contacted, /*is_sender=*/false) &&
+                      !coordinated_twice;
         }
         return arm_status[i];
       }
@@ -909,6 +914,8 @@ absl::Status ReshardCoordinator::RunSubPlan(
   // (Python gathers the same fan-out on its per-connection event loop).
   const int64_t sender_dispatch_ns = MonotonicNs();
   std::vector<absl::Status> sender_status(plan.src_units.size());
+  // One byte per sender: its start was never sent.
+  std::vector<char> never_sent(plan.src_units.size(), 0);
   if (delivery_.mode == WorkerDelivery::Mode::kController) {
     if (delivery_.controller == nullptr) {
       if (index == 0) {
@@ -923,12 +930,15 @@ absl::Status ReshardCoordinator::RunSubPlan(
     std::vector<tsl::Future<::tpu_sync::proto::TransferProgramResponse>>
         futures;
     futures.reserve(plan.src_units.size());
+    // src_units index of each future.
+    std::vector<size_t> dispatched;
     for (size_t i = 0; i < plan.src_units.size(); ++i) {
       const RaidenId& unit = plan.src_units[i];
       auto key_it = plan.src_schedule_keys.find(unit);
       if (key_it == plan.src_schedule_keys.end()) {
         sender_status[i] = absl::InternalError(absl::StrCat(
             "No schedule key assigned for ", PythonRepr(unit)));
+        never_sent[i] = 1;
         continue;
       }
       const std::string worker_id = absl::StrCat("worker_", key_it->second);
@@ -936,13 +946,16 @@ absl::Status ReshardCoordinator::RunSubPlan(
           core::CompileStartTransfer(BuildStartTransferForTarget(plan, unit));
       if (!compiled.ok()) {
         sender_status[i] = compiled.status();
+        never_sent[i] = 1;
         continue;
       }
+      dispatched.push_back(i);
       futures.push_back(
           delivery_.controller->SubmitTransferProgram(worker_id, *compiled));
     }
-    for (size_t i = 0; i < futures.size(); ++i) {
-      auto resp = futures[i].Await();
+    for (size_t k = 0; k < futures.size(); ++k) {
+      const size_t i = dispatched[k];
+      auto resp = futures[k].Await();
       if (!resp.ok()) {
         sender_status[i] = resp.status();
       } else if (!resp->success()) {
@@ -955,7 +968,8 @@ absl::Status ReshardCoordinator::RunSubPlan(
     senders.reserve(plan.src_units.size());
     for (size_t i = 0; i < plan.src_units.size(); ++i) {
       const RaidenId& unit = plan.src_units[i];
-      senders.emplace_back([this, &plan, &sender_status, i, unit]() {
+      senders.emplace_back([this, &plan, &sender_status, &never_sent, i,
+                            unit]() {
         auto addr_it = plan.worker_rpc_addresses.find(unit);
         if (addr_it == plan.worker_rpc_addresses.end()) {
           sender_status[i] = absl::InternalError(absl::StrCat(
@@ -966,6 +980,7 @@ absl::Status ReshardCoordinator::RunSubPlan(
             SendWorkerRpc(addr_it->second,
                           BuildStartTransferControlRequest(plan, unit))
                 .status();
+        never_sent[i] = IsControlPipeNotSent(sender_status[i]);
       });
     }
     for (std::thread& t : senders) t.join();
@@ -974,7 +989,28 @@ absl::Status ReshardCoordinator::RunSubPlan(
   for (const absl::Status& status : sender_status) {
     if (!status.ok()) {
       if (released != nullptr) {
-        *released = CancelReceivers(plan, plan.dst_units);
+        *released = CancelUnits(plan, plan.dst_units, /*is_sender=*/false);
+        // Stop the senders this dispatch may have reached. When the request
+        // is coordinated twice, only those that accepted its start: a send on
+        // another sender may belong to the other coordination.
+        const bool coordinated_twice =
+            registry_->ClaimIsShared(args.req_id, uuid, ctx->claim_owner);
+        std::vector<RaidenId> started;
+        for (size_t j = 0; j < plan.src_units.size(); ++j) {
+          if (sender_status[j].ok() || (!coordinated_twice && !never_sent[j])) {
+            started.push_back(plan.src_units[j]);
+          }
+        }
+        // They may still read the source blocks the claim protects, so it
+        // goes only once every one of them has stopped. When coordinated
+        // twice, not every sender was asked, so the claim stays.
+        if (CancelUnits(plan, started, /*is_sender=*/true) &&
+            (coordinated_twice ||
+             !registry_->CancelClaim(args.req_id, uuid, ctx->claim_owner))) {
+          LOG(ERROR) << "Pool reshard rollback for req_id=" << args.req_id
+                     << " uuid=" << uuid << ": the claim is not cancelled, "
+                     << "another coordination holds it or it is already gone";
+        }
       }
       return status;
     }

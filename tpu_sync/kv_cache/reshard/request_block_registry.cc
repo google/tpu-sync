@@ -518,6 +518,31 @@ bool RequestBlockRegistry::AbandonClaim(const std::string& req_id, int64_t uuid,
   return true;
 }
 
+bool RequestBlockRegistry::CancelClaim(const std::string& req_id, int64_t uuid,
+                                       const void* claim_owner) {
+  const double now = clock_();
+  const LifecycleKey lifecycle_key{req_id, uuid};
+  absl::MutexLock lock(*mu_);
+  auto claimed_it = claimed_.find(lifecycle_key);
+  auto owner_it = claimed_owners_.find(lifecycle_key);
+  if (claimed_it == claimed_.end() || owner_it == claimed_owners_.end() ||
+      owner_it->second.erase(claim_owner) == 0 || !owner_it->second.empty()) {
+    return false;
+  }
+  RetireLocked(lifecycle_key);
+  cancelled_[lifecycle_key] = now + ttl_s_;
+  return true;
+}
+
+bool RequestBlockRegistry::ClaimIsShared(const std::string& req_id,
+                                         int64_t uuid,
+                                         const void* claim_owner) {
+  absl::MutexLock lock(*mu_);
+  auto owner_it = claimed_owners_.find(LifecycleKey{req_id, uuid});
+  return owner_it != claimed_owners_.end() &&
+         owner_it->second.size() > owner_it->second.count(claim_owner);
+}
+
 void RequestBlockRegistry::InvalidateUnitLocked(const RaidenId& unit) {
   for (auto it = request_blocks_.begin(); it != request_blocks_.end();) {
     if (it->first.second == unit) {

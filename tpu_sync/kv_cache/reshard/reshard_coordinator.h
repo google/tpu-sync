@@ -177,14 +177,15 @@ class ReshardCoordinator {
   // on a planning or arm failure (nothing was dispatched yet); later ones
   // leave the claim to the dispatched senders' terminals. With a non-null
   // `released`, a failure cancels the receivers it prepared and reports
-  // whether none is left.
+  // whether none is left; a sender failure also stops the started senders
+  // and then cancels the claim.
   absl::Status RunSubPlan(const std::shared_ptr<ChainContext>& ctx,
                           int32_t index, bool* released = nullptr);
 
-  // Cancels the receives of `plan` on `units`. Returns true when every unit
-  // confirms that nothing of its receive is still running.
-  bool CancelReceivers(const PoolReshardPlan& plan,
-                       const std::vector<RaidenId>& units);
+  // Cancels the receives (with `is_sender`, the sends) of `plan` on `units`.
+  // Returns true when every unit confirms that nothing of it is still running.
+  bool CancelUnits(const PoolReshardPlan& plan,
+                   const std::vector<RaidenId>& units, bool is_sender);
 
   // Runs sub-transfers 1..count-1 of `ctx` on a coordinator thread, which
   // sets the request's transfer status to kCompleted once every sub-transfer

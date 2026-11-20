@@ -45,6 +45,7 @@
 #include "absl/types/span.h"
 #include "xla/future.h"
 #include "tpu_sync/core/raw_transfer_core.h"
+#include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
@@ -919,6 +920,10 @@ TEST(PoolReshardRecvTest, CancelFreesTheStagingOfAnIdleReceive) {
       manager.PoolReshardRegisterRecv(plan, std::vector<int64_t>{0}));
   EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 1);
 
+  // A send cancel finds no send and leaves the receive alone.
+  EXPECT_TRUE(manager.CancelPoolReshardSend(/*uuid=*/3004));
+  EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 1);
+
   // No push arrived, so the cancel frees the staging at once.
   EXPECT_TRUE(manager.CancelPoolReshardRecv(/*uuid=*/3004));
   EXPECT_EQ(manager.base()->PoolStagingSummary()[0].free_slots, 2);
@@ -1026,6 +1031,78 @@ TEST(PoolReshardRecvTest, PrepareThatArrivesAfterItsCancelIsRefused) {
   EXPECT_TRUE(manager.CancelPoolReshardRecv(/*uuid=*/6002));
 }
 
+TEST(PoolReshardSendTest, CancelStopsAnIdleSend) {
+  TestManager manager;
+  ABSL_ASSERT_OK(manager.base()->RegisterPools({DensePool("fa")}));
+  manager.AttachPlaceholderDeviceHold();
+
+  ABSL_ASSERT_OK(manager.AddPoolReshardSend(ValidPlan(/*uuid=*/6101),
+                                            std::vector<int64_t>{0}));
+  TF_ASSERT_OK_AND_ASSIGN(auto session, manager.GetSession(/*uuid=*/6101));
+  ASSERT_FALSE(session->Done());
+
+  // A receive cancel finds no receive and leaves the send alone.
+  EXPECT_TRUE(manager.CancelPoolReshardRecv(/*uuid=*/6101));
+  EXPECT_FALSE(session->Done());
+
+  // No copy or push is in flight, so the cancel stops the send at once.
+  EXPECT_TRUE(manager.CancelPoolReshardSend(/*uuid=*/6101));
+  EXPECT_TRUE(session->Done());
+  EXPECT_THAT(session->GetStatus(), StatusIs(absl::StatusCode::kCancelled));
+}
+
+TEST(PoolReshardSendTest, StartThatArrivesAfterItsCancelIsRefused) {
+  TestManager manager;
+  ABSL_ASSERT_OK(manager.base()->RegisterPools({DensePool("fa")}));
+  manager.AttachPlaceholderDeviceHold();
+
+  // The cancel overtakes the start: nothing is there yet.
+  EXPECT_TRUE(manager.CancelPoolReshardSend(/*uuid=*/6102));
+
+  // The late start is refused and leaves no send.
+  EXPECT_THAT(manager.PoolReshardPush(ValidPlan(/*uuid=*/6102),
+                                      std::vector<int64_t>{0}),
+              StatusIs(absl::StatusCode::kCancelled));
+  EXPECT_THAT(manager.GetSession(/*uuid=*/6102),
+              StatusIs(absl::StatusCode::kNotFound));
+}
+
+TEST(PoolReshardSendTest, CancelWhileTheSendIsBeingSetUp) {
+  TestManager manager;
+  ABSL_ASSERT_OK(manager.base()->RegisterPools({DensePool("fa")}));
+  manager.AttachPlaceholderDeviceHold();
+
+  // Hold the start between its first check and the point where it installs
+  // the send.
+  ABSL_ASSERT_OK(GetFaultInjector().Install({FaultInjectionRule{
+      .hook = std::string(hooks::kKvCacheManagerPoolReshardSendSetup),
+      .action = FaultInjectionType::kDelay,
+      .probability = 1.0,
+      .min_delay_ms = 500,
+      .max_delay_ms = 500}}));
+  absl::Cleanup reset_faults = []() { GetFaultInjector().Reset(); };
+
+  absl::Status start_status;
+  std::thread starter([&manager, &start_status]() {
+    start_status = manager.PoolReshardPush(ValidPlan(/*uuid=*/6103),
+                                           std::vector<int64_t>{0});
+  });
+  while (GetFaultInjector().GetHitCount(
+             hooks::kKvCacheManagerPoolReshardSendSetup) == 0) {
+    absl::SleepFor(absl::Milliseconds(1));
+  }
+
+  // No send is installed yet, so the cancel has nothing to stop.
+  EXPECT_TRUE(manager.CancelPoolReshardSend(/*uuid=*/6103));
+  starter.join();
+
+  // The start sees the cancel and installs nothing.
+  EXPECT_THAT(start_status,
+              StatusIs(absl::StatusCode::kCancelled,
+                       ::testing::HasSubstr("while it was being started")));
+  EXPECT_THAT(manager.GetSession(/*uuid=*/6103),
+              StatusIs(absl::StatusCode::kNotFound));
+}
 
 // ---------------------------------------------------------------------------
 // Sub-plan chains: a request coordinated as several pool-reshard plans

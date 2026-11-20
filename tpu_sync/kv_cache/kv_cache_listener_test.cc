@@ -101,8 +101,13 @@ class RoutingKVCacheManager final : public KVCacheManagerBase {
     cancelled_uuid_ = uuid;
     return cancel_settled_;
   }
+  bool CancelPoolReshardSend(uint64_t uuid) {
+    cancelled_send_uuid_ = uuid;
+    return true;
+  }
   void set_cancel_settled(bool settled) { cancel_settled_ = settled; }
   uint64_t cancelled_uuid() const { return cancelled_uuid_; }
+  uint64_t cancelled_send_uuid() const { return cancelled_send_uuid_; }
 
   Route route() const { return route_.load(std::memory_order_acquire); }
   const StartTransferRequest& request() const { return request_; }
@@ -122,6 +127,7 @@ class RoutingKVCacheManager final : public KVCacheManagerBase {
   bool registered_is_sender_ = true;
   bool cancel_settled_ = true;
   uint64_t cancelled_uuid_ = 0;
+  uint64_t cancelled_send_uuid_ = 0;
 };
 
 bool WriteAll(int fd, const void* data, size_t size) {
@@ -252,6 +258,22 @@ TEST(KVCacheListenerTest, CancelTransferCancelsTheReceive) {
   response = SendRequest(listener.listener_port(), request);
   EXPECT_TRUE(response.success()) << response.message();
   EXPECT_FALSE(response.cancel_settled());
+}
+
+TEST(KVCacheListenerTest, CancelTransferForASenderCancelsTheSend) {
+  RoutingKVCacheManager manager;
+  KVCacheListener listener(&manager, /*listener_port=*/0);
+
+  ControlRequest request;
+  request.set_command(ControlRequest::COMMAND_CANCEL_TRANSFER);
+  request.mutable_cancel_transfer_request()->set_uuid(1235);
+  request.mutable_cancel_transfer_request()->set_is_sender(true);
+
+  ControlResponse response = SendRequest(listener.listener_port(), request);
+  EXPECT_TRUE(response.success()) << response.message();
+  EXPECT_TRUE(response.cancel_settled());
+  EXPECT_EQ(manager.cancelled_send_uuid(), 1235u);
+  EXPECT_EQ(manager.cancelled_uuid(), 0u);
 }
 
 TEST(KVCacheListenerTest, PoolReceiverArmReplyCarriesHostBaseAddrs) {

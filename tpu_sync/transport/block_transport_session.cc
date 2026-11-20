@@ -392,11 +392,12 @@ void BlockTransportServerPushSession::ReleaseAdmittedPosts() {
 absl::Status BlockTransportServerPushSession::StartStream(
     int client_fd, const lib::ChunkHeader& header) {
   ABSL_ASSIGN_OR_RETURN(MajorOrder major_order, ParseMajorOrder(header.flags));
+  const bool is_block_major = major_order == MajorOrder::kBlockMajor;
   ABSL_ASSIGN_OR_RETURN(
       IncomingPushSpec push_spec,
       ResolveIncomingPushSpec(delegate_, header.local_id,
                               /*is_explicit_dst_push=*/header.op == 6,
-                              header.uuid));
+                              header.uuid, major_order));
 
   std::vector<int> allocated_ids;
   std::vector<int> src_block_ids;
@@ -427,6 +428,16 @@ absl::Status BlockTransportServerPushSession::StartStream(
     ABSL_RETURN_IF_ERROR(ReadExact(client_fd, ids_buf.data(), ids_buf.size(),
                                    config_.handshake_read_timeout_ms));
     src_block_ids = lib::DeserializeBlockIds(ids_buf);
+    if (is_block_major) {
+      const size_t num_arrays = delegate_->num_block_arrays();
+      for (int layer_id : allocated_ids) {
+        if (layer_id < 0 || static_cast<size_t>(layer_id) >= num_arrays) {
+          return absl::OutOfRangeError(absl::StrCat(
+              "MajorOrder::kBlockMajor push layer_id ", layer_id,
+              " out of range [0, ", num_arrays, ") for uuid ", header.uuid));
+        }
+      }
+    }
     uint8_t ack = 1;
     FaultInjectSocket(hooks::kBlockTransportRecvSendHandshakeAck, client_fd);
     ABSL_RETURN_IF_ERROR(
@@ -461,23 +472,26 @@ absl::Status BlockTransportServerPushSession::StartStream(
                                        config_.payload_read_timeout_ms));
         const uint32_t sender_size = lib::DeserializeChunkSize(size_buf);
 
-        const int64_t block_id_val = dst_id;
+        const size_t layer_idx =
+            is_block_major ? static_cast<size_t>(dst_id) : l;
+        const int64_t block_id_val =
+            is_block_major ? static_cast<int64_t>(l) : dst_id;
         int64_t src_bid = -1;
-        if (!src_block_ids.empty()) {
+        if (!is_block_major && !src_block_ids.empty()) {
           ABSL_DCHECK_LT(k, src_block_ids.size());
           src_bid = src_block_ids[k];
         }
         std::vector<BlockChunk> chunks = delegate_->GetBlockChunks(
-            l, sh, absl::MakeConstSpan(&block_id_val, 1), sender_size,
+            layer_idx, sh, absl::MakeConstSpan(&block_id_val, 1), sender_size,
             header.uuid, static_cast<int64_t>(header.remote_id),
             /*peer=*/"", src_bid);
         if (chunks.empty()) {
           return absl::NotFoundError(
-              absl::StrCat("No transfer chunks found for block ", dst_id,
+              absl::StrCat("No transfer chunks found for block ", block_id_val,
                            " and uuid ", header.uuid));
         }
         ABSL_RETURN_IF_ERROR(
-            ValidateChunks(delegate_, l, sh, header.uuid, chunks));
+            ValidateChunks(delegate_, layer_idx, sh, header.uuid, chunks));
 
         uint32_t expected_size = 0;
         for (const auto& chunk : chunks) {
@@ -487,8 +501,8 @@ absl::Status BlockTransportServerPushSession::StartStream(
           return absl::InternalError(absl::StrCat(
               "Incoming push size mismatch: sender offered ", sender_size,
               " bytes, receiver expected ", expected_size, " bytes (chunks=",
-              chunks.size(), ") uuid=", header.uuid, " layer/pool=", l,
-              " src_block=", src_bid, " dst_block=", dst_id));
+              chunks.size(), ") uuid=", header.uuid, " layer/pool=", layer_idx,
+              " src_block=", src_bid, " dst_block=", block_id_val));
         }
 
         if (expected_size > 0) {
@@ -509,13 +523,18 @@ absl::Status BlockTransportServerPushSession::StartStream(
   ABSL_RETURN_IF_ERROR(CompleteIncomingPush(
       session, header.local_id, header.remote_id, header.reserved,
       header.buffer_id == 0 ? 0 : stream_shards.size(),
-      push_spec.pool_progress_spec));
+      push_spec.pool_progress_spec, /*is_peregrine=*/false, major_order));
 
   // Report exactly the shards this stream carried: every shard for a legacy
   // stream, one route's subset for a routed stream. The delegate owns
-  // per-block shard accounting across streams.
-  ABSL_RETURN_IF_ERROR(delegate_->OnBlockShardsReceived(
-      allocated_ids, stream_shards, header.uuid));
+  // per-block shard accounting across streams. For kBlockMajor, parallelism
+  // splits layer_ids across streams carrying the same dst_block_id and shards,
+  // so CompleteIncomingPush reports OnBlockShardsReceived once after all
+  // streams (and NUMA shard groups) for the block have landed.
+  if (!is_block_major) {
+    ABSL_RETURN_IF_ERROR(delegate_->OnBlockShardsReceived(
+        allocated_ids, stream_shards, header.uuid));
+  }
   incoming_push_lease_held = false;
   ABSL_RETURN_IF_ERROR(EndIncomingPush(session));
   uint8_t ack = 1;
@@ -732,15 +751,10 @@ absl::Status BlockTransportServerPushSession::OnPeregrinePostComplete(
     if (!held) {
       ABSL_ASSIGN_OR_RETURN(session, BeginIncomingPush(delegate_, uuid_));
     }
-    ABSL_RETURN_IF_ERROR(CompleteIncomingPush(
+    return CompleteIncomingPush(
         session, post.local_id, post.remote_id, /*num_streams=*/1,
         post.shard_mask == 0 ? 0 : shards.size(), push_spec.pool_progress_spec,
-        /*is_peregrine=*/true, config_.major_order));
-    if (config_.major_order == MajorOrder::kBlockMajor) {
-      ABSL_RETURN_IF_ERROR(delegate_->OnBlockShardsReceived(
-          {static_cast<int>(post.local_id)}, shards, uuid_));
-    }
-    return absl::OkStatus();
+        /*is_peregrine=*/true, config_.major_order);
   }();
   return EndIncomingPush(session, status);
 }
@@ -918,11 +932,14 @@ absl::Status BlockTransportServerPushSession::CompleteIncomingPush(
       ABSL_RETURN_IF_ERROR(session->OnDataReceived(
           static_cast<size_t>(major_dim_idx),
           /*minor_dimension_indices=*/{}, /*shard_ids=*/{}));
-    } else if (!is_block_major) {
+    } else if (is_block_major) {
+      // TODO: Wire block-major unit completion to TransferSession once
+      // TransferReceiveSession supports block-major H2D.
+      ABSL_RETURN_IF_ERROR(delegate_->OnBlockShardsReceived(
+          {major_dim_idx}, AllShards(delegate_->num_shards()), uuid_));
+    } else {
       ABSL_RETURN_IF_ERROR(delegate_->OnLayerReceived(major_dim_idx, uuid_));
     }
-    // TODO: Wire block-major unit completion to TransferSession once
-    // TransferReceiveSession supports block-major H2D.
   }
   return absl::OkStatus();
 }

@@ -151,6 +151,17 @@ class BlockTransport final {
       MajorOrder major_order = MajorOrder::kLayerMajor, uint64_t uuid = 0,
       int layer_idx = -1, std::optional<int> wire_layer_idx = std::nullopt);
 
+  // Block-major overload of `AsyncPush`: pushes a single block
+  // (`src_block_id` -> `dst_block_id`) across `layer_ids`, splitting
+  // `layer_ids` evenly across `parallelism` streams.
+  //
+  // Returns a future that resolves with `layer_ids` once every peer has
+  // acknowledged, or with the first error.
+  tsl::Future<std::vector<int>> AsyncPush(
+      const std::vector<PeerEndpoint>& peers, int src_block_id,
+      int dst_block_id, const std::vector<int>& layer_ids, int parallelism = 1,
+      uint64_t uuid = 0);
+
   // Synchronous Scatter-Gather Pull (op = 2)
   // When explicit_dst_ptrs is supplied it contains one base pointer per
   // (block array, shard), in block-array-major order.

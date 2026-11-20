@@ -450,8 +450,9 @@ TEST_F(KVCacheHostStoreNodeBootTest, BootsFromGrsPublishedSpec) {
       std::make_unique<kv_cache::global_registry::GlobalRegistryServiceImpl>();
   grpc::ServerBuilder builder;
   int port = 0;
-  builder.AddListeningPort("localhost:0", grpc::InsecureServerCredentials(),
-                           &port);
+  builder.AddListeningPort(
+      "localhost:0", kv_cache::global_registry::CreateTestServerCredentials(),
+      &port);
   builder.RegisterService(service.get());
   std::unique_ptr<grpc::Server> registry_server = builder.BuildAndStart();
   ASSERT_NE(registry_server, nullptr);
@@ -460,8 +461,9 @@ TEST_F(KVCacheHostStoreNodeBootTest, BootsFromGrsPublishedSpec) {
   // A serving host publishes the spec; the node then boots entirely from
   // the registry, no static spec anywhere.
   kv_cache::global_registry::GlobalRegistryClient registry_client(
-      grpc::CreateChannel(registry_address,
-                          grpc::InsecureChannelCredentials()));
+      grpc::CreateChannel(
+          registry_address,
+          kv_cache::global_registry::CreateTestClientCredentials()));
   kv_cache::global_registry::KVTransferSpec published;
   published.add_block_arrays()->set_block_bytes(256);
   published.add_block_arrays()->set_block_bytes(256);

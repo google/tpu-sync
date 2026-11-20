@@ -25,12 +25,14 @@
 #include "absl/flags/flag.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/strings/str_cat.h"
 #include "absl/time/time.h"
 #include "grpcpp/security/server_credentials.h"
 #include "grpcpp/server.h"
 #include "grpcpp/server_builder.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry_server.h"
+#include "tpu_sync/platform/grpc_credential_factory.h"
 
 ABSL_FLAG(int32_t, port, 50051, "Port to listen on");
 ABSL_FLAG(absl::Duration, default_ttl, absl::InfiniteDuration(),
@@ -54,9 +56,11 @@ absl::Status RunServer() {
       default_ttl, cleanup_interval,
       absl::GetFlag(FLAGS_pull_owned_batch_size));
 
+  ABSL_ASSIGN_OR_RETURN(
+      std::shared_ptr<grpc::ServerCredentials> server_creds,
+      tpu_raiden::CreateGrpcCredentialFactory()->CreateServerCredentials());
   grpc::ServerBuilder builder;
-  // Listen on the given address without any authentication mechanism.
-  builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
+  builder.AddListeningPort(server_address, server_creds);
   // Register "service" as the instance through which we'll communicate with
   // clients. In this case it corresponds to an *synchronous* service.
   builder.RegisterService(&service);

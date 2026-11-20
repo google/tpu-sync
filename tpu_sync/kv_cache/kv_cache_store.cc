@@ -61,6 +61,7 @@
 #include "tpu_sync/kv_cache/reshard/reshard_service.h"
 #include "tpu_sync/kv_cache/store_monitor.h"
 #include "tpu_sync/kv_cache_offload/backends/backend.h"
+#include "tpu_sync/platform/grpc_credential_factory.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
@@ -69,6 +70,13 @@ namespace tpu_raiden {
 namespace kv_cache {
 
 namespace {
+
+std::shared_ptr<grpc::ChannelCredentials> CreateClientCredentialsOrDie() {
+  absl::StatusOr<std::shared_ptr<grpc::ChannelCredentials>> creds =
+      CreateGrpcCredentialFactory()->CreateClientCredentials();
+  CHECK_OK(creds.status());
+  return *std::move(creds);
+}
 
 // Registration TTL, in heartbeat periods: the registration survives two
 // missed heartbeats and expires on the third. A lapse is cheap to recover
@@ -405,13 +413,24 @@ absl::StatusOr<std::unique_ptr<KVCacheStore>> KVCacheStore::Create(
 
   ABSL_RETURN_IF_ERROR(ValidateBackends(backends));
 
+  std::shared_ptr<global_registry::GlobalRegistryClient> registry_client;
+  if (!global_registry_address.empty()) {
+    ABSL_ASSIGN_OR_RETURN(
+        std::shared_ptr<grpc::ChannelCredentials> creds,
+        CreateGrpcCredentialFactory()->CreateClientCredentials());
+    auto channel = grpc::CreateChannel(std::string(global_registry_address),
+                                       std::move(creds));
+    registry_client =
+        std::make_shared<global_registry::GlobalRegistryClient>(channel);
+  }
+
   // The private constructor used here deliberately does no controller
   // wiring (the public ones do, and FATAL on failure) -- that would defeat
   // Create()'s whole purpose of returning a recoverable Status. Create()
   // does the wiring below instead.
   auto store = absl::WrapUnique(new KVCacheStore(
       std::move(backends), effective_raiden_id, std::move(raiden_controller),
-      store_server_ip, global_registry_address));
+      store_server_ip, std::move(registry_client)));
 
   // Before SetRaidenController: the registration published there carries
   // these attributes.
@@ -655,8 +674,9 @@ KVCacheStore::KVCacheStore(
     RaidenId raiden_id,
     std::unique_ptr<controller::RaidenController> raiden_controller,
     absl::string_view store_server_ip,
-    absl::string_view global_registry_address)
+    std::shared_ptr<global_registry::GlobalRegistryClient> registry_client)
     : backends_(std::move(backends)),
+      registry_client_(std::move(registry_client)),
       raiden_id_(std::move(raiden_id)),
       raiden_controller_(std::move(raiden_controller)),
       store_server_ip_(store_server_ip),
@@ -676,13 +696,6 @@ KVCacheStore::KVCacheStore(
     LOG(FATAL) << "KVCacheStore construction rules violated: " << v.message()
                << " Use KVCacheStore::Create() for a recoverable error.";
   }
-  // Created before SetRaidenController: publishing happens there, and needs it.
-  if (!global_registry_address.empty()) {
-    auto channel = grpc::CreateChannel(std::string(global_registry_address),
-                                       grpc::InsecureChannelCredentials());
-    registry_client_ =
-        std::make_shared<global_registry::GlobalRegistryClient>(channel);
-  }
   RecordHostPoolMetrics();
 }
 
@@ -700,7 +713,12 @@ KVCacheStore::KVCacheStore(
                                num_shards, shard_size_bytes, store_server_ip,
                                raiden_controller_port, expected_worker_count)
               .value_or(nullptr),
-          store_server_ip, global_registry_address) {
+          store_server_ip,
+          global_registry_address.empty()
+              ? nullptr
+              : std::make_shared<global_registry::GlobalRegistryClient>(
+                    grpc::CreateChannel(std::string(global_registry_address),
+                                        CreateClientCredentialsOrDie()))) {
   if (raiden_controller_) {
     if (absl::Status s = SetRaidenController(raiden_controller_.get());
         !s.ok()) {
@@ -743,7 +761,7 @@ KVCacheStore::KVCacheStore(
   }
   if (!global_registry_address.empty()) {
     auto channel = grpc::CreateChannel(std::string(global_registry_address),
-                                       grpc::InsecureChannelCredentials());
+                                       CreateClientCredentialsOrDie());
     registry_client_ =
         std::make_shared<global_registry::GlobalRegistryClient>(channel);
   }
@@ -816,7 +834,7 @@ KVCacheStore::KVCacheStore(
   }
   if (!global_registry_address.empty()) {
     auto channel = grpc::CreateChannel(std::string(global_registry_address),
-                                       grpc::InsecureChannelCredentials());
+                                       CreateClientCredentialsOrDie());
     registry_client_ =
         std::make_shared<global_registry::GlobalRegistryClient>(channel);
   }

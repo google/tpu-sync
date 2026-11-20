@@ -1255,7 +1255,7 @@ TEST_F(GlobalRegistryTest, AsyncSurvivesClientDestruction) {
   tsl::Future<> future;
   {
     std::shared_ptr<grpc::Channel> local_channel = grpc::CreateChannel(
-        test_server_->server_address, grpc::InsecureChannelCredentials());
+        test_server_->server_address, CreateTestClientCredentials());
     GlobalRegistryClient local_client(local_channel);
     future = local_client.RegisterAsync({{hash, host, block}});
   }

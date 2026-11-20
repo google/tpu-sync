@@ -20,6 +20,7 @@
 #include <utility>
 
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
@@ -29,6 +30,7 @@
 #include "tpu_sync/core/controller/raiden_controller.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_service.h"
+#include "tpu_sync/platform/grpc_credential_factory.h"
 namespace tpu_raiden {
 namespace kv_cache {
 
@@ -75,10 +77,12 @@ absl::Status KVCacheStoreServer::StartServerInternal(
     }
   }
 
+  ABSL_ASSIGN_OR_RETURN(
+      std::shared_ptr<grpc::ServerCredentials> server_creds,
+      CreateGrpcCredentialFactory()->CreateServerCredentials());
   grpc::ServerBuilder builder;
   int selected_port = 0;
-  builder.AddListeningPort(target_address, grpc::InsecureServerCredentials(),
-                           &selected_port);
+  builder.AddListeningPort(target_address, server_creds, &selected_port);
   builder.RegisterService(service_.get());
   grpc_server_ = builder.BuildAndStart();
 

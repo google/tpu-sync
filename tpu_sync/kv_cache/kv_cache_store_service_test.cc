@@ -129,14 +129,15 @@ class KVCacheStoreServiceTest : public ::testing::Test {
         store_->backend().get(), store_->raiden_controller());
     ::grpc::ServerBuilder builder;
     int selected_port = 0;
-    builder.AddListeningPort("localhost:0", ::grpc::InsecureServerCredentials(),
+    builder.AddListeningPort("localhost:0",
+                             global_registry::CreateTestServerCredentials(),
                              &selected_port);
     builder.RegisterService(service_.get());
     server_ = builder.BuildAndStart();
 
     std::string server_address = "localhost:" + std::to_string(selected_port);
-    auto channel = ::grpc::CreateChannel(server_address,
-                                         ::grpc::InsecureChannelCredentials());
+    auto channel = ::grpc::CreateChannel(
+        server_address, global_registry::CreateTestClientCredentials());
     client_ = std::make_unique<KVCacheStoreClient>(channel);
   }
 
@@ -351,14 +352,14 @@ TEST_F(KVCacheStoreServiceTest, FetchNullStoreHandling) {
       std::make_unique<KVCacheStoreServiceImpl>(nullptr, nullptr);
   ::grpc::ServerBuilder builder;
   int port = 0;
-  builder.AddListeningPort("localhost:0", ::grpc::InsecureServerCredentials(),
-                           &port);
+  builder.AddListeningPort(
+      "localhost:0", global_registry::CreateTestServerCredentials(), &port);
   builder.RegisterService(null_service.get());
   auto null_server = builder.BuildAndStart();
 
   auto null_client = std::make_unique<KVCacheStoreClient>(
       ::grpc::CreateChannel("localhost:" + std::to_string(port),
-                            ::grpc::InsecureChannelCredentials()));
+                            global_registry::CreateTestClientCredentials()));
 
   std::vector<std::string> hashes = {"block_hash_1"};
   std::vector<int32_t> host_block_ids = {100};
@@ -522,13 +523,13 @@ TEST_F(KVCacheStoreServiceTest, FetchWithMultiWorkerEndpointsRoutesPerWorker) {
                                   store.raiden_controller());
   ::grpc::ServerBuilder builder;
   int port = 0;
-  builder.AddListeningPort("localhost:0", ::grpc::InsecureServerCredentials(),
-                           &port);
+  builder.AddListeningPort(
+      "localhost:0", global_registry::CreateTestServerCredentials(), &port);
   builder.RegisterService(&service);
   auto server = builder.BuildAndStart();
   KVCacheStoreClient client(
       ::grpc::CreateChannel("localhost:" + std::to_string(port),
-                            ::grpc::InsecureChannelCredentials()));
+                            global_registry::CreateTestClientCredentials()));
 
   ::tpu_sync::rpc::RaidenIdProto client_id;
   client_id.set_job_name("client_job");
@@ -633,13 +634,13 @@ class WriteRemoteTest : public ::testing::Test {
 
     ::grpc::ServerBuilder builder;
     int port = 0;
-    builder.AddListeningPort("localhost:0", ::grpc::InsecureServerCredentials(),
-                             &port);
+    builder.AddListeningPort(
+        "localhost:0", global_registry::CreateTestServerCredentials(), &port);
     builder.RegisterService(service_.get());
     server_ = builder.BuildAndStart();
     client_ = std::make_unique<KVCacheStoreClient>(
         ::grpc::CreateChannel("localhost:" + std::to_string(port),
-                              ::grpc::InsecureChannelCredentials()));
+                              global_registry::CreateTestClientCredentials()));
   }
 
   void TearDown() override {
@@ -1100,13 +1101,13 @@ TEST(WriteRemotePublishTest, PublishDoesNotBlockTheTransferCompletion) {
 
   ::grpc::ServerBuilder builder;
   int port = 0;
-  builder.AddListeningPort("localhost:0", ::grpc::InsecureServerCredentials(),
-                           &port);
+  builder.AddListeningPort(
+      "localhost:0", global_registry::CreateTestServerCredentials(), &port);
   builder.RegisterService(&service);
   auto server = builder.BuildAndStart();
   KVCacheStoreClient client(
       ::grpc::CreateChannel("localhost:" + std::to_string(port),
-                            ::grpc::InsecureChannelCredentials()));
+                            global_registry::CreateTestClientCredentials()));
 
   ::tpu_sync::rpc::RaidenIdProto src_id;
   src_id.set_job_name("src_job_publish");
@@ -1203,13 +1204,13 @@ TEST(WriteRemoteRegistryFailureTest, StoredButUnregisteredIsReportedAsSuch) {
 
   ::grpc::ServerBuilder builder;
   int port = 0;
-  builder.AddListeningPort("localhost:0", ::grpc::InsecureServerCredentials(),
-                           &port);
+  builder.AddListeningPort(
+      "localhost:0", global_registry::CreateTestServerCredentials(), &port);
   builder.RegisterService(&service);
   auto server = builder.BuildAndStart();
   KVCacheStoreClient client(
       ::grpc::CreateChannel("localhost:" + std::to_string(port),
-                            ::grpc::InsecureChannelCredentials()));
+                            global_registry::CreateTestClientCredentials()));
 
   ::tpu_sync::rpc::RaidenIdProto src_id;
   src_id.set_job_name("src_job_unreg");
@@ -1344,13 +1345,13 @@ TEST(FetchWithdrawTest, ARefusedFetchWithdrawsOnlyTheEntriesItCannotBack) {
                                   store.raiden_controller());
   ::grpc::ServerBuilder builder;
   int port = 0;
-  builder.AddListeningPort("localhost:0", ::grpc::InsecureServerCredentials(),
-                           &port);
+  builder.AddListeningPort(
+      "localhost:0", global_registry::CreateTestServerCredentials(), &port);
   builder.RegisterService(&service);
   auto server = builder.BuildAndStart();
   KVCacheStoreClient client(
       ::grpc::CreateChannel("localhost:" + std::to_string(port),
-                            ::grpc::InsecureChannelCredentials()));
+                            global_registry::CreateTestClientCredentials()));
 
   // The dead hash sits in the MIDDLE, and the peer chose that order. Two
   // things ride on this shape: the retired hash is found by index rather than
@@ -1408,13 +1409,13 @@ TEST(FetchWithdrawTest, TheWithdrawDoesNotDelayTheRefusal) {
                                   store.raiden_controller());
   ::grpc::ServerBuilder builder;
   int port = 0;
-  builder.AddListeningPort("localhost:0", ::grpc::InsecureServerCredentials(),
-                           &port);
+  builder.AddListeningPort(
+      "localhost:0", global_registry::CreateTestServerCredentials(), &port);
   builder.RegisterService(&service);
   auto server = builder.BuildAndStart();
   KVCacheStoreClient client(
       ::grpc::CreateChannel("localhost:" + std::to_string(port),
-                            ::grpc::InsecureChannelCredentials()));
+                            global_registry::CreateTestClientCredentials()));
 
   // Released from another thread on a timer rather than on the stall itself,
   // so a withdraw that never arrives cannot hang the test and a synchronous
@@ -1465,13 +1466,13 @@ TEST(FetchWithdrawTest, AFetchRefusedOnTheWrongTierKeepsTheEntry) {
   KVCacheStoreServiceImpl service(backend, store.raiden_controller());
   ::grpc::ServerBuilder builder;
   int port = 0;
-  builder.AddListeningPort("localhost:0", ::grpc::InsecureServerCredentials(),
-                           &port);
+  builder.AddListeningPort(
+      "localhost:0", global_registry::CreateTestServerCredentials(), &port);
   builder.RegisterService(&service);
   auto server = builder.BuildAndStart();
   KVCacheStoreClient client(
       ::grpc::CreateChannel("localhost:" + std::to_string(port),
-                            ::grpc::InsecureChannelCredentials()));
+                            global_registry::CreateTestClientCredentials()));
 
   auto response = client.Fetch({"staged"}, /*device_block_ids=*/{},
                                /*host_block_ids=*/{100})
@@ -1523,13 +1524,13 @@ TEST(FetchWithdrawTest, ARefusedFetchKeepsAnEvictionCandidatesEntry) {
   KVCacheStoreServiceImpl service(backend, store.raiden_controller());
   ::grpc::ServerBuilder builder;
   int port = 0;
-  builder.AddListeningPort("localhost:0", ::grpc::InsecureServerCredentials(),
-                           &port);
+  builder.AddListeningPort(
+      "localhost:0", global_registry::CreateTestServerCredentials(), &port);
   builder.RegisterService(&service);
   auto server = builder.BuildAndStart();
   KVCacheStoreClient client(
       ::grpc::CreateChannel("localhost:" + std::to_string(port),
-                            ::grpc::InsecureChannelCredentials()));
+                            global_registry::CreateTestClientCredentials()));
 
   // The lookup cannot see a candidate, so the fetch is refused...
   auto response = client.Fetch({"demoted"}, /*device_block_ids=*/{},
@@ -1570,13 +1571,13 @@ TEST(FetchWithdrawTest, AHashOnlyAPeerHoldsIsAMissAndThePeerKeepsItsEntry) {
                                   store.raiden_controller());
   ::grpc::ServerBuilder builder;
   int port = 0;
-  builder.AddListeningPort("localhost:0", ::grpc::InsecureServerCredentials(),
-                           &port);
+  builder.AddListeningPort(
+      "localhost:0", global_registry::CreateTestServerCredentials(), &port);
   builder.RegisterService(&service);
   auto server = builder.BuildAndStart();
   KVCacheStoreClient client(
       ::grpc::CreateChannel("localhost:" + std::to_string(port),
-                            ::grpc::InsecureChannelCredentials()));
+                            global_registry::CreateTestClientCredentials()));
 
   // NOT_FOUND. A validation that consulted the registry would come back with a
   // full-length answer carrying a REMOTE slice, and report the wrong thing --

@@ -50,8 +50,10 @@ class GrsKVTransferSpecSourceTest : public ::testing::Test {
     service_ = std::make_unique<
         ::tpu_raiden::kv_cache::global_registry::GlobalRegistryServiceImpl>();
     grpc::ServerBuilder builder;
-    builder.AddListeningPort("localhost:0", grpc::InsecureServerCredentials(),
-                             &port_);
+    builder.AddListeningPort(
+        "localhost:0",
+        ::tpu_raiden::kv_cache::global_registry::CreateTestServerCredentials(),
+        &port_);
     builder.RegisterService(service_.get());
     server_ = builder.BuildAndStart();
     ASSERT_NE(server_, nullptr);
@@ -65,7 +67,8 @@ class GrsKVTransferSpecSourceTest : public ::testing::Test {
       const ::tpu_raiden::kv_cache::global_registry::KVTransferSpec& spec,
       absl::string_view kv_pool_group = "prefill_pool") {
     ::tpu_raiden::kv_cache::global_registry::GlobalRegistryClient client(
-        grpc::CreateChannel(address_, grpc::InsecureChannelCredentials()));
+        grpc::CreateChannel(address_, ::tpu_raiden::kv_cache::global_registry::
+                                          CreateTestClientCredentials()));
     ASSERT_TRUE(client.RegisterKVTransferSpec(spec, kv_pool_group).ok());
   }
 

@@ -606,8 +606,8 @@ TEST(HostOffloadBackendTest, CreateRegistersKVTransferSpecFromConfig) {
                           HostOffloadBackend::Create(config, controller.get()));
 
   // The registry now serves the registered spec under the configured group.
-  auto channel =
-      grpc::CreateChannel(server_address, grpc::InsecureChannelCredentials());
+  auto channel = grpc::CreateChannel(
+      server_address, global_registry::CreateTestClientCredentials());
   global_registry::GlobalRegistryClient registry_client(channel);
   TF_ASSERT_OK_AND_ASSIGN(auto spec,
                           registry_client.GetKVTransferSpec("node_group"));
@@ -948,8 +948,9 @@ TEST(HostOffloadBackendTest, EndToEndFetchRPC) {
   EXPECT_GT(store_server->GetGrpcPort(), 0);
 
   // 7. Issue Fetch RPC using KVCacheStoreClient
-  auto client_channel = grpc::CreateChannel(store_server->GetServerAddress(),
-                                            grpc::InsecureChannelCredentials());
+  auto client_channel =
+      grpc::CreateChannel(store_server->GetServerAddress(),
+                          global_registry::CreateTestClientCredentials());
   KVCacheStoreClient client(client_channel);
 
   std::vector<std::string> hashes = {"fetch_hash_1", "fetch_hash_2"};
@@ -1005,8 +1006,8 @@ TEST(HostOffloadBackendTest, LoadSuccess) {
   auto reg_server = global_registry::CreateTestGlobalRegistryServer();
   std::string server_address = reg_server->server_address;
 
-  auto channel =
-      grpc::CreateChannel(server_address, grpc::InsecureChannelCredentials());
+  auto channel = grpc::CreateChannel(
+      server_address, global_registry::CreateTestClientCredentials());
   auto registry_client =
       std::make_shared<global_registry::GlobalRegistryClient>(channel);
 
@@ -1495,8 +1496,8 @@ TEST(HostOffloadBackendTest, LoadWithOptionsOverload) {
   auto reg_server = global_registry::CreateTestGlobalRegistryServer();
   std::string server_address = reg_server->server_address;
 
-  auto channel =
-      grpc::CreateChannel(server_address, grpc::InsecureChannelCredentials());
+  auto channel = grpc::CreateChannel(
+      server_address, global_registry::CreateTestClientCredentials());
   auto registry_client =
       std::make_shared<global_registry::GlobalRegistryClient>(channel);
 
@@ -1774,8 +1775,8 @@ TEST(HostOffloadBackendWriteRemoteTest,
 TEST(HostOffloadBackendWriteRemoteTest, RegisterBlocksAsyncReportsFailure) {
   RaidenId id{"job_regfail", "0", "data", 0};
   // Port 1 is reserved and never listening.
-  auto channel =
-      grpc::CreateChannel("127.0.0.1:1", grpc::InsecureChannelCredentials());
+  auto channel = grpc::CreateChannel(
+      "127.0.0.1:1", global_registry::CreateTestClientCredentials());
   HostOffloadBackendTest::Backend backend(
       /*capacity=*/8, std::nullopt, id, /*raiden_controller=*/nullptr,
       std::make_shared<global_registry::GlobalRegistryClient>(channel));

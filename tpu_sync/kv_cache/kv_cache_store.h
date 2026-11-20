@@ -558,7 +558,8 @@ class KVCacheStore {
       RaidenId raiden_id,
       std::unique_ptr<controller::RaidenController> raiden_controller,
       absl::string_view store_server_ip = "",
-      absl::string_view global_registry_address = "");
+      std::shared_ptr<global_registry::GlobalRegistryClient> registry_client =
+          nullptr);
 
   // Registers ValidateAndPinHostBlocks/UnpinHostBlocks on raiden_controller_
   // as the source-side hooks that a peer's ReadRemote lease acquisition and

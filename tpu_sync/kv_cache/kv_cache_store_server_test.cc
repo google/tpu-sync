@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <gmock/gmock.h>
@@ -35,6 +36,7 @@
 #include "tpu_sync/kv_cache/kv_cache_store.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_client.h"
+#include "tpu_sync/platform/grpc_credential_factory.h"
 namespace tpu_raiden {
 namespace kv_cache {
 namespace {
@@ -119,8 +121,11 @@ TEST_F(KVCacheStoreServerTest, StartServerWithRawPointerStore) {
   EXPECT_FALSE(server_->GetServerAddress().empty());
 
   // Connect via KVCacheStoreClient
+  absl::StatusOr<std::shared_ptr<::grpc::ChannelCredentials>> client_creds =
+      CreateGrpcCredentialFactory()->CreateClientCredentials();
+  ABSL_ASSERT_OK(client_creds.status());
   auto channel = ::grpc::CreateChannel(server_->GetServerAddress(),
-                                       ::grpc::InsecureChannelCredentials());
+                                       *std::move(client_creds));
   KVCacheStoreClient client(channel);
 
   std::vector<std::string> hashes = {"block_hash_1", "block_hash_2"};
@@ -154,8 +159,11 @@ TEST_F(KVCacheStoreServerTest, RestartServerAfterShutdown) {
   EXPECT_GT(second_port, 0);
 
   // Verify client connection after restart
+  absl::StatusOr<std::shared_ptr<::grpc::ChannelCredentials>> client_creds =
+      CreateGrpcCredentialFactory()->CreateClientCredentials();
+  ABSL_ASSERT_OK(client_creds.status());
   auto channel = ::grpc::CreateChannel(server_->GetServerAddress(),
-                                       ::grpc::InsecureChannelCredentials());
+                                       *std::move(client_creds));
   KVCacheStoreClient client(channel);
 
   std::vector<std::string> hashes = {"block_hash_1", "block_hash_2"};

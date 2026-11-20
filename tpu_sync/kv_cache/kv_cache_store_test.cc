@@ -222,8 +222,9 @@ bool InsertResident(KVCacheStore& store,
 absl::Status PublishPeerController(absl::string_view registry_address,
                                    const RaidenId& peer_id,
                                    absl::string_view controller_address) {
-  global_registry::GlobalRegistryClient client(grpc::CreateChannel(
-      std::string(registry_address), grpc::InsecureChannelCredentials()));
+  global_registry::GlobalRegistryClient client(
+      grpc::CreateChannel(std::string(registry_address),
+                          global_registry::CreateTestClientCredentials()));
   return client.RegisterStore(peer_id, "peer.store.unused:1",
                               controller_address);
 }
@@ -661,8 +662,8 @@ TEST(KVCacheStoreTest, GlobalLookupRegistryDown) {
   LookupFailingRegistryService service;
   grpc::ServerBuilder builder;
   int port = 0;
-  builder.AddListeningPort("localhost:0", grpc::InsecureServerCredentials(),
-                           &port);
+  builder.AddListeningPort(
+      "localhost:0", global_registry::CreateTestServerCredentials(), &port);
   builder.RegisterService(&service);
   auto server = builder.BuildAndStart();
   std::string server_address = "localhost:" + std::to_string(port);
@@ -1180,7 +1181,8 @@ class KVCacheStoreEmbeddedControllerTest : public ::testing::Test {
         std::make_unique<global_registry::GlobalRegistryServiceImpl>();
     grpc::ServerBuilder builder;
     int bound_port = 0;
-    builder.AddListeningPort("localhost:0", grpc::InsecureServerCredentials(),
+    builder.AddListeningPort("localhost:0",
+                             global_registry::CreateTestServerCredentials(),
                              &bound_port);
     builder.RegisterService(registry_service_.get());
     registry_server_ = builder.BuildAndStart();
@@ -2041,8 +2043,8 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, LoadWithSlicesRemoteSuccess) {
   ABSL_ASSERT_OK(remote_server->StartServer(remote_backend.get(),
                                             controller.get(), "127.0.0.1"));
 
-  auto channel =
-      grpc::CreateChannel(registry_address, grpc::InsecureChannelCredentials());
+  auto channel = grpc::CreateChannel(
+      registry_address, global_registry::CreateTestClientCredentials());
   auto registry_client =
       std::make_shared<global_registry::GlobalRegistryClient>(channel);
   ABSL_ASSERT_OK(registry_client->RegisterStore(
@@ -2119,8 +2121,8 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, LoadRemoteWithSlicesRecordsNothing) {
   auto remote_server = KVCacheStoreServer::Create();
   ABSL_ASSERT_OK(remote_server->StartServer(remote_backend.get(),
                                             controller.get(), "127.0.0.1"));
-  auto channel =
-      grpc::CreateChannel(registry_address, grpc::InsecureChannelCredentials());
+  auto channel = grpc::CreateChannel(
+      registry_address, global_registry::CreateTestClientCredentials());
   auto registry_client =
       std::make_shared<global_registry::GlobalRegistryClient>(channel);
   ABSL_ASSERT_OK(registry_client->RegisterStore(
@@ -2390,8 +2392,8 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, SaveWriteThrough) {
 
   // 7. Verify registry has been updated (need to poll registry since
   // registration is async)
-  auto channel =
-      grpc::CreateChannel(server_address, grpc::InsecureChannelCredentials());
+  auto channel = grpc::CreateChannel(
+      server_address, global_registry::CreateTestClientCredentials());
   global_registry::GlobalRegistryClient registry_client(channel);
 
   bool registered = false;
@@ -2569,8 +2571,8 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, EvictByHashesErasesEitherStatus) {
                        std::nullopt, /*store_server_ip=*/"127.0.0.1");
 
     // Register in the global registry first to simulate write-through.
-    auto channel =
-        grpc::CreateChannel(server_address, grpc::InsecureChannelCredentials());
+    auto channel = grpc::CreateChannel(
+        server_address, global_registry::CreateTestClientCredentials());
     global_registry::GlobalRegistryClient registry_client(channel);
     ABSL_ASSERT_OK(
         registry_client.Register({{"hash_1", rid, host_block_ids[0]},
@@ -2640,8 +2642,8 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, EvictKeepsASkippedHashRegistered) {
   KVCacheStore store(10, std::move(controller), server_address, rid,
                      std::nullopt, /*store_server_ip=*/"127.0.0.1");
 
-  auto channel =
-      grpc::CreateChannel(server_address, grpc::InsecureChannelCredentials());
+  auto channel = grpc::CreateChannel(
+      server_address, global_registry::CreateTestClientCredentials());
   global_registry::GlobalRegistryClient registry_client(channel);
   ABSL_ASSERT_OK(
       registry_client.Register({{"pinned_1", rid, host_block_ids[0]},
@@ -2700,8 +2702,8 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, EvictOnSave) {
   KVCacheStore store(3, std::move(controller), server_address, rid,
                      std::nullopt, /*store_server_ip=*/"127.0.0.1");
 
-  auto channel =
-      grpc::CreateChannel(server_address, grpc::InsecureChannelCredentials());
+  auto channel = grpc::CreateChannel(
+      server_address, global_registry::CreateTestClientCredentials());
   global_registry::GlobalRegistryClient registry_client(channel);
 
   TF_ASSERT_OK_AND_ASSIGN(std::vector<int> host_block_ids,
@@ -2917,8 +2919,8 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, ReadRemoteSuccess) {
   ABSL_ASSERT_OK(src_store_server->StartServer(src_backend.get(),
                                                controller.get(), "127.0.0.1"));
 
-  auto channel =
-      grpc::CreateChannel(registry_address, grpc::InsecureChannelCredentials());
+  auto channel = grpc::CreateChannel(
+      registry_address, global_registry::CreateTestClientCredentials());
   auto registry_client =
       std::make_shared<global_registry::GlobalRegistryClient>(channel);
   ABSL_ASSERT_OK(registry_client->RegisterStore(
@@ -3008,8 +3010,8 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, ReadRemoteReturnsStagingOnSuccess) {
   ABSL_ASSERT_OK(src_store_server->StartServer(
       src_backend.get(), dst_controller.get(), "127.0.0.1"));
 
-  auto channel =
-      grpc::CreateChannel(registry_address, grpc::InsecureChannelCredentials());
+  auto channel = grpc::CreateChannel(
+      registry_address, global_registry::CreateTestClientCredentials());
   auto registry_client =
       std::make_shared<global_registry::GlobalRegistryClient>(channel);
   ABSL_ASSERT_OK(registry_client->RegisterStore(
@@ -3128,7 +3130,8 @@ TEST_F(KVCacheStoreEmbeddedControllerTest,
   CountingRegistryService counting_registry;
   grpc::ServerBuilder builder;
   int registry_port = 0;
-  builder.AddListeningPort("localhost:0", grpc::InsecureServerCredentials(),
+  builder.AddListeningPort("localhost:0",
+                           global_registry::CreateTestServerCredentials(),
                            &registry_port);
   builder.RegisterService(&counting_registry);
   auto registry_server = builder.BuildAndStart();
@@ -3167,7 +3170,7 @@ TEST_F(KVCacheStoreEmbeddedControllerTest,
       old_src->StartServer(src_backend.get(), controller_ptr, "127.0.0.1"));
 
   global_registry::GlobalRegistryClient reg_client(grpc::CreateChannel(
-      registry_address, grpc::InsecureChannelCredentials()));
+      registry_address, global_registry::CreateTestClientCredentials()));
   ABSL_ASSERT_OK(
       reg_client.RegisterStore(src_raiden_id, old_src->GetServerAddress(),
                                controller_ptr->controller_address()));
@@ -3228,7 +3231,8 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, ReadRemoteFailure) {
   grpc::ServerBuilder registry_builder;
   int registry_port = 0;
   registry_builder.AddListeningPort(
-      "localhost:0", grpc::InsecureServerCredentials(), &registry_port);
+      "localhost:0", global_registry::CreateTestServerCredentials(),
+      &registry_port);
   registry_builder.RegisterService(service.get());
   auto registry_server = registry_builder.BuildAndStart();
   std::string registry_address = "localhost:" + std::to_string(registry_port);
@@ -3365,8 +3369,8 @@ TEST_F(KVCacheStoreEmbeddedControllerTest,
   ABSL_ASSERT_OK(src_store_server->StartServer(src_backend.get(),
                                                controller.get(), "127.0.0.1"));
 
-  auto channel = grpc::CreateChannel(registry_address_,
-                                     grpc::InsecureChannelCredentials());
+  auto channel = grpc::CreateChannel(
+      registry_address_, global_registry::CreateTestClientCredentials());
   global_registry::GlobalRegistryClient registry_client(channel);
   ABSL_ASSERT_OK(registry_client.RegisterStore(
       src_raiden_id, src_store_server->GetServerAddress(),
@@ -3477,7 +3481,7 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, ReadRemoteDuplicateFails) {
       src_server->StartServer(src_backend.get(), controller_ptr, "127.0.0.1"));
 
   global_registry::GlobalRegistryClient reg_client(grpc::CreateChannel(
-      registry_address_, grpc::InsecureChannelCredentials()));
+      registry_address_, global_registry::CreateTestClientCredentials()));
   ABSL_ASSERT_OK(
       reg_client.RegisterStore(src_raiden_id, src_server->GetServerAddress(),
                                controller_ptr->controller_address()));
@@ -3567,8 +3571,8 @@ TEST_F(KVCacheStoreEmbeddedControllerTest, ReadRemoteMultipleSources) {
   ABSL_ASSERT_OK(src_server_2->StartServer(src_backend_2.get(),
                                            controller.get(), "127.0.0.1"));
 
-  auto channel =
-      grpc::CreateChannel(registry_address, grpc::InsecureChannelCredentials());
+  auto channel = grpc::CreateChannel(
+      registry_address, global_registry::CreateTestClientCredentials());
   global_registry::GlobalRegistryClient client(channel);
   ABSL_ASSERT_OK(client.RegisterStore(src_raiden_id_1,
                                       src_server_1->GetServerAddress(),
@@ -3920,13 +3924,13 @@ class StoreDiscoveryTest : public ::testing::Test {
     service_ = std::make_unique<global_registry::GlobalRegistryServiceImpl>();
     grpc::ServerBuilder builder;
     int port = 0;
-    builder.AddListeningPort("localhost:0", grpc::InsecureServerCredentials(),
-                             &port);
+    builder.AddListeningPort(
+        "localhost:0", global_registry::CreateTestServerCredentials(), &port);
     builder.RegisterService(service_.get());
     server_ = builder.BuildAndStart();
     registry_address_ = "localhost:" + std::to_string(port);
-    channel_ = grpc::CreateChannel(registry_address_,
-                                   grpc::InsecureChannelCredentials());
+    channel_ = grpc::CreateChannel(
+        registry_address_, global_registry::CreateTestClientCredentials());
     client_ = std::make_unique<global_registry::GlobalRegistryClient>(channel_);
   }
 
@@ -3978,8 +3982,9 @@ TEST_F(StoreDiscoveryTest, PublishedAddressIsConnectable) {
   auto resolved = client_->ResolveStore(rid);
   ABSL_ASSERT_OK(resolved);
 
-  auto peer_channel = grpc::CreateChannel(resolved->store_server_address(),
-                                          grpc::InsecureChannelCredentials());
+  auto peer_channel =
+      grpc::CreateChannel(resolved->store_server_address(),
+                          global_registry::CreateTestClientCredentials());
   ASSERT_TRUE(peer_channel->WaitForConnected(std::chrono::system_clock::now() +
                                              std::chrono::seconds(10)));
 }
@@ -4242,8 +4247,9 @@ TEST_F(StoreDiscoveryTest, TeardownDrainsAnInFlightPeerRpc) {
       /*raiden_controller_port=*/0, registry_address_);
   ASSERT_FALSE(store->store_server_address().empty());
 
-  auto peer_channel = grpc::CreateChannel(store->store_server_address(),
-                                          grpc::InsecureChannelCredentials());
+  auto peer_channel =
+      grpc::CreateChannel(store->store_server_address(),
+                          global_registry::CreateTestClientCredentials());
   KVCacheStoreClient peer(peer_channel);
   auto fetch_future = peer.Fetch({"h1"}, /*device_block_ids=*/{},
                                  /*host_block_ids=*/{7});
@@ -4794,8 +4800,8 @@ class RemoteWriteSourceTest : public StoreDiscoveryTest {
                             int32_t evict_tier = 0) {
     grpc::ServerBuilder builder;
     int port = 0;
-    builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(),
-                             &port);
+    builder.AddListeningPort(
+        "127.0.0.1:0", global_registry::CreateTestServerCredentials(), &port);
     builder.RegisterService(&fake_destination_);
     fake_destination_server_ = builder.BuildAndStart();
     ASSERT_NE(fake_destination_server_, nullptr);
@@ -6233,8 +6239,8 @@ TEST(KVCacheStoreConstructionRulesTest, CreateFailsWhenRegistryPublishFails) {
   auto service = std::make_unique<global_registry::GlobalRegistryServiceImpl>();
   grpc::ServerBuilder builder;
   int port = 0;
-  builder.AddListeningPort("localhost:0", grpc::InsecureServerCredentials(),
-                           &port);
+  builder.AddListeningPort(
+      "localhost:0", global_registry::CreateTestServerCredentials(), &port);
   builder.RegisterService(service.get());
   auto server = builder.BuildAndStart();
   std::string server_address = "localhost:" + std::to_string(port);
@@ -6399,7 +6405,8 @@ TEST(KVCacheStoreTest, RegisterKVTransferSpecFromWorkersPublishesToRegistry) {
   grpc::ServerBuilder registry_builder;
   int registry_port = 0;
   registry_builder.AddListeningPort(
-      "localhost:0", grpc::InsecureServerCredentials(), &registry_port);
+      "localhost:0", global_registry::CreateTestServerCredentials(),
+      &registry_port);
   registry_builder.RegisterService(registry_service.get());
   auto registry_server = registry_builder.BuildAndStart();
   ASSERT_NE(registry_server, nullptr);
@@ -6433,7 +6440,7 @@ TEST(KVCacheStoreTest, RegisterKVTransferSpecFromWorkersPublishesToRegistry) {
   // No kv_pool_group was configured, so the publish fell back to the
   // store's raiden_id.job_name as the group.
   global_registry::GlobalRegistryClient registry_client(grpc::CreateChannel(
-      registry_address, grpc::InsecureChannelCredentials()));
+      registry_address, global_registry::CreateTestClientCredentials()));
   TF_ASSERT_OK_AND_ASSIGN(auto spec, registry_client.GetKVTransferSpec("job"));
   ASSERT_EQ(spec.block_arrays_size(), 2);
   EXPECT_EQ(spec.block_arrays(0).block_bytes(), 4096);

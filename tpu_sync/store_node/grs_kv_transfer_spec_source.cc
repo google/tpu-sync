@@ -16,9 +16,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
@@ -27,6 +30,7 @@
 #include "grpcpp/create_channel.h"
 #include "grpcpp/security/credentials.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry.pb.h"
+#include "tpu_sync/platform/grpc_credential_factory.h"
 #include "tpu_sync/store_node/kv_transfer_spec_source.h"
 namespace tpu_raiden {
 namespace store_node {
@@ -47,12 +51,19 @@ absl::StatusOr<uint64_t> PositiveBlockBytes(
   return static_cast<uint64_t>(array.block_bytes());
 }
 
+std::shared_ptr<grpc::ChannelCredentials> CreateClientCredentialsOrDie() {
+  absl::StatusOr<std::shared_ptr<grpc::ChannelCredentials>> creds =
+      CreateGrpcCredentialFactory()->CreateClientCredentials();
+  CHECK_OK(creds.status());
+  return *std::move(creds);
+}
+
 }  // namespace
 
 GrsKVTransferSpecSource::GrsKVTransferSpecSource(
     absl::string_view global_registry_address, absl::string_view kv_pool_group)
     : client_(grpc::CreateChannel(std::string(global_registry_address),
-                                  grpc::InsecureChannelCredentials())),
+                                  CreateClientCredentialsOrDie())),
       kv_pool_group_(kv_pool_group) {}
 
 absl::StatusOr<KVTransferSpec> GrsKVTransferSpecSource::Get() {

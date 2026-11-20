@@ -54,6 +54,7 @@
 #include "tpu_sync/kv_cache/kv_cache_store_client.h"
 #include "tpu_sync/kv_cache/kv_cache_telemetry.h"
 #include "tpu_sync/kv_cache/lru_cache.h"
+#include "tpu_sync/platform/grpc_credential_factory.h"
 #include "tpu_sync/proto/kv_cache_store_service.pb.h"
 #include "tpu_sync/proto/worker_service.pb.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
@@ -200,8 +201,11 @@ absl::StatusOr<std::shared_ptr<KVCacheStoreBackend>> HostOffloadBackend::Create(
   }
   std::shared_ptr<global_registry::GlobalRegistryClient> registry_client;
   if (!config.global_registry_address.empty()) {
+    ABSL_ASSIGN_OR_RETURN(
+        std::shared_ptr<grpc::ChannelCredentials> client_creds,
+        CreateGrpcCredentialFactory()->CreateClientCredentials());
     auto channel = grpc::CreateChannel(config.global_registry_address,
-                                       grpc::InsecureChannelCredentials());
+                                       std::move(client_creds));
     registry_client = std::make_shared<
         ::tpu_raiden::kv_cache::global_registry::GlobalRegistryClient>(channel);
   }
@@ -852,8 +856,11 @@ HostOffloadBackend::GetKVCacheStoreClient(const RaidenId& remote_id) {
         "Peer is registered but published an empty store server address");
   }
 
+  ABSL_ASSIGN_OR_RETURN(
+      std::shared_ptr<grpc::ChannelCredentials> client_creds,
+      CreateGrpcCredentialFactory()->CreateClientCredentials());
   auto channel = grpc::CreateChannel(store_info.store_server_address(),
-                                     grpc::InsecureChannelCredentials());
+                                     std::move(client_creds));
   auto client = std::make_shared<KVCacheStoreClient>(channel);
   {
     absl::MutexLock lock(mutex_);

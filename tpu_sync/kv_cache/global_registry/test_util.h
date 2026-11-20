@@ -22,6 +22,7 @@
 #include <utility>
 
 #include "absl/log/check.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/notification.h"
 #include "absl/time/time.h"
@@ -36,6 +37,7 @@
 #include "tpu_sync/kv_cache/global_registry/global_registry.grpc.pb.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry_server.h"
+#include "tpu_sync/platform/grpc_credential_factory.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
@@ -183,6 +185,20 @@ struct TestGlobalRegistryServer {
   }
 };
 
+inline std::shared_ptr<grpc::ServerCredentials> CreateTestServerCredentials() {
+  absl::StatusOr<std::shared_ptr<grpc::ServerCredentials>> creds =
+      CreateGrpcCredentialFactory()->CreateServerCredentials();
+  CHECK_OK(creds.status());
+  return *std::move(creds);
+}
+
+inline std::shared_ptr<grpc::ChannelCredentials> CreateTestClientCredentials() {
+  absl::StatusOr<std::shared_ptr<grpc::ChannelCredentials>> creds =
+      CreateGrpcCredentialFactory()->CreateClientCredentials();
+  CHECK_OK(creds.status());
+  return *std::move(creds);
+}
+
 // Creates and starts an in-process gRPC TestGlobalRegistryServer hosting
 // GlobalRegistryServiceImpl on an ephemeral port ("localhost:0").
 inline std::unique_ptr<TestGlobalRegistryServer> CreateTestGlobalRegistryServer(
@@ -196,14 +212,14 @@ inline std::unique_ptr<TestGlobalRegistryServer> CreateTestGlobalRegistryServer(
 
   grpc::ServerBuilder builder;
   int selected_port = 0;
-  builder.AddListeningPort("localhost:0", grpc::InsecureServerCredentials(),
+  builder.AddListeningPort("localhost:0", CreateTestServerCredentials(),
                            &selected_port);
   builder.RegisterService(test_server->service.get());
   test_server->server = builder.BuildAndStart();
 
   test_server->server_address = absl::StrCat("localhost:", selected_port);
-  test_server->channel = grpc::CreateChannel(
-      test_server->server_address, grpc::InsecureChannelCredentials());
+  test_server->channel = grpc::CreateChannel(test_server->server_address,
+                                             CreateTestClientCredentials());
   test_server->client =
       std::make_unique<GlobalRegistryClient>(test_server->channel);
   return test_server;
@@ -219,7 +235,7 @@ CreateTestGlobalRegistryServerWithService(
 
   grpc::ServerBuilder builder;
   int selected_port = 0;
-  builder.AddListeningPort("localhost:0", grpc::InsecureServerCredentials(),
+  builder.AddListeningPort("localhost:0", CreateTestServerCredentials(),
                            &selected_port);
   builder.RegisterService(test_server->custom_service.get());
   test_server->server = builder.BuildAndStart();
@@ -227,8 +243,8 @@ CreateTestGlobalRegistryServerWithService(
       << "Failed to start test GlobalRegistry server";
 
   test_server->server_address = absl::StrCat("localhost:", selected_port);
-  test_server->channel = grpc::CreateChannel(
-      test_server->server_address, grpc::InsecureChannelCredentials());
+  test_server->channel = grpc::CreateChannel(test_server->server_address,
+                                             CreateTestClientCredentials());
   test_server->client =
       std::make_unique<GlobalRegistryClient>(test_server->channel);
   return test_server;

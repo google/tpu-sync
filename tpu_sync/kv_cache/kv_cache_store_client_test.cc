@@ -33,6 +33,7 @@
 #include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/core/raiden_future.h"
 #include "tpu_sync/kv_cache/block_tracker.h"
+#include "tpu_sync/platform/grpc_credential_factory.h"
 #include "tpu_sync/proto/kv_cache_store_service.grpc.pb.h"
 #include "tpu_sync/proto/kv_cache_store_service.pb.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
@@ -100,16 +101,20 @@ class KVCacheStoreClientTest : public ::testing::Test {
  protected:
   void SetUp() override {
     service_ = std::make_unique<TestKVCacheStoreService>();
+    TF_ASSERT_OK_AND_ASSIGN(
+        std::shared_ptr<::grpc::ServerCredentials> server_creds,
+        CreateGrpcCredentialFactory()->CreateServerCredentials());
     ::grpc::ServerBuilder builder;
     int selected_port = 0;
-    builder.AddListeningPort("localhost:0", ::grpc::InsecureServerCredentials(),
-                             &selected_port);
+    builder.AddListeningPort("localhost:0", server_creds, &selected_port);
     builder.RegisterService(service_.get());
     server_ = builder.BuildAndStart();
 
+    TF_ASSERT_OK_AND_ASSIGN(
+        std::shared_ptr<::grpc::ChannelCredentials> client_creds,
+        CreateGrpcCredentialFactory()->CreateClientCredentials());
     std::string server_address = "localhost:" + std::to_string(selected_port);
-    auto channel = ::grpc::CreateChannel(server_address,
-                                         ::grpc::InsecureChannelCredentials());
+    auto channel = ::grpc::CreateChannel(server_address, client_creds);
     client_ = std::make_unique<KVCacheStoreClient>(channel);
   }
 

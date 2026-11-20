@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "tpu_sync/kv_cache/global_registry/global_registry_server.h"
+#include "tpu_sync/kv_cache_offload/global_registry/global_registry_server.h"
 
 #include <grpcpp/grpcpp.h>
 
@@ -35,7 +35,7 @@
 #include "grpcpp/server_context.h"
 #include "grpcpp/support/status.h"
 #include "tpu_sync/common/raiden_id.h"
-#include "tpu_sync/kv_cache/global_registry/global_registry.pb.h"
+#include "tpu_sync/kv_cache_offload/global_registry/global_registry.pb.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
@@ -185,11 +185,12 @@ grpc::Status GlobalRegistryServiceImpl::Lookup(grpc::ServerContext* context,
       }
     }
     entries.erase(
-        std::remove_if(entries.begin(), entries.end(),
-                       [now, filter_caller, &caller](const RegistryEntry& entry) {
-                         return entry.expire_time <= now ||
-                                (filter_caller && entry.raiden_id == caller);
-                       }),
+        std::remove_if(
+            entries.begin(), entries.end(),
+            [now, filter_caller, &caller](const RegistryEntry& entry) {
+              return entry.expire_time <= now ||
+                     (filter_caller && entry.raiden_id == caller);
+            }),
         entries.end());
 
     if (entries.empty()) {

@@ -46,12 +46,12 @@
 #include "tpu_sync/core/controller/raiden_controller.h"
 #include "tpu_sync/core/controller/test_util.h"
 #include "tpu_sync/core/kv_manager_holder.h"
-#include "tpu_sync/kv_cache/global_registry/global_registry_server.h"
-#include "tpu_sync/kv_cache/global_registry/test_util.h"
 #include "tpu_sync/kv_cache/host_offload_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_client.h"
+#include "tpu_sync/kv_cache_offload/global_registry/global_registry_server.h"
+#include "tpu_sync/kv_cache_offload/global_registry/test_util.h"
 #include "tpu_sync/proto/kv_cache_store_service.grpc.pb.h"
 namespace tpu_raiden {
 namespace kv_cache {

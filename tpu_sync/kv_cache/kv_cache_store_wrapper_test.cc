@@ -32,11 +32,11 @@
 #include "absl/time/time.h"
 #include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/common/raiden_id.h"
-#include "tpu_sync/kv_cache/global_registry/test_util.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata_shm.h"
 #include "tpu_sync/kv_cache/kv_cache_store.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
+#include "tpu_sync/kv_cache_offload/global_registry/test_util.h"
 
 namespace tpu_raiden {
 namespace kv_cache {

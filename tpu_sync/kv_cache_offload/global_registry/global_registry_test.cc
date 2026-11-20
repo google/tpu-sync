@@ -38,11 +38,11 @@
 #include "grpcpp/support/status.h"
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/common/raiden_id.h"
-#include "tpu_sync/kv_cache/global_registry/global_registry.grpc.pb.h"
-#include "tpu_sync/kv_cache/global_registry/global_registry.pb.h"
-#include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
-#include "tpu_sync/kv_cache/global_registry/global_registry_server.h"
-#include "tpu_sync/kv_cache/global_registry/test_util.h"
+#include "tpu_sync/kv_cache_offload/global_registry/global_registry.grpc.pb.h"
+#include "tpu_sync/kv_cache_offload/global_registry/global_registry.pb.h"
+#include "tpu_sync/kv_cache_offload/global_registry/global_registry_client.h"
+#include "tpu_sync/kv_cache_offload/global_registry/global_registry_server.h"
+#include "tpu_sync/kv_cache_offload/global_registry/test_util.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
@@ -238,11 +238,11 @@ TEST_F(GlobalRegistryTest, LookupOffersAnotherHolderWhenTheCallerIsOne) {
   const RaidenId caller = {"job1", "replica1", "data1", 0};
   const RaidenId peer = {"job1", "replica2", "data1", 1};
 
-  ASSERT_TRUE(client_
-                  ->Register({{hash1, caller, 42},
-                              {hash1, peer, 43},
-                              {hash2, peer, 44}})
-                  .ok());
+  ASSERT_TRUE(
+      client_
+          ->Register(
+              {{hash1, caller, 42}, {hash1, peer, 43}, {hash2, peer, 44}})
+          .ok());
 
   // Both positions must come back, and hash1's must name the peer. Naming the
   // caller there would be an answer it cannot use, and its own walk stops at a
@@ -262,11 +262,11 @@ TEST_F(GlobalRegistryTest, LookupRoundRobinsOverTheHoldersLeftAfterTheSkip) {
   const RaidenId peer_a = {"job1", "replica2", "data1", 1};
   const RaidenId peer_b = {"job1", "replica3", "data1", 2};
 
-  ASSERT_TRUE(client_
-                  ->Register({{hash, caller, 42},
-                              {hash, peer_a, 43},
-                              {hash, peer_b, 44}})
-                  .ok());
+  ASSERT_TRUE(
+      client_
+          ->Register(
+              {{hash, caller, 42}, {hash, peer_a, 43}, {hash, peer_b, 44}})
+          .ok());
 
   // Round-robin cycles through remaining peers.
   auto first = client_->Lookup({hash}, caller);
@@ -390,8 +390,7 @@ TEST_F(GlobalRegistryTest, PullOwnedReturnsOnlyOwnedEntries) {
 TEST_F(GlobalRegistryTest, PullOwnedEmptyForUnknownOwner) {
   grpc::Status status;
   int num_messages = 0;
-  auto entries =
-      PullOwned({"unknown", "r1", "d1", 0}, &status, &num_messages);
+  auto entries = PullOwned({"unknown", "r1", "d1", 0}, &status, &num_messages);
   EXPECT_TRUE(status.ok()) << status.error_message();
   EXPECT_TRUE(entries.empty());
   EXPECT_EQ(num_messages, 0);
@@ -848,8 +847,8 @@ TEST_F(GlobalRegistryTest, PlacementTargetsHonorCapAndSkipExpired) {
     RaidenId id = {std::string(job), "r0", "dataS", 0};
     ASSERT_TRUE(client_
                     ->RegisterStore(id, absl::StrCat(job, ":1111"),
-                                    /*controller_address=*/"",
-                                    ttl, "groupA", /*evict_tier=*/1)
+                                    /*controller_address=*/"", ttl, "groupA",
+                                    /*evict_tier=*/1)
                     .ok());
   };
   register_node("node_a", absl::ZeroDuration());
@@ -1231,8 +1230,8 @@ TEST(GlobalRegistryAsyncTest, AsyncCallHonoursItsDeadline) {
   std::string hash = "deadline_hash";
   RaidenId host = {"job1", "replica1", "data1", 0};
 
-  auto future = server->client->RegisterAsync({{hash, host, 1}},
-                                              absl::Milliseconds(50));
+  auto future =
+      server->client->RegisterAsync({{hash, host, 1}}, absl::Milliseconds(50));
   service_ptr->WaitForStall();
 
   auto status = future.Await();
@@ -1277,8 +1276,7 @@ TEST_F(GlobalRegistryTest, RegisterAsyncZeroTimeout) {
   // Zero is a deadline of *now*, NOT "no deadline" -- unlike Registration::ttl
   // and RegisterStore's ttl, where zero means "never expires". The call must
   // fail rather than block forever, and must leave the registry untouched.
-  auto future =
-      client_->RegisterAsync({{hash, host, 1}}, absl::ZeroDuration());
+  auto future = client_->RegisterAsync({{hash, host, 1}}, absl::ZeroDuration());
   auto status = future.Await();
   ASSERT_FALSE(status.ok())
       << "zero timeout must expire the call, not mean 'never expire'";
@@ -1341,7 +1339,8 @@ TEST_F(GlobalRegistryTest, ConcurrentAsyncRegistersFromManyThreads) {
 
   for (int i = 0; i < kNumThreads * kEntriesPerThread; ++i) {
     auto status = futures[i].Await();
-    EXPECT_TRUE(status.ok()) << "Entry " << i << " failed: " << status.ToString();
+    EXPECT_TRUE(status.ok())
+        << "Entry " << i << " failed: " << status.ToString();
   }
 
   for (int i = 0; i < kNumThreads * kEntriesPerThread; ++i) {
@@ -1373,7 +1372,8 @@ TEST_F(GlobalRegistryTest, DroppedFutureStillReachesTheServer) {
     }
     absl::SleepFor(absl::Milliseconds(10));
   }
-  EXPECT_TRUE(found) << "Dropped future registration never appeared in registry";
+  EXPECT_TRUE(found)
+      << "Dropped future registration never appeared in registry";
 }
 
 // A one-entry batch cannot catch a half-built request; an empty one must

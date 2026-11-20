@@ -33,11 +33,11 @@
 #include "grpcpp/server_builder.h"
 #include "grpcpp/server_context.h"
 #include "grpcpp/support/status.h"
-#include "tpu_sync/kv_cache/global_registry/global_registry.grpc.pb.h"
-#include "tpu_sync/kv_cache/global_registry/global_registry.pb.h"
-#include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
-#include "tpu_sync/kv_cache/global_registry/global_registry_server.h"
-#include "tpu_sync/kv_cache/global_registry/test_util.h"
+#include "tpu_sync/kv_cache_offload/global_registry/global_registry.grpc.pb.h"
+#include "tpu_sync/kv_cache_offload/global_registry/global_registry.pb.h"
+#include "tpu_sync/kv_cache_offload/global_registry/global_registry_client.h"
+#include "tpu_sync/kv_cache_offload/global_registry/global_registry_server.h"
+#include "tpu_sync/kv_cache_offload/global_registry/test_util.h"
 #include "tpu_sync/store_node/kv_transfer_spec_source.h"
 
 namespace tpu_raiden {

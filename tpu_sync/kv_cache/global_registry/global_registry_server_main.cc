@@ -31,7 +31,7 @@
 #include "grpcpp/security/server_credentials.h"
 #include "grpcpp/server.h"
 #include "grpcpp/server_builder.h"
-#include "tpu_sync/kv_cache/global_registry/global_registry_server.h"
+#include "tpu_sync/kv_cache_offload/global_registry/global_registry_server.h"
 #include "tpu_sync/platform/grpc_credential_factory.h"
 
 ABSL_FLAG(int32_t, port, 50051, "Port to listen on");

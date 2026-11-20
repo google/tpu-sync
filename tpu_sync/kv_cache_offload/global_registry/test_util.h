@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef THIRD_PARTY_TPU_RAIDEN_KV_CACHE_GLOBAL_REGISTRY_TEST_UTIL_H_
-#define THIRD_PARTY_TPU_RAIDEN_KV_CACHE_GLOBAL_REGISTRY_TEST_UTIL_H_
+#ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_OFFLOAD_GLOBAL_REGISTRY_TEST_UTIL_H_
+#define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_OFFLOAD_GLOBAL_REGISTRY_TEST_UTIL_H_
 
 #include <atomic>
 #include <cstdint>
@@ -34,9 +34,9 @@
 #include "grpcpp/server_builder.h"
 #include "grpcpp/server_context.h"
 #include "grpcpp/support/status.h"
-#include "tpu_sync/kv_cache/global_registry/global_registry.grpc.pb.h"
-#include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
-#include "tpu_sync/kv_cache/global_registry/global_registry_server.h"
+#include "tpu_sync/kv_cache_offload/global_registry/global_registry.grpc.pb.h"
+#include "tpu_sync/kv_cache_offload/global_registry/global_registry_client.h"
+#include "tpu_sync/kv_cache_offload/global_registry/global_registry_server.h"
 #include "tpu_sync/platform/grpc_credential_factory.h"
 
 namespace tpu_raiden {
@@ -254,4 +254,4 @@ CreateTestGlobalRegistryServerWithService(
 }  // namespace kv_cache
 }  // namespace tpu_raiden
 
-#endif  // THIRD_PARTY_TPU_RAIDEN_KV_CACHE_GLOBAL_REGISTRY_TEST_UTIL_H_
+#endif  // THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_OFFLOAD_GLOBAL_REGISTRY_TEST_UTIL_H_

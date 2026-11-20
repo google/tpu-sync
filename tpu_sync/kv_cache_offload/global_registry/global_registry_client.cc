@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
+#include "tpu_sync/kv_cache_offload/global_registry/global_registry_client.h"
 
 #include <cstdint>
 #include <memory>
@@ -33,8 +33,8 @@
 #include <openssl/sha.h>
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/common/raiden_id.h"
-#include "tpu_sync/kv_cache/global_registry/global_registry.grpc.pb.h"
-#include "tpu_sync/kv_cache/global_registry/global_registry.pb.h"
+#include "tpu_sync/kv_cache_offload/global_registry/global_registry.grpc.pb.h"
+#include "tpu_sync/kv_cache_offload/global_registry/global_registry.pb.h"
 
 namespace tpu_raiden {
 namespace kv_cache {

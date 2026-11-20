@@ -19,7 +19,7 @@
 
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
-#include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
+#include "tpu_sync/kv_cache_offload/global_registry/global_registry_client.h"
 #include "tpu_sync/store_node/kv_transfer_spec_source.h"
 
 namespace tpu_raiden {

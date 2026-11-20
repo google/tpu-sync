@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef THIRD_PARTY_TPU_RAIDEN_KV_CACHE_GLOBAL_REGISTRY_GLOBAL_REGISTRY_CLIENT_H_
-#define THIRD_PARTY_TPU_RAIDEN_KV_CACHE_GLOBAL_REGISTRY_GLOBAL_REGISTRY_CLIENT_H_
+#ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_OFFLOAD_GLOBAL_REGISTRY_GLOBAL_REGISTRY_CLIENT_H_
+#define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_OFFLOAD_GLOBAL_REGISTRY_GLOBAL_REGISTRY_CLIENT_H_
 
 #include <cstdint>
 #include <memory>
@@ -27,8 +27,8 @@
 #include "grpcpp/channel.h"
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/common/raiden_id.h"
-#include "tpu_sync/kv_cache/global_registry/global_registry.grpc.pb.h"
-#include "tpu_sync/kv_cache/global_registry/global_registry.pb.h"
+#include "tpu_sync/kv_cache_offload/global_registry/global_registry.grpc.pb.h"
+#include "tpu_sync/kv_cache_offload/global_registry/global_registry.pb.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
@@ -72,9 +72,8 @@ class GlobalRegistryClient {
       absl::Duration timeout = absl::InfiniteDuration());
 
   // Registers a batch of KV cache entries.
-  absl::Status Register(
-      const std::vector<Registration>& registrations,
-      absl::Duration timeout = absl::InfiniteDuration());
+  absl::Status Register(const std::vector<Registration>& registrations,
+                        absl::Duration timeout = absl::InfiniteDuration());
 
   // Looks up KV cache entries for a batch of prefix hashes.
   // The lookup processes prefix hashes sequentially and stops at the first miss
@@ -91,15 +90,13 @@ class GlobalRegistryClient {
   // See RegisterAsync for what the future resolves to, and for the meaning of
   // `timeout` (zero is "expire now", not "never").
   tsl::Future<> UnregisterAsync(
-      const std::vector<std::string>& prefix_hashes,
-      const RaidenId& raiden_id,
+      const std::vector<std::string>& prefix_hashes, const RaidenId& raiden_id,
       absl::Duration timeout = absl::InfiniteDuration());
 
   // Unregisters a batch of KV cache entries for a raiden id.
-  absl::Status Unregister(
-      const std::vector<std::string>& prefix_hashes,
-      const RaidenId& raiden_id,
-      absl::Duration timeout = absl::InfiniteDuration());
+  absl::Status Unregister(const std::vector<std::string>& prefix_hashes,
+                          const RaidenId& raiden_id,
+                          absl::Duration timeout = absl::InfiniteDuration());
 
   // A single active registration returned by PullOwned.
   struct PulledEntry {
@@ -186,4 +183,4 @@ std::string CalculatePrefixHash(const std::vector<int64_t>& tokens,
 }  // namespace kv_cache
 }  // namespace tpu_raiden
 
-#endif  // THIRD_PARTY_TPU_RAIDEN_KV_CACHE_GLOBAL_REGISTRY_GLOBAL_REGISTRY_CLIENT_H_
+#endif  // THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_OFFLOAD_GLOBAL_REGISTRY_GLOBAL_REGISTRY_CLIENT_H_

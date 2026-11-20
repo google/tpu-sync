@@ -29,7 +29,7 @@
 #include "absl/strings/string_view.h"
 #include "grpcpp/create_channel.h"
 #include "grpcpp/security/credentials.h"
-#include "tpu_sync/kv_cache/global_registry/global_registry.pb.h"
+#include "tpu_sync/kv_cache_offload/global_registry/global_registry.pb.h"
 #include "tpu_sync/platform/grpc_credential_factory.h"
 #include "tpu_sync/store_node/kv_transfer_spec_source.h"
 namespace tpu_raiden {

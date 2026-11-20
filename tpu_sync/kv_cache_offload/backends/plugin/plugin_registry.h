@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_BACKENDS_PLUGIN_PLUGIN_REGISTRY_H_
-#define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_BACKENDS_PLUGIN_PLUGIN_REGISTRY_H_
+#ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_OFFLOAD_BACKENDS_PLUGIN_PLUGIN_REGISTRY_H_
+#define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_OFFLOAD_BACKENDS_PLUGIN_PLUGIN_REGISTRY_H_
 
 #include <string>
 
@@ -24,7 +24,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
-#include "tpu_sync/kv_cache/backends/plugin/raiden_storage_plugin_abi.h"
+#include "tpu_sync/kv_cache_offload/backends/plugin/raiden_storage_plugin_abi.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
@@ -84,4 +84,4 @@ class PluginRegistry {
 }  // namespace kv_cache
 }  // namespace tpu_raiden
 
-#endif  // THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_BACKENDS_PLUGIN_PLUGIN_REGISTRY_H_
+#endif  // THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_OFFLOAD_BACKENDS_PLUGIN_PLUGIN_REGISTRY_H_

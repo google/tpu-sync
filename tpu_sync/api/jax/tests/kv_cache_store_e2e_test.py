@@ -108,7 +108,7 @@ def _mock_plugin_so_path():
           "..",
           "..",
           "..",
-          "kv_cache",
+          "kv_cache_offload",
           "backends",
           "plugin",
           "libmock_storage_plugin.so",

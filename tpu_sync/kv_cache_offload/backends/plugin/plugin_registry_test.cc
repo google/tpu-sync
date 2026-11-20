@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "tpu_sync/kv_cache/backends/plugin/plugin_registry.h"
+#include "tpu_sync/kv_cache_offload/backends/plugin/plugin_registry.h"
 
 #include <unistd.h>
 
@@ -28,8 +28,8 @@
 #include "absl/status/status_matchers.h"
 #include "absl/strings/str_cat.h"
 #include "xla/tsl/platform/statusor.h"  // IWYU pragma: keep
-#include "tpu_sync/kv_cache/backends/plugin/mock_storage_plugin_loader.h"
-#include "tpu_sync/kv_cache/backends/plugin/raiden_storage_plugin_abi.h"
+#include "tpu_sync/kv_cache_offload/backends/plugin/mock_storage_plugin_loader.h"
+#include "tpu_sync/kv_cache_offload/backends/plugin/raiden_storage_plugin_abi.h"
 
 namespace tpu_raiden {
 namespace kv_cache {

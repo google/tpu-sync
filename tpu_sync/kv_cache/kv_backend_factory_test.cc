@@ -31,11 +31,11 @@
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
 #include "xla/tsl/platform/statusor.h"  // IWYU pragma: keep
-#include "tpu_sync/kv_cache/backends/backend.h"
-#include "tpu_sync/kv_cache/backends/plugin/mock_storage_plugin_loader.h"
-#include "tpu_sync/kv_cache/backends/plugin/plugin_registry.h"
-#include "tpu_sync/kv_cache/backends/plugin/raiden_storage_plugin_abi.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
+#include "tpu_sync/kv_cache_offload/backends/backend.h"
+#include "tpu_sync/kv_cache_offload/backends/plugin/mock_storage_plugin_loader.h"
+#include "tpu_sync/kv_cache_offload/backends/plugin/plugin_registry.h"
+#include "tpu_sync/kv_cache_offload/backends/plugin/raiden_storage_plugin_abi.h"
 
 namespace tpu_raiden {
 namespace kv_cache {

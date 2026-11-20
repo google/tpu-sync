@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "tpu_sync/kv_cache/backends/plugin/plugin_kv_backend.h"
+#include "tpu_sync/kv_cache_offload/backends/plugin/plugin_kv_backend.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -30,8 +30,8 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
-#include "tpu_sync/kv_cache/backends/backend.h"
-#include "tpu_sync/kv_cache/backends/plugin/raiden_storage_plugin_abi.h"
+#include "tpu_sync/kv_cache_offload/backends/backend.h"
+#include "tpu_sync/kv_cache_offload/backends/plugin/raiden_storage_plugin_abi.h"
 
 namespace tpu_raiden {
 namespace kv_cache {

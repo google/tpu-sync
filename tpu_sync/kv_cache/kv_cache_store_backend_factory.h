@@ -33,9 +33,9 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "tpu_sync/common/raiden_id.h"
-#include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
+#include "tpu_sync/kv_cache_offload/backends/backend.h"
 
 namespace tpu_raiden {
 

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "tpu_sync/kv_cache/backends/storage/posix_backend.h"
+#include "tpu_sync/kv_cache_offload/backends/storage/posix_backend.h"
 
 #include <fcntl.h>
 #include <limits.h>
@@ -59,11 +59,11 @@
 #include "absl/types/span.h"
 #include "tpu_sync/core/controller/raiden_controller.h"
 #include "tpu_sync/core/numa_thread_pool.h"
-#include "tpu_sync/kv_cache/backends/backend.h"
-#include "tpu_sync/kv_cache/backends/storage/storage_lookup_helper.h"
 #include "tpu_sync/kv_cache/kv_backend_factory.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
+#include "tpu_sync/kv_cache_offload/backends/backend.h"
+#include "tpu_sync/kv_cache_offload/backends/storage/storage_lookup_helper.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 
@@ -281,7 +281,8 @@ bool PosixKVBackend::ProbeDirectIO(absl::string_view dir) {
   std::error_code ec;
   fs::create_directories(std::string(dir), ec);
 
-  int fd = open(probe_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_DIRECT, 0644);
+  int fd =
+      open(probe_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_DIRECT, 0644);
   if (fd < 0) {
     LOG(WARNING) << "PosixKVBackend: O_DIRECT probe open failed on '" << dir
                  << "' (errno: " << errno << " - " << strerror(errno) << ")";
@@ -505,7 +506,8 @@ void PosixKVBackend::ReadAsync(const BlockKey& key,
                                absl::Span<const HostBufferDescriptor> slices,
                                size_t /*total_bytes*/,
                                std::function<void(absl::Status)> callback) {
-  thread_pool_->Schedule(std::nullopt, [direct_io_supported = direct_io_supported_,
+  thread_pool_->Schedule(std::nullopt, [direct_io_supported =
+                                            direct_io_supported_,
                                         key,
                                         slices =
                                             std::vector<HostBufferDescriptor>(
@@ -513,9 +515,8 @@ void PosixKVBackend::ReadAsync(const BlockKey& key,
                                         callback = std::move(callback)]() {
     // With direct_io there is no buffered fallback: a misaligned file offset
     // or buffer fails the operation before the file is opened.
-    if (direct_io_supported &&
-        ((key.offset & (DirectIOAlignment() - 1)) != 0 ||
-         !SlicesAreDirectIOAligned(slices))) {
+    if (direct_io_supported && ((key.offset & (DirectIOAlignment() - 1)) != 0 ||
+                                !SlicesAreDirectIOAligned(slices))) {
       if (callback)
         callback(absl::InvalidArgumentError(absl::StrCat(
             "PosixKVBackend::ReadAsync: direct_io=true but the file offset, a "

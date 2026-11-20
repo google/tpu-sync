@@ -24,7 +24,7 @@
 #include "absl/status/statusor.h"
 #include "tpu_sync/core/controller/test_util.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
-#include "tpu_sync/kv_cache/backends/backend.h"
+#include "tpu_sync/kv_cache_offload/backends/backend.h"
 #include "tpu_sync/transport/peer_endpoint.h"
 
 namespace tpu_raiden {

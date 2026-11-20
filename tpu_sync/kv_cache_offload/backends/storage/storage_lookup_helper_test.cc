@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "tpu_sync/kv_cache/backends/storage/storage_lookup_helper.h"
+#include "tpu_sync/kv_cache_offload/backends/storage/storage_lookup_helper.h"
 
 #include <cstddef>
 #include <functional>
@@ -31,8 +31,8 @@
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "xla/tsl/platform/statusor.h"  // IWYU pragma: keep
-#include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
+#include "tpu_sync/kv_cache_offload/backends/backend.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/telemetry/mock_metrics_backend.h"
 

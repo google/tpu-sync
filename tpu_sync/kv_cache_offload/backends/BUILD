@@ -43,7 +43,7 @@ cc_test(
     srcs = ["backend_test.cc"],
     deps = [
         ":backend",
-        "//tpu_sync/kv_cache/backends/storage:posix_backend",
+        "//tpu_sync/kv_cache_offload/backends/storage:posix_backend",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",
         "@com_google_absl//absl/strings",

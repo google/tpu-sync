@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "tpu_sync/kv_cache/backends/backend.h"
+#include "tpu_sync/kv_cache_offload/backends/backend.h"
 
 #include <string>
 
@@ -22,7 +22,7 @@
 #include "absl/status/status_matchers.h"
 #include "absl/strings/string_view.h"
 #include "xla/tsl/platform/statusor.h"
-#include "tpu_sync/kv_cache/backends/storage/posix_backend.h"
+#include "tpu_sync/kv_cache_offload/backends/storage/posix_backend.h"
 
 namespace tpu_raiden {
 namespace kv_cache {

@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_BACKENDS_STORAGE_POSIX_BACKEND_H_
-#define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_BACKENDS_STORAGE_POSIX_BACKEND_H_
+#ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_OFFLOAD_BACKENDS_STORAGE_POSIX_BACKEND_H_
+#define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_OFFLOAD_BACKENDS_STORAGE_POSIX_BACKEND_H_
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -38,10 +38,10 @@
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/core/numa_thread_pool.h"
-#include "tpu_sync/kv_cache/backends/backend.h"
-#include "tpu_sync/kv_cache/backends/storage/storage_lookup_helper.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/kv_cache/lru_cache.h"
+#include "tpu_sync/kv_cache_offload/backends/backend.h"
+#include "tpu_sync/kv_cache_offload/backends/storage/storage_lookup_helper.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
@@ -359,4 +359,4 @@ class PosixKVCacheStoreBackend : public KVCacheStoreBackend {
 }  // namespace kv_cache
 }  // namespace tpu_raiden
 
-#endif  // THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_BACKENDS_STORAGE_POSIX_BACKEND_H_
+#endif  // THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_OFFLOAD_BACKENDS_STORAGE_POSIX_BACKEND_H_

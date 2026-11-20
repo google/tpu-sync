@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_BACKENDS_PLUGIN_MOCK_STORAGE_PLUGIN_LOADER_H_
-#define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_BACKENDS_PLUGIN_MOCK_STORAGE_PLUGIN_LOADER_H_
+#ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_OFFLOAD_BACKENDS_PLUGIN_MOCK_STORAGE_PLUGIN_LOADER_H_
+#define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_OFFLOAD_BACKENDS_PLUGIN_MOCK_STORAGE_PLUGIN_LOADER_H_
 
 #include <dlfcn.h>
 
@@ -21,7 +21,7 @@
 #include <string>
 
 #include "absl/strings/str_cat.h"
-#include "tpu_sync/kv_cache/backends/plugin/raiden_storage_plugin_abi.h"
+#include "tpu_sync/kv_cache_offload/backends/plugin/raiden_storage_plugin_abi.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
@@ -37,10 +37,10 @@ inline std::string GetMockPluginSoPath() {
         (workspace != nullptr && workspace[0] != '\0') ? workspace : "google3";
     return absl::StrCat(
         srcdir, "/", ws,
-        "/tpu_sync/kv_cache/backends/plugin/"
+        "/tpu_sync/kv_cache_offload/backends/plugin/"
         "libmock_storage_plugin.so");
   }
-  return "tpu_sync/kv_cache/backends/plugin/"
+  return "tpu_sync/kv_cache_offload/backends/plugin/"
          "libmock_storage_plugin.so";
 }
 
@@ -59,4 +59,4 @@ inline const RaidenStorageOutofTreePluginV1* LoadMockPlugin() {
 }  // namespace kv_cache
 }  // namespace tpu_raiden
 
-#endif  // THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_BACKENDS_PLUGIN_MOCK_STORAGE_PLUGIN_LOADER_H_
+#endif  // THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_OFFLOAD_BACKENDS_PLUGIN_MOCK_STORAGE_PLUGIN_LOADER_H_

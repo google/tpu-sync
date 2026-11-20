@@ -37,16 +37,16 @@
 #include "xla/tsl/platform/statusor.h"  // IWYU pragma: keep
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/core/controller/raiden_controller.h"
-#include "tpu_sync/kv_cache/backends/backend.h"
-#include "tpu_sync/kv_cache/backends/plugin/mock_storage_plugin_loader.h"
-#include "tpu_sync/kv_cache/backends/plugin/plugin_kv_cache_store_backend.h"
-#include "tpu_sync/kv_cache/backends/plugin/plugin_registry.h"
-#include "tpu_sync/kv_cache/backends/plugin/raiden_storage_plugin_abi.h"
 #include "tpu_sync/kv_cache/block_tracker.h"
 #include "tpu_sync/kv_cache/host_offload_backend.h"
 #include "tpu_sync/kv_cache/kv_backend_factory.h"
 #include "tpu_sync/kv_cache/kv_cache_store.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
+#include "tpu_sync/kv_cache_offload/backends/backend.h"
+#include "tpu_sync/kv_cache_offload/backends/plugin/mock_storage_plugin_loader.h"
+#include "tpu_sync/kv_cache_offload/backends/plugin/plugin_kv_cache_store_backend.h"
+#include "tpu_sync/kv_cache_offload/backends/plugin/plugin_registry.h"
+#include "tpu_sync/kv_cache_offload/backends/plugin/raiden_storage_plugin_abi.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 
 namespace tpu_raiden {

@@ -33,7 +33,7 @@
 #include "absl/types/span.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
-#include "tpu_sync/kv_cache/backends/backend.h"
+#include "tpu_sync/kv_cache_offload/backends/backend.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/transport/peer_endpoint.h"
 

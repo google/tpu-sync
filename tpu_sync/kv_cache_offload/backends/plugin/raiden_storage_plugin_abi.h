@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_BACKENDS_PLUGIN_RAIDEN_STORAGE_PLUGIN_ABI_H_
-#define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_BACKENDS_PLUGIN_RAIDEN_STORAGE_PLUGIN_ABI_H_
+#ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_OFFLOAD_BACKENDS_PLUGIN_RAIDEN_STORAGE_PLUGIN_ABI_H_
+#define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_OFFLOAD_BACKENDS_PLUGIN_RAIDEN_STORAGE_PLUGIN_ABI_H_
 
 // Canonical C ABI header for TPU Raiden out-of-tree storage plugins.
-// Upstream source of truth: tpu_sync/kv_cache/backends/plugin/ in
+// Upstream source of truth: tpu_sync/kv_cache_offload/backends/plugin/ in
 // google/tpu-sync. Copies vendored into plugin repositories are read-only; make
 // ABI changes here first.
 
@@ -186,4 +186,4 @@ typedef const RaidenStorageOutofTreePluginV1* (*RaidenStoragePluginGetV1Fn)(
 }  // extern "C"
 #endif
 
-#endif  // THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_BACKENDS_PLUGIN_RAIDEN_STORAGE_PLUGIN_ABI_H_
+#endif  // THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_OFFLOAD_BACKENDS_PLUGIN_RAIDEN_STORAGE_PLUGIN_ABI_H_

@@ -36,7 +36,7 @@
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/transfer_program_reshard.h"
-#include "tpu_sync/kv_cache/backends/backend.h"
+#include "tpu_sync/kv_cache_offload/backends/backend.h"
 #include "tpu_sync/proto/transfer_program.pb.h"
 #include "tpu_sync/proto/worker_service.pb.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "tpu_sync/kv_cache/backends/storage/posix_backend.h"
+#include "tpu_sync/kv_cache_offload/backends/storage/posix_backend.h"
 
 #include <limits.h>
 #include <sys/mman.h>
@@ -59,10 +59,10 @@
 #include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/core/controller/raiden_controller.h"
 #include "tpu_sync/core/controller/worker_registry.h"
-#include "tpu_sync/kv_cache/backends/backend.h"
 #include "tpu_sync/kv_cache/kv_backend_factory.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend.h"
 #include "tpu_sync/kv_cache/kv_cache_store_backend_factory.h"
+#include "tpu_sync/kv_cache_offload/backends/backend.h"
 #include "tpu_sync/proto/worker_service.pb.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
@@ -251,17 +251,15 @@ TEST_F(PosixBackendTest, PosixPathMapperFixedWidthAndEmptyHashHandling) {
                        HasSubstr("must not be empty")));
 
   TF_ASSERT_OK_AND_ASSIGN(BlockKey one_byte,
-                          mapper.MapKey("a", {.parallelism = {.tp_rank = 0}}));
+                       mapper.MapKey("a", {.parallelism = {.tp_rank = 0}}));
   EXPECT_EQ(one_byte.resolved_key, absl::StrCat(base, "/610/00/61.bin"));
 
-  TF_ASSERT_OK_AND_ASSIGN(
-      BlockKey three_bytes,
-      mapper.MapKey("abc", {.parallelism = {.tp_rank = 0}}));
+  TF_ASSERT_OK_AND_ASSIGN(BlockKey three_bytes,
+                       mapper.MapKey("abc", {.parallelism = {.tp_rank = 0}}));
   EXPECT_EQ(three_bytes.resolved_key, absl::StrCat(base, "/616/26/616263.bin"));
 
-  TF_ASSERT_OK_AND_ASSIGN(
-      BlockKey four_bytes,
-      mapper.MapKey("abcd", {.parallelism = {.tp_rank = 0}}));
+  TF_ASSERT_OK_AND_ASSIGN(BlockKey four_bytes,
+                       mapper.MapKey("abcd", {.parallelism = {.tp_rank = 0}}));
   EXPECT_EQ(four_bytes.resolved_key,
             absl::StrCat(base, "/616/26/61626364.bin"));
 }
@@ -303,9 +301,9 @@ TEST_F(PosixBackendTest, PosixPathMapperNulBytesDoNotAlias) {
                          ParallelismConfig{.tp_size = 8, .tp_rank = 2});
 
   TF_ASSERT_OK_AND_ASSIGN(BlockKey shorter,
-                          mapper.MapKey(std::string("\x01\x00", 2)));
+                       mapper.MapKey(std::string("\x01\x00", 2)));
   TF_ASSERT_OK_AND_ASSIGN(BlockKey longer,
-                          mapper.MapKey(std::string("\x01\x00\x02", 3)));
+                       mapper.MapKey(std::string("\x01\x00\x02", 3)));
 
   // Same leaf directory, but the NUL is preserved in distinct filenames.
   EXPECT_EQ(shorter.resolved_key,
@@ -421,7 +419,7 @@ TEST_F(PosixBackendTest, PosixPathMapperPerCallPcpRankOverride) {
           .tp_size = 1, .tp_rank = 0, .pcp_size = 8, .pcp_rank = 3});
 
   TF_ASSERT_OK_AND_ASSIGN(BlockKey key,
-                          mapper.MapKey("a", {.parallelism = {.pcp_rank = 5}}));
+                       mapper.MapKey("a", {.parallelism = {.pcp_rank = 5}}));
   EXPECT_EQ(key.resolved_key,
             "/tmp/kv_cache/llama3/pcp8_r5_tp1_r0/610/00/61.bin");
 }
@@ -479,12 +477,11 @@ TEST_F(PosixBackendTest, PosixPathMapperRejectsInvalidNegativeOverride) {
 }
 
 TEST_F(PosixBackendTest, PosixBackendOptions_ParsesPcpTopology) {
-  TF_ASSERT_OK_AND_ASSIGN(
-      PosixBackendOptions opts,
-      PosixBackendOptions::FromProperties({{"pcp_size", "4"},
-                                           {"pcp_rank", "3"},
-                                           {"tp_size", "2"},
-                                           {"tp_rank", "1"}}));
+  TF_ASSERT_OK_AND_ASSIGN(PosixBackendOptions opts,
+                       PosixBackendOptions::FromProperties({{"pcp_size", "4"},
+                                                            {"pcp_rank", "3"},
+                                                            {"tp_size", "2"},
+                                                            {"tp_rank", "1"}}));
   EXPECT_EQ(opts.pcp_size, 4);
   EXPECT_EQ(opts.pcp_rank, 3);
   EXPECT_EQ(opts.tp_size, 2);
@@ -493,7 +490,7 @@ TEST_F(PosixBackendTest, PosixBackendOptions_ParsesPcpTopology) {
 
 TEST_F(PosixBackendTest, PosixBackendOptions_LeavesUndeclaredAxes) {
   TF_ASSERT_OK_AND_ASSIGN(PosixBackendOptions opts,
-                          PosixBackendOptions::FromProperties({}));
+                       PosixBackendOptions::FromProperties({}));
   EXPECT_EQ(opts.pcp_size, kAxisUndeclared);
   EXPECT_EQ(opts.pcp_rank, kAxisUndeclared);
   EXPECT_EQ(opts.tp_size, kAxisUndeclared);
@@ -573,7 +570,7 @@ TEST_F(PosixBackendTest, PosixPathMapperPerCallPpRankOverride) {
           .tp_size = 2, .tp_rank = 0, .pp_size = 4, .pp_rank = 0});
 
   TF_ASSERT_OK_AND_ASSIGN(BlockKey key,
-                          mapper.MapKey("a", {.parallelism = {.pp_rank = 3}}));
+                       mapper.MapKey("a", {.parallelism = {.pp_rank = 3}}));
   EXPECT_EQ(key.resolved_key,
             "/tmp/kv_cache/llama3/pp4_r3_tp2_r0/610/00/61.bin");
 }
@@ -594,14 +591,13 @@ TEST_F(PosixBackendTest, PosixPathMapperRejectsInvalidPpAxis) {
 }
 
 TEST_F(PosixBackendTest, PosixBackendOptions_ParsesPpTopology) {
-  TF_ASSERT_OK_AND_ASSIGN(
-      PosixBackendOptions opts,
-      PosixBackendOptions::FromProperties({{"pp_size", "2"},
-                                           {"pp_rank", "1"},
-                                           {"pcp_size", "4"},
-                                           {"pcp_rank", "3"},
-                                           {"tp_size", "2"},
-                                           {"tp_rank", "0"}}));
+  TF_ASSERT_OK_AND_ASSIGN(PosixBackendOptions opts,
+                       PosixBackendOptions::FromProperties({{"pp_size", "2"},
+                                                            {"pp_rank", "1"},
+                                                            {"pcp_size", "4"},
+                                                            {"pcp_rank", "3"},
+                                                            {"tp_size", "2"},
+                                                            {"tp_rank", "0"}}));
   EXPECT_EQ(opts.pp_size, 2);
   EXPECT_EQ(opts.pp_rank, 1);
   EXPECT_EQ(opts.pcp_size, 4);
@@ -610,7 +606,7 @@ TEST_F(PosixBackendTest, PosixBackendOptions_ParsesPpTopology) {
   EXPECT_EQ(opts.tp_rank, 0);
 
   TF_ASSERT_OK_AND_ASSIGN(PosixBackendOptions empty,
-                          PosixBackendOptions::FromProperties({}));
+                       PosixBackendOptions::FromProperties({}));
   EXPECT_EQ(empty.pp_size, kAxisUndeclared);
   EXPECT_EQ(empty.pp_rank, kAxisUndeclared);
 }
@@ -677,11 +673,11 @@ TEST_F(PosixBackendTest, NulContainingHashesDoNotAliasOnDisk) {
                          ParallelismConfig{.tp_size = 1, .tp_rank = 0});
 
   TF_ASSERT_OK_AND_ASSIGN(BlockKey shorter,
-                          mapper.MapKey(std::string("\x01\x00", 2),
-                                        {.parallelism = {.tp_rank = 0}}));
+                       mapper.MapKey(std::string("\x01\x00", 2),
+                                     {.parallelism = {.tp_rank = 0}}));
   TF_ASSERT_OK_AND_ASSIGN(BlockKey longer,
-                          mapper.MapKey(std::string("\x01\x00\x02", 3),
-                                        {.parallelism = {.tp_rank = 0}}));
+                       mapper.MapKey(std::string("\x01\x00\x02", 3),
+                                     {.parallelism = {.tp_rank = 0}}));
   ASSERT_NE(shorter.resolved_key, longer.resolved_key);
 
   const size_t kSize = 1024;
@@ -944,8 +940,8 @@ TEST_F(StorageDriverTest, BatchExistsMixedHitsAndMisses) {
   keys.reserve(kNumFiles);
   for (int i = 0; i < kNumFiles; ++i) {
     TF_ASSERT_OK_AND_ASSIGN(BlockKey key,
-                            mapper.MapKey(absl::StrCat("block_mixed_", i),
-                                          {.parallelism = {.tp_rank = 0}}));
+                         mapper.MapKey(absl::StrCat("block_mixed_", i),
+                                       {.parallelism = {.tp_rank = 0}}));
     if (i % 2 == 0) {
       CreateFile(key.resolved_key);
     }
@@ -980,9 +976,9 @@ TEST_F(StorageDriverTest, BatchExistsAsyncAndWorkerThreads) {
   std::vector<BlockKey> keys;
   keys.reserve(kNumFiles);
   for (int i = 0; i < kNumFiles; ++i) {
-    TF_ASSERT_OK_AND_ASSIGN(
-        BlockKey key, mapper.MapKey(absl::StrCat("block_async_worker_", i),
-                                    {.parallelism = {.tp_rank = 0}}));
+    TF_ASSERT_OK_AND_ASSIGN(BlockKey key,
+                         mapper.MapKey(absl::StrCat("block_async_worker_", i),
+                                       {.parallelism = {.tp_rank = 0}}));
     if (i % 2 == 0) {
       CreateFile(key.resolved_key);
     }
@@ -1108,8 +1104,8 @@ TEST_F(StorageDriverTest,
   env.CreateBlock("present_1");
 
   // Positive control: standard local prefix lookup finds both blocks.
-  TF_ASSERT_OK_AND_ASSIGN(
-      auto prefix_res, env.store->Lookup({"present_0", "present_1"},
+  TF_ASSERT_OK_AND_ASSIGN(auto prefix_res,
+                       env.store->Lookup({"present_0", "present_1"},
                                          ::tpu_raiden::kv_cache::LookupOptions{
                                              .enable_global = false}));
   EXPECT_EQ(prefix_res.size(), 2);
@@ -1376,9 +1372,9 @@ std::vector<std::string> EntriesContaining(const fs::path& dir,
 TEST(MakeTempPathTest, SameDirectoryShortAndMarked) {
   // A final name at the hash cap is 254 characters; the temp name must not
   // grow with it, or it crosses NAME_MAX.
-  const std::string final_path = absl::StrCat(
-      "/some/root/model/tp1_r0/abc/de/", std::string(2 * kMaxBlockHashBytes, 'f'),
-      ".bin");
+  const std::string final_path =
+      absl::StrCat("/some/root/model/tp1_r0/abc/de/",
+                   std::string(2 * kMaxBlockHashBytes, 'f'), ".bin");
   ASSERT_EQ(fs::path(final_path).filename().string().size(), NAME_MAX - 1);
 
   const std::string tmp = MakeTempPath(final_path);
@@ -1491,9 +1487,9 @@ TEST_F(PosixBackendTest, PosixKVBackendConcurrentSameKeyWritesLastRenameWins) {
   read_done.WaitForNotification();
   ABSL_ASSERT_OK(read_status);
   EXPECT_EQ(read_back, data);
-  EXPECT_THAT(EntriesContaining(fs::path(key.resolved_key).parent_path(),
-                                ".tmp_"),
-              ::testing::IsEmpty());
+  EXPECT_THAT(
+      EntriesContaining(fs::path(key.resolved_key).parent_path(), ".tmp_"),
+      ::testing::IsEmpty());
 }
 
 // Sanitizing only replaces characters; a model name that is still longer
@@ -1511,8 +1507,8 @@ TEST_F(PosixBackendTest, PosixBackendOptions_RejectsOverlongModelName) {
                        HasSubstr("the limit is 255")));
   // Exactly NAME_MAX is fine.
   TF_ASSERT_OK_AND_ASSIGN(PosixBackendOptions opts,
-                          PosixBackendOptions::FromProperties(
-                              {{"model_name", std::string(NAME_MAX, 'm')}}));
+                       PosixBackendOptions::FromProperties(
+                           {{"model_name", std::string(NAME_MAX, 'm')}}));
   EXPECT_EQ(opts.model_name.size(), NAME_MAX);
 }
 
@@ -1556,10 +1552,9 @@ TEST_F(StorageDriverTest, StorageErrorHandlingAndRecovery) {
       {{"root_dir", scratch_dir_}, {"tp_size", "1"}, {"tp_rank", "0"}});
 
   // Non-existent file read returns NotFoundError
-  TF_ASSERT_OK_AND_ASSIGN(
-      BlockKey missing_key,
-      backend.mapper()->MapKey("missing_key_xyz",
-                               {.parallelism = {.tp_rank = 0}}));
+  TF_ASSERT_OK_AND_ASSIGN(BlockKey missing_key,
+                       backend.mapper()->MapKey(
+                           "missing_key_xyz", {.parallelism = {.tp_rank = 0}}));
   std::vector<uint8_t> read_buf(4096, 0);
   HostBufferDescriptor valid_desc{.ptr = read_buf.data(), .size = 4096};
 
@@ -1825,7 +1820,7 @@ TEST_F(PosixBackendTest, PosixBackendOptions_DirectIOPropertyParsing) {
   // 1. Defaults to false when omitted
   {
     TF_ASSERT_OK_AND_ASSIGN(PosixBackendOptions opts,
-                            PosixBackendOptions::FromProperties({}));
+                         PosixBackendOptions::FromProperties({}));
     EXPECT_FALSE(opts.direct_io);
   }
 
@@ -1943,10 +1938,8 @@ TEST_F(PosixBackendTest, PosixKVBackend_DirectIO_AlignedWriteAndReadFidelity) {
     GTEST_SKIP() << "O_DIRECT is not supported on " << scratch_dir_;
   }
   auto backend = std::make_shared<PosixKVBackend>(
-      "posix_directio",
-      absl::flat_hash_map<std::string, std::string>{
-          {"root_dir", scratch_dir_},
-          {"direct_io", "true"}});
+      "posix_directio", absl::flat_hash_map<std::string, std::string>{
+                            {"root_dir", scratch_dir_}, {"direct_io", "true"}});
   ASSERT_TRUE(backend->is_direct_io_supported());
 
   auto mapper = std::make_shared<PosixPathMapper>(
@@ -1999,11 +1992,10 @@ TEST_F(PosixBackendTest, PosixKVBackend_DirectIO_UnsupportedFilesystemIsFatal) {
   GTEST_FLAG_SET(death_test_style, "threadsafe");
   EXPECT_DEATH(
       {
-        PosixKVBackend backend(
-            "posix_unsupported",
-            absl::flat_hash_map<std::string, std::string>{
-                {"root_dir", "/proc/raiden_no_o_direct"},
-                {"direct_io", "true"}});
+        PosixKVBackend backend("posix_unsupported",
+                               absl::flat_hash_map<std::string, std::string>{
+                                   {"root_dir", "/proc/raiden_no_o_direct"},
+                                   {"direct_io", "true"}});
       },
       "O_DIRECT is not supported");
 }
@@ -2014,9 +2006,8 @@ TEST_F(PosixBackendTest, PosixKVBackend_DirectIO_UnalignedBufferRejected) {
   }
   auto backend = std::make_shared<PosixKVBackend>(
       "posix_unaligned",
-      absl::flat_hash_map<std::string, std::string>{
-          {"root_dir", scratch_dir_},
-          {"direct_io", "true"}});
+      absl::flat_hash_map<std::string, std::string>{{"root_dir", scratch_dir_},
+                                                    {"direct_io", "true"}});
   auto mapper = std::make_shared<PosixPathMapper>(
       scratch_dir_, "model_test",
       ParallelismConfig{.tp_size = 1, .tp_rank = 0});
@@ -2035,8 +2026,8 @@ TEST_F(PosixBackendTest, PosixKVBackend_DirectIO_UnalignedBufferRejected) {
       HostBufferDescriptor{.ptr = base + 1, .size = align}};
   const std::vector<HostBufferDescriptor> misaligned_size = {
       HostBufferDescriptor{.ptr = base, .size = 1234}};
-  const auto kNotAligned = StatusIs(absl::StatusCode::kInvalidArgument,
-                                    HasSubstr("not aligned to"));
+  const auto kNotAligned =
+      StatusIs(absl::StatusCode::kInvalidArgument, HasSubstr("not aligned to"));
 
   // Writes are rejected before any file (temp or final) is created.
   EXPECT_THAT(RunWrite(*backend, key, misaligned_ptr, align), kNotAligned);
@@ -2197,7 +2188,7 @@ class MetadataCacheTest : public StorageDriverTest {
 TEST_F(PosixBackendTest, PosixBackendOptions_MetadataCachePropertyParsing) {
   {
     TF_ASSERT_OK_AND_ASSIGN(PosixBackendOptions opts,
-                            PosixBackendOptions::FromProperties({}));
+                         PosixBackendOptions::FromProperties({}));
     EXPECT_EQ(opts.metadata_cache_max_entries, 0);
     EXPECT_EQ(opts.metadata_cache_ttl_secs, 60);
     const MetadataCacheOptions cache =
@@ -2208,9 +2199,9 @@ TEST_F(PosixBackendTest, PosixBackendOptions_MetadataCachePropertyParsing) {
   }
   {
     TF_ASSERT_OK_AND_ASSIGN(PosixBackendOptions opts,
-                            PosixBackendOptions::FromProperties(
-                                {{"metadata_cache_max_entries", "-1"},
-                                 {"metadata_cache_ttl_secs", "-1"}}));
+                         PosixBackendOptions::FromProperties(
+                             {{"metadata_cache_max_entries", "-1"},
+                              {"metadata_cache_ttl_secs", "-1"}}));
     const MetadataCacheOptions cache =
         MetadataCacheOptions::FromPosixOptions(opts);
     EXPECT_TRUE(cache.enabled());
@@ -2219,9 +2210,9 @@ TEST_F(PosixBackendTest, PosixBackendOptions_MetadataCachePropertyParsing) {
   }
   {
     TF_ASSERT_OK_AND_ASSIGN(PosixBackendOptions opts,
-                            PosixBackendOptions::FromProperties(
-                                {{"metadata_cache_max_entries", "7"},
-                                 {"metadata_cache_ttl_secs", "5"}}));
+                         PosixBackendOptions::FromProperties(
+                             {{"metadata_cache_max_entries", "7"},
+                              {"metadata_cache_ttl_secs", "5"}}));
     const MetadataCacheOptions cache =
         MetadataCacheOptions::FromPosixOptions(opts);
     EXPECT_TRUE(cache.enabled());
@@ -2332,7 +2323,7 @@ TEST_F(MetadataCacheTest, DirectStorageLookupRequiresAllShards) {
   for (int r : {0, 1, 3}) env.CreateBlock("b", r);  // Rank 2's write failed.
   env.CreateAllShards("c");
   TF_ASSERT_OK_AND_ASSIGN(BlockSliceList result,
-                          env.store->Lookup({"a", "b", "c"}));
+                       env.store->Lookup({"a", "b", "c"}));
   ASSERT_EQ(result.size(), 1);
   EXPECT_EQ(result[0].first, "a");
   EXPECT_EQ(env.store->metadata_cache_size(), 0);
@@ -2348,7 +2339,7 @@ TEST_F(MetadataCacheTest, ShardsSplitAcrossChunksStopAtMissingShard) {
   for (int r : {0, 2, 3}) env.CreateBlock("c", r);  // c is missing rank 1.
   env.CreateAllShards("d");
   TF_ASSERT_OK_AND_ASSIGN(BlockSliceList result,
-                          env.store->Lookup({"a", "b", "c", "d"}));
+                       env.store->Lookup({"a", "b", "c", "d"}));
   ASSERT_EQ(result.size(), 2);
   EXPECT_EQ(result[0].first, "a");
   EXPECT_EQ(result[1].first, "b");
@@ -2662,7 +2653,7 @@ TEST_F(MetadataCacheTest, PrefixMergesCacheAndStorage) {
 
   env.backend->ResetCounts();
   TF_ASSERT_OK_AND_ASSIGN(BlockSliceList result,
-                          env.store->Lookup({"a", "b", "c", "d"}));
+                       env.store->Lookup({"a", "b", "c", "d"}));
   ASSERT_EQ(result.size(), 3);
   EXPECT_EQ(result[0].first, "a");
   EXPECT_EQ(result[1].first, "b");
@@ -2713,9 +2704,8 @@ TEST_F(MetadataCacheTest, UnmappableHashTruncatesPrefix) {
   Env env = CreateEnv(Enabled());
   env.CreateBlock("a");
   env.CreateBlock("c");
-  EXPECT_EQ(env.LookupCount({"a", std::string(kMaxBlockHashBytes + 1, 'x'),
-                             "c"}),
-            1);
+  EXPECT_EQ(
+      env.LookupCount({"a", std::string(kMaxBlockHashBytes + 1, 'x'), "c"}), 1);
 }
 
 // ===========================================================================

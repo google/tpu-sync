@@ -39,8 +39,6 @@
 #include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/core/raw_transfer_core.h"
-#include "tpu_sync/kv_cache/backends/backend.h"
-#include "tpu_sync/kv_cache/backends/storage/posix_backend.h"
 #include "tpu_sync/kv_cache/block_tracker.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata.h"
 #include "tpu_sync/kv_cache/kv_cache_metadata_shm.h"
@@ -49,6 +47,8 @@
 #include "tpu_sync/kv_cache/kv_cache_store_server.h"
 #include "tpu_sync/kv_cache/lru_cache.h"
 #include "tpu_sync/kv_cache/reshard/reshard_service.h"
+#include "tpu_sync/kv_cache_offload/backends/backend.h"
+#include "tpu_sync/kv_cache_offload/backends/storage/posix_backend.h"
 
 namespace tpu_raiden {
 

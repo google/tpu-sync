@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_BACKENDS_BACKEND_H_
-#define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_BACKENDS_BACKEND_H_
+#ifndef THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_OFFLOAD_BACKENDS_BACKEND_H_
+#define THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_OFFLOAD_BACKENDS_BACKEND_H_
 
 #include <algorithm>
 #include <cstddef>
@@ -51,7 +51,7 @@ struct BlockKey {
   // workers write to the same backend entity (e.g. file) to support cross-TP
   // reads and writes.
   int64_t offset = 0;
-  int64_t size = 0;          // Byte size of this slice
+  int64_t size = 0;  // Byte size of this slice
 };
 
 // Encapsulates a single disjoint memory slice within a multi-layer, multi-shard
@@ -217,4 +217,4 @@ class BlockKeyMapper {
 }  // namespace kv_cache
 }  // namespace tpu_raiden
 
-#endif  // THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_BACKENDS_BACKEND_H_
+#endif  // THIRD_PARTY_TPU_RAIDEN_TPU_SYNC_KV_CACHE_OFFLOAD_BACKENDS_BACKEND_H_

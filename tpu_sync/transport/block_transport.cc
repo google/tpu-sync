@@ -530,8 +530,18 @@ tsl::Future<std::vector<int>> BlockTransport::AsyncPush(
     const std::vector<int>& dst_block_ids, int parallelism,
     MajorOrder major_order, uint64_t uuid, int layer_idx,
     std::optional<int> wire_layer_idx) {
+  return AsyncPushInternal(peers, src_block_ids, dst_block_ids, parallelism,
+                           major_order, uuid, layer_idx, wire_layer_idx);
+}
+
+tsl::Future<std::vector<int>> BlockTransport::AsyncPushInternal(
+    const std::vector<PeerEndpoint>& peers,
+    const std::vector<int>& src_minor_dim_indices,
+    const std::vector<int>& dst_minor_dim_indices, int parallelism,
+    MajorOrder major_order, uint64_t uuid, int major_dim_idx,
+    std::optional<int> wire_major_dim_idx) {
   const size_t num_shards = block_delegate_->num_shards();
-  const lib::TransferOp op = dst_block_ids.empty()
+  const lib::TransferOp op = dst_minor_dim_indices.empty()
                                  ? lib::TransferOp::kBlockPush
                                  : lib::TransferOp::kBlockPushExplicit;
   const TransportBackend backend = BackendForTransfer(op, peers);
@@ -542,11 +552,14 @@ tsl::Future<std::vector<int>> BlockTransport::AsyncPush(
       return tsl::Future<std::vector<int>>(adapter.status());
     }
     const std::vector<int> all_shards = AllShards(num_shards);
-    return AsyncPushShards(peers, src_block_ids, dst_block_ids, parallelism,
-                           major_order, uuid, layer_idx, wire_layer_idx,
-                           all_shards, /*num_groups=*/1, backend, *adapter)
+    return AsyncPushShards(peers, src_minor_dim_indices, dst_minor_dim_indices,
+                           parallelism, major_order, uuid, major_dim_idx,
+                           wire_major_dim_idx, all_shards,
+                           /*num_groups=*/1, backend, *adapter)
         .Map<std::vector<int>>(
-            [dst_block_ids](const std::vector<int>&) { return dst_block_ids; });
+            [dst_minor_dim_indices](const std::vector<int>&) {
+              return dst_minor_dim_indices;
+            });
   }
   // Split the push by source NUMA node: every group of shards sharing a node
   // is pushed by the adapter pinned to that node. The receiver pairs the
@@ -555,7 +568,7 @@ tsl::Future<std::vector<int>> BlockTransport::AsyncPush(
   // back to one legacy group.
   std::vector<ShardGroup> groups =
       ShardGroupsByNuma(block_delegate_->shards(), num_shards);
-  if (groups.size() > 1 && dst_block_ids.empty()) {
+  if (groups.size() > 1 && dst_minor_dim_indices.empty()) {
     LOG_FIRST_N(WARNING, 1)
         << "Push without explicit destination block ids cannot be split by "
            "NUMA node; sending every shard on each stream.";
@@ -565,9 +578,9 @@ tsl::Future<std::vector<int>> BlockTransport::AsyncPush(
   futures.reserve(groups.size());
   for (const ShardGroup& group : groups) {
     futures.push_back(AsyncPushShards(
-        peers, src_block_ids, dst_block_ids, parallelism, major_order, uuid,
-        layer_idx, wire_layer_idx, group.shards, groups.size(), backend,
-        AdapterFor(group.numa_node)));
+        peers, src_minor_dim_indices, dst_minor_dim_indices, parallelism,
+        major_order, uuid, major_dim_idx, wire_major_dim_idx, group.shards,
+        groups.size(), backend, AdapterFor(group.numa_node)));
   }
   // Every group returns the same destination ids; keep the first.
   return tsl::JoinFutures(absl::MakeSpan(futures))
@@ -576,10 +589,11 @@ tsl::Future<std::vector<int>> BlockTransport::AsyncPush(
 }
 
 tsl::Future<std::vector<int>> BlockTransport::AsyncPushShards(
-    absl::Span<const PeerEndpoint> peers, const std::vector<int>& src_block_ids,
-    const std::vector<int>& dst_block_ids, int parallelism,
-    MajorOrder major_order, uint64_t uuid, int layer_idx,
-    std::optional<int> wire_layer_idx, absl::Span<const int> shard_ids,
+    absl::Span<const PeerEndpoint> peers,
+    const std::vector<int>& src_minor_dim_indices,
+    const std::vector<int>& dst_minor_dim_indices, int parallelism,
+    MajorOrder major_order, uint64_t uuid, int major_dim_idx,
+    std::optional<int> wire_major_dim_idx, absl::Span<const int> shard_ids,
     size_t num_groups, TransportBackend backend,
     lib::TransportAdapter* adapter) {
   auto [promise, future] = tsl::MakePromise<std::vector<int>>();
@@ -593,8 +607,8 @@ tsl::Future<std::vector<int>> BlockTransport::AsyncPushShards(
     }
     shared_promise->Set(std::move(res));
   };
-  size_t num_blocks = src_block_ids.size();
-  if (num_blocks == 0) {
+  size_t minor_dim_size = src_minor_dim_indices.size();
+  if (minor_dim_size == 0) {
     on_complete(absl::InvalidArgumentError("Block list cannot be empty"));
     return std::move(future);
   }
@@ -608,7 +622,7 @@ tsl::Future<std::vector<int>> BlockTransport::AsyncPushShards(
     on_complete(absl::InvalidArgumentError("parallelism must be positive"));
     return std::move(future);
   }
-  if (static_cast<int>(num_blocks) < P) P = num_blocks;
+  if (static_cast<int>(minor_dim_size) < P) P = minor_dim_size;
 
   // The receiver completes a block array once it has seen the stream count
   // declared in the header, i.e. the streams of every shard group.
@@ -624,8 +638,9 @@ tsl::Future<std::vector<int>> BlockTransport::AsyncPushShards(
   // destination host. Request chunk resolution is identical across NICs, so
   // we pass `peers[0].data` as the destination peer to build requests.
   auto requests = BuildBlockRequests(
-      peers[0].data, src_block_ids, dst_block_ids, major_order, uuid, layer_idx,
-      P, wire_layer_idx, shard_ids, static_cast<int>(total_streams));
+      peers[0].data, src_minor_dim_indices, dst_minor_dim_indices, major_order,
+      uuid, major_dim_idx, P, wire_major_dim_idx, shard_ids,
+      static_cast<int>(total_streams));
   if (!requests.ok()) {
     on_complete(requests.status());
     return std::move(future);
@@ -641,8 +656,8 @@ tsl::Future<std::vector<int>> BlockTransport::AsyncPushShards(
   // Post reports its own errors through `on_complete`, so the returned status
   // carries no additional information.
   adapter
-      ->Post(*adapter_peers, *requests, src_block_ids, dst_block_ids,
-             std::move(on_complete))
+      ->Post(*adapter_peers, *requests, src_minor_dim_indices,
+             dst_minor_dim_indices, std::move(on_complete))
       .status()
       .IgnoreError();
   return std::move(future);
@@ -760,31 +775,31 @@ lib::Request BlockTransport::BuildBlockRequest(
 }
 
 absl::StatusOr<std::vector<lib::Request>> BlockTransport::BuildBlockRequests(
-    absl::string_view peer, const std::vector<int>& src_block_ids,
-    const std::vector<int>& dst_block_ids, MajorOrder major_order,
-    uint64_t uuid, int layer_idx, int parallelism,
-    std::optional<int> wire_layer_idx, absl::Span<const int> shard_ids,
+    absl::string_view peer, const std::vector<int>& src_minor_dim_indices,
+    const std::vector<int>& dst_minor_dim_indices, MajorOrder major_order,
+    uint64_t uuid, int major_dim_idx, int parallelism,
+    std::optional<int> wire_major_dim_idx, absl::Span<const int> shard_ids,
     int total_streams) {
-  const size_t num_blocks = src_block_ids.size();
-  const lib::TransferOp op = dst_block_ids.empty()
+  const size_t minor_dim_size = src_minor_dim_indices.size();
+  const lib::TransferOp op = dst_minor_dim_indices.empty()
                                  ? lib::TransferOp::kBlockPush
                                  : lib::TransferOp::kBlockPushExplicit;
   const uint32_t remote_id = static_cast<uint32_t>(block_delegate_->node_id());
-  // Chunks are read from the local block array `layer_idx`; the request
-  // header names the array the receiver writes into.
-  const int header_layer_idx = wire_layer_idx.value_or(layer_idx);
-  const uint32_t local_id = header_layer_idx == -1
+  // Chunks are read from the local block array `major_dim_idx`; the
+  // request header names the array the receiver writes into.
+  const int header_major_dim_idx = wire_major_dim_idx.value_or(major_dim_idx);
+  const uint32_t local_id = header_major_dim_idx == -1
                                 ? lib::kUnspecifiedLocalId
-                                : static_cast<uint32_t>(header_layer_idx);
-  if (num_blocks == 0) {
+                                : static_cast<uint32_t>(header_major_dim_idx);
+  if (minor_dim_size == 0) {
     return std::vector<lib::Request>{BuildBlockRequest(
         op, /*laddr=*/nullptr, /*raddr=*/nullptr, /*len=*/0,
         /*count_or_size=*/0, /*request_id=*/0, uuid, /*buffer_id=*/0,
         parallelism, major_order, remote_id, local_id)};
   }
-  if (parallelism <= 0 || static_cast<size_t>(parallelism) > num_blocks) {
+  if (parallelism <= 0 || static_cast<size_t>(parallelism) > minor_dim_size) {
     return absl::InvalidArgumentError(absl::StrCat(
-        "parallelism ", parallelism, " must be in [1, ", num_blocks, "]"));
+        "parallelism ", parallelism, " must be in [1, ", minor_dim_size, "]"));
   }
 
   // The wire shard mask stays 0 (legacy "every shard") unless this call
@@ -806,61 +821,66 @@ absl::StatusOr<std::vector<lib::Request>> BlockTransport::BuildBlockRequests(
     }
   }
 
-  std::vector<int> target_layers;
-  if (layer_idx == -1) {
-    target_layers.resize(block_delegate_->num_block_arrays());
-    std::iota(target_layers.begin(), target_layers.end(), 0);
+  std::vector<int> target_major_dim_indices;
+  if (major_dim_idx == -1) {
+    target_major_dim_indices.resize(block_delegate_->num_block_arrays());
+    std::iota(target_major_dim_indices.begin(), target_major_dim_indices.end(),
+              0);
   } else {
-    target_layers = {layer_idx};
+    target_major_dim_indices = {major_dim_idx};
   }
 
   std::vector<lib::Request> requests;
-  requests.reserve(target_layers.size() * shard_ids.size() * num_blocks);
+  requests.reserve(target_major_dim_indices.size() * shard_ids.size() *
+                   minor_dim_size);
 
-  // One stream per `stream_idx`, over an even block partition; the adapter
-  // derives the same partition from `stream_idx` and `parallelism`.
-  const size_t base_blocks_per_stream = num_blocks / parallelism;
-  const size_t remainder = num_blocks % parallelism;
+  // One stream per `stream_idx`, over an even minor-dimension partition; the
+  // adapter derives the same partition from `stream_idx` and `parallelism`.
+  const size_t base_minor_per_stream = minor_dim_size / parallelism;
+  const size_t remainder = minor_dim_size % parallelism;
   for (int stream_idx = 0; stream_idx < parallelism; ++stream_idx) {
-    const size_t block_count =
-        base_blocks_per_stream +
+    const size_t minor_dim_count =
+        base_minor_per_stream +
         (static_cast<size_t>(stream_idx) < remainder ? 1 : 0);
-    const size_t block_offset = stream_idx * base_blocks_per_stream +
-                                std::min<size_t>(stream_idx, remainder);
-    const uint32_t count_or_size = static_cast<uint32_t>(block_count);
+    const size_t minor_dim_offset = stream_idx * base_minor_per_stream +
+                                    std::min<size_t>(stream_idx, remainder);
+    const uint32_t count_or_size = static_cast<uint32_t>(minor_dim_count);
     uint32_t request_id = 0;
     ABSL_RETURN_IF_ERROR(ForEachPayload(
-        major_order, target_layers, shard_ids, block_count,
+        major_order, target_major_dim_indices, shard_ids, minor_dim_count,
         [&](size_t l, size_t sh, size_t k) -> absl::Status {
-          ABSL_DCHECK_LT(block_offset + k, src_block_ids.size());
-          const int src_id = src_block_ids[block_offset + k];
+          ABSL_DCHECK_LT(minor_dim_offset + k, src_minor_dim_indices.size());
+          const int src_minor_dim_idx =
+              src_minor_dim_indices[minor_dim_offset + k];
 
-          const int64_t block_id_val = src_id;
-          const int64_t dst_id_val =
-              block_offset + k < dst_block_ids.size()
-                  ? static_cast<int64_t>(dst_block_ids[block_offset + k])
+          const int64_t block_id_val = src_minor_dim_idx;
+          const int64_t dst_minor_dim_idx =
+              minor_dim_offset + k < dst_minor_dim_indices.size()
+                  ? static_cast<int64_t>(
+                        dst_minor_dim_indices[minor_dim_offset + k])
                   : -1;
           std::vector<BlockChunk> chunks = block_delegate_->GetBlockChunks(
               l, sh, absl::MakeConstSpan(&block_id_val, 1),
               block_delegate_->block_bytes(l), uuid, -1, peer,
-              /*src_block_id=*/-1, /*dst_block_id=*/dst_id_val);
+              /*src_block_id=*/-1, /*dst_block_id=*/dst_minor_dim_idx);
           if (chunks.empty()) {
             return absl::NotFoundError(
-                absl::StrCat("No transfer chunks found for block ", src_id,
-                             " and uuid ", uuid));
+                absl::StrCat("No transfer chunks found for block ",
+                             src_minor_dim_idx, " and uuid ", uuid));
           }
           ABSL_RETURN_IF_ERROR(
               ValidateChunks(block_delegate_, l, sh, uuid, chunks));
 
           // What the receiver needs to handle these chunks. Uses
-          // `wire_layer_idx` when set (the receiver's array index), otherwise
-          // the iterated layer `l` (not `layer_idx`, which is -1 for all-layer
-          // pushes).
-          const size_t wire_layer =
-              wire_layer_idx.has_value() ? static_cast<size_t>(*wire_layer_idx)
-                                         : l;
+          // `wire_major_dim_idx` when set (the receiver's array index),
+          // otherwise the iterated layer `l` (not `major_dim_idx`,
+          // which is -1 for all-layer pushes).
+          const size_t effective_major_dim_idx =
+              wire_major_dim_idx.has_value()
+                  ? static_cast<size_t>(*wire_major_dim_idx)
+                  : l;
           const uint64_t buffer_id =
-              (static_cast<uint64_t>(wire_layer) << 32) |
+              (static_cast<uint64_t>(effective_major_dim_idx) << 32) |
               static_cast<uint32_t>(sh);
           for (size_t chunk_idx = 0; chunk_idx < chunks.size(); ++chunk_idx) {
             const BlockChunk& chunk = chunks[chunk_idx];
@@ -869,7 +889,7 @@ absl::StatusOr<std::vector<lib::Request>> BlockTransport::BuildBlockRequests(
                 request_id, uuid, buffer_id, parallelism, major_order,
                 remote_id, local_id, stream_idx,
                 /*on_block_received=*/nullptr, shard_mask, total_streams,
-                static_cast<int32_t>(dst_id_val), src_id,
+                static_cast<int32_t>(dst_minor_dim_idx), src_minor_dim_idx,
                 static_cast<uint16_t>(chunk_idx)));
           }
           ++request_id;
@@ -935,20 +955,20 @@ absl::StatusOr<lib::TransportAdapter*> BlockTransport::AdapterForBackend(
 
 absl::StatusOr<std::vector<lib::Request>>
 BlockTransport::BuildBlockPullRequests(
-    const std::vector<int>& src_block_ids,
-    const std::vector<int>& allocated_ids,
+    const std::vector<int>& src_minor_dim_indices,
+    const std::vector<int>& dst_minor_dim_indices,
     const std::vector<uint8_t*>& explicit_dst_ptrs, MajorOrder major_order,
     uint64_t uuid, int parallelism, BlockReceivedCallback on_block_received) {
   if (parallelism <= 0) {
     return absl::InvalidArgumentError("parallelism must be positive");
   }
 
-  const size_t num_blocks = src_block_ids.size();
-  if (num_blocks == 0) {
+  const size_t minor_dim_size = src_minor_dim_indices.size();
+  if (minor_dim_size == 0) {
     return std::vector<lib::Request>{};
   }
   const size_t SF = block_delegate_->shard_factor();
-  const size_t local_blocks = num_blocks / SF;
+  const size_t local_blocks = minor_dim_size / SF;
   const size_t base_blocks_per_stream = local_blocks / parallelism;
   const size_t remainder = local_blocks % parallelism;
 
@@ -962,8 +982,9 @@ BlockTransport::BuildBlockPullRequests(
     const size_t remote_block_count = local_block_count * SF;
     const size_t remote_block_offset = local_block_offset * SF;
 
-    if (remote_block_offset > src_block_ids.size() ||
-        remote_block_count > src_block_ids.size() - remote_block_offset) {
+    if (remote_block_offset > src_minor_dim_indices.size() ||
+        remote_block_count >
+            src_minor_dim_indices.size() - remote_block_offset) {
       return absl::OutOfRangeError(
           "Remote block range exceeds source block list");
     }
@@ -979,14 +1000,18 @@ BlockTransport::BuildBlockPullRequests(
   if (local_block_count > 0) {
     size_t curr_local_start = 0;
     size_t curr_local_count = 1;
-    ABSL_DCHECK_LT(remote_block_offset, src_block_ids.size());
-    int curr_base_remote_id = src_block_ids[remote_block_offset];
+    ABSL_DCHECK_LT(remote_block_offset, src_minor_dim_indices.size());
+    int curr_base_remote_id = src_minor_dim_indices[remote_block_offset];
 
     for (size_t k = 1; k < local_block_count; ++k) {
-      ABSL_DCHECK_LT(remote_block_offset + k * SF - 1, src_block_ids.size());
-      int prev_last_remote = src_block_ids[remote_block_offset + k * SF - 1];
-      ABSL_DCHECK_LT(remote_block_offset + k * SF, src_block_ids.size());
-      int curr_first_remote = src_block_ids[remote_block_offset + k * SF];
+      ABSL_DCHECK_LT(remote_block_offset + k * SF - 1,
+                     src_minor_dim_indices.size());
+      int prev_last_remote =
+          src_minor_dim_indices[remote_block_offset + k * SF - 1];
+      ABSL_DCHECK_LT(remote_block_offset + k * SF,
+                     src_minor_dim_indices.size());
+      int curr_first_remote =
+          src_minor_dim_indices[remote_block_offset + k * SF];
 
       if (curr_first_remote == prev_last_remote + 1) {
         curr_local_count++;
@@ -1018,17 +1043,19 @@ BlockTransport::BuildBlockPullRequests(
     const uint32_t remote_id = static_cast<uint32_t>(remote_read_block_id);
     const uint32_t count_or_size = static_cast<uint32_t>(chunk.remote_count);
 
-    std::vector<int> target_layers(block_delegate_->num_block_arrays());
-    std::iota(target_layers.begin(), target_layers.end(), 0);
+    std::vector<int> target_major_dim_indices(
+        block_delegate_->num_block_arrays());
+    std::iota(target_major_dim_indices.begin(), target_major_dim_indices.end(),
+              0);
     const std::vector<int> all_shards =
         AllShards(block_delegate_->num_shards());
     ABSL_RETURN_IF_ERROR(ForEachPayload(
-        major_order, target_layers, all_shards, chunk.local_count,
+        major_order, target_major_dim_indices, all_shards, chunk.local_count,
         [&](size_t l, size_t sh, size_t k) -> absl::Status {
           ABSL_DCHECK_LT(local_block_offset + chunk.local_start_idx + k,
-                         allocated_ids.size());
-          const int dst_id =
-              allocated_ids[local_block_offset + chunk.local_start_idx + k];
+                         dst_minor_dim_indices.size());
+          const int dst_id = dst_minor_dim_indices[local_block_offset +
+                                                   chunk.local_start_idx + k];
           if (dst_id < 0) {
             return absl::InvalidArgumentError(
                 "Destination block id is negative");
@@ -1063,8 +1090,8 @@ BlockTransport::BuildBlockPullRequests(
           const uint32_t local_id = static_cast<uint32_t>(dst_id);
           // What the source serving this pull needs to locate and bounds-check
           // the data.
-          const uint64_t buffer_id = (static_cast<uint64_t>(l) << 32) |
-                                     static_cast<uint32_t>(sh);
+          const uint64_t buffer_id =
+              (static_cast<uint64_t>(l) << 32) | static_cast<uint32_t>(sh);
 
           for (auto& bc : block_chunks) {
             if (!explicit_dst_ptrs.empty()) {

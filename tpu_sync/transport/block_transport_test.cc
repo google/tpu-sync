@@ -1895,6 +1895,51 @@ TEST_P(BlockTransportTest, MultiShardPushBlockMajor) {
   }
 }
 
+TEST_P(BlockTransportTest, MultiShardPushBlockMajorMoreLayersThanBlocks) {
+  constexpr size_t kBlockSize = 256;
+  constexpr int kNumBlocks = 2;
+  constexpr size_t kNumLayers = 4;
+  constexpr size_t kNumShards = 2;
+
+  MockDelegate sender_delegate(kBlockSize, kNumBlocks, kNumLayers, kNumShards);
+  MockDelegate receiver_delegate(kBlockSize, kNumBlocks, kNumLayers,
+                                 kNumShards);
+
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    for (size_t sh = 0; sh < kNumShards; ++sh) {
+      for (int b = 0; b < kNumBlocks; ++b) {
+        std::memset(sender_delegate.block_data(b, l, sh),
+                    static_cast<int>(0x10 + l * 0x20 + sh * 0x08 + b),
+                    kBlockSize);
+        std::memset(receiver_delegate.block_data(b, l, sh), 0, kBlockSize);
+      }
+    }
+  }
+
+  BlockTransport sender(&sender_delegate, 0);
+  BlockTransport receiver(&receiver_delegate, 0);
+  BindControlChannels(&sender, &sender_delegate, &receiver, &receiver_delegate);
+
+  ABSL_ASSERT_OK(
+      sender
+          .AsyncPush({absl::StrCat("localhost:", receiver.local_port())},
+                     /*src_block_ids=*/{0, 1}, /*dst_block_ids=*/{0, 1},
+                     /*parallelism=*/2, MajorOrder::kBlockMajor, /*uuid=*/0,
+                     /*layer_idx=*/-1)
+          .Await());
+
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    for (size_t sh = 0; sh < kNumShards; ++sh) {
+      for (int b = 0; b < kNumBlocks; ++b) {
+        int expected = static_cast<int>(0x10 + l * 0x20 + sh * 0x08 + b);
+        EXPECT_EQ(receiver_delegate.block_data(b, l, sh)[0], expected);
+        EXPECT_EQ(receiver_delegate.block_data(b, l, sh)[kBlockSize - 1],
+                  expected);
+      }
+    }
+  }
+}
+
 TEST_P(BlockTransportTest, MultiShardPushLayerMajor) {
   constexpr size_t kBlockSize = 256;
   constexpr int kNumBlocks = 3;
@@ -2942,14 +2987,14 @@ TEST(PeregrineRecvCompleteTest, RejectsSenderSession) {
       ADD_FAILURE() << "ResolveStagingSlot should not be called";
       return absl::UnimplementedError("unused");
     }
-    absl::Status OnDataReceived(size_t major_dimension_idx,
+    absl::Status OnDataReceived(size_t major_dim_idx,
                                 absl::Span<const int> minor_dimension_indices,
                                 absl::Span<const int> shard_ids) override {
       ADD_FAILURE() << "OnDataReceived should not be called on sender session";
       return absl::FailedPreconditionError(
           "send session does not receive data");
     }
-    tsl::Future<> GetDataReadyFuture(size_t major_dimension_idx) override {
+    tsl::Future<> GetDataReadyFuture(size_t major_dim_idx) override {
       return tsl::Future<>(absl::OkStatus());
     }
   };

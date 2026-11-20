@@ -155,7 +155,7 @@ class BlockTransportServerPushSession final
       const std::optional<PoolPushProgressSpec>& pool_progress_spec,
       bool is_peregrine = false);
 
-  struct LayerProgress {
+  struct MajorDimensionProgress {
     size_t completed_chunks = 0;
     struct SenderStreams {
       size_t landed = 0;
@@ -166,11 +166,12 @@ class BlockTransportServerPushSession final
     size_t senders_complete = 0;
     bool expected_senders_resolved = false;
     std::optional<size_t> expected_senders;
-    bool on_layer_received_called = false;
+    bool on_major_unit_completed = false;
   };
 
-  static size_t AccumulateLandedShards(LayerProgress::SenderStreams& streams,
-                                       size_t shards, size_t full_shards);
+  static size_t AccumulateLandedShards(
+      MajorDimensionProgress::SenderStreams& streams, size_t shards,
+      size_t full_shards);
 
   // One Peregrine Post seen by ResolveRecvBuffer and the op it holds.
   struct PostLease {
@@ -198,7 +199,8 @@ class BlockTransportServerPushSession final
   mutable absl::Mutex mu_;
   bool done_ ABSL_GUARDED_BY(mu_) = false;
   absl::Status status_ ABSL_GUARDED_BY(mu_);
-  absl::flat_hash_map<int, LayerProgress> layer_progress_ ABSL_GUARDED_BY(mu_);
+  absl::flat_hash_map<int, MajorDimensionProgress> major_dimension_progress_
+      ABSL_GUARDED_BY(mu_);
   // Keyed by (remote_id, local_id, shard_mask) rather than Peregrine's handle
   // (one Post per key per uuid). Only receiver-resolved Posts get a lease here;
   // sender-addressed Posts take the op in OnPeregrinePostComplete.

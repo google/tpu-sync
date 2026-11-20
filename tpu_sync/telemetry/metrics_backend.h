@@ -150,6 +150,8 @@ inline constexpr absl::string_view kPeregrineErrorsTotal =
 
 inline constexpr absl::string_view kStorageMetadataCheckTotal =
     "storage_metadata_check_total";
+inline constexpr absl::string_view kStorageLookupDurationMs =
+    "storage_lookup_duration_ms";
 
 }  // namespace metric_names
 
@@ -272,6 +274,9 @@ inline constexpr absl::string_view kPeregrineErrorsTotal =
 
 inline constexpr absl::string_view kStorageMetadataCheckTotal =
     "Total secondary storage metadata existence checks by result";
+inline constexpr absl::string_view kStorageLookupDurationMs =
+    "Duration in milliseconds of secondary storage metadata existence probing "
+    "per lookup batch.";
 
 }  // namespace metric_descriptions
 
@@ -369,6 +374,7 @@ inline constexpr absl::string_view kStorageFilesystemBytesLabels[] = {kMount,
                                                                       kState};
 inline constexpr absl::string_view kStorageMetadataCheckLabels[] = {kDpRank,
                                                                     kResult};
+inline constexpr absl::string_view kStorageLookupLabels[] = {kDpRank};
 inline constexpr absl::string_view kStorageIoLabels[] = {kLocalRank,
                                                          kDirection};
 inline constexpr absl::string_view kHostPoolBlocksLabels[] = {kDpRank, kState};
@@ -390,6 +396,7 @@ using metric_labels::kSentBytesLabels;
 using metric_labels::kStorageBytesLabels;
 using metric_labels::kStorageFilesystemBytesLabels;
 using metric_labels::kStorageIoLabels;
+using metric_labels::kStorageLookupLabels;
 using metric_labels::kStorageMetadataCheckLabels;
 using metric_labels::kTransferFailuresLabels;
 
@@ -608,6 +615,12 @@ inline constexpr MetricMetadata kStorageMetadataCheckTotal{
     .type = MetricType::kCounter,
     .label_names = kStorageMetadataCheckLabels};
 
+inline constexpr MetricMetadata kStorageLookupDurationMs{
+    .name = metric_names::kStorageLookupDurationMs,
+    .description = metric_descriptions::kStorageLookupDurationMs,
+    .type = MetricType::kHistogram,
+    .label_names = kStorageLookupLabels};
+
 inline constexpr MetricMetadata kAllMetrics[] = {
     kSentBytesTotal,
     kReceivedBytesTotal,
@@ -630,6 +643,7 @@ inline constexpr MetricMetadata kAllMetrics[] = {
     kHostNumaMemoryBytes,
     kStorageFilesystemBytes,
     kStorageMetadataCheckTotal,
+    kStorageLookupDurationMs,
     kStorageIoTimeMs,
     kHostPoolBlocks,
     // Weight Sync Metrics

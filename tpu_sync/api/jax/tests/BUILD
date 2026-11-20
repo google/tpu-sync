@@ -20,7 +20,7 @@ py_test(
     name = "kv_cache_store_test",
     srcs = ["kv_cache_store_test.py"],
     data = [
-        "//tpu_sync/kv_cache/global_registry:global_registry_server",
+        "//tpu_sync/kv_cache_offload/global_registry:global_registry_server",
     ],
     tags = [
         "manual",

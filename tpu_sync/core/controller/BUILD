@@ -367,7 +367,7 @@ py_library(
     name = "binary_launcher",
     srcs = ["binary_launcher.py"],
     data = [
-        "//tpu_sync/kv_cache/global_registry:global_registry_server",
+        "//tpu_sync/kv_cache_offload/global_registry:global_registry_server",
         "//tpu_sync/store_node:kv_cache_host_store_node_main",
     ],
 )

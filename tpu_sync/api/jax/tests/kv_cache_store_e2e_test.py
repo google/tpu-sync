@@ -79,7 +79,7 @@ def _registry_binary_path():
           "..",
           "..",
           "..",
-          "kv_cache",
+          "kv_cache_offload",
           "global_registry",
           "global_registry_server",
       )

@@ -220,7 +220,7 @@ if [[ "${RAIDEN_RUN_E2E_BUILD}" == "true" ]]; then
   echo "=== Verifying E2E Build Artifacts ==="
   EXPECTED_ARTIFACTS=(
     "${REPO_ROOT}/tpu_sync/frameworks/jax/_tpu_raiden_jax.so"
-    "${REPO_ROOT}/tpu_sync/kv_cache/global_registry/global_registry_server"
+    "${REPO_ROOT}/tpu_sync/kv_cache_offload/global_registry/global_registry_server"
     "${REPO_ROOT}/tpu_sync/store_node/kv_cache_host_store_node_main"
   )
   for artifact in "${EXPECTED_ARTIFACTS[@]}"; do

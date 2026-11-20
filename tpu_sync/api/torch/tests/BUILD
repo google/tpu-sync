@@ -40,7 +40,7 @@ py_test(
     name = "kv_cache_store_test",
     srcs = ["kv_cache_store_test.py"],
     data = [
-        "//tpu_sync/kv_cache/global_registry:global_registry_server",
+        "//tpu_sync/kv_cache_offload/global_registry:global_registry_server",
     ],
     deps = [
         "//pyglib:resources",
@@ -137,7 +137,7 @@ py_test(
     timeout = "long",
     srcs = ["kv_cache_store_e2e_test.py"],
     data = [
-        "//tpu_sync/kv_cache/global_registry:global_registry_server",
+        "//tpu_sync/kv_cache_offload/global_registry:global_registry_server",
     ],
     tags = [
         "manual",
@@ -160,8 +160,8 @@ py_test(
     timeout = "long",
     srcs = ["kv_cache_store_mpmd_e2e_test.py"],
     data = [
-        "//tpu_sync/kv_cache/global_registry:global_registry_server",
         "//tpu_sync/kv_cache_offload/backends/plugin:libmock_storage_plugin.so",
+        "//tpu_sync/kv_cache_offload/global_registry:global_registry_server",
     ],
     tags = [
         "manual",

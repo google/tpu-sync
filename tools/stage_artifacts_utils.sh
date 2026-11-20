@@ -29,7 +29,7 @@ RAIDEN_PROTO_BAZEL_TARGETS=(
 
 # C++ control-plane service binaries. These do not depend on JAX or Torch.
 RAIDEN_SERVER_BAZEL_TARGETS=(
-  "//tpu_sync/kv_cache/global_registry:global_registry_server"
+  "//tpu_sync/kv_cache_offload/global_registry:global_registry_server"
   "//tpu_sync/store_node:kv_cache_host_store_node_main"
 )
 
@@ -67,7 +67,7 @@ raiden_stage_server_binaries() {
   echo "=== Linking C++ control-plane service binaries into source tree ==="
   local rel src dst
   for rel in \
-    "tpu_sync/kv_cache/global_registry/global_registry_server" \
+    "tpu_sync/kv_cache_offload/global_registry/global_registry_server" \
     "tpu_sync/store_node/kv_cache_host_store_node_main"; do
     src="${workspace_dir}/bazel-bin/${rel}"
     dst="${workspace_dir}/${rel}"

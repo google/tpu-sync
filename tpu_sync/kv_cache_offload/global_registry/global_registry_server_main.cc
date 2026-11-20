@@ -39,11 +39,10 @@ ABSL_FLAG(absl::Duration, default_ttl, absl::InfiniteDuration(),
           "Default TTL for registrations");
 ABSL_FLAG(absl::Duration, cleanup_interval, absl::Seconds(300),
           "Interval for cleanup thread");
-ABSL_FLAG(
-    int64_t, pull_owned_batch_size,
-    tpu_raiden::kv_cache::global_registry::GlobalRegistryServiceImpl::
-        kDefaultPullOwnedBatchSize,
-    "Maximum number of entries per streamed PullOwned response message");
+ABSL_FLAG(int64_t, pull_owned_batch_size,
+          tpu_raiden::kv_cache::global_registry::GlobalRegistryServiceImpl::
+              kDefaultPullOwnedBatchSize,
+          "Maximum number of entries per streamed PullOwned response message");
 
 absl::Status RunServer() {
   std::string server_address =

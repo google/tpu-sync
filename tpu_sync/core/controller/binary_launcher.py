@@ -32,7 +32,10 @@ import sys
 _PACKAGE_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 GLOBAL_REGISTRY_SERVER = (
-    _PACKAGE_ROOT / "kv_cache" / "global_registry" / "global_registry_server"
+    _PACKAGE_ROOT
+    / "kv_cache_offload"
+    / "global_registry"
+    / "global_registry_server"
 )
 KV_CACHE_HOST_STORE_NODE = (
     _PACKAGE_ROOT / "store_node" / "kv_cache_host_store_node_main"

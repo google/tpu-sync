@@ -62,6 +62,7 @@ struct BlockTransportConfig {
   int ack_write_timeout_ms = -1;
   int payload_write_timeout_ms = -1;
   size_t coalesce_window_bytes = 0;
+  MajorOrder major_order = MajorOrder::kLayerMajor;
 
   absl::flat_hash_map<lib::TransferOp, TransportBackend> op_backends;
 
@@ -155,7 +156,8 @@ class BlockTransportServerPushSession final
       std::shared_ptr<TransferSession> session, uint32_t local_id,
       uint32_t remote_id, size_t num_streams, size_t landed_shards,
       const std::optional<PoolPushProgressSpec>& pool_progress_spec,
-      bool is_peregrine = false);
+      bool is_peregrine = false,
+      MajorOrder major_order = MajorOrder::kLayerMajor);
 
   struct MajorDimensionProgress {
     size_t completed_chunks = 0;

@@ -41,6 +41,7 @@ namespace transport {
 namespace {
 
 using ::absl_testing::IsOk;
+using ::absl_testing::IsOkAndHolds;
 using ::absl_testing::StatusIs;
 using ::testing::Eq;
 using ::testing::HasSubstr;
@@ -242,6 +243,48 @@ TEST(BlockTransportServerPushSessionTest,
   EXPECT_FALSE(session->HasAdmittedPosts());
 }
 
+TEST(BlockTransportServerPushSessionTest,
+     PeregrineBlockMajorResolveAndComplete) {
+  constexpr size_t kSliceSize = 1024;
+  constexpr size_t kMaxBlocks = 5;
+  constexpr size_t kNumLayers = 2;
+  constexpr size_t kNumShards = 1;
+  MockSessionDelegate delegate(kSliceSize, kMaxBlocks, kNumLayers, kNumShards);
+  BlockTransportConfig config;
+  config.major_order = MajorOrder::kBlockMajor;
+
+  auto session = std::make_shared<BlockTransportServerPushSession>(
+      /*uuid=*/0, &delegate, config);
+  const lib::PostMetadata post{
+      .uuid = 0,
+      .remote_id = 7,
+      .local_id = 3,  // dst_block_id >= kNumLayers
+      .shard_mask = 0,
+      .op = lib::TransferOp::kBlockPushExplicit,
+  };
+  const lib::RequestMetadata req{
+      .shard = 0,
+      .block_id = 1,  // layer_id
+      .src_block_id = 1,
+      .chunk_idx = 0,
+      .len = kSliceSize,
+  };
+
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> host, delegate.GetHostBuffer(1, 0));
+  EXPECT_THAT(session->ResolveRecvBuffer(post, req),
+              IsOkAndHolds(host.data() + 3 * kSliceSize));
+  ABSL_EXPECT_OK(session->OnPeregrinePostComplete(post, {}, absl::OkStatus()));
+  EXPECT_TRUE(session->IsDone());
+  EXPECT_THAT(delegate.layers_received(), Eq(0));
+
+  // Out-of-range layer_id is rejected under kBlockMajor.
+  auto bad_session = std::make_shared<BlockTransportServerPushSession>(
+      /*uuid=*/0, &delegate, config);
+  lib::RequestMetadata bad_req = req;
+  bad_req.block_id = kNumLayers;
+  EXPECT_THAT(bad_session->ResolveRecvBuffer(post, bad_req),
+              StatusIs(absl::StatusCode::kOutOfRange));
+}
 TEST(BlockTransportServerPullSessionTest, InvalidArgumentsRejected) {
   MockSessionDelegate delegate;
   BlockTransportConfig config;

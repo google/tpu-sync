@@ -5,103 +5,94 @@ import TpuSyncVerify.Transfer.Caller.Traces
 # Intra-worker NUMA sub-manager barrier (`TpuSyncVerify.Transfer.Caller.NumaBarrier`)
 
 Where `MultiWorker.lean` models `KVOutputAggregator` combining completions across
-separate worker processes above `get_transfer_results()`, this module models the
-barrier *inside* a single JAX worker (`NumaAwareKVCacheManager::CompleteReadRaw`
-in `tpu_sync/frameworks/jax/kv_cache_manager.cc`), which aggregates
-`(done_sending, done_recving, failed_recving)` across `sub_managers_`
-(`num_subs = 1` under `ENABLE_MULTI_NUMA=0`, `num_subs = 2` under
-`ENABLE_MULTI_NUMA=1`) before `TPUConnectorWorker.get_transfer_results` forwards
-the worker's report to vLLM, across arbitrarily many sequential transfers reusing
-the same `req_id` (`recycle`).
+worker processes above `get_transfer_results()`, this module models the barrier
+*inside* one JAX worker (`NumaAwareKVCacheManager::CompleteReadRaw` in
+`tpu_sync/frameworks/jax/kv_cache_manager.cc`), which aggregates
+`(done_sending, done_recving, failed_recving)` across `sub_managers_` before
+`TPUConnectorWorker.get_transfer_results` forwards the worker's report to vLLM,
+across arbitrarily many sequential transfers reusing `req_id` (`recycle`).
 
-Two barrier policies (`NumaPolicy`) are compared over the same sub-manager,
-connector, and scheduler transitions:
+## Policies (`NumaPolicy`)
 
-1. `NumaPolicy.eagerFailSet` — the `NumaAwareKVCacheManager::CompleteReadRaw`
-   implementation in `tpu_sync/frameworks/jax/kv_cache_manager.cc`:
+1. **`NumaPolicy.settledCounts`** (shipping `CompleteReadRaw`): each sub-manager
+   terminal report increments `done_sending_counts_[req]`,
+   `done_recving_counts_[req]`, or `failed_recving_counts_[req]` and runs
+   `process_completion(req)`. Once `s_count + r_count + f_count >= expected`
+   (`req_expected_counts_[req]` when set by `StartRead(remote_descriptors)`,
+   else `num_subs`), it emits `failed_recving` if `f_count > 0`, else
+   `done_recving` at `r_count >= expected`, else `done_sending` at
+   `s_count >= expected` (else `failed_recving`), and erases all four per-request
+   map entries.
+2. **`NumaPolicy.eagerFailSet`** (mutant): replaces `failed_recving_counts_`
+   with a per-request failure set (`NumaMgr.failedRecvingSet`):
    * `done_sending_counts_[req]` emits `done_sending` and erases its entry at
      `num_subs`;
-   * `done_recving_counts_[req]` emits `done_recving` (unless `req` is in
-     `failed_recving_set_`) and erases `done_recving_counts_[req]`,
-     `req_expected_counts_[req]`, and `failed_recving_set_[req]` at `expected`;
-   * `if (failed_recving_set_.insert(req).second)` emits `failed_recving`
-     immediately on the first failing sub-manager without waiting for sibling
-     sub-managers or erasing any map entry
-     (`KVCacheManagerWrapperTest.AnyFailureImmediatelyTriggersFailedRecvingAndSuppressesFutureAcks`).
-   Witnesses show both coupled failure modes:
-   * under `twoSubs = true` (`num_subs = 2`), a failing sub-manager causes the
-     engine to free consumer or producer HBM while the sibling sub-manager's DMA
-     is still in flight (`trace_eagerFailSet_recv_early_free`,
-     `trace_eagerFailSet_send_early_free`);
-   * across `recycle` (`req_id` reuse, **N3**), `failed_recving_set_` stays
-     populated even at `twoSubs = false` (`num_subs = 1`), suppressing later
-     failure and success reports into permanent block leaks
-     (`trace_eagerFailSet_single_sub_reuse_leaks`), while at `num_subs = 2` a
-     partial failure leaves `done_recving_counts_[req] = 1` and
-     `failed_recving_set_` set, suppressing the second transfer's `done_recving`
-     and causing the third transfer to emit `done_recving` after only one of two
-     sub-managers finishes (`trace_eagerFailSet_partial_fail_desync_premature_doneRecving`).
+   * `done_recving_counts_[req]` emits `done_recving` (unless `req` is in the
+     failure set) and erases `done_recving_counts_[req]`,
+     `req_expected_counts_[req]`, and the set entry at `expected`;
+   * the first failing sub-manager's `insert(req).second` emits `failed_recving`
+     immediately, without waiting for sibling sub-managers or erasing any entry.
 
-2. `NumaPolicy.settledCounts` — the settled-count barrier (`failed_recving_counts_`
-   replacing `failed_recving_set_`): every sub-manager terminal report increments
-   its respective count map (`done_sending_counts_`, `done_recving_counts_`, or
-   `failed_recving_counts_`), emits once
-   `done_sending_counts_ + done_recving_counts_ + failed_recving_counts_ ≥ expected`
-   (`failed_recving` if `failed_recving_counts_ > 0`, else `done_recving` or
-   `done_sending`), and erases all four maps for `req` (no such policy exists in
-   C++ at the baseline commit).
-   * `numa_settledCounts_safe` proves inductively across unbounded `recycle`
-     rounds, for both `num_subs = 1` and `num_subs = 2`, both failure policies,
-     and any `Contract`-satisfying connector, that HBM is never freed while a
-     sub-manager is still unpublished (`numaEarlyFree = false`, discharging
-     `Pipeline` **A4** across NUMA sub-managers), no blocks leak on P or D
-     (`numaLeakP = false`, `numaLeakD = false`), and D never decodes unwritten KV
-     (`numaDecodesUnwritten = false`).
-   * `numa_settledCounts_maps_clean` proves all four per-request map entries are
-     erased whenever all participating sub-managers settle, so `recycle` returns
-     to the exact initial state (which exhaustive `ModelCheck.check` confirms on
-     the cyclic state graph).
-   * `numaProcessSettled_expected_numSubs_eq_none` proves that pre-populating
-     `req_expected_counts_[req] = num_subs` in `StartRead(remote_descriptors)`
-     emits the identical report and post-settlement state as leaving
-     `req_expected_counts_` unset (`StartRead(remote_endpoint)`).
+## Main results
+
+* **Safety (`numa_settledCounts_safe`).** Across unbounded `recycle` rounds, for
+  `num_subs ∈ {1, 2}`, both failure policies, and any `Contract`-satisfying
+  connector: HBM is never freed while a sub-manager is still unpublished
+  (`numaEarlyFree = false`, discharging `Pipeline` **A4** across sub-managers),
+  no blocks leak on P or D (`numaLeakP = false`, `numaLeakD = false`), and D
+  never decodes unwritten KV (`numaDecodesUnwritten = false`).
+* **Map cleanup & `expected` equivalence (`numa_settledCounts_maps_clean`,
+  `numaProcessSettled_expected_numSubs_eq_none`).** Every settled round erases
+  all four per-request map entries so `recycle` returns to `numaInit` (closing
+  the exhaustive `numaSearch` checks with `.safe`), and pre-setting
+  `req_expected_counts_[req] = num_subs` (`StartRead(remote_descriptors)`) is
+  equivalent to leaving it unset (`StartRead(remote_endpoint)`).
+* **Test replay & mutant counterexamples (`trace_settledCounts_*`,
+  `trace_eagerFailSet_*`).** Replays the seven `KVCacheManagerWrapperTest`
+  barrier/consensus tests (`setExpected = false`) and
+  `StartReadUnifiedMultiEndpointMultiSubManager` (`setExpected = true`) on
+  `settledCounts`, and refutes `eagerFailSet` on both coupled failure modes:
+  early HBM free while a sibling sub-manager's DMA is still in flight
+  (`trace_eagerFailSet_recv_early_free`, `trace_eagerFailSet_send_early_free`)
+  and stale map state across `req_id` reuse
+  (`trace_eagerFailSet_single_sub_reuse_leaks`,
+  `trace_eagerFailSet_partial_fail_desync_premature_doneRecving`).
 
 ## Assumptions
 
 * **N1 (one report per participating sub-manager per round).** Each of the
-  `num_subs` sub-managers publishes exactly one terminal outcome for the
-  request per transfer (`pSub` / `dSub` fire once per round). This is `Caller`
-  **B1** applied per sub-manager; the model assumes it and does not discharge
-  it. `KVCacheManagerWithTransfer::StartRead` reports on every exit path
-  reachable from `NumaAwareKVCacheManager::StartRead` (session creation and
-  registration failures go to `failed_recving_`; a same-`req_id` re-delivery is
-  answered by the incumbent). On P, `NumaAwareKVCacheManager::NotifyForRead`
-  registers on every sub-manager in turn with the same `block_ids`; empty
-  `block_ids` registers nothing on any sub-manager, and a throw on a later
-  sub-manager after an earlier one registered would leave the barrier one
-  report short under both policies (not modelled).
-* **N2 (same `num_subs` on P and D).** `twoSubs` sets both sides; the two
-  barriers are independent, so an asymmetric deployment changes nothing in the
-  per-side argument, but it is not instantiated.
+  `num_subs` sub-managers reaches its `mu_` scope and publishes one terminal
+  outcome per transfer (`pSub` / `dSub` fire once per round; `Caller` **B1** per
+  sub-manager). Once inside `KVCacheManagerWithTransfer`'s `mu_` scope that holds
+  (duplicate UUIDs, creation/registration failures, and settled sessions each
+  report once; same-`req_id` re-delivery is a no-op). Not modelled are pre-`mu_`
+  returns with no report (`StartReadInputVectorValidation`, empty `block_ids` in
+  `NotifyForRead`) and mid-loop exceptions (`CheckHostBlockIds`,
+  `FaultInjectThrow`) that leave only a subset of sub-managers registered (and
+  `req_expected_counts_[req_id]` already set on the descriptors overload), which
+  stall the barrier short of `expected` and leave counts behind.
+* **N2 (1 or 2 sub-managers, symmetric on P and D).**
+  `NumaAwareKVCacheManager::InitSubManagers` creates one sub-manager unless
+  `ENABLE_MULTI_NUMA` is `1` or `true`, in which case it creates one per device
+  NUMA node (`GetPjRtDeviceNumaNode`), or `min(num_ext_nics, total_num_shards_)`
+  round-robin sub-managers when multiple shards share one node on a multi-NIC
+  host. `numaProcessSettled` is written for any `numSubs`, while `numaSys`,
+  `numaSearch`, and `numa_settledCounts_safe` instantiate `twoSubs ∈ {false, true}`
+  (1 or 2 sub-managers, matching on P and D; 3 or more and asymmetric counts are
+  not instantiated, though P and D barriers are independent).
 * **N3 (`req_id` reuse only after the previous transfer is released).**
-  `recycle` fires only once every participating sub-manager on both nodes has
-  settled and both schedulers have freed the blocks. Under
-  `NumaPolicy.settledCounts` the sub-manager guard is implied by
-  `pHeld = false ∧ dHeld = false` (nothing is freed before emission). Under
-  `NumaPolicy.eagerFailSet` it also excludes a reuse racing a sibling's late
-  report, so the `eagerFailSet` counterexamples are a lower bound. Reuse itself
-  needs an engine that repeats request ids: vLLM appends a random suffix to
-  every request id unless `VLLM_DISABLE_REQUEST_ID_RANDOMIZATION=1`; direct
-  `jax::KVCacheManager` callers with deterministic ids reuse them freely. With
-  unique ids the shipping code's per-request entries are never reused but never
-  erased either (unbounded map growth), which a one-request model cannot show.
-* **N4 (one sub-manager report per step).** One `CompleteReadRaw()` call polls
-  every sub-manager and hands the whole batch to the connector; the model splits
-  the batch into consecutive `pSub` / `dSub` steps, each followed by the
-  connector and scheduler. This only adds interleavings, so it is sound for the
-  safety results; the `nanobind` bindings `notify_for_read`, `start_read`, and
-  `complete_read` in `tpu_sync/frameworks/jax/tpu_raiden_jax_module.cc` do not
-  release the GIL, so the unguarded maps are never touched concurrently.
+  `recycle` fires only once every sub-manager has settled and both schedulers
+  have freed the blocks (implied by `pHeld = false ∧ dHeld = false` under
+  `settledCounts`; a lower bound under `eagerFailSet`). vLLM randomizes request
+  ids unless `VLLM_DISABLE_REQUEST_ID_RANDOMIZATION=1` (turning `eagerFailSet`'s
+  uncleaned entries into unbounded map growth rather than `req_id` collision),
+  whereas direct `jax::KVCacheManager` callers may reuse deterministic ids.
+* **N4 (one sub-manager report per step, serialized by the GIL).** Splitting one
+  `CompleteReadRaw()` batch into consecutive `pSub` / `dSub` steps only adds
+  interleavings (sound for safety), and the `nanobind` bindings
+  (`notify_for_read`, `start_read`, `complete_read` in
+  `tpu_raiden_jax_module.cc`) hold the GIL so the unguarded count maps are never
+  accessed concurrently.
 -/
 
 namespace TpuSyncVerify.Transfer.Caller
@@ -117,11 +108,12 @@ inductive RawReport where
 
 /-- Sub-manager aggregation policy in `NumaAwareKVCacheManager::CompleteReadRaw`. -/
 inductive NumaPolicy where
-  /-- Baseline `kv_cache_manager.cc`: eager `failed_recving` via `failed_recving_set_`,
-  cleared only when `done_recving_counts_` reaches `expected`. -/
+  /-- Mutant: eager `failed_recving` through a per-request failure set, cleared
+  only when `done_recving_counts_` reaches `expected`. -/
   | eagerFailSet
-  /-- Settled-count barrier: `failed_recving_counts_` with emission and full map
-  cleanup at `done_sending_counts_ + done_recving_counts_ + failed_recving_counts_ ≥ expected`. -/
+  /-- `process_completion` in `kv_cache_manager.cc`: `failed_recving_counts_`
+  with emission and full map cleanup at
+  `s_count + r_count + f_count >= expected`. -/
   | settledCounts
   deriving Repr, DecidableEq
 
@@ -134,20 +126,24 @@ structure NumaMgr where
   doneRecvingCounts : Nat := 0
   /-- `failed_recving_counts_[req]` (`0` when absent; used by `settledCounts`). -/
   failedRecvingCounts : Nat := 0
-  /-- `req ∈ failed_recving_set_` (used by `eagerFailSet`). -/
+  /-- Membership in the `eagerFailSet` mutant's per-request failure set (no C++
+  field). -/
   failedRecvingSet : Bool := false
   /-- `req_expected_counts_[req]` (`none` when absent; set to `some numSubs` by
   `NumaAwareKVCacheManager::StartRead(remote_descriptors)`). -/
   reqExpected : Option Nat := none
   deriving Repr, DecidableEq
 
-/-- Number of sub-managers (`1` under `ENABLE_MULTI_NUMA=0`, `2` under
-`ENABLE_MULTI_NUMA=1`). -/
+/-- Number of sub-managers the model instantiates: `1` (always the case when
+`ENABLE_MULTI_NUMA` is unset) or `2` (two NUMA nodes or two data-plane NICs
+with `ENABLE_MULTI_NUMA=1`). Larger counts are not instantiated. -/
 def numaCount (twoSubs : Bool) : Nat := if twoSubs then 2 else 1
 
-/-- Settled-count completion check (`process_completion`): once total reports
-reach `expected`, emit `failed_recving` if any sub-manager failed, else
-`done_recving` / `done_sending`, and erase all four map entries for `req`. -/
+/-- `process_completion` in `NumaAwareKVCacheManager::CompleteReadRaw`: once
+`s_count + r_count + f_count >= expected`, emit `failed_recving` if
+`f_count > 0`, else `done_recving` at `r_count >= expected`, else `done_sending`
+at `s_count >= expected`, else `failed_recving`; and erase all four map entries
+for `req`. -/
 def numaProcessSettled (numSubs : Nat) (m : NumaMgr) :
     NumaMgr × Option RawReport :=
   let expected := m.reqExpected.getD numSubs
@@ -240,8 +236,7 @@ structure NumaCfg where
   conn : Connector
   policy : Policy
   numaPolicy : NumaPolicy := .settledCounts
-  /-- `false` = 1 sub-manager (`ENABLE_MULTI_NUMA=0`);
-  `true` = 2 sub-managers (`ENABLE_MULTI_NUMA=1`). -/
+  /-- `false` = 1 sub-manager; `true` = 2 sub-managers (`numaCount`). -/
   twoSubs : Bool := true
   /-- `true` models `StartRead(remote_descriptors)` setting
   `req_expected_counts_[req_id] = sub_managers_.size()`; `false` models
@@ -1240,6 +1235,7 @@ theorem numa_settledCounts_maps_clean {c : NumaCfg}
 
 /-! ## Exhaustive state-space searches and concrete traces -/
 
+/-- Every instance of every `NumaEv` constructor. -/
 def numaAllEvents : List NumaEv :=
   [ .pSub false true, .pSub false false,
     .pSub true true, .pSub true false,
@@ -1258,8 +1254,10 @@ def numaHasCounterexample (c : NumaCfg) : Bool :=
 
 def numaView (twoSubs : Bool) (s : NumaS) : View := view (numaToS twoSubs s)
 
--- `NumaPolicy.settledCounts` exhausts the cyclic multi-round state space (`.safe`)
--- across both 1 and 2 sub-managers, both failure policies, and both `StartRead` overloads:
+-- Under `NumaPolicy.settledCounts` the search over `numaAllEvents` closes with no
+-- violation (`.safe`: every state of the cyclic multi-round graph reachable
+-- within the default 24 levels was visited and no unvisited successor remains),
+-- for 1 and 2 sub-managers, both failure policies, and both `StartRead` overloads:
 #guard numaSearch ⟨connectorTwoChannel, .fail, .settledCounts, true, true⟩ = .safe
 #guard numaSearch ⟨connectorTwoChannel, .recompute, .settledCounts, true, true⟩ = .safe
 #guard numaSearch ⟨connectorTwoChannel, .fail, .settledCounts, true, false⟩ = .safe
@@ -1270,7 +1268,7 @@ def numaView (twoSubs : Bool) (s : NumaS) : View := view (numaToS twoSubs s)
 #guard numaSearch ⟨connectorTwoChannel, .recompute, .settledCounts, false, false⟩ = .safe
 
 -- `NumaPolicy.eagerFailSet` finds a counterexample both at `num_subs = 2`
--- (`ENABLE_MULTI_NUMA=1`) and — via `recycle` — at `num_subs = 1` (`ENABLE_MULTI_NUMA=0`),
+-- and — via `recycle` — at `num_subs = 1` (the count when `ENABLE_MULTI_NUMA` is unset),
 -- under either `StartRead` overload:
 #guard numaHasCounterexample ⟨connectorTwoChannel, .fail, .eagerFailSet, true, true⟩ = true
 #guard numaHasCounterexample ⟨connectorTwoChannel, .recompute, .eagerFailSet, true, true⟩ = true
@@ -1279,17 +1277,36 @@ def numaView (twoSubs : Bool) (s : NumaS) : View := view (numaToS twoSubs s)
 #guard numaHasCounterexample ⟨connectorTwoChannel, .fail, .eagerFailSet, true, false⟩ = true
 #guard numaHasCounterexample ⟨connectorTwoChannel, .fail, .eagerFailSet, false, false⟩ = true
 
-/-! ### `NumaPolicy.settledCounts` traces -/
+/-! ### `NumaPolicy.settledCounts` traces (`process_completion`)
 
-/-- **Settled-count barrier on D (`twoSubs = true`): sibling H2D in flight keeps
-`dHeld = true`, and subsequent `req_id` reuse succeeds cleanly.**
-Sub-manager 0 fails while sub-manager 1 is still running H2D (`dHeld` stays
-`true`, `dMgr.failedRecvingCounts = 1`). When sub-manager 1 finishes (`ok = true`),
-`CompleteReadRaw` emits `failed_recving`, D frees `dHeld = false`, and `dMgr` is
-cleared to `{}`. After P settles and `recycle` reuses `req_id`, a healthy receive
-across both sub-managers promotes to `.decoding`. -/
+The wrapper tests drive `NumaAwareKVCacheManager::CompleteReadRaw` over
+`MockSubManager`s whose `CompleteReadRaw()` returns the lists the test pushes;
+there is no connector or scheduler, so a test is replayed by its `pSub` / `dSub`
+reports and read through the emitted `RawReport` (`numaStepSend` /
+`numaStepRecv`) or, on `numaSys`, through the engine state the report produces
+under `connectorTwoChannel` (`.finished` with `dHeld = false` for a consumer
+`failed_recving` under `Policy.fail`, `pHeld = false` for a producer report).
+
+The seven barrier tests replayed first never call `StartRead`: they push ids
+into the mocks' lists and poll, so `req_expected_counts_` has no entry and
+`expected` is `sub_managers_.size()`. Their replays therefore run with
+`setExpected = false` (`reqExpected = none`).
+`KVCacheManagerWrapperTest.StartReadUnifiedMultiEndpointMultiSubManager` is
+the one test that calls `StartRead(remote_descriptors)` and then polls the
+barrier; it is replayed last with `setExpected = true`. An empty poll in a
+test (nothing pushed, nothing returned) is replayed as "no `pSub` / `dSub` is
+enabled". -/
+
+/-- `KVCacheManagerWrapperTest.FailureWaitsForSiblingSubManagersBeforeEmittingFailedRecving`
+(`twoSubs = true`): sub-manager 0 fails while sub-manager 1 is still running H2D
+— `process_completion` sees `f_count = 1 < expected = 2` and emits nothing
+(`dHeld` stays `true`, `dMgr.failedRecvingCounts = 1`). When sub-manager 1
+finishes (`ok = true`), `failed_recving` is emitted (`f_count > 0`), D frees
+`dHeld = false`, and `dMgr` is cleared to `{}`. After P settles and `recycle`
+reuses `req_id`, a healthy receive across both sub-managers emits `done_recving`
+and promotes to `.decoding`. -/
 theorem trace_settledCounts_recv_fail_waits_for_sibling :
-    let c : NumaCfg := ⟨connectorTwoChannel, .fail, .settledCounts, true, true⟩
+    let c : NumaCfg := ⟨connectorTwoChannel, .fail, .settledCounts, true, false⟩
     ((numaSys c).run [.dSub false false]).map
       (fun s => (s.dMgr.failedRecvingCounts, numaView true s, numaEarlyFree true s)) =
       some (1, ⟨true, .waitingRemoteKv, true, false, false⟩, false) ∧
@@ -1302,10 +1319,44 @@ theorem trace_settledCounts_recv_fail_waits_for_sibling :
       some ⟨true, .decoding, true, false, false⟩ := by
   decide
 
-/-- **Settled-count barrier on P (`twoSubs = true`): sibling D2H in flight keeps
-`pHeld = true` until both producer sub-managers settle.** -/
+/-- `KVCacheManagerWrapperTest.FailureWhenAllSubManagersFailEmitsFailedRecvingOnce`
+and `KVCacheManagerWrapperTest.RecvFirstThenFailureWaitsForSubManagersAndEmitsFailure`
+(`twoSubs = true`): the first report, a failure or a success, emits nothing;
+the second report settles the request and emits `failed_recving` exactly once
+(`f_count > 0` takes precedence over `r_count`), after which the maps are empty
+and no sub-manager has anything left to report (`dSub` is refused). -/
+theorem trace_settledCounts_recv_second_report_emits_failure_once :
+    let c : NumaCfg := ⟨connectorTwoChannel, .fail, .settledCounts, true, false⟩
+    (numaStepRecv .settledCounts 2 false {}).2 = none ∧
+    (numaStepRecv .settledCounts 2 false { failedRecvingCounts := 1 }) =
+      ({}, some .failedRecving) ∧
+    (numaStepRecv .settledCounts 2 true {}).2 = none ∧
+    (numaStepRecv .settledCounts 2 false { doneRecvingCounts := 1 }) =
+      ({}, some .failedRecving) ∧
+    ((numaSys c).run [.dSub false false, .dSub true false]).map
+      (fun s => (s.dMgr, numaView true s)) =
+      some ({}, ⟨true, .finished, false, false, false⟩) ∧
+    (numaSys c).run [.dSub false false, .dSub true false, .dSub false false] = none ∧
+    ((numaSys c).run [.dSub false true, .dSub true false]).map
+      (fun s => (s.dMgr, numaView true s)) =
+      some ({}, ⟨true, .finished, false, false, false⟩) := by
+  decide
+
+/-- `KVCacheManagerWrapperTest.SendFailureWaitsForSiblingSubManagersBeforeEmittingFailedRecving`
+(`twoSubs = true`): producer sub-manager 0 reports `done_sending` (nothing
+emitted), then sub-manager 1 fails: `failed_recving` is emitted instead of
+`done_sending` (`f_count > 0` before `s_count >= expected`), the producer
+connector merges it into `finished_sending`, and P frees. The other order —
+sibling D2H still in flight when the failure lands — keeps `pHeld = true` until
+both producer sub-managers settle. -/
 theorem trace_settledCounts_send_fail_waits_for_sibling :
-    let c : NumaCfg := ⟨connectorTwoChannel, .fail, .settledCounts, true, true⟩
+    let c : NumaCfg := ⟨connectorTwoChannel, .fail, .settledCounts, true, false⟩
+    ((numaSys c).run [.pSub false true]).map
+      (fun s => (s.pMgr.doneSendingCounts, s.pHeld)) = some (1, true) ∧
+    (numaStepSend .settledCounts 2 false { doneSendingCounts := 1 }) =
+      ({}, some .failedRecving) ∧
+    ((numaSys c).run [.pSub false true, .pSub true false]).map
+      (fun s => (s.pMgr, s.pHeld)) = some ({}, false) ∧
     ((numaSys c).run [.pSub false false]).map
       (fun s => (s.pMgr.failedRecvingCounts, s.pHeld, numaEarlyFree true s)) =
       some (1, true, false) ∧
@@ -1314,11 +1365,35 @@ theorem trace_settledCounts_send_fail_waits_for_sibling :
       some ({}, false) := by
   decide
 
-/-- **Settled-count barrier at `num_subs = 1` (`twoSubs = false`): repeated
-failures and subsequent healthy reuse on the same `req_id` all clear `dMgr` and
-complete cleanly.** -/
+/-- `KVCacheManagerWrapperTest.VotingConsensusPromotesDoneRecvingOnlyWhenAllAgree`
+and `KVCacheManagerWrapperTest.VotingConsensusPromotesDoneSendingOnlyWhenAllAgree`
+(`twoSubs = true`): one successful sub-manager emits nothing; the second emits
+`done_recving` (resp. `done_sending`) and clears the maps. -/
+theorem trace_settledCounts_voting_consensus :
+    let c : NumaCfg := ⟨connectorTwoChannel, .fail, .settledCounts, true, false⟩
+    (numaStepRecv .settledCounts 2 true {}).2 = none ∧
+    (numaStepRecv .settledCounts 2 true { doneRecvingCounts := 1 }) =
+      ({}, some .doneRecving) ∧
+    (numaStepSend .settledCounts 2 true {}).2 = none ∧
+    (numaStepSend .settledCounts 2 true { doneSendingCounts := 1 }) = ({}, some .doneSending) ∧
+    ((numaSys c).run [.dSub false true, .dSub true true, .promote]).map
+      (fun s => (s.dMgr, numaView true s)) =
+      some ({}, ⟨true, .decoding, true, false, false⟩) ∧
+    ((numaSys c).run [.pSub false true, .pSub true true]).map
+      (fun s => (s.pMgr, s.pHeld)) = some ({}, false) := by
+  decide
+
+/-- `KVCacheManagerWrapperTest.SingleSubManagerFailureEmitsImmediatelyAndCleansUp`
+(`twoSubs = false`): with one sub-manager a failure is emitted on its own
+report (`f_count = 1 >= expected = 1`) and the maps are erased, so a reuse of
+`req_id` on a healthy transfer emits `done_recving`; repeated failures and the
+subsequent healthy reuse all clear `dMgr` and complete cleanly. -/
 theorem trace_settledCounts_single_sub_fail_and_reuse :
-    let c : NumaCfg := ⟨connectorTwoChannel, .fail, .settledCounts, false, true⟩
+    let c : NumaCfg := ⟨connectorTwoChannel, .fail, .settledCounts, false, false⟩
+    (numaStepRecv .settledCounts 1 false {}) = ({}, some .failedRecving) ∧
+    ((numaSys c).run [.dSub false false]).map
+      (fun s => (s.dMgr, numaView false s)) =
+      some ({}, ⟨true, .finished, false, false, false⟩) ∧
     ((numaSys c).run
       [.pSub false false, .dSub false false, .recycle,
        .pSub false false, .dSub false false, .recycle,
@@ -1327,14 +1402,37 @@ theorem trace_settledCounts_single_sub_fail_and_reuse :
       some ({}, {}, ⟨false, .decoding, true, false, false⟩) := by
   decide
 
-/-! ### `NumaPolicy.eagerFailSet` counterexample traces (baseline `kv_cache_manager.cc`) -/
+/-- `KVCacheManagerWrapperTest.StartReadUnifiedMultiEndpointMultiSubManager`
+(`twoSubs = true`, `setExpected = true`): `StartRead(remote_descriptors)`
+forwards the read to both sub-managers and sets
+`req_expected_counts_[req_id] = 2` (`numaInit`). Sub-manager 0's
+`done_recving` alone emits nothing (the test's empty `r1`); sub-manager 1's
+emits `done_recving` and erases the maps (the test's
+`r2 == {"req_unified"}`). -/
+theorem trace_settledCounts_start_read_descriptors_barrier :
+    let c : NumaCfg := ⟨connectorTwoChannel, .fail, .settledCounts, true, true⟩
+    (numaInit c).dMgr = { reqExpected := some 2 } ∧
+    (numaStepRecv .settledCounts 2 true { reqExpected := some 2 }) =
+      ({ doneRecvingCounts := 1, reqExpected := some 2 }, none) ∧
+    (numaStepRecv .settledCounts 2 true { doneRecvingCounts := 1, reqExpected := some 2 }) =
+      ({}, some .doneRecving) ∧
+    ((numaSys c).run [.dSub false true]).map
+      (fun s => (s.dMgr, numaView true s)) =
+      some ({ doneRecvingCounts := 1, reqExpected := some 2 },
+            ⟨true, .waitingRemoteKv, true, false, false⟩) ∧
+    ((numaSys c).run [.dSub false true, .dSub true true, .promote]).map
+      (fun s => (s.dMgr, numaView true s)) =
+      some ({}, ⟨true, .decoding, true, false, false⟩) := by
+  decide
 
-/-- **Baseline `eagerFailSet`, consumer premature HBM free (`twoSubs = true`).**
+/-! ### `NumaPolicy.eagerFailSet` counterexample traces (mutant) -/
+
+/-- **Mutant `eagerFailSet`, consumer premature HBM free (`twoSubs = true`).**
 Consumer sub-manager 0 fails while sub-manager 1 still has H2D in flight
-(`recvSub1 = none`, as in step 1 of
-`KVCacheManagerWrapperTest.AnyFailureImmediatelyTriggersFailedRecvingAndSuppressesFutureAcks`):
-`CompleteReadRaw` immediately emits `failed_recving`, freeing `dHeld = false`
-while `recvSub1 = none` (`numaEarlyFree = true`). -/
+(`recvSub1 = none`, step 1 of
+`KVCacheManagerWrapperTest.FailureWaitsForSiblingSubManagersBeforeEmittingFailedRecving`,
+where `process_completion` emits nothing): the mutant emits `failed_recving` at
+once, freeing `dHeld = false` while `recvSub1 = none` (`numaEarlyFree = true`). -/
 theorem trace_eagerFailSet_recv_early_free :
     let cFail : NumaCfg := ⟨connectorTwoChannel, .fail, .eagerFailSet, true, true⟩
     let cRec : NumaCfg := ⟨connectorTwoChannel, .recompute, .eagerFailSet, true, true⟩
@@ -1346,9 +1444,9 @@ theorem trace_eagerFailSet_recv_early_free :
       some (none, false, true) := by
   decide
 
-/-- **Baseline `eagerFailSet`, producer premature HBM free (`twoSubs = true`).**
+/-- **Mutant `eagerFailSet`, producer premature HBM free (`twoSubs = true`).**
 Producer sub-manager 0 fails while sub-manager 1 still has D2H in flight
-(`sendSub1 = none`): `CompleteReadRaw` immediately emits `failed_recving`, which
+(`sendSub1 = none`): the mutant emits `failed_recving` at once, which
 the producer connector merges into `finished_sending`, freeing `pHeld = false`
 while `sendSub1 = none` (`numaEarlyFree = true`). -/
 theorem trace_eagerFailSet_send_early_free :
@@ -1358,14 +1456,16 @@ theorem trace_eagerFailSet_send_early_free :
       some (none, false, true) := by
   decide
 
-/-- **Baseline `eagerFailSet` at `num_subs = 1` (`twoSubs = false`, default
-`ENABLE_MULTI_NUMA=0`): `failed_recving_set_` is never erased on failure,
-leaking blocks on `req_id` reuse (**N3**).**
+/-- **Mutant `eagerFailSet` at `num_subs = 1` (`twoSubs = false`, the count
+when `ENABLE_MULTI_NUMA` is unset): the failure set is never erased on failure,
+leaking blocks on `req_id` reuse (**N3**) — the reuse that
+`KVCacheManagerWrapperTest.SingleSubManagerFailureEmitsImmediatelyAndCleansUp`
+expects to succeed.**
 Round 1 fails on both P and D (`pMgr.failedRecvingSet = true`,
 `dMgr.failedRecvingSet = true`) and recycles `req_id`. In Round 2:
-* if P and D fail again, `failed_recving_set_.insert(req).second` is `false` on
-  both managers, dropping `failed_recving` and leaking both `pHeld` and `dHeld`;
-* if D's retry succeeds (`dSub false true`), `failed_recving_set_` suppresses
+* if P and D fail again, the set insertion is a no-op on both managers,
+  dropping `failed_recving` and leaking both `pHeld` and `dHeld`;
+* if D's retry succeeds (`dSub false true`), the set suppresses
   `done_recving` (`emit = none`), leaving D permanently parked (`numaLeakD = true`). -/
 theorem trace_eagerFailSet_single_sub_reuse_leaks :
     let c : NumaCfg := ⟨connectorTwoChannel, .fail, .eagerFailSet, false, true⟩
@@ -1380,7 +1480,7 @@ theorem trace_eagerFailSet_single_sub_reuse_leaks :
       some true := by
   decide
 
-/-- **Baseline `eagerFailSet` at `num_subs = 2`: partial failure desynchronizes
+/-- **Mutant `eagerFailSet` at `num_subs = 2`: partial failure desynchronizes
 `done_recving_counts_`, suppressing Transfer 2's `done_recving` and emitting
 premature `done_recving` on Transfer 3 after only 1 of 2 sub-managers finishes.**
 1. Transfer 1: `sub0` fails (`some .failedRecving`) and `sub1` finishes H2D

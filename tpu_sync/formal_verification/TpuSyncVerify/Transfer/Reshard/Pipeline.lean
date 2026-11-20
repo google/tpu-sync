@@ -8,129 +8,96 @@ import TpuSyncVerify.Transfer.Reshard.Pipeline.Traces
 /-!
 # Pool-reshard transfer pipeline
 
-End-to-end pool-addressed resharding model (`docs/transfer/reshard.md`):
-composes `Reshard.Send` (`ReshardSendSession`, `Send.lean`), `Reshard.Recv`
-(`ReshardReceiveSession`, `Receive.lean`), the plan-declared stream progress in
-the per-uuid `BlockTransportServerPushSession` (`StartStream`, reached from
-`BlockTransport::HandleIncomingPush`, and `CompleteIncomingPush`), the
-Arm-then-Dispatch coordination barrier in `ReshardCoordinator::RunSubPlan`, and
-the five memories KV data moves
-through between source and destination HBM — including **aliased device pages**
-shared across pool ranks (`pool_order_ranks_` in `ReshardReceiveSession`,
-`D2hPoolBlocks` / `H2dPoolBlocks` in `KVCacheManagerBase`).
+End-to-end single-plan pool-reshard model (`docs/transfer/reshard.md`; multi-window
+sub-plan chaining is `Reshard/SubPlanChain.lean`), composing `Reshard.Send`,
+`Reshard.Recv`, plan-declared stream progress in `BlockTransportServerPushSession`,
+the `ReshardCoordinator::RunSubPlan` Arm-then-Dispatch barrier, and five
+pool-indexed memories with aliased-page rank overwrites (`writePoolHbm`,
+over-approximating `KVCacheManagerBase::CopyPoolBlocks`).
 
-File aliases used in the source map below:
-* `reshard_send.cc` — `tpu_sync/kv_cache/reshard_send_session.cc`
-* `slots.cc` — `tpu_sync/core/pool_reshard_send_slots.cc`
-* `reshard_recv.h` / `reshard_recv.cc` — `tpu_sync/kv_cache/reshard_receive_session.{h,cc}`
-* `bt.cc` — `tpu_sync/transport/block_transport.cc`
-* `bts.cc` — `tpu_sync/transport/block_transport_session.cc`
-* `mgr.cc` — `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`
-* `base.h` — `tpu_sync/kv_cache/kv_cache_manager_base.h`
-* `coord.cc` — `tpu_sync/kv_cache/reshard/reshard_coordinator.cc`
-* `utils.h` — `tpu_sync/core/utils.h`
+File aliases: `base.{h,cc}` = `tpu_sync/kv_cache/kv_cache_manager_base.{h,cc}`,
+`bts.cc` = `tpu_sync/transport/block_transport_session.cc`,
+`reshard_send_test.cc` = `tpu_sync/kv_cache/reshard_send_session_test.cc`.
 
-## Scope: one plan
+## State
 
-The model is one transfer plan — one engine `uuid` with one
-`ReshardSendSession` per source unit, one `ReshardReceiveSession` per
-destination unit, and one `BlockTransportServerPushSession` per receiving
-transport. A request whose destination lists are windowed
-(`dst_window_blocks`) is coordinated as a chain of such plans
-(`ReshardCoordinator::PlanSubTransfers`, `ReshardCoordinator::StartChain`):
-each sub-plan carries its own plan uuid (`SubPlanUuid`), is armed and
-dispatched by its own `ReshardCoordinator::RunSubPlan` call, and lands in its
-own staging leases, so everything below applies to each sub-plan in turn. How
-a worker folds the sub-plans' settlements into the request's single
-`done_sending` / `done_recving` / `failed_recving` entry
-(`KVCacheManagerWithTransfer::NoteSubPlanRegisteredLocked`,
-`RecordPoolReshardTerminalLocked`, `SweepSubPlanChainsLocked`) is modelled in
-`Reshard/SubPlanChain.lean`; `send.published` and `recv.published` here are the
-session's own terminal as `CompleteReadWithDetails` hands it to that
-bookkeeping.
+Memories are `List Cell` (`Cell := .blank | .kv p | .junk`) indexed by pool `p < numPools`:
 
-## Memories and aliased device pages
+| Field | C++ | Role |
+|---|---|---|
+| `send`, `recv` | `ReshardSendSession`, `ReshardReceiveSession` | producer and consumer session states (`Send.lean`, `Receive.lean`) |
+| `srcHbm`, `dstHbm` | producer and consumer device HBM (`CopyPoolBlocks`) | `writePoolHbm` writes `dstHbm[p]` and clobbers `dstHbm[q] := .junk` for `rank p < rank q` |
+| `srcStaging`, `dstStaging` | per-pool host staging (`StagingLayerManager`, `PoolStagingStorage`, or mirror) | disjoint per-pool `Cell` lists (A1; `docs/transfer/reshard.md` §Boundaries) |
+| `wire` | push payload from `ReshardSendSession::StartPoolPush` | written at `send (.pushDone p true)` |
+| `sentStreams`, `landedStreams` | `AsyncPush` completions, `CompleteIncomingPush` `plan_pushes` | per-pool sent and landed counts against `peerCounts` (A2, A3) |
+| `reclaimed`, `armed` | caller HBM free flag, `RunSubPlan` Stage 1 barrier | ghost flags (`init` starts armed, `initUnarmed` unarmed) |
 
-A memory is a list indexed by pool `p < numPools`. A `Cell` is `.kv p` (pool
-`p`'s resharded KV data), `.junk` (stale/reclaimed memory or lower-rank coarse
-padding on an aliased page), or `.blank` (never written on the wire).
+## Events
 
-| Memory       | Role | Written by |
-|--------------|------|------------|
-| `srcHbm`     | producer KV cache in source HBM | `reclaim` (after `send.published ≠ none`) |
-| `srcStaging` | sender `PoolStagingStorage` (`ReshardSendSession::ExecutePush`) | `send (.d2hDone p true)`, `reseatSrcStaging` |
-| `wire`       | bytes delivered by sender peer pushes (`ReshardSendSession::StartPoolPush`) | `send (.pushDone p true)` |
-| `dstStaging` | receiver `PoolStagingStorage` (`ReshardReceiveSession::AcquireStagingLeases`) | `landStream p` (`BlockTransportServerPushSession::StartStream`), `reseatDstStaging` |
-| `dstHbm`     | consumer KV cache in destination HBM (`ReshardReceiveSession::ExecuteEligiblePoolH2ds` / `FinishPoolH2d`) | `recv (.h2dDone p true)` via `writePoolHbm` |
-
-### Modelling aliased device pages (`writePoolHbm`)
-
-On hybrid attention + state arenas (`D2hPoolBlocks` / `H2dPoolBlocks` in
-`KVCacheManagerBase`, `pool_order_ranks_` in `ReshardReceiveSession`), pools of
-different ranks can share physical HBM pages: a lower-rank pool's coarse H2D
-copy writes across the page (clobbering bytes belonging to higher-rank pools),
-and higher-rank H2D waves are meant to run afterwards to overwrite those bytes
-with the true higher-rank pool data.
-
-We model this pessimistic page aliasing directly on `dstHbm`: when pool `p`
-completes its H2D copy (`recv (.h2dDone p true)`), `writePoolHbm` writes
-`dstStaging[p]` to `dstHbm[p]` **and** clobbers `dstHbm[q] := .junk` for every
-pool `q` of strictly higher rank (`pool_p.rank < pool_q.rank`). Because
-`Recv.RankWaveOrder` guarantees that no higher-rank pool `q` has entered
-`queued`, `issued`, `ready`, or `completed` when a lower-rank pool `p` is in
-`ready`, this clobbering never overwrites a completed higher-rank pool
-(`AliasedPageCorrect`), so `dstHbm = good numPools` holds when `done_recving`
-is published (`PublicationCorrect`). Conversely, a mutant that omits the rank
-gate allows pool 1 (rank 1) to finish H2D before pool 0 (rank 0), and pool 0's
-subsequent H2D clobbers `dstHbm[1]` to `.junk`.
+| Event | C++ |
+|---|---|
+| `armRecv` | `ReshardCoordinator::RunSubPlan` Stage 1 (`PoolReshardRegisterRecv`) |
+| `send e` | `Send.step` (`d2hIssue p true` requires `armed`; `d2hDone` stages `srcHbm`; `pushDone` writes `wire` and `sentStreams`) |
+| `recv e` | `Recv.step` (`pushBegin` requires `armed`; `onPoolReceived p` requires `landedStreams[p] = peerCounts[p]`; `h2dDone` runs `writePoolHbm`) |
+| `landStream p` | `StartStream` payload read into `dstStaging[p]` + `CompleteIncomingPush` `plan_pushes` increment while `recv.pushes > 0` |
+| `reclaim` | caller engine reclaims `srcHbm` after `send.published ≠ none` |
+| `reseatSrcStaging`, `reseatDstStaging` | host staging reuse after `!send.life.hasStaging` or `!recv.life.hasStaging` |
 
 ## Lock scopes
 
-Sender events (`send e`) and receiver events (`recv e`) inherit the
-`ReshardSendSession::mu_` and `ReshardReceiveSession::mu_` scopes from
-`Send.lean` and `Receive.lean`. The pipeline-level events and cross-component
-guards map to C++ synchronization as follows:
+Sender and receiver transitions inherit `Send.lean` and `Receive.lean` scopes.
 
 | Event | Scopes | Between them |
 |---|---|---|
-| `armRecv` | 2 `KVCacheManagerWithTransfer::mu_` scopes in `PoolReshardRegisterRecv`: incumbent check, then `ReshardReceiveSession::Create` (`RegisterActivePlanDirect` + `AcquireStagingLeases`) outside manager `mu_`, then insertion into `active_pool_reshard_recvs_` (and `NoteSubPlanRegisteredLocked`) | Stage 1's `for (std::thread& t : armers) t.join();` barrier in `RunSubPlan` completes before Stage 2 dispatches any sender (`send (.d2hIssue p true)`), so no push arrives before `active_pool_reshard_recvs_` is populated (`recv .pushBegin` requires `armed = true`) |
-| `landStream p` | unlocked socket read into staging (`if (expected_size > 0)`, `ReadVExact`) in `BlockTransportServerPushSession::StartStream` while holding a `pushBegin` lease (`pushes > 0`), followed by 1 `BlockTransportServerPushSession::mu_` scope in `CompleteIncomingPush` (`if (plan_declared)`; `layer_progress_` is per push session, i.e. per uuid, keyed by pool) | the `pushBegin` lease keeps `in_flight_ > 0` on the receive session so `dstStaging` cannot be released (`reseatDstStaging` is disabled) during the read; when `plan_pushes` reaches `expected_chunks`, the same `mu_` scope latches `trigger_completion = true` before `OnPoolReceived` (`recv (.onPoolReceived p)`) and `EndIncomingPush` (`pushEnd`) run |
-| `reclaim`, `reseatSrcStaging`, `reseatDstStaging` | 0 (caller engine or `KVCacheManagerBase::staging_mu_`, outside session `mu_`) | enabled only after `send.published ≠ none` or `hasStaging = false`, which `Send.lean` and `Receive.lean` establish under their session locks |
+| `armRecv` | 2 manager `mu_` scopes in `PoolReshardRegisterRecv` around `CreateReshardReceiveSession` | `RunSubPlan` thread join blocks Stage 2 dispatch until `sessions_` seats receiver |
+| `landStream p` | unlocked `StartStream` socket read, then 1 push-session `mu_` scope in `CompleteIncomingPush` | active `pushBegin` op keeps `recv.life.inFlight > 0`, disabling `reseatDstStaging` |
+| `reclaim`, `reseatSrcStaging`, `reseatDstStaging` | 0 (caller engine or `staging_mu_`, outside session `mu_`) | enabled only after publication or staging release under session/manager locks |
+
+## Assumptions
+
+Session assumptions from `Send.lean` and `Receive.lean` carry over, plus:
+
+* **A1 (disjoint host staging across pools; no same-rank device overlap).** `srcStaging` and
+  `dstStaging` keep one cell per pool, and `clobberHigherRanks` clobbers only strictly higher
+  `order_rank`s (`CollectEligiblePoolH2dsLocked`). Device-overlapping pools are covered only
+  across distinct `order_rank`s under `HostLayersBounded()`; full-mirror shared-storage overlap
+  (`StaticHostLayer`) and same-rank device overlap are outside the model (`docs/transfer/reshard.md` §Boundaries).
+* **A2 (`landStream` ordered after `pushDone`).** On TCP sockets (`PostSocketPushInternal` /
+  `PostSocketPush`), `StartStream` lands and acks before `AsyncPush(...).OnReady` (`pushDone`),
+  whereas the model orders `landStream` after `pushDone`. For succeeding pushes, `srcStaging[p]`
+  is constant while the push op is held (`StagingSafe`); mid-push landings and landed-then-failed
+  pushes are not model states (`docs/transfer/reshard.md` §Assumptions).
+* **A3 (one stream equals one plan push from one sender peer push).** `peerCounts[p]` is both
+  `Send.init`'s peer count and `CompleteIncomingPush`'s `expected_pushes`. That `AsyncPushShards`
+  per-NUMA stream fan-out and `AccumulateLandedShards` fold to `expected_pushes` is assumed
+  (`Reshard/Coverage.lean` proves the validator check only).
+
+## Properties
+
+Proved for `sys` (`reachable_safe`, `reachable_can_settle`, `attention_safe`) and `sysUnarmed`
+(`reachable_unarmed_safe`, `reachable_unarmed_can_settle`) within A1–A3:
+* **`PublicationCorrect` & `attention_safe`**: `recv.published = some true → dstHbm = good numPools`,
+  preserved across all subsequent transitions (`dstHbm_quiet`).
+* **`AliasedPageCorrect`**: any completed pool `q` holds `dstHbm[q] = .kv q` across later H2D waves.
+* **`DstHbmSafe`, `SrcHbmSafe`, `StagingSafe`**: no H2D/D2H/push op touches HBM after publication
+  (`srcHbm_quiet`) or staging after lease release.
+* **`StreamAccountingSafe` & `NoUnarmedPush`**: `OnPoolReceived(p)` fires only at
+  `landedStreams[p] = peerCounts[p]`, and neither sender D2H nor receiver `pushBegin` runs while `!armed`.
+* **`NoOpLeak`**: `Send.NoOpLeak` and `Recv.NoOpLeak`, draining every reachable state to settlement.
 
 ## Source map
 
-Line ranges are populated and checked by `tpu_sync/formal_verification/tools/resolve_anchors.py`.
+Generated by `tools/resolve_anchors.py`.
 
 <!-- source-map:begin -->
 | File | Symbol / anchor | Lines |
 |---|---|---|
-| `reshard_send.cc` | `ReshardSendSession::ExecutePush` | `:177-265` |
-| `reshard_send.cc` | `ReshardSendSession::StartPoolPush` | `:267-349` |
-| `reshard_send.cc` | `ReshardSendSession::EndOp` | `:418-468` |
-| `reshard_send.cc` | `ReshardSendSession::SettleLocked` | `:476-481` |
-| `slots.cc` | `CountPoolReshardSendSlots` | `:27-51` |
-| `reshard_recv.h` | `ReshardReceiveSession` (`absl::flat_hash_map<size_t, int> pool_order_ranks_`) | `:195` |
-| `reshard_recv.cc` | `ReshardReceiveSession::Create` | `:351-390` |
-| `reshard_recv.cc` | `ReshardReceiveSession::AcquireStagingLeases` | `:422-461` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ReleaseStagingLocked` | `:463-467` |
-| `reshard_recv.cc` | `ReshardReceiveSession::RecordPoolReceivedLocked` | `:543-554` |
-| `reshard_recv.cc` | `ReshardReceiveSession::CollectEligiblePoolH2dsLocked` | `:556-585` |
-| `reshard_recv.cc` | `ReshardReceiveSession::OnPoolReceived` | `:602-614` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ExecuteEligiblePoolH2ds` | `:616-668` |
-| `reshard_recv.cc` | `ReshardReceiveSession::FinishPoolH2d` | `:670-708` |
-| `bt.cc` | `BlockTransport::HandleIncomingPush` | `:458-463` |
-| `bts.cc` | `BlockTransportServerPushSession::StartStream` (`if (expected_size > 0)`) | `:423-427` |
-| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` | `:506-702` |
-| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` (`progress.completed_chunks++;` .. `if (trigger_completion)`) | `:555-678` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.on_pool_received =`) | `:320-342` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.begin_incoming_push =`) | `:364-389` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::InitializeBaseHooks` (`hooks.end_incoming_push =`) | `:390-436` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardPush` | `:833-871` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardRegisterRecv` | `:873-910` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = active_pool_reshard_sends_.begin();`) | `:1182-1202` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`for (auto it = active_pool_reshard_recvs_.begin();`) | `:1239-1267` |
-| `base.h` | `KVCacheManagerBase` (`absl::StatusOr<raiden::PjRtCopyFuture> D2hPoolBlocks` .. `absl::StatusOr<raiden::PjRtCopyFuture> H2dPoolBlocks`) | `:699-705` |
-| `coord.cc` | `ReshardCoordinator::RunSubPlan` (`const int64_t receiver_arm_start_ns = MonotonicNs();` .. `if (!status.ok()) return status;`) | `:741-877` |
-| `utils.h` | `ValidateCommonPoolReshardPlan` (`if (plan.transfer_pool_indices().empty())` .. `if (group.expected_pushes() <= 0)`) | `:367-377` |
+| `base.cc` | `KVCacheManagerBase::CopyPoolBlocks` | `:2917-3058` |
+| `bts.cc` | `BlockTransportServerPushSession::CompleteIncomingPush` (`progress.completed_chunks++;` .. `if (trigger_completion)`) | `:772-882` |
+| `tpu_sync/transport/lib/adapter/socket_transport_adapter.cc` | `SocketTransportAdapter::PostSocketPush` (`if (remaining_workers->fetch_sub(1) == 1) {`) | `:474-495` |
+| `tpu_sync/transport/lib/adapter/socket_transport_adapter.cc` | `SocketTransportAdapter::PostSocketPushInternal` (`ReadExact(fd, &ack, 1, config_.final_ack_read_timeout_ms);`) | `:706` |
+| `base.h` | `KVCacheManagerBase` (`absl::StatusOr<raiden::PjRtCopyFuture> D2hPoolBlocks` .. `absl::StatusOr<raiden::PjRtCopyFuture> H2dPoolBlocks`) | `:643-652` |
+| `reshard_send_test.cc` | `RecordingH2dReceiverBase` | `:846-904` |
+| `reshard_send_test.cc` | `ReshardSendSessionTest.PoolOrderInvertedFromStorageOrderPassesTransportValidateChunks` | `:906-966` |
 <!-- source-map:end -->
 -/

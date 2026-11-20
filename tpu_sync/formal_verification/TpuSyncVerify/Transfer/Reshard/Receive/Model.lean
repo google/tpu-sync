@@ -17,13 +17,13 @@ inductive PoolStage where
   | ready
   | completed
   | aborted
-  deriving Repr, DecidableEq
+  deriving Repr, DecidableEq, Hashable
 
 namespace PoolStage
 
 /-- Stages that hold one unit of `in_flight_` (from
 `in_flight_ += static_cast<int32_t>(to_launch.size())` in
-`ExecuteEligiblePoolH2ds` until `EndRecvOpLocked()` or `EndRecvOp()`). -/
+`ExecuteEligiblePoolH2ds` until `EndRecvOpLocked()` or `EndOp()`). -/
 def holdsOp : PoolStage → Bool
   | .queued | .issued | .ready => true
   | _ => false
@@ -49,14 +49,14 @@ end PoolStage
 structure Pool where
   rank : Nat
   stage : PoolStage := .waiting
-  deriving Repr, DecidableEq
+  deriving Repr, DecidableEq, Hashable
 
-/-- Policy for `hooks.end_incoming_push` on `ReshardReceiveSession`
-(`KVCacheManagerWithTransfer::InitializeBaseHooks`): `finishOnError`, the
-shipping code, mirrors the `TransferReceiveSession` branch by calling
-`reshard_session->Finish(status)` before `reshard_session->EndRecvOp()` when
-the incoming push failed; `endOpOnly` is the mutant that calls `EndRecvOp()`
-unconditionally (`trace_failed_incoming_push` shows what that leaks). -/
+/-- Policy for `EndIncomingPush` (`block_transport_session.cc`) on a
+`ReshardReceiveSession`: `finishOnError`, the shipping code, calls
+`session->Finish(status)` before `session->EndOp()` when the incoming push
+failed (`if (!status.ok())`), for every session type; `endOpOnly` is the mutant
+that calls `EndOp()` unconditionally (`trace_failed_incoming_push` shows what
+that leaks). -/
 inductive PushEndPolicy where
   | finishOnError
   | endOpOnly
@@ -66,12 +66,10 @@ structure Recv where
   pools : List Pool
   life : Lifecycle := {}
   finalizing : Bool := false
-  networkCompleted : Bool := false
-  planUnregistered : Bool := false
   durationRecorded : Bool := false
   published : Option Bool := none
   pushes : Nat := 0
-  deriving Repr, DecidableEq
+  deriving Repr, DecidableEq, Hashable
 
 namespace Recv
 
@@ -89,12 +87,6 @@ def poolDrainSteps : List Pool → Nat
 (`RecordPoolH2dResultLocked`). -/
 def allCompleted (pools : List Pool) : Bool :=
   pools.all fun p => p.stage == .completed
-
-/-- `ReshardReceiveSession::AllH2dDoneLocked`: every future pushed into
-`h2d_futures_` (`h2d_futures_.push_back(future)` in `ExecuteEligiblePoolH2ds`,
-stage `.issued`) has become `IsReady()`. -/
-def allH2dDone (pools : List Pool) : Bool :=
-  pools.all fun p => p.stage != .issued
 
 /-- Every expected pool of order rank strictly below `r` has completed its H2D
 upload (`CollectEligiblePoolH2dsLocked`). -/
@@ -123,16 +115,6 @@ def launchPass (canLaunch : Nat → Bool) : List Pool → List Pool × Nat
 def init (ranks : List Nat) : Recv :=
   { pools := ranks.map fun r => { rank := r, stage := .waiting } }
 
-/-- `ReshardReceiveSession::IsReadyToComplete`. -/
-def isReadyToComplete (s : Recv) : Bool :=
-  s.networkCompleted && allH2dDone s.pools
-
-/-- `KVCacheManagerWithTransfer::MaybeUnregisterSettledReshardRecv`
-(`ReshardReceiveSession::TakePendingUnregister`): once `done_` is set, claims
-`unregister_on_settle_` and unregisters the plan. -/
-def maybeUnregisterSettled (s : Recv) : Recv :=
-  if s.life.done = true then { s with planUnregistered := true } else s
-
 /-- First critical section of `ReshardReceiveSession::ExecuteEligiblePoolH2ds`:
 if not done, draining, or finalizing, launches all eligible `.received` pools
 and adds `to_launch.size()` to `in_flight_`. -/
@@ -149,29 +131,28 @@ inductive Ev where
   | h2dIssue (p : Nat) (ok : Bool)
   | h2dReady (p : Nat)
   | h2dDone (p : Nat) (ok : Bool)
-  | pollReady
   | cancel
   | publish
   deriving Repr, DecidableEq
 
-/-- `ReshardReceiveSession::TryBeginRecvOp` from `hooks.begin_incoming_push`. -/
+/-- `ReshardReceiveSession::TryBeginOp` from `BeginIncomingPush`
+(`block_transport_session.cc`, after `delegate->GetSession(uuid)`). -/
 def pushBegin (s : Recv) : Option Recv :=
   s.life.beginOp.map fun l => { s with life := l, pushes := s.pushes + 1 }
 
-/-- `hooks.end_incoming_push` (`KVCacheManagerWithTransfer::InitializeBaseHooks`).
-Under `.finishOnError` (shipping), a failed push calls
-`reshard_session->Finish(status)` before `reshard_session->EndRecvOp()`; under
-`.endOpOnly` (mutant), only `EndRecvOp()` runs. If the session is now
-settled, `reshard_session->TakePendingUnregister(&generation)` unregisters the
-plan (`UnregisterSettledPlan`). -/
+/-- `EndIncomingPush` (`block_transport_session.cc`). Under `.finishOnError`
+(shipping), a failed push calls `session->Finish(status)` before
+`session->EndOp()`; under `.endOpOnly` (mutant), only `EndOp()` runs. -/
 def pushEnd (pol : PushEndPolicy) (ok : Bool) (s : Recv) : Option Recv :=
   if s.pushes = 0 then none
   else
     let l := if pol == .finishOnError && !ok then s.life.finishLocked false else s.life
-    some (maybeUnregisterSettled { s with life := l.endOpLocked, pushes := s.pushes - 1 })
+    some { s with life := l.endOpLocked, pushes := s.pushes - 1 }
 
-/-- `ReshardReceiveSession::OnPoolReceived`: records `p` in
-`started_pool_indices_` (`RecordPoolReceivedLocked`) and calls
+/-- `ReshardReceiveSession::OnPoolReceived` (reached as
+`OnDataReceived(pool_idx, {}, {})` from
+`BlockTransportServerPushSession::CompleteIncomingPush` on the stream's session):
+records `p` in `started_pool_indices_` (`RecordPoolReceivedLocked`) and calls
 `ExecuteEligiblePoolH2ds`. -/
 def onPoolReceived (p : Nat) (s : Recv) : Option Recv :=
   match s.pools[p]? with
@@ -184,10 +165,11 @@ def onPoolReceived (p : Nat) (s : Recv) : Option Recv :=
 
 /-- Per-pool body of `ReshardReceiveSession::ExecuteEligiblePoolH2ds`. Re-checks
 `if (done_ || draining_)` under `mu_`; if set, calls `EndRecvOpLocked()` and
-skips the upload. Otherwise dispatches `base_->H2dPoolBlocks`: on synchronous
-failure calls `FinishPoolH2d`, `EndRecvOp`, and
-`MaybeUnregisterSettledReshardRecv`; on success pushes the future into
-`h2d_futures_` (`h2d_futures_.push_back(future)`). -/
+skips the upload. Otherwise resolves the pool's host buffer
+(`LookupStagingSlot`) and dispatches `base_->H2dPoolBlocks`: on a synchronous
+failure (empty destination list, no leased buffer, `H2dPoolBlocks` error) calls
+`FinishPoolH2d(pool_idx, status)` and `EndOp()`; on success attaches the
+completion to `future.OnReady`. -/
 def h2dIssue (p : Nat) (ok : Bool) (s : Recv) : Option Recv :=
   match s.pools[p]? with
   | some pool =>
@@ -200,14 +182,14 @@ def h2dIssue (p : Nat) (ok : Bool) (s : Recv) : Option Recv :=
       some { s with pools := s.pools.set p { pool with stage := .issued } }
     else
       let l := if s.finalizing then s.life else s.life.finishLocked false
-      some (maybeUnregisterSettled { s with
+      some { s with
         pools := s.pools.set p { pool with stage := .aborted }
         finalizing := true
-        life := l.endOpLocked })
+        life := l.endOpLocked }
   | none => none
 
-/-- Device finishes pool `p`'s H2D copy; its future in `h2d_futures_` becomes
-`IsReady()`. -/
+/-- Device finishes pool `p`'s H2D copy; the `future.OnReady` continuation has
+not run yet. -/
 def h2dReady (p : Nat) (s : Recv) : Option Recv :=
   match s.pools[p]? with
   | some pool =>
@@ -217,55 +199,49 @@ def h2dReady (p : Nat) (s : Recv) : Option Recv :=
   | none => none
 
 /-- `ExecuteEligiblePoolH2ds`'s `future.OnReady` callback calling
-`FinishPoolH2d`, `EndRecvOp`, and `MaybeUnregisterSettledReshardRecv`. -/
+`FinishPoolH2d` and `EndOp`. -/
 def h2dDone (p : Nat) (ok : Bool) (s : Recv) : Option Recv :=
   match s.pools[p]? with
   | some pool =>
     if pool.stage != .ready then none
     else if s.life.done = true then
-      some (maybeUnregisterSettled { s with
+      some { s with
         pools := s.pools.set p { pool with stage := .aborted }
-        life := s.life.endOpLocked })
+        life := s.life.endOpLocked }
     else if s.finalizing = true then
-      some (maybeUnregisterSettled { s with
+      some { s with
         pools := s.pools.set p { pool with stage := .aborted }
-        life := s.life.endOpLocked })
+        life := s.life.endOpLocked }
     else if !ok then
-      some (maybeUnregisterSettled { s with
+      some { s with
         pools := s.pools.set p { pool with stage := .aborted }
         finalizing := true
-        life := (s.life.finishLocked false).endOpLocked })
+        life := (s.life.finishLocked false).endOpLocked }
     else
       let pools₁ := s.pools.set p { pool with stage := .completed }
       if allCompleted pools₁ then
-        some (maybeUnregisterSettled { s with
+        some { s with
           pools := pools₁
           finalizing := true
-          networkCompleted := true
           durationRecorded := true
-          life := (s.life.finishLocked true).endOpLocked })
+          life := (s.life.finishLocked true).endOpLocked }
       else
         let s₁ := launchEligible { s with pools := pools₁ }
-        some (maybeUnregisterSettled { s₁ with life := s₁.life.endOpLocked })
+        some { s₁ with life := s₁.life.endOpLocked }
   | none => none
 
-/-- `CompleteReadWithDetails` polls a non-draining session and sees
-`IsReadyToComplete()`. -/
-def pollReady (s : Recv) : Option Recv :=
-  if s.life.draining = false ∧ isReadyToComplete s = true then
-    some { s with life := s.life.finishLocked true }
-  else none
-
 /-- External `Finish(error)` (`~KVCacheManagerWithTransfer`,
-`UnregisterActivePlan`, `CompleteReadWithDetails`). -/
+`UnregisterActivePlan`, `CompleteReadWithDetails`, a staging wait that timed
+out in `AcquireStagingSlot`). -/
 def cancel (s : Recv) : Option Recv :=
   some { s with life := s.life.finishLocked false }
 
-/-- `CompleteReadWithDetails` publishes a settled session (`session->Done()`,
-reported through `RecordPoolReshardTerminalLocked`). -/
+/-- `CompleteReadWithDetails` retires a settled session
+(`RetireSettledSessionLocked`: `session->Done()`, reported through
+`RecordPoolReshardTerminalLocked`, erased from `sessions_`). -/
 def publish (s : Recv) : Option Recv :=
   if s.life.done = true ∧ s.published = none then
-    some { s with published := some s.life.statusOk, planUnregistered := true }
+    some { s with published := some s.life.statusOk }
   else none
 
 def step (pol : PushEndPolicy := .finishOnError) (s : Recv) : Ev → Option Recv
@@ -275,7 +251,6 @@ def step (pol : PushEndPolicy := .finishOnError) (s : Recv) : Ev → Option Recv
   | .h2dIssue p ok => s.h2dIssue p ok
   | .h2dReady p => s.h2dReady p
   | .h2dDone p ok => s.h2dDone p ok
-  | .pollReady => s.pollReady
   | .cancel => s.cancel
   | .publish => s.publish
 

@@ -51,16 +51,16 @@ theorem drain_step {s : Send} (h : Inv s)
       exact ⟨.execFinish, _, hs₁, by simp [endOp, hdr], by simp [endOp]; omega⟩
 
 /-- Every reachable reshard send session on a valid schedule can drain to
-`done = true`, release its `PoolStagingLease`s (`hasStaging = false`), and
-unregister its active plan (`planUnregistered = true`) in finitely many steps
-(`System.settles_of_rank` over `in_flight_`, with `drain_step` as the one-step
-argument). -/
+`done = true` and release its `PoolStagingLease`s (`hasStaging = false`) in
+finitely many steps (`System.settles_of_rank` over `in_flight_`, with
+`drain_step` as the one-step argument). Once `done_` is set, `plan()` returns
+`absl::nullopt`, so this is also when the plan is gone. -/
 theorem reachable_can_settle {ns : List Nat} {s : Send}
     (hvalid : validSchedule ns = true) (h : (sys ns).Reachable s) :
     ∃ evs s', (sys ns).runFrom s evs = some s' ∧
-      s'.life.done = true ∧ s'.life.hasStaging = false ∧ s'.planUnregistered = true := by
+      s'.life.done = true ∧ s'.life.hasStaging = false := by
   have hinv := reachable_inv hvalid h
-  have hcancel : step s .cancel = some { s with life := s.life.finishLocked false } := rfl
+  have hcancel : step s .cancel = some { s with life := s.life.finishOnceLocked false } := rfl
   have hinv₁ := step_inv hinv hcancel
   obtain ⟨evs, s', hrun, ⟨hinv', _⟩, hd'⟩ :=
     (sys ns).settles_of_rank (Inv := fun s => Inv s ∧ s.life.draining = true)
@@ -68,8 +68,8 @@ theorem reachable_can_settle {ns : List Nat} {s : Send}
       (fun s ⟨hi, hdr⟩ hnd => by
         obtain ⟨e, s₁, hs₁, hdr₁, hlt⟩ := drain_step hi hdr (by simpa using hnd)
         exact ⟨e, s₁, hs₁, ⟨step_inv hi hs₁, hdr₁⟩, hlt⟩)
-      ⟨hinv₁, by simp⟩
-  refine ⟨.cancel :: evs, s', ?_, hd', by rw [hinv'.life.staging, hd']; rfl, hinv'.done_plan hd'⟩
+      ⟨hinv₁, hinv.life.finishOnceLocked_draining false⟩
+  refine ⟨.cancel :: evs, s', ?_, hd', by rw [hinv'.life.staging, hd']; rfl⟩
   simp only [System.runFrom, sys, List.foldlM_cons, hcancel]
   exact hrun
 

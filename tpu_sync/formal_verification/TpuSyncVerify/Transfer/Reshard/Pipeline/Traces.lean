@@ -12,26 +12,10 @@ namespace Pipeline
 
 /-! ## Concrete traces and bounded verification
 
-### Out-of-order network arrival on aliased device pages
-
-Two pools with `ranks = [0, 1]` and `peerCounts = [1, 2]` share an aliased
-device page (`pool_order_ranks_` in `ReshardReceiveSession`, `D2hPoolBlocks` /
-`H2dPoolBlocks` in `KVCacheManagerBase`). Even when pool 1 (rank 1, 2 peer
-streams) finishes landing all of its network streams and calls
-`onPoolReceived 1` **before** pool 0 (rank 0, 1 peer stream) has landed its
-stream:
-1. `onPoolReceived 1` records pool 1 as `.received` without launching its H2D
-   copy (`dstHbm = [.junk, .junk]`).
-2. When pool 0 subsequently lands its stream and calls `onPoolReceived 0`,
-   pool 0 enters `.queued`, completes its H2D copy (`h2dDone 0 true`), writes
-   `.kv 0` to `dstHbm[0]` (while clobbering `dstHbm[1]` to `.junk`), and
-   `FinishPoolH2d` automatically unblocks and queues pool 1 (`stage = .queued`).
-3. Pool 1's second-wave H2D copy (`h2dDone 1 true`) then overwrites `dstHbm[1]`
-   with `.kv 1`, so `publish` reports `done_recving` with `dstHbm = good 2`.
--/
+Out-of-order arrival on aliased device pages (`ranks = [0, 1]`, `peerCounts = [1, 2]`): pool 1 lands first and waits in `.received` until pool 0 finishes Wave 0 H2D, then runs Wave 1 H2D to publish `good 2`. -/
 
 def outOfOrderPrefix : List Ev :=
-  [ -- Sender issues D2H for pool 0 (1 peer) and pool 1 (2 peers), finishes ExecutePush,
+  [ -- Sender issues D2H for pool 0 (1 peer) and pool 1 (2 peers), finishes ExecutePushPipeline,
     -- and completes all 3 peer pushes onto the wire.
     .send (.d2hIssue 0 true), .send (.d2hIssue 1 true), .send .execFinish,
     .send (.d2hDone 0 true), .send (.d2hDone 1 true),
@@ -67,10 +51,7 @@ theorem trace_aliased_page_out_of_order_arrival :
       (fun p => (p.send.published, p.recv.published, p.dstHbm, p.reclaimed)) =
       some (some true, some true, [.kv 0, .kv 1], true) := by decide
 
-/-- Two-phase Arm-then-Dispatch trace (`ReshardCoordinator::RunSubPlan`):
-from `initUnarmed`, neither sender D2H (`d2hIssue 0 true`) nor receiver
-`pushBegin` can fire before `armRecv`; once `armRecv` runs, the transfer
-completes cleanly. -/
+/-- Arm-then-Dispatch (`ReshardCoordinator::RunSubPlan`): `initUnarmed` refuses sender D2H and receiver `pushBegin` before `armRecv`, and succeeds after. -/
 theorem trace_arm_before_dispatch :
     let s := sysUnarmed [0] [1]
     s.run [.send (.d2hIssue 0 true)] = none ∧
@@ -115,23 +96,7 @@ theorem violates_iff {s : Pipeline} : violates s = false ↔ Safe s := by
   simp [violates]
 
 
-/-! ## Mutants (`docs/transfer/reshard.md`)
-
-1. **Rank-blind H2D launch (`stepRankBlind`)**: if `CollectEligiblePoolH2dsLocked`
-   ignores pool rank (`prereqsCompleted` replaced by `fun _ => true`, as in
-   `Recv.onPoolReceivedIgnoringRank`), then when pool 1 (rank 1) lands before
-   pool 0 (rank 0), pool 1 completes H2D first and pool 0's subsequent coarse
-   H2D copy clobbers `dstHbm[1]` to `.junk`, violating `PublicationCorrect` and
-   `AliasedPageCorrect`.
-2. **Premature `OnPoolReceived` (`stepPrematurePoolReceived`)**: if
-   `BlockTransportServerPushSession::CompleteIncomingPush` fires `OnPoolReceived(p)` on the first
-   arriving stream (`0 < landedStreams[p]`) instead of waiting for all
-   `peerCounts[p]` streams (`progress.completed_chunks >= progress.expected_chunks`),
-   `StreamAccountingSafe` is violated.
-3. **Premature producer reclamation (`stepReclaimEarly`)**: if producer HBM is
-   reclaimed before `send.published ≠ none`, D2H copies `.junk` into destination
-   HBM and violates `PublicationCorrect`.
--/
+/-! ## Mutants (`docs/transfer/reshard.md`) -/
 
 def recvStepRankBlind (s : Pipeline) (e : Recv.Ev) : Option Pipeline :=
   match e with
@@ -149,11 +114,7 @@ def stepRankBlind (s : Pipeline) : Ev → Option Pipeline
 def sysRankBlind (ranks peerCounts : List Nat) : System Pipeline Ev :=
   ⟨init ranks peerCounts, stepRankBlind⟩
 
-/-- Mutant 1: without the rank gate in `CollectEligiblePoolH2dsLocked`,
-out-of-order network arrival lets pool 1 (rank 1) finish H2D before pool 0
-(rank 0), and pool 0's subsequent H2D copy clobbers the shared page slot
-`dstHbm[1]` to `.junk`, publishing `done_recving` with corrupted HBM
-(`[.kv 0, .junk] ≠ good 2`). -/
+/-- Mutant 1: omitting the rank gate in `CollectEligiblePoolH2dsLocked` lets rank 0 H2D clobber completed rank 1 (`dstHbm = [.kv 0, .junk]`). -/
 theorem mutant_ignoring_rank_corrupts_aliased_page :
     ∃ s, (sysRankBlind [0, 1] [1, 2]).Reachable s ∧
       s.recv.published = some true ∧ s.dstHbm = [.kv 0, .junk] ∧
@@ -163,7 +124,7 @@ theorem mutant_ignoring_rank_corrupts_aliased_page :
     [ -- Without the rank gate, pool 1 (rank 1) was already queued by onPoolReceived 1
       -- and completes its H2D copy BEFORE pool 0 (rank 0) even lands!
       .recv (.h2dIssue 1 true), .recv (.h2dReady 1), .recv (.h2dDone 1 true),
-      -- Now pool 0 (rank 0) lands and runs its coarse H2D copy, clobbering dstHbm[1]!
+      -- Pool 0 (rank 0) lands and runs its H2D copy, which overwrites dstHbm[1].
       .landStream 0, .recv (.onPoolReceived 0),
       .recv (.h2dIssue 0 true), .recv (.h2dReady 0), .recv (.h2dDone 0 true),
       .recv (.pushEnd true), .recv .publish ]

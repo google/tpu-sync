@@ -16,10 +16,6 @@ namespace Pipeline
     (Recv.launchEligible r).published = r.published := by
   unfold Recv.launchEligible; split <;> rfl
 
-@[simp] theorem maybeUnregisterSettled_published (r : Recv) :
-    (Recv.maybeUnregisterSettled r).published = r.published := by
-  unfold Recv.maybeUnregisterSettled; split <;> rfl
-
 theorem recv_step_published_eq {pol : PushEndPolicy} {r r' : Recv} {e : Recv.Ev}
     (hs : Recv.step pol r e = some r') (hpub : r.published ≠ none) :
     r'.published = r.published := by
@@ -56,9 +52,6 @@ theorem recv_step_published_eq {pol : PushEndPolicy} {r r' : Recv} {e : Recv.Ev}
       · split at hs
         · simp at hs; subst hs; simp
         · split at hs <;> { simp at hs; subst hs; simp }
-  | pollReady =>
-    simp only [Recv.step, Recv.pollReady] at hs
-    split at hs <;> simp at hs; subst hs; rfl
   | cancel =>
     simp only [Recv.step, Recv.cancel, Option.some.injEq] at hs
     subst hs; rfl
@@ -78,6 +71,7 @@ theorem dstHbm_quiet {s s' : Pipeline} {e : Ev} (h : Inv s)
     split at hs <;> simp at hs; subst hs; exact ⟨rfl, rfl, rfl⟩
   | send e =>
     cases e <;> simp only [step, sendStep, Option.map_eq_some_iff] at hs
+    · obtain ⟨_, _, rfl⟩ := hs; exact ⟨rfl, rfl, rfl⟩
     · split at hs <;> try cases hs
       simp only [Option.map_eq_some_iff] at hs
       obtain ⟨_, _, rfl⟩ := hs; exact ⟨rfl, rfl, rfl⟩
@@ -112,9 +106,9 @@ theorem dstHbm_quiet {s s' : Pipeline} {e : Ev} (h : Inv s)
       cases hb : s.recv.published with
       | none => exact absurd hb hpub
       | some b =>
-        have ⟨hd, _⟩ := h.recvInv.published_done b hb
+        have hd := h.recvInv.published_done b hb
         simp [hnd] at hd
-    | pushEnd ok | h2dIssue p ok | h2dReady p | pollReady | cancel | publish =>
+    | pushEnd ok | h2dIssue p ok | h2dReady p | cancel | publish =>
       simp only [step, recvStep, Option.map_eq_some_iff] at hs
       obtain ⟨rcv, hrcv, rfl⟩ := hs
       exact ⟨rfl, recv_step_published_eq hrcv hpub, rfl⟩
@@ -179,6 +173,7 @@ theorem srcHbm_quiet {s s' : Pipeline} {e : Ev}
     simp only [step, armRecv] at hs; split at hs <;> simp at hs; subst hs; rfl
   | send e =>
     cases e <;> simp only [step, sendStep, Option.map_eq_some_iff] at hs
+    · obtain ⟨_, _, rfl⟩ := hs; rfl
     · split at hs <;> try cases hs
       simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; rfl
     · obtain ⟨_, _, rfl⟩ := hs; rfl
@@ -198,7 +193,6 @@ theorem srcHbm_quiet {s s' : Pipeline} {e : Ev}
     · split at hs <;> try cases hs
       simp only [Option.map_eq_some_iff] at hs
       obtain ⟨_, _, hs'⟩ := hs; split at hs' <;> { subst hs'; rfl }
-    · simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; rfl
     · simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; rfl
     · simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; rfl
   | landStream p =>
@@ -254,7 +248,7 @@ theorem srcStaging_quiet {s s' : Pipeline} {e : Send.Ev} (h : Inv s)
         | succ k =>
           have hnd := send_not_done_of_stage h.sendInv hget (by simp [hpush, SendStage.opCount])
           simp [hnd] at hd
-  | execFinish | cancel | publish =>
+  | startFail | execFinish | cancel | publish =>
     simp only [step, sendStep, Option.map_eq_some_iff] at hs
     obtain ⟨_, _, rfl⟩ := hs; exact ⟨rfl, rfl⟩
 
@@ -274,6 +268,7 @@ theorem dstStaging_quiet {s s' : Pipeline} {e : Ev} (h : Inv s)
     simp only [step, armRecv] at hs; split at hs <;> simp at hs; subst hs; exact ⟨rfl, rfl⟩
   | send e =>
     cases e <;> simp only [step, sendStep, Option.map_eq_some_iff] at hs
+    · obtain ⟨_, _, rfl⟩ := hs; exact ⟨rfl, rfl⟩
     · split at hs <;> try cases hs
       simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; exact ⟨rfl, rfl⟩
     · obtain ⟨_, _, rfl⟩ := hs; exact ⟨rfl, rfl⟩
@@ -303,7 +298,7 @@ theorem dstStaging_quiet {s s' : Pipeline} {e : Ev} (h : Inv s)
       rw [hget] at hget₀; injection hget₀ with heq; subst heq
       have hnd := recv_not_done_of_ready h.recvInv hget hrd
       simp [hnd] at hd
-    | pushEnd ok | h2dIssue p ok | h2dReady p | pollReady | cancel | publish =>
+    | pushEnd ok | h2dIssue p ok | h2dReady p | cancel | publish =>
       simp only [step, recvStep, Option.map_eq_some_iff] at hs
       obtain ⟨_, _, rfl⟩ := hs; exact ⟨rfl, rfl⟩
   | landStream p =>
@@ -430,7 +425,7 @@ theorem recv_drain_step_lift {s : Pipeline} (h : Inv s)
       refine ⟨s', ?_, ?_⟩
       · simp only [step, recvStep, hget, hrcv, Option.map_some, s']
       · dsimp only [s']; split <;> exact ⟨rfl, rfl⟩
-    | pushEnd ok | h2dIssue p ok | h2dReady p | pollReady | cancel | publish =>
+    | pushEnd ok | h2dIssue p ok | h2dReady p | cancel | publish =>
       exact ⟨{ s with recv := rcv }, by simp [step, recvStep, hrcv], rfl, rfl⟩
   obtain ⟨s', hs', hrcv_eq, hsnd_eq⟩ := hlift
   exact ⟨e, s', hs', by rw [hrcv_eq]; exact hdr', hsnd_eq, by rw [hrcv_eq]; exact hlt⟩
@@ -455,40 +450,20 @@ theorem drain_step {s : Pipeline} (h : Inv s)
     unfold drainRank
     rw [hsnd_eq]; omega
 
-theorem both_done_settle (sys₀ : System Pipeline Ev) (hstep : sys₀.step = step)
-    {s : Pipeline} (h : Inv s)
+theorem both_done_settle {s : Pipeline} (h : Inv s)
     (hs_done : s.send.life.done = true) (hr_done : s.recv.life.done = true) :
-    ∃ evs s', sys₀.runFrom s evs = some s' ∧
-      s'.send.life.done = true ∧ s'.recv.life.done = true ∧
-      s'.send.life.hasStaging = false ∧ s'.recv.life.hasStaging = false ∧
-      s'.send.planUnregistered = true ∧ s'.recv.planUnregistered = true := by
-  have hs_stg : s.send.life.hasStaging = false := by rw [h.sendInv.life.staging, hs_done]; rfl
-  have hr_stg : s.recv.life.hasStaging = false := by rw [h.recvInv.life.staging, hr_done]; rfl
-  have hs_pl : s.send.planUnregistered = true := h.sendInv.done_plan hs_done
-  by_cases hpl : s.recv.planUnregistered = true
-  · exact ⟨[], s, rfl, hs_done, hr_done, hs_stg, hr_stg, hs_pl, hpl⟩
-  · cases hpub : s.recv.published with
-    | none =>
-      let s₁ : Pipeline :=
-        { s with recv := { s.recv with published := some s.recv.life.statusOk,
-                                       planUnregistered := true } }
-      have hstep_pub : step s (.recv .publish) = some s₁ := by
-        simp [step, recvStep, Recv.step, Recv.publish, hr_done, hpub, s₁]
-      refine ⟨[.recv .publish], s₁, ?_, hs_done, hr_done, hs_stg, hr_stg, hs_pl, rfl⟩
-      simp [System.runFrom, hstep, hstep_pub]
-    | some b =>
-      exact absurd (h.recvInv.published_done b hpub).2 hpl
+    s.send.life.hasStaging = false ∧ s.recv.life.hasStaging = false :=
+  ⟨by rw [h.sendInv.life.staging, hs_done]; rfl, by rw [h.recvInv.life.staging, hr_done]; rfl⟩
 
-/-- Both sessions drain to `done`, then `both_done_settle` finishes the job
-(`System.settles_of_rank` over `drainRank` with `drain_step` as the one-step
-argument). -/
+/-- Both sessions drain to `done` (`System.settles_of_rank` over `drainRank`
+with `drain_step` as the one-step argument), which releases both stagings
+(`both_done_settle`); with `done_`, both `plan()`s are gone. -/
 theorem draining_can_settle (sys₀ : System Pipeline Ev) (hstep : sys₀.step = step)
     {s : Pipeline} (h : Inv s)
     (hsdr : s.send.life.draining = true) (hrdr : s.recv.life.draining = true) :
     ∃ evs s', sys₀.runFrom s evs = some s' ∧
       s'.send.life.done = true ∧ s'.recv.life.done = true ∧
-      s'.send.life.hasStaging = false ∧ s'.recv.life.hasStaging = false ∧
-      s'.send.planUnregistered = true ∧ s'.recv.planUnregistered = true := by
+      s'.send.life.hasStaging = false ∧ s'.recv.life.hasStaging = false := by
   obtain ⟨evs₁, s₁, hrun₁, ⟨hinv₁, _, _⟩, hsd, hrd⟩ :=
     sys₀.settles_of_rank
       (Inv := fun s => Inv s ∧ s.send.life.draining = true ∧ s.recv.life.draining = true)
@@ -497,56 +472,54 @@ theorem draining_can_settle (sys₀ : System Pipeline Ev) (hstep : sys₀.step =
         obtain ⟨e, s₁, hs₁, hsdr₁, hrdr₁, hlt⟩ := drain_step hi hsdr hrdr hnd
         exact ⟨e, s₁, hstep ▸ hs₁, ⟨step_inv hi hs₁, hsdr₁, hrdr₁⟩, hlt⟩)
       ⟨h, hsdr, hrdr⟩
-  obtain ⟨evs₂, s', hrun₂, h1, h2, h3, h4, h5, h6⟩ := both_done_settle sys₀ hstep hinv₁ hsd hrd
-  exact ⟨evs₁ ++ evs₂, s', sys₀.runFrom_append evs₁ evs₂ hrun₁ hrun₂, h1, h2, h3, h4, h5, h6⟩
+  obtain ⟨h3, h4⟩ := both_done_settle hinv₁ hsd hrd
+  exact ⟨evs₁, s₁, hrun₁, hsd, hrd, h3, h4⟩
 
 theorem can_settle_of_inv (sys₀ : System Pipeline Ev) (hstep : sys₀.step = step)
     {s : Pipeline} (hinv : Inv s) :
     ∃ evs s', sys₀.runFrom s evs = some s' ∧
       s'.send.life.done = true ∧ s'.recv.life.done = true ∧
-      s'.send.life.hasStaging = false ∧ s'.recv.life.hasStaging = false ∧
-      s'.send.planUnregistered = true ∧ s'.recv.planUnregistered = true := by
-  let s₁ : Pipeline := { s with send := { s.send with life := s.send.life.finishLocked false } }
+      s'.send.life.hasStaging = false ∧ s'.recv.life.hasStaging = false := by
+  let s₁ : Pipeline := { s with send := { s.send with life := s.send.life.finishOnceLocked false } }
   let s₂ : Pipeline := { s₁ with recv := { s₁.recv with life := s₁.recv.life.finishLocked false } }
   have hs₁ : step s (.send .cancel) = some s₁ := rfl
   have hs₂ : step s₁ (.recv .cancel) = some s₂ := rfl
   have hinv₁ := step_inv hinv hs₁
   have hinv₂ := step_inv hinv₁ hs₂
-  have hsdr₂ : s₂.send.life.draining = true := by simp [s₂, s₁]
+  have hsdr₂ : s₂.send.life.draining = true :=
+    hinv.sendInv.life.finishOnceLocked_draining false
   have hrdr₂ : s₂.recv.life.draining = true := by simp [s₂]
-  obtain ⟨evs, s', hrun, h1, h2, h3, h4, h5, h6⟩ :=
+  obtain ⟨evs, s', hrun, h1, h2, h3, h4⟩ :=
     draining_can_settle sys₀ hstep hinv₂ hsdr₂ hrdr₂
   have hstep₁ : sys₀.step s (.send .cancel) = some s₁ := hstep ▸ hs₁
   have hstep₂ : sys₀.step s₁ (.recv .cancel) = some s₂ := hstep ▸ hs₂
-  refine ⟨.send .cancel :: .recv .cancel :: evs, s', ?_, h1, h2, h3, h4, h5, h6⟩
+  refine ⟨.send .cancel :: .recv .cancel :: evs, s', ?_, h1, h2, h3, h4⟩
   simp only [System.runFrom, List.foldlM_cons, hstep₁]
   change (sys₀.step s₁ (.recv .cancel) >>= fun s₃ => List.foldlM sys₀.step s₃ evs) = some s'
   rw [hstep₂]
   exact hrun
 
 /-- Every reachable state of the composed reshard pipeline on a valid schedule
-can drain both sessions to `done = true`, release both `PoolStagingLease`s
-(`hasStaging = false`), and unregister both active plans
-(`planUnregistered = true`) in finitely many steps. -/
+can drain both sessions to `done = true` and release both `PoolStagingLease`s
+(`hasStaging = false`) in finitely many steps; with `done_`, both sessions'
+`plan()` return `absl::nullopt`. -/
 theorem reachable_can_settle {ranks peerCounts : List Nat} {s : Pipeline}
     (hvalid : validConfig ranks peerCounts = true)
     (h : (sys ranks peerCounts).Reachable s) :
     ∃ evs s', (sys ranks peerCounts).runFrom s evs = some s' ∧
       s'.send.life.done = true ∧ s'.recv.life.done = true ∧
-      s'.send.life.hasStaging = false ∧ s'.recv.life.hasStaging = false ∧
-      s'.send.planUnregistered = true ∧ s'.recv.planUnregistered = true :=
+      s'.send.life.hasStaging = false ∧ s'.recv.life.hasStaging = false :=
   can_settle_of_inv (sys ranks peerCounts) rfl (reachable_inv hvalid h)
 
 /-- Every state reachable from the pre-Phase-1 unarmed state (`initUnarmed`)
 can also drain both sessions to `done = true` and release all staging leases
-and active plans in finitely many steps. -/
+in finitely many steps. -/
 theorem reachable_unarmed_can_settle {ranks peerCounts : List Nat} {s : Pipeline}
     (hvalid : validConfig ranks peerCounts = true)
     (h : (sysUnarmed ranks peerCounts).Reachable s) :
     ∃ evs s', (sysUnarmed ranks peerCounts).runFrom s evs = some s' ∧
       s'.send.life.done = true ∧ s'.recv.life.done = true ∧
-      s'.send.life.hasStaging = false ∧ s'.recv.life.hasStaging = false ∧
-      s'.send.planUnregistered = true ∧ s'.recv.planUnregistered = true :=
+      s'.send.life.hasStaging = false ∧ s'.recv.life.hasStaging = false :=
   can_settle_of_inv (sysUnarmed ranks peerCounts) rfl (reachable_unarmed_inv hvalid h)
 
 /-! ### Buffer release predicates, non-interference, and single-request handoff
@@ -566,6 +539,7 @@ theorem srcHbm_quiet_step {s s' : Pipeline} {e : Ev}
     simp only [step, armRecv] at hs; split at hs <;> simp at hs; subst hs; rfl
   | send e =>
     cases e <;> simp only [step, sendStep, Option.map_eq_some_iff] at hs
+    · obtain ⟨_, _, rfl⟩ := hs; rfl
     · split at hs <;> try cases hs
       simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; rfl
     · obtain ⟨_, _, rfl⟩ := hs; rfl
@@ -585,7 +559,6 @@ theorem srcHbm_quiet_step {s s' : Pipeline} {e : Ev}
     · split at hs <;> try cases hs
       simp only [Option.map_eq_some_iff] at hs
       obtain ⟨_, _, hs'⟩ := hs; split at hs' <;> { subst hs'; rfl }
-    · simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; rfl
     · simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; rfl
     · simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; rfl
   | landStream p =>
@@ -608,6 +581,7 @@ theorem step_numPools {s s' : Pipeline} {e : Ev} (hs : step s e = some s') :
     simp only [step, armRecv] at hs; split at hs <;> simp at hs; subst hs; rfl
   | send e =>
     cases e <;> simp only [step, sendStep, Option.map_eq_some_iff] at hs
+    · obtain ⟨_, _, rfl⟩ := hs; rfl
     · split at hs <;> try cases hs
       simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; rfl
     · obtain ⟨_, _, rfl⟩ := hs; rfl
@@ -627,7 +601,6 @@ theorem step_numPools {s s' : Pipeline} {e : Ev} (hs : step s e = some s') :
     · split at hs <;> try cases hs
       simp only [Option.map_eq_some_iff] at hs
       obtain ⟨_, _, hs'⟩ := hs; split at hs' <;> { subst hs'; rfl }
-    · simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; rfl
     · simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; rfl
     · simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; rfl
   | landStream p =>
@@ -666,7 +639,6 @@ theorem srcStaging_quiet_step {s s' : Pipeline} {e : Ev} (h : Inv s)
     · split at hs <;> try cases hs
       simp only [Option.map_eq_some_iff] at hs
       obtain ⟨_, _, hs'⟩ := hs; split at hs' <;> { subst hs'; exact ⟨rfl, rfl⟩ }
-    · simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; exact ⟨rfl, rfl⟩
     · simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; exact ⟨rfl, rfl⟩
     · simp only [Option.map_eq_some_iff] at hs; obtain ⟨_, _, rfl⟩ := hs; exact ⟨rfl, rfl⟩
   | landStream p =>
@@ -843,8 +815,7 @@ theorem settled_can_handoff (sys₀ : System Pipeline Ev) (hstep : sys₀.step =
     cases hpubR : s.recv.published with
     | none =>
       let s₂ : Pipeline :=
-        { s₁ with recv := { s₁.recv with published := some s₁.recv.life.statusOk,
-                                         planUnregistered := true } }
+        { s₁ with recv := { s₁.recv with published := some s₁.recv.life.statusOk } }
       have hstepR : step s₁ (.recv .publish) = some s₂ := by
         simp [step, recvStep, Recv.step, Recv.publish, hr_done, hpubR, s₂, s₁]
       refine ⟨[.send .publish, .recv .publish], s₂, ?_, ⟨hs_stg, hr_stg, by simp [s₂, s₁], by simp [s₂]⟩⟩
@@ -856,8 +827,7 @@ theorem settled_can_handoff (sys₀ : System Pipeline Ev) (hstep : sys₀.step =
     cases hpubR : s.recv.published with
     | none =>
       let s₂ : Pipeline :=
-        { s with recv := { s.recv with published := some s.recv.life.statusOk,
-                                       planUnregistered := true } }
+        { s with recv := { s.recv with published := some s.recv.life.statusOk } }
       have hstepR : step s (.recv .publish) = some s₂ := by
         simp [step, recvStep, Recv.step, Recv.publish, hr_done, hpubR, s₂]
       refine ⟨[.recv .publish], s₂, ?_, ⟨hs_stg, hr_stg, by simp [s₂, hpubS], by simp [s₂]⟩⟩
@@ -871,7 +841,7 @@ publishes both HBM outcomes (`HandedOff`). -/
 theorem inv_can_handoff {ranks peerCounts : List Nat} {s : Pipeline}
     (hinv : Inv s) :
     ∃ evs s', (sys ranks peerCounts).runFrom s evs = some s' ∧ HandedOff s' := by
-  obtain ⟨evs₁, s₁, hrun₁, hsd, hrd, hstS, hstR, _, _⟩ :=
+  obtain ⟨evs₁, s₁, hrun₁, hsd, hrd, hstS, hstR⟩ :=
     can_settle_of_inv (sys ranks peerCounts) rfl hinv
   obtain ⟨evs₂, s', hrun₂, hhand⟩ := settled_can_handoff (sys ranks peerCounts) rfl hsd hrd hstS hstR
   exact ⟨evs₁ ++ evs₂, s', (sys ranks peerCounts).runFrom_append evs₁ evs₂ hrun₁ hrun₂, hhand⟩

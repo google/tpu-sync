@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "absl/algorithm/container.h"
+#include "absl/base/nullability.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/log/absl_check.h"
 #include "absl/log/log.h"
@@ -482,11 +483,22 @@ uint8_t* BlockTransport::ResolveRecvBuffer(const lib::PostMetadata& post,
                                            const lib::RequestMetadata& req) {
   std::shared_ptr<BlockTransportServerPushSession> session =
       GetOrCreatePushSession(post.uuid);
-  uint8_t* addr = session->ResolveRecvBuffer(post, req);
+  absl::StatusOr<uint8_t* absl_nonnull> addr =
+      session->ResolveRecvBuffer(post, req);
   if (session->IsDone()) {
     DeletePushSession(session);
   }
-  return addr;
+  if (!addr.ok()) {
+    LOG_EVERY_N_SEC(ERROR, 1)
+        << "Peregrine request rejected: uuid=" << post.uuid
+        << " remote=" << post.remote_id << " local_id=" << post.local_id
+        << " shard_mask=" << post.shard_mask << " shard=" << req.shard
+        << " block=" << req.block_id << " src_block=" << req.src_block_id
+        << " chunk=" << req.chunk_idx << " len=" << req.len << ": "
+        << addr.status();
+    return nullptr;
+  }
+  return *addr;
 }
 
 absl::Status BlockTransport::OnRecvComplete(

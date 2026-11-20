@@ -25,9 +25,11 @@
 #include <utility>
 #include <vector>
 
+#include "absl/base/nullability.h"
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
@@ -134,8 +136,8 @@ class BlockTransportServerPushSession final
   // Receiver-side address of one incoming Peregrine request. Thread-safe across
   // concurrent requests of the same or different Posts; admits each PostKey at
   // most once and holds its TransferSession lease until OnPeregrinePostComplete.
-  uint8_t* ResolveRecvBuffer(const lib::PostMetadata& post,
-                             const lib::RequestMetadata& req);
+  absl::StatusOr<uint8_t* absl_nonnull> ResolveRecvBuffer(
+      const lib::PostMetadata& post, const lib::RequestMetadata& req);
 
   // Processes receiver-side completion of a Peregrine Post.
   absl::Status OnPeregrinePostComplete(
@@ -187,6 +189,8 @@ class BlockTransportServerPushSession final
   void DropLeaseLocked(const lib::PostMetadata& post,
                        std::shared_ptr<PostLease> lease)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  // Admits |post| once per PostKey, acquiring its TransferSession lease.
+  absl::Status AdmitPush(const lib::PostMetadata& post);
   // Releases the lease of an admitted Post that is being refused.
   void RejectPost(const lib::PostMetadata& post, const absl::Status& status);
   // Releases the leases of every admitted Post with the session's status.

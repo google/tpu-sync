@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "absl/algorithm/container.h"
+#include "absl/base/nullability.h"
 #include "absl/cleanup/cleanup.h"
 #include "absl/log/absl_check.h"
 #include "absl/log/log.h"
@@ -508,122 +509,121 @@ absl::Status BlockTransportServerPushSession::StartStream(
 // ---------------------------------------------------------------------------
 // Peregrine receive path.
 // ---------------------------------------------------------------------------
-uint8_t* BlockTransportServerPushSession::ResolveRecvBuffer(
-    const lib::PostMetadata& post, const lib::RequestMetadata& req) {
+absl::Status BlockTransportServerPushSession::AdmitPush(
+    const lib::PostMetadata& post) {
   const uint32_t layer = post.local_id;
 
-  absl::Status admitted;
   std::shared_ptr<PostLease> lease;
   {
     absl::MutexLock lock(mu_);
     if (!status_.ok()) {
-      admitted = status_;
-    } else if (auto it = peregrine_posts_.find(PostKeyOf(post));
-               it == peregrine_posts_.end()) {
+      return status_;
+    }
+    if (auto it = peregrine_posts_.find(PostKeyOf(post));
+        it == peregrine_posts_.end()) {
       if (done_) {
-        admitted = absl::CancelledError("Push session already completed");
-      } else {
-        lease = std::make_shared<PostLease>();
-        peregrine_posts_.emplace(PostKeyOf(post), lease);
+        return absl::CancelledError("Push session already completed");
       }
+      lease = std::make_shared<PostLease>();
+      peregrine_posts_.emplace(PostKeyOf(post), lease);
     } else {
       // Another request of this Post is being admitted.
       std::shared_ptr<PostLease> current = it->second;
       AwaitSettled(*current);
       if (!status_.ok()) {
-        admitted = status_;
-      } else if (current->state != PostLease::State::kAdmitted) {
-        admitted =
-            !current->status.ok()
-                ? current->status
-                : absl::FailedPreconditionError("Post already completed");
+        return status_;
+      }
+      if (current->state != PostLease::State::kAdmitted) {
+        return !current->status.ok()
+                   ? current->status
+                   : absl::FailedPreconditionError("Post already completed");
       }
     }
   }
-  if (lease != nullptr) {
-    absl::StatusOr<std::shared_ptr<TransferSession>> session =
-        [&]() -> absl::StatusOr<std::shared_ptr<TransferSession>> {
-      if (layer == lib::kUnspecifiedLocalId) {
-        return absl::InvalidArgumentError(
-            "Peregrine post requires an explicit layer/pool index");
-      }
-      ABSL_RETURN_IF_ERROR(
-          ShardsFromMask(post.shard_mask, delegate_->num_shards()).status());
-      ABSL_RETURN_IF_ERROR(
-          ResolveIncomingPushSpec(delegate_, layer,
-                                  /*is_explicit_dst_push=*/true, uuid_)
-              .status());
-      return BeginIncomingPush(delegate_, uuid_);
-    }();
-    admitted = session.status();
-    std::shared_ptr<TransferSession> release;
-    {
-      absl::MutexLock lock(mu_);
-      if (!session.ok()) {
-        lease->status = admitted;
-        DropLeaseLocked(post, lease);
-      } else if (!status_.ok() || done_) {
-        // Cancelled or completed while admitting: hand the op back without
-        // failing the transfer, which may already belong to a reused uuid.
-        admitted = !status_.ok()
-                       ? status_
-                       : absl::CancelledError("Push session already completed");
-        lease->status = admitted;
-        DropLeaseLocked(post, lease);
-        release = *std::move(session);
-      } else {
-        lease->session = *std::move(session);
-        lease->state = PostLease::State::kAdmitted;
-      }
-    }
-    if (release != nullptr) {
-      EndIncomingPush(release).IgnoreError();
-    }
+  if (lease == nullptr) {
+    return absl::OkStatus();
   }
-
-  // A request must address one of the shards its Post declared.
-  const bool shard_in_post =
-      req.shard < delegate_->num_shards() &&
-      (post.shard_mask == 0 ||
-       (req.shard < static_cast<uint32_t>(kMaxShardMaskBits) &&
-        ((post.shard_mask >> req.shard) & 1u)));
-  uint8_t* addr = nullptr;
-  absl::Status status = admitted;
-  if (status.ok()) {
-    if (!shard_in_post || req.block_id < 0 || req.len == 0) {
-      status = absl::InvalidArgumentError(
-          !shard_in_post ? "shard not in post" : "invalid block_id or len");
+  absl::StatusOr<std::shared_ptr<TransferSession>> session =
+      [&]() -> absl::StatusOr<std::shared_ptr<TransferSession>> {
+    if (layer == lib::kUnspecifiedLocalId) {
+      return absl::InvalidArgumentError(
+          "Peregrine post requires an explicit layer/pool index");
+    }
+    ABSL_RETURN_IF_ERROR(
+        ShardsFromMask(post.shard_mask, delegate_->num_shards()).status());
+    ABSL_RETURN_IF_ERROR(ResolveIncomingPushSpec(delegate_, layer,
+                                                 /*is_explicit_dst_push=*/true,
+                                                 uuid_)
+                             .status());
+    return BeginIncomingPush(delegate_, uuid_);
+  }();
+  absl::Status admission_error;
+  std::shared_ptr<TransferSession> release;
+  {
+    absl::MutexLock lock(mu_);
+    if (!session.ok()) {
+      lease->status = session.status();
+      DropLeaseLocked(post, lease);
+      return session.status();
+    }
+    if (!status_.ok() || done_) {
+      // Cancelled or completed while admitting: hand the op back without
+      // failing the transfer, which may already belong to a reused uuid.
+      admission_error =
+          !status_.ok()
+              ? status_
+              : absl::CancelledError("Push session already completed");
+      lease->status = admission_error;
+      DropLeaseLocked(post, lease);
+      release = *std::move(session);
     } else {
-      const int64_t block_id = req.block_id;
-      // Full block: the same chunk list the sender resolved, so `chunk_idx`
-      // means the same on both ends.
-      std::vector<BlockChunk> chunks = delegate_->GetBlockChunks(
-          layer, req.shard, absl::MakeConstSpan(&block_id, 1),
-          delegate_->block_bytes(layer), uuid_,
-          static_cast<int64_t>(post.remote_id), /*peer=*/"", req.src_block_id);
-      if (req.chunk_idx >= chunks.size() ||
-          chunks[req.chunk_idx].ptr == nullptr) {
-        status = absl::OutOfRangeError("chunk_idx out of range or null");
-      } else if (chunks[req.chunk_idx].size != req.len) {
-        status = absl::InvalidArgumentError("chunk length mismatch");
-      } else if (status =
-                     ValidateChunks(delegate_, layer, req.shard, uuid_, chunks);
-                 status.ok()) {
-        addr = chunks[req.chunk_idx].ptr;
-      }
+      lease->session = *std::move(session);
+      lease->state = PostLease::State::kAdmitted;
     }
   }
-  if (addr == nullptr) {
-    status = absl::Status(
-        status.code(),
-        absl::StrCat("Peregrine request rejected: uuid=", uuid_,
-                     " remote=", post.remote_id, " array=", layer,
-                     " shard_mask=", post.shard_mask, " shard=", req.shard,
-                     " block=", req.block_id, " src_block=", req.src_block_id,
-                     " chunk=", req.chunk_idx, " len=", req.len, ": ",
-                     status.message()));
-    LOG_EVERY_N_SEC(ERROR, 1) << status;
-    if (admitted.ok()) RejectPost(post, status);
+  if (release != nullptr) {
+    EndIncomingPush(release).IgnoreError();
+  }
+  return admission_error;
+}
+
+absl::StatusOr<uint8_t* absl_nonnull>
+BlockTransportServerPushSession::ResolveRecvBuffer(
+    const lib::PostMetadata& post, const lib::RequestMetadata& req) {
+  ABSL_RETURN_IF_ERROR(AdmitPush(post));
+  absl::StatusOr<uint8_t* absl_nonnull> addr =
+      [&]() -> absl::StatusOr<uint8_t* absl_nonnull> {
+    const uint32_t layer = post.local_id;
+    // A request must address one of the shards its Post declared.
+    const bool shard_in_post =
+        req.shard < delegate_->num_shards() &&
+        (post.shard_mask == 0 ||
+         (req.shard < static_cast<uint32_t>(kMaxShardMaskBits) &&
+          ((post.shard_mask >> req.shard) & 1u)));
+    if (!shard_in_post || req.block_id < 0 || req.len == 0) {
+      return absl::InvalidArgumentError(
+          !shard_in_post ? "shard not in post" : "invalid block_id or len");
+    }
+    const int64_t block_id = req.block_id;
+    // Full block: the same chunk list the sender resolved, so `chunk_idx`
+    // means the same on both ends.
+    std::vector<BlockChunk> chunks = delegate_->GetBlockChunks(
+        layer, req.shard, absl::MakeConstSpan(&block_id, 1),
+        delegate_->block_bytes(layer), uuid_,
+        static_cast<int64_t>(post.remote_id), /*peer=*/"", req.src_block_id);
+    if (req.chunk_idx >= chunks.size() ||
+        chunks[req.chunk_idx].ptr == nullptr) {
+      return absl::OutOfRangeError("chunk_idx out of range or null");
+    }
+    if (chunks[req.chunk_idx].size != req.len) {
+      return absl::InvalidArgumentError("chunk length mismatch");
+    }
+    ABSL_RETURN_IF_ERROR(
+        ValidateChunks(delegate_, layer, req.shard, uuid_, chunks));
+    return chunks[req.chunk_idx].ptr;
+  }();
+  if (!addr.ok()) {
+    RejectPost(post, addr.status());
   }
   return addr;
 }

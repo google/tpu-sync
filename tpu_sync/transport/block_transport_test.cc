@@ -2501,6 +2501,30 @@ TEST_P(BlockTransportTest, MixedBackendsRouteIndependently) {
   EXPECT_EQ(puller_delegate.data()[kSize - 1], 0xAB);
 }
 
+TEST_P(BlockTransportTest,
+       PullFallsBackToSocketWhenPeerHasNoPeregrineEndpoint) {
+  constexpr size_t kSize = 1024;
+  auto cleanup =
+      absl::MakeCleanup([] { unsetenv("TPU_RAIDEN_ENABLE_PEREGRINE"); });
+  setenv("TPU_RAIDEN_ENABLE_PEREGRINE", "2", 1);
+  MockDelegate source_delegate(kSize);
+  MockDelegate puller_delegate(kSize);
+  std::memset(source_delegate.data(), 0xAB, kSize);
+  // The source has Peregrine off, so it advertises no Peregrine endpoint.
+  BlockTransport source(&source_delegate, 0, /*local_ips=*/{},
+                        /*parallelism=*/1, /*socket_only_transport=*/true);
+  BlockTransport puller(&puller_delegate, 0);
+  BindControlChannels(&source, &source_delegate, &puller, &puller_delegate);
+  ASSERT_TRUE(puller.config().uses_peregrine());
+  ASSERT_EQ(source.peregrine_local_port(), 0);
+
+  ABSL_ASSERT_OK(
+      puller.SyncPull({absl::StrCat("localhost:", source.local_port())},
+                      /*src_block_ids=*/{0}));
+  EXPECT_EQ(puller_delegate.data()[0], 0xAB);
+  EXPECT_EQ(puller_delegate.data()[kSize - 1], 0xAB);
+}
+
 INSTANTIATE_TEST_SUITE_P(
     PspAndPlainTcp, BlockTransportTest, ::testing::Bool(),
     [](const ::testing::TestParamInfo<bool>& info) {
@@ -2653,25 +2677,33 @@ TEST(TransportBackendTest, AllLayerPushOverPeregrineWithUuidZero) {
 }
 
 TEST(TransportBackendTest,
-     PeregrinePeerWithEmptyPeregrineEndpointFailsClosedWithFailedPrecondition) {
+     PushFallsBackToSocketWhenPeerHasNoPeregrineEndpoint) {
+  constexpr size_t kSize = 64;
   auto cleanup =
       absl::MakeCleanup([] { unsetenv("TPU_RAIDEN_ENABLE_PEREGRINE"); });
   setenv("TPU_RAIDEN_ENABLE_PEREGRINE", "6", 1);
-  MockDelegate sender_delegate(/*slice_size=*/64);
-  MockDelegate receiver_delegate(/*slice_size=*/64);
+  MockDelegate sender_delegate(kSize);
+  MockDelegate receiver_delegate(kSize);
+  std::memset(sender_delegate.data(), 0xAB, kSize);
   BlockTransport sender(&sender_delegate, 0);
   BlockTransport receiver(&receiver_delegate, 0);
   const std::string peer_data_ep =
       absl::StrCat("127.0.0.1:", receiver.local_port());
 
-  EXPECT_THAT(
-      sender
-          .AsyncPush({peer_data_ep}, /*src_block_ids=*/{0},
-                     /*dst_block_ids=*/{0})
-          .Await(),
-      StatusIs(absl::StatusCode::kFailedPrecondition, HasSubstr(peer_data_ep)));
+  EXPECT_THAT(sender
+                  .AsyncPush({peer_data_ep}, /*src_block_ids=*/{0},
+                             /*dst_block_ids=*/{0})
+                  .Await(),
+              IsOkAndHolds(ElementsAre(0)));
+  EXPECT_EQ(receiver_delegate.data()[0], 0xAB);
+  EXPECT_EQ(receiver_delegate.data()[kSize - 1], 0xAB);
+  // The fallback push left its socket in the pool.
+  EXPECT_GT(sender.IdleConnectionCount(peer_data_ep), 0u);
 
-  // Positive control: supplying the Peregrine endpoint on the call succeeds.
+  // Positive control: with the Peregrine endpoint the same push goes over
+  // Peregrine and opens no socket to the data port.
+  std::memset(sender_delegate.data(), 0xCD, kSize);
+  sender.CloseIdleConnections(peer_data_ep);
   EXPECT_THAT(
       sender
           .AsyncPush(
@@ -2682,6 +2714,56 @@ TEST(TransportBackendTest,
               /*dst_block_ids=*/{0})
           .Await(),
       IsOkAndHolds(ElementsAre(0)));
+  EXPECT_EQ(receiver_delegate.data()[0], 0xCD);
+  EXPECT_EQ(receiver_delegate.data()[kSize - 1], 0xCD);
+  EXPECT_EQ(sender.IdleConnectionCount(peer_data_ep), 0u);
+}
+
+TEST(TransportBackendTest,
+     PushFallsBackToSocketWhenAnyPeerHasNoPeregrineEndpoint) {
+  constexpr size_t kSize = 64;
+  auto cleanup =
+      absl::MakeCleanup([] { unsetenv("TPU_RAIDEN_ENABLE_PEREGRINE"); });
+  setenv("TPU_RAIDEN_ENABLE_PEREGRINE", "6", 1);
+  MockDelegate sender_delegate(kSize);
+  MockDelegate receiver_delegate(kSize);
+  std::memset(sender_delegate.data(), 0xAB, kSize);
+  BlockTransport sender(&sender_delegate, 0);
+  BlockTransport receiver(&receiver_delegate, 0);
+  const std::string peer_data_ep =
+      absl::StrCat("127.0.0.1:", receiver.local_port());
+
+  // Only the first peer advertises Peregrine, so the whole push uses the
+  // socket backend and leaves its socket in the pool.
+  EXPECT_THAT(
+      sender
+          .AsyncPush(
+              {PeerEndpoint{
+                   peer_data_ep,
+                   absl::StrCat("127.0.0.1:", receiver.peregrine_local_port())},
+               PeerEndpoint{peer_data_ep}},
+              /*src_block_ids=*/{0},
+              /*dst_block_ids=*/{0})
+          .Await(),
+      IsOkAndHolds(ElementsAre(0)));
+  EXPECT_EQ(receiver_delegate.data()[0], 0xAB);
+  EXPECT_EQ(receiver_delegate.data()[kSize - 1], 0xAB);
+  EXPECT_GT(sender.IdleConnectionCount(peer_data_ep), 0u);
+}
+
+TEST(TransportBackendTest, PeregrinePushWithEmptyPeerListIsInvalidArgument) {
+  auto cleanup =
+      absl::MakeCleanup([] { unsetenv("TPU_RAIDEN_ENABLE_PEREGRINE"); });
+  setenv("TPU_RAIDEN_ENABLE_PEREGRINE", "6", 1);
+  MockDelegate delegate(/*slice_size=*/64);
+  BlockTransport sender(&delegate, 0);
+
+  EXPECT_THAT(sender
+                  .AsyncPush(/*peers=*/{}, /*src_block_ids=*/{0},
+                             /*dst_block_ids=*/{0})
+                  .Await(),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("Peer list cannot be empty")));
 }
 
 TEST(PeregrineRecvCompleteTest, SplitPostsFromOneSenderCompleteLayerOnce) {

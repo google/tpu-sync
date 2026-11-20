@@ -481,6 +481,10 @@ TEST(HostMemoryTransferTest,
                                               /*dst_offsets=*/{2, 0}));
   ABSL_ASSERT_OK(write_fut.Await());
   receiver.ExpectBlocks('r', {{2, 's', 1}, {0, 's', 3}});
+  // The push went over Peregrine: no socket to the data endpoint was pooled.
+  EXPECT_EQ(sender.base()->transport_server()->IdleConnectionCount(
+                data_eps[0].endpoint),
+            0u);
 }
 
 }  // namespace

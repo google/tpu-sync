@@ -4135,11 +4135,17 @@ TEST(KVCacheManagerTest, D2hWriteAndH2dWriteOverPeregrineOp6Succeed) {
   ABSL_ASSERT_OK(h2d_res.Await());
   EXPECT_TRUE(std::all_of(receiver_buf + 128, receiver_buf + 256,
                           [](uint8_t v) { return v == 0x3C; }));
+  // Both writes went over Peregrine: no socket to the data port was pooled.
+  EXPECT_EQ(sender.transport_server()->IdleConnectionCount(data_ep), 0u);
 
-  // Negative control: the data endpoint alone fails closed under Peregrine.
-  EXPECT_THAT(sender.H2dWrite(data_ep, /*src_host=*/{0}, /*dst_host=*/{1},
-                              /*dst_device=*/{0}, /*copy_sizes=*/{1}),
-              StatusIs(absl::StatusCode::kFailedPrecondition));
+  // The data endpoint alone is pushed over the socket backend, which leaves
+  // its socket in the pool.
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto socket_res,
+      sender.H2dWrite(data_ep, /*src_host=*/{0}, /*dst_host=*/{1},
+                      /*dst_device=*/{0}, /*copy_sizes=*/{1}));
+  ABSL_ASSERT_OK(socket_res.Await());
+  EXPECT_GT(sender.transport_server()->IdleConnectionCount(data_ep), 0u);
 }
 
 class CapturingSliceKVBackend : public backends::KVBackend {

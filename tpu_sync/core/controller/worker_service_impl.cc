@@ -280,8 +280,8 @@ grpc::Status WorkerServiceImpl::TransferBuffers(
     } else if (transfer.dst_buffers_size() > 0 &&
                !transfer.dst_buffers(0).remote_address().empty()) {
       // Flow order: local device src -> local host staging -> remote host dst.
-      // remote_address is a socket data endpoint only: explicit pushes routed
-      // over Peregrine fail closed in the transport (no Peregrine endpoint).
+      // remote_address is a socket data endpoint only, so the explicit push
+      // uses the socket backend.
       future_or = transfer_manager_.D2hWrite(
           transport::PeerEndpoint(transfer.dst_buffers(0).remote_address()),
           src_offsets, staging_host_offsets, dst_offsets, copy_sizes);

@@ -534,8 +534,9 @@ tsl::Future<std::vector<int>> BlockTransport::AsyncPush(
   const lib::TransferOp op = dst_block_ids.empty()
                                  ? lib::TransferOp::kBlockPush
                                  : lib::TransferOp::kBlockPushExplicit;
-  if (config_.backend_for(op) == TransportBackend::kPeregrine) {
-    absl::StatusOr<lib::TransportAdapter*> adapter = AdapterForOp(op);
+  const TransportBackend backend = BackendForTransfer(op, peers);
+  if (backend == TransportBackend::kPeregrine) {
+    absl::StatusOr<lib::TransportAdapter*> adapter = AdapterForBackend(backend);
     if (!adapter.ok()) {
       RecordTransferFailure(adapter.status(), metric_labels::kDirectionPush);
       return tsl::Future<std::vector<int>>(adapter.status());
@@ -543,10 +544,9 @@ tsl::Future<std::vector<int>> BlockTransport::AsyncPush(
     const std::vector<int> all_shards = AllShards(num_shards);
     return AsyncPushShards(peers, src_block_ids, dst_block_ids, parallelism,
                            major_order, uuid, layer_idx, wire_layer_idx,
-                           all_shards, /*num_groups=*/1, *adapter)
-        .Map<std::vector<int>>([dst_block_ids](const std::vector<int>&) {
-          return dst_block_ids;
-        });
+                           all_shards, /*num_groups=*/1, backend, *adapter)
+        .Map<std::vector<int>>(
+            [dst_block_ids](const std::vector<int>&) { return dst_block_ids; });
   }
   // Split the push by source NUMA node: every group of shards sharing a node
   // is pushed by the adapter pinned to that node. The receiver pairs the
@@ -566,7 +566,7 @@ tsl::Future<std::vector<int>> BlockTransport::AsyncPush(
   for (const ShardGroup& group : groups) {
     futures.push_back(AsyncPushShards(
         peers, src_block_ids, dst_block_ids, parallelism, major_order, uuid,
-        layer_idx, wire_layer_idx, group.shards, groups.size(),
+        layer_idx, wire_layer_idx, group.shards, groups.size(), backend,
         AdapterFor(group.numa_node)));
   }
   // Every group returns the same destination ids; keep the first.
@@ -580,7 +580,8 @@ tsl::Future<std::vector<int>> BlockTransport::AsyncPushShards(
     const std::vector<int>& dst_block_ids, int parallelism,
     MajorOrder major_order, uint64_t uuid, int layer_idx,
     std::optional<int> wire_layer_idx, absl::Span<const int> shard_ids,
-    size_t num_groups, lib::TransportAdapter* adapter) {
+    size_t num_groups, TransportBackend backend,
+    lib::TransportAdapter* adapter) {
   auto [promise, future] = tsl::MakePromise<std::vector<int>>();
   // The adapter's completion callback must be copyable, while tsl::Promise is
   // move-only.
@@ -630,11 +631,8 @@ tsl::Future<std::vector<int>> BlockTransport::AsyncPushShards(
     return std::move(future);
   }
 
-  const lib::TransferOp op = dst_block_ids.empty()
-                                 ? lib::TransferOp::kBlockPush
-                                 : lib::TransferOp::kBlockPushExplicit;
   absl::StatusOr<std::vector<std::string>> adapter_peers =
-      SelectAdapterPeers(op, peers);
+      SelectAdapterPeers(backend, peers);
   if (!adapter_peers.ok()) {
     on_complete(adapter_peers.status());
     return std::move(future);
@@ -704,10 +702,12 @@ absl::StatusOr<std::vector<int>> BlockTransport::SyncPullInternal(
   if (static_cast<int>(local_blocks) < P) P = local_blocks;
 
   // TODO(swasthi): Support `kBlockPull` over Peregrine.
+  const TransportBackend backend =
+      BackendForTransfer(lib::TransferOp::kBlockPull, peers);
   ABSL_ASSIGN_OR_RETURN(lib::TransportAdapter* const adapter,
-                        AdapterForOp(lib::TransferOp::kBlockPull));
+                        AdapterForBackend(backend));
   ABSL_ASSIGN_OR_RETURN(const std::vector<std::string> adapter_peers,
-                        SelectAdapterPeers(lib::TransferOp::kBlockPull, peers));
+                        SelectAdapterPeers(backend, peers));
 
   std::vector<int> allocated_ids;
   if (!local_block_ids.empty()) {
@@ -879,17 +879,31 @@ absl::StatusOr<std::vector<lib::Request>> BlockTransport::BuildBlockRequests(
   return requests;
 }
 
-absl::StatusOr<std::vector<std::string>> BlockTransport::SelectAdapterPeers(
+TransportBackend BlockTransport::BackendForTransfer(
     lib::TransferOp op, absl::Span<const PeerEndpoint> peers) const {
+  if (config_.backend_for(op) != TransportBackend::kPeregrine) {
+    return TransportBackend::kSocket;
+  }
+  for (const PeerEndpoint& peer : peers) {
+    if (peer.peregrine.empty()) {
+      LOG_EVERY_N_SEC(WARNING, 60)
+          << "TPU_RAIDEN_ENABLE_PEREGRINE selects Peregrine for block op "
+          << static_cast<int>(op) << ", but peer " << peer.data
+          << " advertises no Peregrine endpoint; using the socket backend for "
+             "this transfer.";
+      return TransportBackend::kSocket;
+    }
+  }
+  return TransportBackend::kPeregrine;
+}
+
+absl::StatusOr<std::vector<std::string>> BlockTransport::SelectAdapterPeers(
+    TransportBackend backend, absl::Span<const PeerEndpoint> peers) const {
   if (peers.empty()) {
     return absl::InvalidArgumentError("Peer list cannot be empty");
   }
-  if (config_.backend_for(op) == TransportBackend::kPeregrine) {
-    if (peers.front().peregrine.empty()) {
-      return absl::FailedPreconditionError(absl::StrCat(
-          "Peer ", peers.front().data,
-          " has no Peregrine control endpoint for op ", static_cast<int>(op)));
-    }
+  if (backend == TransportBackend::kPeregrine) {
+    ABSL_DCHECK(!peers.front().peregrine.empty());
     return std::vector<std::string>{peers.front().peregrine};
   }
   std::vector<std::string> data_peers;
@@ -906,18 +920,17 @@ lib::TransportAdapter* BlockTransport::AdapterFor(int numa_node) {
                                     : transport_adapter_.get();
 }
 
-absl::StatusOr<lib::TransportAdapter*> BlockTransport::AdapterForOp(
-    lib::TransferOp op) {
-  switch (config_.backend_for(op)) {
+absl::StatusOr<lib::TransportAdapter*> BlockTransport::AdapterForBackend(
+    TransportBackend backend) {
+  switch (backend) {
     case TransportBackend::kSocket:
       return transport_adapter_.get();
     case TransportBackend::kPeregrine:
       ABSL_DCHECK(peregrine_adapter_ != nullptr);
       return peregrine_adapter_.get();
   }
-  return absl::InternalError(absl::StrCat(
-      "Unknown transport backend ", static_cast<int>(config_.backend_for(op)),
-      " for block op ", static_cast<int>(op)));
+  return absl::InternalError(
+      absl::StrCat("Unknown transport backend ", static_cast<int>(backend)));
 }
 
 absl::StatusOr<std::vector<lib::Request>>

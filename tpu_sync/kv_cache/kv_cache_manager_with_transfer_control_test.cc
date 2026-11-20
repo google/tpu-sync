@@ -63,6 +63,7 @@
 #include "tpu_sync/kv_cache/transfer_receive_session.h"
 // Needed for the complete type behind FindSessionLocked<TransferSendSession>.
 #include "tpu_sync/kv_cache/transfer_send_session.h"  // IWYU pragma: keep
+#include "tpu_sync/transport/peer_endpoint.h"
 
 namespace tpu_raiden {
 namespace {
@@ -1370,6 +1371,12 @@ TEST(ControlHandshakeTest,
     EXPECT_EQ(std::memcmp(consumer_buf.data() + 0 * kBlockBytes,
                           producer_buf.data() + 3 * kBlockBytes, kBlockBytes),
               0);
+  }
+  // The push went over Peregrine: no socket to a data endpoint was pooled.
+  for (const std::string& ip : consumer.base()->local_ips()) {
+    EXPECT_EQ(producer.base()->transport_server()->IdleConnectionCount(
+                  transport::FormatIpPort(ip, *consumer.base()->local_port())),
+              0u);
   }
 }
 

@@ -19,7 +19,6 @@
 #include <limits>
 #include <memory>
 #include <string>
-#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -150,20 +149,17 @@ using OnPostComplete = PeregrineTransportAdapter::RecvHooks::OnPostComplete;
   };
 }
 
-template <typename Result =
-              std::invoke_result_t<::peregrine::ResolveAddrCallback,
-                                   const MetadataBytes&, const MetadataBytes&>>
 ::peregrine::ResolveAddrCallback MakeResolveAddrCallback(
     PeregrineTransportAdapter::RecvHooks::ResolveAddr hook,
     std::shared_ptr<OnPostComplete> done) {
   return [hook = std::move(hook), done = std::move(done)](
              const MetadataBytes& post_bytes,
-             const MetadataBytes& req_bytes) -> Result {
+             const MetadataBytes& req_bytes) -> absl::Span<uint8_t> {
     absl::StatusOr<PostMetadata> post = DecodePostMetadata(post_bytes);
     if (!post.ok()) {
       LOG(ERROR) << "Rejecting Peregrine Post with undecodable metadata: "
                  << post.status();
-      return Result{};
+      return {};
     }
     absl::StatusOr<RequestMetadata> req =
         DecodeRequestMetadata(*post, req_bytes);
@@ -180,14 +176,9 @@ template <typename Result =
                     "Undecodable request metadata: ", req.status().message())))
             .IgnoreError();
       }
-      return Result{};
+      return {};
     }
-    const absl::Span<uint8_t> buf = hook(*post, *req);
-    if constexpr (std::is_same_v<Result, uint8_t*>) {
-      return buf.data();
-    } else {
-      return buf;
-    }
+    return hook(*post, *req);
   };
 }
 

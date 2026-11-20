@@ -22,6 +22,7 @@
 #include <utility>
 #include <vector>
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
@@ -43,6 +44,8 @@
 #include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry_server.h"
 #include "tpu_sync/kv_cache/global_registry/test_util.h"
+#include "tpu_sync/telemetry/metrics_backend.h"
+#include "tpu_sync/telemetry/mock_metrics_backend.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
@@ -1404,6 +1407,72 @@ TEST_F(GlobalRegistryTest, RegisterAsyncBatchAndEmptyBatch) {
   for (int i = 0; i < kBatchSize; ++i) {
     EXPECT_EQ((*lookup_res)[i].block_id(), i);
   }
+}
+
+auto RegistryRpcLabels(absl::string_view method, absl::string_view status) {
+  return testing::ElementsAre(
+      testing::FieldsAre(telemetry::metric_labels::kMethod,
+                         std::string(method)),
+      testing::FieldsAre(telemetry::metric_labels::kStatus,
+                         std::string(status)));
+}
+
+TEST_F(GlobalRegistryTest,
+       EmitsGlobalRegistryRpcDurationMsForSyncAndAsyncRpcs) {
+  auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+  telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
+
+  EXPECT_CALL(
+      *raw_mock,
+      ObserveHistogram(telemetry::metric_names::kGlobalRegistryRpcDurationMs,
+                       RegistryRpcLabels("RegisterStore", "OK"),
+                       testing::Ge(0.0)))
+      .Times(1);
+  EXPECT_CALL(
+      *raw_mock,
+      ObserveHistogram(telemetry::metric_names::kGlobalRegistryRpcDurationMs,
+                       RegistryRpcLabels("Register", "OK"), testing::Ge(0.0)))
+      .Times(1);
+  EXPECT_CALL(
+      *raw_mock,
+      ObserveHistogram(telemetry::metric_names::kGlobalRegistryRpcDurationMs,
+                       RegistryRpcLabels("Register", "DEADLINE_EXCEEDED"),
+                       testing::Ge(0.0)))
+      .Times(1);
+  EXPECT_CALL(
+      *raw_mock,
+      ObserveHistogram(telemetry::metric_names::kGlobalRegistryRpcDurationMs,
+                       RegistryRpcLabels("Lookup", "OK"), testing::Ge(0.0)))
+      .Times(1);
+  EXPECT_CALL(
+      *raw_mock,
+      ObserveHistogram(telemetry::metric_names::kGlobalRegistryRpcDurationMs,
+                       RegistryRpcLabels("ResolveStore", "NOT_FOUND"),
+                       testing::Ge(0.0)))
+      .Times(1);
+  EXPECT_CALL(
+      *raw_mock,
+      ObserveHistogram(telemetry::metric_names::kGlobalRegistryRpcDurationMs,
+                       RegistryRpcLabels("Unregister", "OK"), testing::Ge(0.0)))
+      .Times(1);
+
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+  RaidenId host = {"telemetry_job", "0", "kv_cache", 0};
+  ABSL_EXPECT_OK(client_->RegisterStore(host, "127.0.0.1:9001",
+                                        "127.0.0.1:9002"));
+  // Empty registration makes no RPC and must not emit a sample.
+  ABSL_EXPECT_OK(client_->RegisterAsync({}).Await());
+  ABSL_EXPECT_OK(client_->RegisterAsync({{"h1", host, 1}}).Await());
+  EXPECT_THAT(
+      client_->RegisterAsync({{"h2", host, 2}}, absl::ZeroDuration()).Await(),
+      absl_testing::StatusIs(absl::StatusCode::kDeadlineExceeded));
+  absl::StatusOr<std::vector<KVBlockMetadata>> found = client_->Lookup({"h1"});
+  ABSL_ASSERT_OK(found);
+  EXPECT_EQ(found->size(), 1);
+  EXPECT_THAT(client_->ResolveStore({"missing_job", "0", "kv_cache", 0}),
+              absl_testing::StatusIs(absl::StatusCode::kNotFound));
+  ABSL_EXPECT_OK(client_->UnregisterAsync({"h1"}, host).Await());
 }
 
 }  // namespace

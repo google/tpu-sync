@@ -14,8 +14,10 @@
 
 #include "tpu_sync/kv_cache/global_registry/global_registry_client.h"
 
+#include <chrono>  // NOLINT(build/c++11)
 #include <cstdint>
 #include <memory>
+#include <ratio>  // NOLINT(build/c++11)
 #include <string>
 #include <utility>
 #include <vector>
@@ -35,6 +37,8 @@
 #include "tpu_sync/common/raiden_id.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry.grpc.pb.h"
 #include "tpu_sync/kv_cache/global_registry/global_registry.pb.h"
+#include "tpu_sync/telemetry/metrics_api.h"
+#include "tpu_sync/telemetry/metrics_backend.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
@@ -80,6 +84,55 @@ void BuildUnregisterRequest(const std::vector<std::string>& prefix_hashes,
   ToProto(raiden_id, request->mutable_raiden_id());
 }
 
+void RecordRpcDurationMs(absl::string_view method, absl::StatusCode code,
+                         std::chrono::steady_clock::time_point start_time) {
+  telemetry::RaidenMetricStore& store =
+      telemetry::RaidenMetricStore::GetGlobalMetricStore();
+  if (!store.HasBackends()) {
+    return;
+  }
+  const double duration_ms =
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - start_time)
+          .count();
+  const telemetry::MetricLabel labels[] = {
+      {telemetry::metric_labels::kMethod, method},
+      {telemetry::metric_labels::kStatus, absl::StatusCodeToStringView(code)},
+  };
+  store.ObserveHistogram(telemetry::metric_names::kGlobalRegistryRpcDurationMs,
+                         labels, duration_ms);
+}
+
+class ScopedRpcTimer {
+ public:
+  explicit ScopedRpcTimer(absl::string_view method)
+      : method_(method),
+        enabled_(telemetry::RaidenMetricStore::GetGlobalMetricStore()
+                     .HasBackends()),
+        start_time_(enabled_ ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point{}) {}
+
+  absl::Status Record(absl::Status status) const {
+    if (enabled_) {
+      RecordRpcDurationMs(method_, status.code(), start_time_);
+    }
+    return status;
+  }
+
+  template <typename T>
+  absl::StatusOr<T> Record(absl::StatusOr<T> result) const {
+    if (enabled_) {
+      RecordRpcDurationMs(method_, result.status().code(), start_time_);
+    }
+    return result;
+  }
+
+ private:
+  absl::string_view method_;
+  bool enabled_;
+  std::chrono::steady_clock::time_point start_time_;
+};
+
 }  // namespace
 
 GlobalRegistryClient::GlobalRegistryClient(
@@ -92,10 +145,19 @@ tsl::Future<> GlobalRegistryClient::RegisterAsync(
     // Nothing to publish, so there is no RPC to make and nothing to wait on.
     return tsl::Future<>(absl::OkStatus());
   }
+  const bool record_metrics =
+      telemetry::RaidenMetricStore::GetGlobalMetricStore().HasBackends();
+  const std::chrono::steady_clock::time_point start_time =
+      record_metrics ? std::chrono::steady_clock::now()
+                     : std::chrono::steady_clock::time_point{};
   if (timeout <= absl::ZeroDuration()) {
     // Already expired. Decided here, not by gRPC: a deadline of exactly "now"
     // races the round trip and on loopback the call usually wins, which would
     // make "zero" silently mean "no timeout" for the callers that matter.
+    if (record_metrics) {
+      RecordRpcDurationMs("Register", absl::StatusCode::kDeadlineExceeded,
+                          start_time);
+    }
     return tsl::Future<>(absl::DeadlineExceededError(
         "Registry call timeout is zero or negative, so it expired before it "
         "was dispatched."));
@@ -112,16 +174,20 @@ tsl::Future<> GlobalRegistryClient::RegisterAsync(
 
   stub_->async()->Register(
       context.get(), request.get(), response.get(),
-      [context, request, response, stub = stub_,
+      [context, request, response, stub = stub_, record_metrics, start_time,
        promise = std::move(promise).ToShared()](grpc::Status status) mutable {
+        absl::Status result;
         if (!status.ok()) {
-          promise->Set(absl::InternalError(status.error_message()));
+          result = absl::InternalError(status.error_message());
         } else if (!response->success()) {
-          promise->Set(
-              absl::FailedPreconditionError(response->error_message()));
+          result = absl::FailedPreconditionError(response->error_message());
         } else {
-          promise->Set(absl::OkStatus());
+          result = absl::OkStatus();
         }
+        if (record_metrics) {
+          RecordRpcDurationMs("Register", result.code(), start_time);
+        }
+        promise->Set(std::move(result));
       });
   return future;
 }
@@ -134,6 +200,7 @@ absl::Status GlobalRegistryClient::Register(
 absl::StatusOr<std::vector<KVBlockMetadata>> GlobalRegistryClient::Lookup(
     const std::vector<std::string>& prefix_hashes,
     const RaidenId& client_raiden_id) {
+  ScopedRpcTimer timer("Lookup");
   LookupRequest request;
   request.mutable_prefix_hashes()->Reserve(prefix_hashes.size());
   for (const auto& hash : prefix_hashes) {
@@ -148,7 +215,8 @@ absl::StatusOr<std::vector<KVBlockMetadata>> GlobalRegistryClient::Lookup(
   grpc::Status status = stub_->Lookup(&context, request, &response);
 
   if (!status.ok()) {
-    return absl::InternalError(status.error_message());
+    return timer.Record<std::vector<KVBlockMetadata>>(
+        absl::InternalError(status.error_message()));
   }
 
   std::vector<KVBlockMetadata> result;
@@ -156,11 +224,13 @@ absl::StatusOr<std::vector<KVBlockMetadata>> GlobalRegistryClient::Lookup(
   for (const auto& meta : response.results()) {
     result.push_back(meta);
   }
-  return result;
+  return timer.Record(absl::StatusOr<std::vector<KVBlockMetadata>>(
+      std::move(result)));
 }
 
 absl::StatusOr<std::vector<GlobalRegistryClient::PulledEntry>>
 GlobalRegistryClient::PullOwned(const RaidenId& raiden_id) {
+  ScopedRpcTimer timer("PullOwned");
   PullOwnedRequest request;
   ToProto(raiden_id, request.mutable_raiden_id());
 
@@ -179,9 +249,11 @@ GlobalRegistryClient::PullOwned(const RaidenId& raiden_id) {
 
   grpc::Status status = reader->Finish();
   if (!status.ok()) {
-    return absl::InternalError(status.error_message());
+    return timer.Record<std::vector<PulledEntry>>(
+        absl::InternalError(status.error_message()));
   }
-  return entries;
+  return timer.Record(
+      absl::StatusOr<std::vector<PulledEntry>>(std::move(entries)));
 }
 
 tsl::Future<> GlobalRegistryClient::UnregisterAsync(
@@ -191,10 +263,19 @@ tsl::Future<> GlobalRegistryClient::UnregisterAsync(
     // Nothing to withdraw, so there is no RPC to make and nothing to wait on.
     return tsl::Future<>(absl::OkStatus());
   }
+  const bool record_metrics =
+      telemetry::RaidenMetricStore::GetGlobalMetricStore().HasBackends();
+  const std::chrono::steady_clock::time_point start_time =
+      record_metrics ? std::chrono::steady_clock::now()
+                     : std::chrono::steady_clock::time_point{};
   if (timeout <= absl::ZeroDuration()) {
     // Already expired. Decided here, not by gRPC: a deadline of exactly "now"
     // races the round trip and on loopback the call usually wins, which would
     // make "zero" silently mean "no timeout" for the callers that matter.
+    if (record_metrics) {
+      RecordRpcDurationMs("Unregister", absl::StatusCode::kDeadlineExceeded,
+                          start_time);
+    }
     return tsl::Future<>(absl::DeadlineExceededError(
         "Registry call timeout is zero or negative, so it expired before it "
         "was dispatched."));
@@ -211,16 +292,20 @@ tsl::Future<> GlobalRegistryClient::UnregisterAsync(
 
   stub_->async()->Unregister(
       context.get(), request.get(), response.get(),
-      [context, request, response, stub = stub_,
+      [context, request, response, stub = stub_, record_metrics, start_time,
        promise = std::move(promise).ToShared()](grpc::Status status) mutable {
+        absl::Status result;
         if (!status.ok()) {
-          promise->Set(absl::InternalError(status.error_message()));
+          result = absl::InternalError(status.error_message());
         } else if (!response->success()) {
-          promise->Set(
-              absl::FailedPreconditionError(response->error_message()));
+          result = absl::FailedPreconditionError(response->error_message());
         } else {
-          promise->Set(absl::OkStatus());
+          result = absl::OkStatus();
         }
+        if (record_metrics) {
+          RecordRpcDurationMs("Unregister", result.code(), start_time);
+        }
+        promise->Set(std::move(result));
       });
   return future;
 }
@@ -235,6 +320,7 @@ absl::Status GlobalRegistryClient::RegisterStore(
     const RaidenId& raiden_id, absl::string_view store_server_address,
     absl::string_view controller_address, absl::Duration ttl,
     absl::string_view kv_pool_group, int32_t evict_tier) {
+  ScopedRpcTimer timer("RegisterStore");
   RegisterStoreRequest request;
   StoreInfo* store = request.mutable_store();
   ToProto(raiden_id, store->mutable_raiden_id());
@@ -253,16 +339,18 @@ absl::Status GlobalRegistryClient::RegisterStore(
   grpc::Status status = stub_->RegisterStore(&context, request, &response);
 
   if (!status.ok()) {
-    return absl::InternalError(status.error_message());
+    return timer.Record(absl::InternalError(status.error_message()));
   }
   if (!response.success()) {
-    return absl::FailedPreconditionError(response.error_message());
+    return timer.Record(
+        absl::FailedPreconditionError(response.error_message()));
   }
-  return absl::OkStatus();
+  return timer.Record(absl::OkStatus());
 }
 
 absl::StatusOr<StoreInfo> GlobalRegistryClient::ResolveStore(
     const RaidenId& raiden_id) {
+  ScopedRpcTimer timer("ResolveStore");
   ResolveStoreRequest request;
   ToProto(raiden_id, request.mutable_raiden_id());
 
@@ -271,18 +359,19 @@ absl::StatusOr<StoreInfo> GlobalRegistryClient::ResolveStore(
   grpc::Status status = stub_->ResolveStore(&context, request, &response);
 
   if (!status.ok()) {
-    return absl::InternalError(status.error_message());
+    return timer.Record<StoreInfo>(absl::InternalError(status.error_message()));
   }
   if (!response.found()) {
-    return absl::NotFoundError(
+    return timer.Record<StoreInfo>(absl::NotFoundError(
         absl::StrCat("no store registered for raiden_id ", raiden_id.job_name,
                      "/", raiden_id.job_replica_id, "/", raiden_id.data_name,
-                     "/", raiden_id.data_replica_idx));
+                     "/", raiden_id.data_replica_idx)));
   }
-  return response.store();
+  return timer.Record(absl::StatusOr<StoreInfo>(response.store()));
 }
 
 absl::Status GlobalRegistryClient::UnregisterStore(const RaidenId& raiden_id) {
+  ScopedRpcTimer timer("UnregisterStore");
   UnregisterStoreRequest request;
   ToProto(raiden_id, request.mutable_raiden_id());
 
@@ -291,15 +380,16 @@ absl::Status GlobalRegistryClient::UnregisterStore(const RaidenId& raiden_id) {
   grpc::Status status = stub_->UnregisterStore(&context, request, &response);
 
   if (!status.ok()) {
-    return absl::InternalError(status.error_message());
+    return timer.Record(absl::InternalError(status.error_message()));
   }
   // Deliberately not an error when nothing was registered: teardown must be
   // idempotent, and a store that never registered still calls this.
-  return absl::OkStatus();
+  return timer.Record(absl::OkStatus());
 }
 
 absl::Status GlobalRegistryClient::Heartbeat(const RaidenId& raiden_id,
                                              const StoreStatus& status) {
+  ScopedRpcTimer timer("Heartbeat");
   HeartbeatRequest request;
   ToProto(raiden_id, request.mutable_raiden_id());
   *request.mutable_status() = status;
@@ -311,18 +401,19 @@ absl::Status GlobalRegistryClient::Heartbeat(const RaidenId& raiden_id,
   grpc::Status rpc_status = stub_->Heartbeat(&context, request, &response);
 
   if (!rpc_status.ok()) {
-    return absl::InternalError(rpc_status.error_message());
+    return timer.Record(absl::InternalError(rpc_status.error_message()));
   }
   if (!response.registered()) {
-    return absl::NotFoundError(
-        "no live store registration to refresh; RegisterStore again");
+    return timer.Record(absl::NotFoundError(
+        "no live store registration to refresh; RegisterStore again"));
   }
-  return absl::OkStatus();
+  return timer.Record(absl::OkStatus());
 }
 
 absl::StatusOr<std::vector<StoreInfo>>
 GlobalRegistryClient::GetPlacementTargets(const RaidenId& raiden_id,
                                           int32_t max_targets) {
+  ScopedRpcTimer timer("GetPlacementTargets");
   GetPlacementTargetsRequest request;
   ToProto(raiden_id, request.mutable_raiden_id());
   request.set_max_targets(max_targets);
@@ -337,16 +428,19 @@ GlobalRegistryClient::GetPlacementTargets(const RaidenId& raiden_id,
   if (!status.ok()) {
     // Preserve the gRPC code (grpc and absl codes match 1:1): NotFound is the
     // caller's cue to RegisterStore again, not a transport failure.
-    return absl::Status(static_cast<absl::StatusCode>(status.error_code()),
-                        status.error_message());
+    return timer.Record<std::vector<StoreInfo>>(
+        absl::Status(static_cast<absl::StatusCode>(status.error_code()),
+                     status.error_message()));
   }
   // An empty list is an answer (bottom tier), not an error.
-  return std::vector<StoreInfo>(response.targets().begin(),
-                                response.targets().end());
+  return timer.Record(absl::StatusOr<std::vector<StoreInfo>>(
+      std::vector<StoreInfo>(response.targets().begin(),
+                             response.targets().end())));
 }
 
 absl::Status GlobalRegistryClient::RegisterKVTransferSpec(
     const KVTransferSpec& spec, absl::string_view kv_pool_group) {
+  ScopedRpcTimer timer("RegisterKVTransferSpec");
   RegisterKVTransferSpecRequest request;
   *request.mutable_spec() = spec;
   request.set_kv_pool_group(std::string(kv_pool_group));
@@ -359,17 +453,19 @@ absl::Status GlobalRegistryClient::RegisterKVTransferSpec(
   if (!status.ok()) {
     // Preserve the gRPC code (grpc and absl codes match 1:1) so callers can
     // tell retryable transport conditions apart.
-    return absl::Status(static_cast<absl::StatusCode>(status.error_code()),
-                        status.error_message());
+    return timer.Record(
+        absl::Status(static_cast<absl::StatusCode>(status.error_code()),
+                     status.error_message()));
   }
   if (!response.success()) {
-    return absl::InvalidArgumentError(response.error_message());
+    return timer.Record(absl::InvalidArgumentError(response.error_message()));
   }
-  return absl::OkStatus();
+  return timer.Record(absl::OkStatus());
 }
 
 absl::StatusOr<KVTransferSpec> GlobalRegistryClient::GetKVTransferSpec(
     absl::string_view kv_pool_group) {
+  ScopedRpcTimer timer("GetKVTransferSpec");
   GetKVTransferSpecRequest request;
   request.set_kv_pool_group(std::string(kv_pool_group));
 
@@ -380,13 +476,15 @@ absl::StatusOr<KVTransferSpec> GlobalRegistryClient::GetKVTransferSpec(
   if (!status.ok()) {
     // Preserve the gRPC code (grpc and absl codes match 1:1) so callers can
     // tell retryable transport conditions apart.
-    return absl::Status(static_cast<absl::StatusCode>(status.error_code()),
-                        status.error_message());
+    return timer.Record<KVTransferSpec>(
+        absl::Status(static_cast<absl::StatusCode>(status.error_code()),
+                     status.error_message()));
   }
   if (!response.found()) {
-    return absl::NotFoundError("no KVTransferSpec published yet");
+    return timer.Record<KVTransferSpec>(
+        absl::NotFoundError("no KVTransferSpec published yet"));
   }
-  return response.spec();
+  return timer.Record(absl::StatusOr<KVTransferSpec>(response.spec()));
 }
 
 std::string CalculatePrefixHash(const std::vector<int64_t>& tokens,

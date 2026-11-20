@@ -466,6 +466,56 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_THAT(metric_metadata::kStorageMetadataCheckTotal.label_names,
               ElementsAre(metric_labels::kDpRank, metric_labels::kResult));
 
+  // Storage Lookup Duration Metrics
+  EXPECT_EQ(metric_names::kStorageLookupDurationMs,
+            "storage_lookup_duration_ms");
+  EXPECT_EQ(metric_descriptions::kStorageLookupDurationMs,
+            "Duration in milliseconds of secondary storage metadata existence "
+            "probing per lookup batch.");
+  EXPECT_EQ(metric_metadata::kStorageLookupDurationMs.name,
+            "storage_lookup_duration_ms");
+  EXPECT_EQ(metric_metadata::kStorageLookupDurationMs.description,
+            "Duration in milliseconds of secondary storage metadata existence "
+            "probing per lookup batch.");
+  EXPECT_EQ(metric_metadata::kStorageLookupDurationMs.type,
+            MetricType::kHistogram);
+  EXPECT_THAT(metric_metadata::kStorageLookupDurationMs.label_names,
+              ElementsAre(metric_labels::kDpRank));
+
+  // Storage I/O Error Metrics
+  EXPECT_EQ(metric_names::kStorageIoErrorsTotal, "storage_io_errors_total");
+  EXPECT_EQ(metric_descriptions::kStorageIoErrorsTotal,
+            "Cumulative count of secondary storage I/O failures by rank, "
+            "direction, and status code.");
+  EXPECT_EQ(metric_metadata::kStorageIoErrorsTotal.name,
+            "storage_io_errors_total");
+  EXPECT_EQ(metric_metadata::kStorageIoErrorsTotal.description,
+            "Cumulative count of secondary storage I/O failures by rank, "
+            "direction, and status code.");
+  EXPECT_EQ(metric_metadata::kStorageIoErrorsTotal.type, MetricType::kCounter);
+  EXPECT_THAT(metric_metadata::kStorageIoErrorsTotal.label_names,
+              ElementsAre(metric_labels::kLocalRank,
+                          metric_labels::kDirection,
+                          metric_labels::kErrorCode));
+
+  // Global Registry RPC Metrics
+  EXPECT_EQ(metric_labels::kMethod, "method");
+  EXPECT_EQ(metric_labels::kStatus, "status");
+  EXPECT_EQ(metric_names::kGlobalRegistryRpcDurationMs,
+            "global_registry_rpc_duration_ms");
+  EXPECT_EQ(metric_descriptions::kGlobalRegistryRpcDurationMs,
+            "Duration in milliseconds of GlobalRegistryClient RPCs by method "
+            "and status code.");
+  EXPECT_EQ(metric_metadata::kGlobalRegistryRpcDurationMs.name,
+            "global_registry_rpc_duration_ms");
+  EXPECT_EQ(metric_metadata::kGlobalRegistryRpcDurationMs.description,
+            "Duration in milliseconds of GlobalRegistryClient RPCs by method "
+            "and status code.");
+  EXPECT_EQ(metric_metadata::kGlobalRegistryRpcDurationMs.type,
+            MetricType::kHistogram);
+  EXPECT_THAT(metric_metadata::kGlobalRegistryRpcDurationMs.label_names,
+              ElementsAre(metric_labels::kMethod, metric_labels::kStatus));
+
   // Direction Labels
   EXPECT_EQ(metric_labels::kDirection, "direction");
   EXPECT_EQ(metric_labels::kDirectionPush, "push");
@@ -634,7 +684,10 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
           metric_metadata::kHostNumaMemoryBytes,
           metric_metadata::kStorageFilesystemBytes,
           metric_metadata::kStorageMetadataCheckTotal,
+          metric_metadata::kStorageLookupDurationMs,
+          metric_metadata::kGlobalRegistryRpcDurationMs,
           metric_metadata::kStorageIoTimeMs,
+          metric_metadata::kStorageIoErrorsTotal,
           metric_metadata::kHostPoolBlocks,
           metric_metadata::kWeightSyncSentBytesTotal,
           metric_metadata::kWeightSyncReceivedBytesTotal,

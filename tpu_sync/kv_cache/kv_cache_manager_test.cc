@@ -3817,6 +3817,213 @@ TEST(KVCacheManagerTest,
   EXPECT_THAT(read_fail.Await(), StatusIs(absl::StatusCode::kNotFound));
 }
 
+auto StorageIoErrorLabels(absl::string_view local_rank,
+                          absl::string_view direction,
+                          absl::string_view error_code) {
+  return testing::ElementsAre(
+      testing::FieldsAre(telemetry::metric_labels::kLocalRank,
+                         std::string(local_rank)),
+      testing::FieldsAre(telemetry::metric_labels::kDirection,
+                         std::string(direction)),
+      testing::FieldsAre(telemetry::metric_labels::kErrorCode,
+                         std::string(error_code)));
+}
+
+TEST(KVCacheManagerTest, FailedStorageWriteOrReadEmitsStorageIoErrorsTotal) {
+  ScopedEnvVar restore_local_rank(telemetry::kLocalRankEnvVar, "3");
+
+  TestKVCacheManager single_shard_mgr(/*num_layers=*/1, /*num_shards=*/1,
+                                      /*slice_byte_size=*/128,
+                                      /*host_blocks=*/2);
+  TestKVCacheManager multi_shard_mgr(/*num_layers=*/1, /*num_shards=*/2,
+                                     /*slice_byte_size=*/128,
+                                     /*host_blocks=*/2);
+
+  auto mock_backend =
+      std::make_unique<testing::NiceMock<telemetry::MockMetricsBackend>>();
+  telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
+
+  EXPECT_CALL(*raw_mock,
+              IncrementCounter(
+                  testing::Ne(telemetry::metric_names::kStorageIoErrorsTotal),
+                  testing::_, testing::_))
+      .Times(testing::AnyNumber());
+
+  EXPECT_CALL(
+      *raw_mock,
+      IncrementCounter(
+          telemetry::metric_names::kStorageIoErrorsTotal,
+          StorageIoErrorLabels("3", telemetry::metric_labels::kDirectionWrite,
+                               "UNAVAILABLE"),
+          1))
+      .Times(1);
+  EXPECT_CALL(
+      *raw_mock,
+      IncrementCounter(
+          telemetry::metric_names::kStorageIoErrorsTotal,
+          StorageIoErrorLabels("3", telemetry::metric_labels::kDirectionRead,
+                               "NOT_FOUND"),
+          1))
+      .Times(1);
+  for (absl::string_view rank : {"0", "1"}) {
+    EXPECT_CALL(
+        *raw_mock,
+        IncrementCounter(telemetry::metric_names::kStorageIoErrorsTotal,
+                         StorageIoErrorLabels(
+                             rank, telemetry::metric_labels::kDirectionWrite,
+                             "UNAVAILABLE"),
+                         1))
+        .Times(1);
+    EXPECT_CALL(
+        *raw_mock,
+        IncrementCounter(
+            telemetry::metric_names::kStorageIoErrorsTotal,
+            StorageIoErrorLabels(rank, telemetry::metric_labels::kDirectionRead,
+                                 "NOT_FOUND"),
+            1))
+        .Times(1);
+  }
+
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+  auto ok_backend = std::make_shared<ConfigurableFakeKVBackend>();
+  auto fail_backend = std::make_shared<ConfigurableFakeKVBackend>(
+      absl::UnavailableError("simulated storage write failure"),
+      absl::NotFoundError("simulated storage read failure"),
+      /*fail_block_hash=*/"fail1");
+
+  const std::vector<backends::BlockKey> keys = {
+      {.block_hash = "ok0", .resolved_key = "/tmp/ok0"},
+      {.block_hash = "fail1", .resolved_key = "/tmp/fail1"}};
+  const std::vector<int64_t> block_ids = {0, 1};
+
+  // Succeeding write/read must not increment storage_io_errors_total.
+  TF_ASSERT_OK_AND_ASSIGN(
+      raiden::PjRtCopyFuture ok_write,
+      single_shard_mgr.D2hWriteToBackend({ok_backend}, keys, block_ids,
+                                         block_ids));
+  ABSL_EXPECT_OK(ok_write.Await());
+  TF_ASSERT_OK_AND_ASSIGN(
+      raiden::PjRtCopyFuture ok_read,
+      single_shard_mgr.H2dReadFromBackend({ok_backend}, keys, block_ids,
+                                          block_ids));
+  ABSL_EXPECT_OK(ok_read.Await());
+
+  // Failing block "fail1" increments storage_io_errors_total once per shard.
+  TF_ASSERT_OK_AND_ASSIGN(
+      raiden::PjRtCopyFuture single_write_fail,
+      single_shard_mgr.D2hWriteToBackend({fail_backend}, keys, block_ids,
+                                         block_ids));
+  EXPECT_THAT(single_write_fail.Await(),
+              StatusIs(absl::StatusCode::kUnavailable));
+  TF_ASSERT_OK_AND_ASSIGN(
+      raiden::PjRtCopyFuture single_read_fail,
+      single_shard_mgr.H2dReadFromBackend({fail_backend}, keys, block_ids,
+                                          block_ids));
+  EXPECT_THAT(single_read_fail.Await(), StatusIs(absl::StatusCode::kNotFound));
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      raiden::PjRtCopyFuture multi_write_fail,
+      multi_shard_mgr.D2hWriteToBackend({fail_backend}, keys, block_ids,
+                                        block_ids));
+  EXPECT_THAT(multi_write_fail.Await(),
+              StatusIs(absl::StatusCode::kUnavailable));
+  TF_ASSERT_OK_AND_ASSIGN(
+      raiden::PjRtCopyFuture multi_read_fail,
+      multi_shard_mgr.H2dReadFromBackend({fail_backend}, keys, block_ids,
+                                         block_ids));
+  EXPECT_THAT(multi_read_fail.Await(), StatusIs(absl::StatusCode::kNotFound));
+}
+
+TEST(KVCacheManagerTest, D2hWriteToBackendEmitsD2hDmaTelemetry) {
+  ScopedEnvVar restore_local_rank(telemetry::kLocalRankEnvVar, "3");
+
+  // 2 layers * 128 bytes/slice = 256 bytes per shard per block.
+  TestKVCacheManager single_shard_mgr(/*num_layers=*/2, /*num_shards=*/1,
+                                      /*slice_byte_size=*/128,
+                                      /*host_blocks=*/2);
+  TestKVCacheManager multi_shard_mgr(/*num_layers=*/2, /*num_shards=*/2,
+                                     /*slice_byte_size=*/128,
+                                     /*host_blocks=*/2);
+
+  auto mock_backend =
+      std::make_unique<testing::NiceMock<telemetry::MockMetricsBackend>>();
+  telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
+
+  EXPECT_CALL(*raw_mock,
+              IncrementCounter(
+                  testing::Ne(telemetry::metric_names::kD2hBytesTotal),
+                  testing::_, testing::_))
+      .Times(testing::AnyNumber());
+  EXPECT_CALL(
+      *raw_mock,
+      ObserveHistogram(
+          testing::AllOf(
+              testing::Ne(telemetry::metric_names::kD2hDmaTimeMs),
+              testing::Ne(telemetry::metric_names::kD2hTransferTimeMs)),
+          testing::_, testing::_))
+      .Times(testing::AnyNumber());
+
+  auto pcie_labels = [](absl::string_view host_ip,
+                        absl::string_view local_rank) {
+    return testing::ElementsAre(
+        testing::FieldsAre(telemetry::metric_labels::kHostIp,
+                           std::string(host_ip)),
+        testing::FieldsAre(telemetry::metric_labels::kLocalRank,
+                           std::string(local_rank)));
+  };
+
+  // 2 blocks -> 2 D2H chunks per manager.
+  EXPECT_CALL(*raw_mock,
+              ObserveHistogram(telemetry::metric_names::kD2hTransferTimeMs,
+                               testing::IsEmpty(), testing::Ge(0.0)))
+      .Times(4);
+  EXPECT_CALL(*raw_mock,
+              ObserveHistogram(
+                  telemetry::metric_names::kD2hDmaTimeMs,
+                  pcie_labels(single_shard_mgr.local_ip(), "3"),
+                  testing::Ge(0.0)))
+      .Times(2);
+  EXPECT_CALL(*raw_mock,
+              IncrementCounter(
+                  telemetry::metric_names::kD2hBytesTotal,
+                  pcie_labels(single_shard_mgr.local_ip(), "3"), 256))
+      .Times(2);
+  for (absl::string_view rank : {"0", "1"}) {
+    EXPECT_CALL(*raw_mock,
+                ObserveHistogram(
+                    telemetry::metric_names::kD2hDmaTimeMs,
+                    pcie_labels(multi_shard_mgr.local_ip(), rank),
+                    testing::Ge(0.0)))
+        .Times(2);
+    EXPECT_CALL(*raw_mock,
+                IncrementCounter(
+                    telemetry::metric_names::kD2hBytesTotal,
+                    pcie_labels(multi_shard_mgr.local_ip(), rank), 256))
+        .Times(2);
+  }
+
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+  auto fake_backend = std::make_shared<ConfigurableFakeKVBackend>();
+  const std::vector<backends::BlockKey> keys = {
+      {.block_hash = "k0", .resolved_key = "/tmp/k0"},
+      {.block_hash = "k1", .resolved_key = "/tmp/k1"}};
+  const std::vector<int64_t> block_ids = {0, 1};
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      raiden::PjRtCopyFuture single_write,
+      single_shard_mgr.D2hWriteToBackend({fake_backend}, keys, block_ids,
+                                         block_ids));
+  ABSL_EXPECT_OK(single_write.Await());
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      raiden::PjRtCopyFuture multi_write,
+      multi_shard_mgr.D2hWriteToBackend({fake_backend}, keys, block_ids,
+                                        block_ids));
+  ABSL_EXPECT_OK(multi_write.Await());
+}
+
 void AdvanceSteadyClock(std::chrono::nanoseconds delta) {
   const std::chrono::steady_clock::time_point start =
       std::chrono::steady_clock::now();

@@ -20,15 +20,17 @@ package tpu_sync.rpc;
 option java_multiple_files = true;
 option java_outer_classname = "WeightTransferCommonProto";
 
-// Opaque version identifier for a set of weights (0 to 256 bytes), compared
-// bytewise for equality. An unset message or empty `tag` denotes the default
-// version (version 0).
+// Opaque version identifier for a set of weights, compared bytewise for
+// equality.
 message WeightVersion {
+  // 0 to 256 bytes; empty (or an unset message) denotes the default version 0.
   bytes tag = 1;
 }
 
-// Canonical absl::Status representation (code 0 = OK).
+// Canonical absl::Status representation.
 message StatusProto {
+  // absl::StatusCode; 0 is OK.
   int32 code = 1;
+  // Error message; empty when OK.
   string message = 2;
 }

@@ -29,15 +29,22 @@ option java_outer_classname = "WeightTransferWorkerServiceProto";
 // Each push moves one `WeightVersion` in an attempt identified by a positive
 // `uuid` (never reused; retries use a new uuid):
 //   1. Coordinated push: coordinator calls `PrepareWeightReceiveRequest` on
-//      receivers, then `StartWeightPushRequest` (mode `coordinated`) on
-//      senders.
-//   2. Direct push: each sender prepares and awaits its own receivers via
-//      `StartWeightPushRequest` (mode `direct`; not implemented yet).
+//      receivers, `StartWeightPushRequest` (mode `coordinated`) on senders,
+//      then each receiver reports its outcome to the coordinator with
+//      `ReportWeightReceiveRequest` (not implemented yet).
+//   2. Direct push: each sender prepares its own receivers and awaits them with
+//      `AwaitWeightReceiveRequest`, via `StartWeightPushRequest` (mode
+//      `direct`; not implemented yet).
 //
 // Shared conventions:
+// - A worker is one weight synchronizer (its listener and data endpoints); a
+//   host may run several, e.g. one per Torch process or Pathways synchronizer
+//   group.
+// - Workers serve every request here except `ReportWeightReceiveRequest`,
+//   which the coordinator serves.
 // - `target_incarnation_id`: non-zero must match the worker's incarnation ID
 //   (else FAILED_PRECONDITION); 0 skips the check.
-// - Timeouts (`timeout_ms`, `receive_timeout_ms`): milliseconds in [0, 1 h].
+// - Timeouts (`timeout_ms`, `receive_timeout_ms`): milliseconds, at most 1 h.
 
 // Outcome of a push for one receiver.
 message PeerResult {
@@ -49,9 +56,62 @@ message PeerResult {
   }
   // Receiver's listener endpoint (or data endpoint for coordinated pushes).
   string peer = 1;
+  // OK if every phase succeeded, else the error of `phase`.
   StatusProto status = 2;
   // Last phase reached.
   Phase phase = 3;
+}
+
+// Local shard mapping reported by a worker.
+message ShardAddress {
+  // Global shard index.
+  int64 global_shard = 1;
+  // `ShardPushEntryProto.dst_shard_idx` that addresses this shard.
+  int32 dst_shard_idx = 2;
+}
+
+// One data endpoint of a worker: a local IP (normally a data NIC NUMA-local to
+// its shards, or `bind_ip`) with the worker's data port.
+message DataEndpoint {
+  // "ip:port" (or "[ip]:port" for IPv6).
+  string endpoint = 1;
+  // Shards to send through this endpoint; each shard is listed at least once.
+  repeated ShardAddress shards = 2;
+}
+
+// Layout of staged bytes for a layer.
+enum StagingLayout {
+  STAGING_LAYOUT_UNSPECIFIED = 0;
+  // Row-major logical bytes of each shard.
+  STAGING_LAYOUT_LOGICAL = 1;
+  // Raw device-layout bytes.
+  STAGING_LAYOUT_DEVICE = 2;
+}
+
+// Logical shape of a shard.
+message LogicalShape {
+  // xla::PrimitiveType.
+  int32 element_type = 1;
+  // Dimension sizes.
+  repeated int64 dims = 2;
+}
+
+// Physical extent of one (layer, global shard) as staged.
+message ShardExtent {
+  // Layer index.
+  int32 layer_idx = 1;
+  // Global shard index.
+  int64 global_shard = 2;
+  // The shard's on-device size in bytes (the slice size on CPU-only workers).
+  int64 device_bytes = 3;
+  // `ShapeUtil::HumanStringWithLayout` of the shard's device shape (the held
+  // version's in serve replies); empty if unknown.
+  string layout_fingerprint = 4;
+  // Layout recorded on commit; unset in receive prepare replies.
+  StagingLayout layout = 5;
+  // Recorded by the version's writer, else derived from the bound device shape;
+  // unset if neither.
+  LogicalShape logical_shape = 6;
 }
 
 // Per-layer chunk counts sent by one sender to one receiver.
@@ -64,12 +124,16 @@ message Chunks {
 
 // Phase 1: prepares this receiver to accept `version` for transfer `uuid`.
 message PrepareWeightReceiveRequest {
+  // Transfer attempt ID; positive and never reused.
   int64 uuid = 1;
   // Unset or empty `tag` denotes the default version (version 0).
   WeightVersion version = 2;
+  // Expected receiver incarnation; 0 skips the check.
   int64 target_incarnation_id = 3;
+  // How this receiver tiles arriving bytes.
   HostTilingMode host_tiling_mode = 4;
-  // Layer index -> true to skip tiling when layouts match.
+  // Layer index -> true to skip (de)tiling; set only when both sides' shard
+  // shapes and layouts match.
   map<int32, bool> skip_tiling = 5;
   // Optional correlation ID for logging.
   string req_id = 6;
@@ -77,12 +141,79 @@ message PrepareWeightReceiveRequest {
   repeated string expected_senders = 7;
   // Per-sender chunk counts; must cover `expected_senders`.
   repeated Chunks chunks = 8;
-  // Receive deadline in milliseconds; 0 disables deadline (not implemented
-  // yet).
+  // Receive deadline in milliseconds; 0 means none (positive values are not
+  // implemented yet).
   int64 receive_timeout_ms = 9;
+  // Set by a coordinator to get the outcome reported back (not implemented
+  // yet); direct-push senders leave it unset and await instead.
+  ReportTo report_to = 10;
 }
 
-message PrepareWeightReceiveResponse {}
+// Where a receiver reports its outcome in a coordinated push; both fields are
+// required.
+message ReportTo {
+  // Coordinator endpoint that serves `ReportWeightReceiveRequest`.
+  string endpoint = 1;
+  // Opaque receiver ID that the report echoes back.
+  string receiver = 2;
+}
+
+// Receiver physical metadata returned to planners/direct senders (currently
+// left empty).
+message PrepareWeightReceiveResponse {
+  // Incarnation that accepted the prepare; later requests can target it.
+  int64 incarnation_id = 1;
+  // Data endpoints, with the `dst_shard_idx` of each local shard.
+  repeated DataEndpoint data_endpoints = 2;
+  // Staging buffer extents, which identity senders check before pushing.
+  repeated ShardExtent shards = 3;
+}
+
+// Long-poll wait for receive `uuid` to commit on this receiver, used by
+// direct-push senders (not implemented yet).
+message AwaitWeightReceiveRequest {
+  // Receive attempt to await.
+  int64 uuid = 1;
+  // Unset or empty `tag` denotes the default version (version 0).
+  WeightVersion version = 2;
+  // Receiver incarnation from the prepare reply; 0 skips the check.
+  int64 target_incarnation_id = 3;
+  // Max wait in milliseconds; required in (0, 1 h].
+  int64 timeout_ms = 4;
+}
+
+message AwaitWeightReceiveResponse {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    // The receive committed `committed_version`.
+    STATE_COMMITTED = 1;
+    // The wait ended first; the receive is still in progress.
+    STATE_PENDING = 2;
+  }
+  // Outcome of the wait.
+  State state = 1;
+  // Populated when `state == STATE_COMMITTED`.
+  WeightVersion committed_version = 2;
+}
+
+// Receiver -> coordinator: the outcome of receive `uuid`, sent once the receive
+// finishes when its prepare set `report_to` (not implemented yet). Delivery is
+// at least once; the coordinator ignores duplicates.
+message ReportWeightReceiveRequest {
+  // Receive attempt.
+  int64 uuid = 1;
+  // `ReportTo.receiver` from the prepare.
+  string receiver = 2;
+  // Reporting receiver's incarnation.
+  int64 incarnation_id = 3;
+  // OK if the receive committed, else why not (e.g. ABORTED if superseded,
+  // DEADLINE_EXCEEDED if expired).
+  StatusProto status = 4;
+  // Version committed when `status` is OK.
+  WeightVersion committed_version = 5;
+}
+
+message ReportWeightReceiveResponse {}
 
 // Push mode where a coordinator has already prepared the receivers.
 message CoordinatedPush {
@@ -101,18 +232,23 @@ message PushSchedules {
 
 // Identity push plan: sends whole receiver shards 1:1 without resharding.
 message IdentityPush {
+  // Receiver global shards this sender sends whole.
   repeated int64 global_shards = 1;
 }
 
 // One receiver of a direct push.
 message PushDestination {
+  // Receiver's listener endpoint.
   string listener_endpoint = 1;
+  // Expected receiver incarnation; 0 skips the check.
   int64 target_incarnation_id = 2;
   // Full sender roster for the receiver; must contain `DirectPush.sender`.
   repeated string expected_senders = 3;
   // Required.
   oneof plan {
+    // Explicit per-shard schedules.
     PushSchedules schedules = 4;
+    // Whole receiver shards, without resharding.
     IdentityPush identity = 5;
   }
 }
@@ -125,27 +261,39 @@ message DirectPush {
   int64 receive_timeout_ms = 1;
   // This sender's ID ("raiden/" prefix is reserved).
   string sender = 2;
+  // Receivers to push to; non-empty.
   repeated PushDestination destinations = 3;
+  // Copied into each receiver's prepare as `host_tiling_mode`.
   HostTilingMode receiver_host_tiling_mode = 4;
 }
 
-// Phase 2: executes the sender side of a weight push.
+// Phase 2: executes the sender side of a weight push. A coordinated push
+// returns once batches are ACKed; receivers report their commits separately
+// (`ReportWeightReceiveRequest`).
 message StartWeightPushRequest {
+  // Transfer attempt ID; positive and never reused.
   int64 uuid = 1;
+  // Expected sender incarnation; 0 skips the check.
   int64 target_incarnation_id = 2;
   // Stream directly from host staging buffers without D2H staging.
   bool skip_d2h = 4;
+  // Sender-side tiling mode (PRE_TILED for relays).
   HostTilingMode host_tiling_mode = 5;
+  // Layer index -> true to skip (de)tiling; set only when both sides' shard
+  // shapes and layouts match.
   map<int32, bool> skip_tiling = 6;
   // Optional stream parallelism override; 0 uses worker default.
   int32 parallelism = 7;
+  // Optional correlation ID for logging.
   string req_id = 8;
   // End-to-end push timeout in milliseconds (currently ignored for coordinated
   // pushes).
   int64 timeout_ms = 10;
   // Required.
   oneof mode {
+    // A coordinator already prepared the receivers.
     CoordinatedPush coordinated = 11;
+    // This sender prepares and awaits its own receivers.
     DirectPush direct = 12;
   }
   // Unset or empty `tag` denotes the default version (version 0).

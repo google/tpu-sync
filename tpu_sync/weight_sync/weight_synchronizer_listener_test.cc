@@ -84,6 +84,8 @@ using ::testing::Pair;
 using ::testing::UnorderedElementsAre;
 using ::testing::status::IsOkAndHolds;
 using ::testing::status::StatusIs;
+using ::tpu_sync::rpc::AwaitWeightReceiveRequest;
+using ::tpu_sync::rpc::AwaitWeightReceiveResponse;
 using ::tpu_sync::rpc::Chunks;
 using ::tpu_sync::rpc::ControlRequest;
 using ::tpu_sync::rpc::ControlResponse;
@@ -815,6 +817,20 @@ absl::Status SendStartPush(const WeightSynchronizerListener& listener,
   return CallListener<StartWeightPushResponse>(listener, req);
 }
 
+// A valid await of push `uuid` of version "v7" that waits at most a second.
+AwaitWeightReceiveRequest MakeAwaitRequest(int64_t uuid) {
+  AwaitWeightReceiveRequest req;
+  req.set_uuid(uuid);
+  req.mutable_version()->set_tag("v7");
+  req.set_timeout_ms(1000);
+  return req;
+}
+
+absl::Status SendAwait(const WeightSynchronizerListener& listener,
+                       const AwaitWeightReceiveRequest& req) {
+  return CallListener<AwaitWeightReceiveResponse>(listener, req);
+}
+
 // Sets byte `i` of source shard `s` to `s * kSrcShardBytes + i`.
 absl::Status FillSourceShards(WeightSynchronizerBase& src) {
   for (size_t s = 0; s < 2; ++s) {
@@ -1084,6 +1100,13 @@ TEST(WeightSynchronizerListenerTest,
       StatusIs(absl::StatusCode::kUnimplemented,
                AllOf(HasSubstr("receive_timeout_ms"),
                      HasSubstr("receive deadlines are not implemented yet"))));
+  PrepareWeightReceiveRequest reported = MakePrepareRequest(kPushUuid, 2);
+  reported.mutable_report_to()->set_endpoint("coordinator:1234");
+  reported.mutable_report_to()->set_receiver("receiver/0");
+  EXPECT_THAT(SendPrepare(listener, reported),
+              StatusIs(absl::StatusCode::kUnimplemented,
+                       HasSubstr("sets report_to; reporting a receive's "
+                                 "outcome is not implemented yet")));
   PrepareWeightReceiveRequest partial = MakePrepareRequest(kPushUuid, 1);
   partial.add_expected_senders("trainer/1");
   EXPECT_THAT(SendPrepare(listener, partial),
@@ -1137,6 +1160,21 @@ TEST(WeightSynchronizerListenerTest,
               StatusIs(absl::StatusCode::kUnimplemented,
                        HasSubstr("receive_timeout_ms=3600000; receive "
                                  "deadlines are not implemented yet")));
+  // An incomplete report_to is invalid, not merely unimplemented.
+  PrepareWeightReceiveRequest no_endpoint = MakePrepareRequest(kPushUuid, 2);
+  no_endpoint.set_receive_timeout_ms(1000);
+  no_endpoint.mutable_report_to()->set_receiver("receiver/0");
+  EXPECT_THAT(SendPrepare(listener, no_endpoint),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("sets report_to with an empty endpoint or "
+                                 "receiver")));
+  PrepareWeightReceiveRequest no_receiver = MakePrepareRequest(kPushUuid, 2);
+  no_receiver.set_receive_timeout_ms(1000);
+  no_receiver.mutable_report_to()->set_endpoint("coordinator:1234");
+  EXPECT_THAT(SendPrepare(listener, no_receiver),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("sets report_to with an empty endpoint or "
+                                 "receiver")));
 }
 
 // Captures the transfer that PrepareWeightReceive registers, which it hands to
@@ -1216,6 +1254,9 @@ TEST(WeightSynchronizerListenerTest, RendezvousRequestsRejectedAfterShutdown) {
         SendStartPush(listener, MakeSwapPushRequest(kPushUuid, "127.0.0.1:1")),
         StatusIs(absl::StatusCode::kUnavailable,
                  "WeightSynchronizerListener is stopping"));
+    EXPECT_THAT(SendAwait(listener, MakeAwaitRequest(kPushUuid)),
+                StatusIs(absl::StatusCode::kUnavailable,
+                         "WeightSynchronizerListener is stopping"));
   }
 }
 
@@ -1484,6 +1525,104 @@ TEST(WeightSynchronizerListenerTest,
               StatusIs(absl::StatusCode::kFailedPrecondition,
                        AllOf(HasSubstr("peer_control_endpoints"),
                              HasSubstr(kPeerB), Not(HasSubstr(kPeerA)))));
+}
+
+TEST(WeightSynchronizerListenerTest, PrepareWeightReceiveReturnsEmptyReply) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> engine,
+      CreateShardedCpuEngine(/*num_shards=*/1, 2 * kSrcShardBytes));
+  WeightSynchronizerListener listener(engine.get(), /*listener_port=*/0);
+
+  ControlPipeConfig cfg;
+  cfg.backend_type = listener.backend_type();
+  TF_ASSERT_OK_AND_ASSIGN(
+      PrepareWeightReceiveResponse resp,
+      (CreateControlPipeClient(cfg)
+           ->Call<PrepareWeightReceiveRequest, PrepareWeightReceiveResponse>(
+               absl::StrCat("127.0.0.1:", listener.listener_port()),
+               MakePrepareRequest(kPushUuid, /*num_chunks=*/2),
+               absl::Seconds(10))));
+  EXPECT_EQ(resp.incarnation_id(), 0);
+  EXPECT_TRUE(resp.data_endpoints().empty());
+  EXPECT_TRUE(resp.shards().empty());
+}
+
+TEST(WeightSynchronizerListenerTest, AwaitWeightReceiveIsNotImplementedYet) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> engine,
+      CreateShardedCpuEngine(/*num_shards=*/1, 2 * kSrcShardBytes));
+  WeightSynchronizerListener listener(engine.get(), /*listener_port=*/0);
+
+  AwaitWeightReceiveRequest req = MakeAwaitRequest(kPushUuid);
+  EXPECT_THAT(SendAwait(listener, req),
+              StatusIs(absl::StatusCode::kUnimplemented,
+                       HasSubstr("AwaitWeightReceive (uuid=4242) for "
+                                 "version(len=2, \"v7\"): awaiting a "
+                                 "receive's commit is not implemented yet")));
+  req.set_target_incarnation_id(engine->incarnation_id() + 1);
+  EXPECT_THAT(SendAwait(listener, req),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("AwaitWeightReceive (uuid=4242) targets "
+                                 "incarnation_id=")));
+  req.set_target_incarnation_id(engine->incarnation_id());
+  EXPECT_THAT(SendAwait(listener, req),
+              StatusIs(absl::StatusCode::kUnimplemented,
+                       HasSubstr("not implemented yet")));
+}
+
+TEST(WeightSynchronizerListenerTest, AwaitWeightReceiveValidatesBeforeItsStub) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> engine,
+      CreateShardedCpuEngine(/*num_shards=*/1, 2 * kSrcShardBytes));
+  WeightSynchronizerListener listener(engine.get(), /*listener_port=*/0);
+  constexpr int64_t kHourMs = 60 * 60 * 1000;
+
+  // Each request is a valid await, which reaches the stub, with one invalid
+  // field.
+  EXPECT_THAT(SendAwait(listener, MakeAwaitRequest(/*uuid=*/0)),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("AwaitWeightReceive requires a positive "
+                                 "uuid; got 0")));
+  AwaitWeightReceiveRequest req = MakeAwaitRequest(kPushUuid);
+  // Unset version maps to default version 0 and reaches the stub.
+  req.clear_version();
+  EXPECT_THAT(SendAwait(listener, req),
+              StatusIs(absl::StatusCode::kUnimplemented,
+                       HasSubstr("AwaitWeightReceive (uuid=4242) for "
+                                 "version(default): awaiting a receive's "
+                                 "commit is not implemented yet")));
+  req.mutable_version()->set_tag(std::string(kMaxWeightVersionBytes + 1, 'x'));
+  EXPECT_THAT(SendAwait(listener, req),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("version has 257 bytes, more than "
+                                 "kMaxWeightVersionBytes=256")));
+  req.mutable_version()->set_tag(std::string(kMaxWeightVersionBytes, 'x'));
+  req.set_timeout_ms(0);
+  EXPECT_THAT(SendAwait(listener, req),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("(uuid=4242) timeout_ms must be in (0, 1h]; "
+                                 "got 0")));
+  req.set_timeout_ms(-1);
+  EXPECT_THAT(SendAwait(listener, req),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("(uuid=4242) timeout_ms must be in (0, 1h]; "
+                                 "got -1")));
+  req.set_timeout_ms(kHourMs + 1);
+  EXPECT_THAT(SendAwait(listener, req),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("(uuid=4242) timeout_ms must be in (0, 1h]; "
+                                 "got 3600001")));
+  // At the bounds (a 256-byte version, 1 h), the request reaches the stub.
+  req.set_timeout_ms(kHourMs);
+  EXPECT_THAT(SendAwait(listener, req),
+              StatusIs(absl::StatusCode::kUnimplemented,
+                       HasSubstr("not implemented yet")));
+  // The incarnation is checked before uuid, version and timeout_ms.
+  AwaitWeightReceiveRequest wrong_incarnation;
+  wrong_incarnation.set_target_incarnation_id(engine->incarnation_id() + 1);
+  EXPECT_THAT(SendAwait(listener, wrong_incarnation),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("targets incarnation_id")));
 }
 
 ControlPipeConfig GrpcClientConfig() {

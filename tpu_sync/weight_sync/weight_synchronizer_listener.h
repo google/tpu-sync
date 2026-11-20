@@ -53,6 +53,14 @@ class WeightSynchronizerBase;
 // destination's listener when PSP-TCP is required, workers send each other no
 // control RPCs.
 //
+// To learn the outcome, the coordinator sets `report_to` in each prepare, and
+// each destination will report to it with a ReportWeightReceiveRequest (D more
+// RPCs); reporting is not implemented yet, so the listener refuses such
+// prepares with UNIMPLEMENTED. The listener also serves
+// AwaitWeightReceiveRequest, with which a direct-push source will learn that a
+// destination committed; awaiting is not implemented yet either, so the
+// listener answers every valid request with UNIMPLEMENTED.
+//
 // On the gRPC backend the listener also serves the engine's PeregrineService
 // (RaidenManagerBase::peregrine_control_service()) on the same port, so one
 // client channel reaches both. On any other backend that service cannot be
@@ -130,7 +138,9 @@ class WeightSynchronizerListener final {
 
   // Step 1 of a coordinated push on a destination worker: registers the
   // incoming transfer with the summed per-layer chunk counts. `req.version`
-  // (empty = default version 0) is validated and not recorded yet.
+  // (empty = default version 0) is validated and not recorded yet, a set
+  // `req.report_to` is validated and then refused as not implemented yet, and
+  // the reply's fields stay empty.
   absl::StatusOr<::tpu_sync::rpc::PrepareWeightReceiveResponse>
   HandlePrepareWeightReceive(
       const ::tpu_sync::rpc::PrepareWeightReceiveRequest& req);
@@ -140,6 +150,12 @@ class WeightSynchronizerListener final {
   // PushWeightsResharded() (ignoring valid `version` and `timeout_ms` for now).
   absl::StatusOr<::tpu_sync::rpc::StartWeightPushResponse>
   HandleStartWeightPush(const ::tpu_sync::rpc::StartWeightPushRequest& req);
+
+  // Waits for receive `req.uuid` to commit on a destination worker (validates
+  // inputs and returns Unimplemented for now).
+  absl::StatusOr<::tpu_sync::rpc::AwaitWeightReceiveResponse>
+  HandleAwaitWeightReceive(
+      const ::tpu_sync::rpc::AwaitWeightReceiveRequest& req);
 
   WeightSynchronizerBase* engine_;
   int listener_port_ = 0;

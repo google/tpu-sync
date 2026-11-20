@@ -1,74 +1,31 @@
 import TpuSyncVerify.Transfer.PrefillDecode.Receive
 
 /-!
-# Receive session: what the poll-side readiness check contributes
+# Receive session: poll-side readiness vs. callback completion
 
-An audit of `TransferReceiveSession::IsReadyToComplete` and of the manager's
-poll that acts on it (`KVCacheManagerWithTransfer::CompleteReadWithDetails`,
-`if (session->IsReadyToComplete()) { ... session->Finish(); }`), on the receive
-model of `Receive.lean`. Abbreviations as in `Receive.lean` (`send.cc`
-is `tpu_sync/kv_cache/transfer_send_session.cc`). Exact line ranges for every
-symbol and sub-block are in the generated `## Source map` table below.
+Compares shipping `CompleteReadWithDetails` readiness polling (`stepM true`,
+where `!IsDraining() && IsReadyToComplete()` calls `recv->Finish()`) against
+callback-only completion (`stepM false`, non-shipping) over `Receive.lean`,
+tracking end-of-transfer metric recording (`if (all_layers_done)` in
+`ExecuteLayerH2d`) via ghost `RecvM.metrics`.
 
-`TransferReceiveSession` has two ways to finish successfully:
+File aliases: `recv.cc` = `tpu_sync/kv_cache/transfer_receive_session.cc`,
+`mgr.cc` = `tpu_sync/kv_cache/kv_cache_manager_with_transfer.cc`.
 
-* the H2D callback that completes the last layer in
-  `TransferReceiveSession::ExecuteLayerH2d` calls `self->FinishLocked()`
-  (`self->num_completed_layers_++;` .. `self->FinishLocked();`) and records the
-  end-of-transfer metrics (`if (all_layers_done)`);
-* the manager's poll calls `Finish()` when `IsReadyToComplete()` holds, i.e.
-  `(network_completed_ || num_completed_layers_ == total_layers) &&
-  AllH2dDoneLocked()`.
+## Properties
 
-`TransferSendSession` has only the first. A design alternative removes
-the second (and with it `h2d_futures_`, `network_completed_` and the dead
-`all_complete` finish reached from `OnBlockShardsReceived`
-(`RecordNetworkCompleteLocked`, called via `should_record_duration = RecordNetworkCompleteLocked(...)`);
-`network_completed_` is also the `if (!network_completed_ && ...)` latch in
-`RecordBlockShardsReceivedLocked` behind `network_just_completed`). This module
-asks what the second way does today, and what changes without it.
-
-## Results
-
-On every reachable state of the shipping model:
-
-* `CallbackFinishes` (`reachable_callbackFinishes`): with at least one layer,
-  `num_completed_layers_ == num_layers()` already implies `draining_` — the
-  callback that completed the last layer finished the session — and an error
-  status implies `draining_`.
-* `pollReady_window`: with at least one layer the poll can only fire through
-  `network_completed_`, in the window after every copy's future is ready and
-  before the last callback has bumped `num_completed_layers_`. The other
-  disjunct of `IsReadyToComplete` is dead code there.
-* `netAccount_frame`: `OnBlockShardsReceived` never finishes the session; when its
-  `all_complete` test could pass the session is already draining and the
-  handler has returned early (`if (done_ || draining_) return absl::OkStatus();`).
-* `pollReady_no_settle`: firing in that window never settles the session — a
-  callback is still in flight, so `done_` and publication wait for it exactly
-  as they would without the poll. The poll moves the start of draining
-  earlier; it does not move settlement or the published outcome.
-
-What the earlier draining changes is the last callback's bookkeeping: it
-finds `draining_` set and skips `RecordTransferDuration`, `RecordH2dComplete`
-and `RecordEnd`. `RecvM` adds a ghost bit `metrics` for those calls and
-`stepM poll` runs the model with (`poll = true`, the shipping code) or without
-(`poll = false`, the design alternative) the poll:
-
-* with the poll, `published = some true ∧ metrics = false` is reachable
-  (`trace_poll_skips_metrics`; the bounded search finds it too);
-* without it, `published = some true → metrics = true` is an invariant
-  (`noPoll_metrics_on_success`), every property of `Receive.lean` still
-  holds (`noPoll_safe`), every reachable state can still settle and release
-  its staging (`noPoll_can_settle`), and the normal completion is unchanged
-  (`trace_noPoll_normal`).
-
-The one case where the poll is load-bearing is `num_layers() == 0`: nothing
-else ever calls `FinishLocked()` (`noPoll_zero_layers_never_succeeds`),
-whereas with the poll `IsReadyToComplete()` holds at once (in C++, via its
-`num_completed_layers_ == total_layers` disjunct while `network_completed_`
-remains `false`, `trace_zero_layers_poll`). A change that drops the poll has to
-finish a zero-layer receive at creation, as `TransferSendSession::StartPush`
-does for a zero-layer send (`if (total_layers == 0)`).
+* **Shipping poll window (`reachable_callbackFinishes`, `pollReady_window`, `netAccount_frame`, `pollReady_no_settle`):**
+  for `0 < numLayers`, `completed = numLayers` already implies `draining`;
+  `RecordBlockShards` never changes `life`; and `pollReady` can fire only via
+  `networkCompleted` after all futures are ready and before the last callback
+  runs, starting `draining` without settling (`0 < inFlight`) so that callback
+  skips `all_layers_done` metrics (`trace_poll_skips_metrics`).
+* **Callback-only alternative (`noPoll_safe`, `noPoll_can_settle`, `noPoll_metrics_on_success`):**
+  `stepM false` preserves `Recv.Safe` and finite settlement while guaranteeing
+  `published = some true → metrics = true`.
+* **Zero layers (`noPoll_zero_layers_never_succeeds`, `trace_zero_layers_poll`):**
+  at `numLayers = 0` only `pollReady` finishes the session OK unless zero-layer
+  receives finish at creation.
 
 ## Source map
 
@@ -77,15 +34,9 @@ Generated by `tools/resolve_anchors.py`.
 <!-- source-map:begin -->
 | File | Symbol / anchor | Lines |
 |---|---|---|
-| `recv.cc` | `TransferReceiveSession::IsReadyToComplete` | `:544-550` |
-| `recv.cc` | `TransferReceiveSession::RecordBlockShardsReceivedLocked` (`if (!network_completed_ &&`) | `:578-584` |
-| `recv.cc` | `TransferReceiveSession::RecordNetworkCompleteLocked` (`if (!all_complete)` .. `return true;`) | `:596-604` |
-| `recv.cc` | `TransferReceiveSession::OnBlockShardsReceived` (`if (done_ || draining_)`) | `:724-726` |
-| `recv.cc` | `TransferReceiveSession::OnBlockShardsReceived` (`should_record_duration = RecordNetworkCompleteLocked(`) | `:747-748` |
-| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`self->num_completed_layers_++;` .. `self->FinishLocked();`) | `:883-889` |
-| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`if (all_layers_done)`) | `:908-918` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`const std::shared_ptr<TransferReceiveSession> session = it->second;` .. `absl::DeadlineExceededError("Receive session timed out"));`) | `:1210-1222` |
-| `send.cc` | `TransferSendSession::StartPush` (`if (total_layers == 0)`) | `:449-452` |
+| `recv.cc` | `TransferReceiveSession::IsReadyToComplete` | `:481-487` |
+| `recv.cc` | `TransferReceiveSession::ExecuteLayerH2d` (`if (all_layers_done)`) | `:877-887` |
+| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` (`if (auto recv =` .. `absl::DeadlineExceededError("Transfer session timed out"));`) | `:1088-1100` |
 <!-- source-map:end -->
 -/
 
@@ -167,7 +118,7 @@ instance : DecidablePred recordsMetrics :=
     s.completed + 1 = s.numLayers ∧ s.life.draining = false))
 
 /-- The only events that start draining with an OK status: the poll, the last
-successful callback, and the `all_complete` finish reached from `OnBlockShardsReceived`. -/
+successful callback, and the `all_complete` finish reached from `RecordBlockShards`. -/
 theorem step_finish_ok {s s' : Recv} {e : Ev} (hs : step s e = some s')
     (hdr : s.life.draining = false) (hdr' : s'.life.draining = true)
     (hok' : s'.life.statusOk = true) :
@@ -264,13 +215,16 @@ theorem pollReady_window {n : Nat} {s s' : Recv} (h : ReachableAny n s) (hn : 0 
       rcases hor with hnet | hcomp
       · exact hnet
       · omega
-    unfold networkCompleted at hnet
-    exact ⟨hnet, hlt, by omega, by omega⟩
+    have hiss : s.issued = s.numLayers := by
+      rcases hnet with hnet | hnet
+      · omega
+      · exact hinv.netIssued_issued hnet
+    exact ⟨hnet, hlt, hiss, by omega⟩
   · cases hs
 
-/-- `OnBlockShardsReceived` never finishes the session: when its `all_complete`
+/-- `RecordBlockShards` never finishes the session: when its `all_complete`
 test could pass, the last callback has already started draining and the
-handler returned early (`if (done_ || draining_) return absl::OkStatus();`). -/
+handler returned early (`if (done_ || draining_ || total_blocks_ == 0) return absl::OkStatus();`). -/
 theorem netAccount_frame {n : Nat} {s s' : Recv} (h : ReachableAny n s)
     (hs : step s .netAccount = some s') : s'.life = s.life := by
   have hinv := h.inv
@@ -287,7 +241,7 @@ theorem netAccount_frame {n : Nat} {s s' : Recv} (h : ReachableAny n s)
         have hn : 0 < s.numLayers := by
           have := hinv.issued_le
           omega
-        have hc : s.completed = s.numLayers := hfin.2
+        have hc : s.completed = s.numLayers := hfin.2.2
         exact hact (Or.inr (hcf.1 hn hc))
       · cases hs
         rfl

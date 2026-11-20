@@ -109,10 +109,10 @@ theorem drain_recv_step {s : Pipeline} (h : Inv s)
     exact ⟨.recv .pushEnd, _, hs₁, by simp [hdr], rfl, by simp [Recv.drainRank]; omega⟩
   · by_cases hq : s.recv.pullPending = true
     · have hs₁ : step s (.recv (.pullReply false)) =
-          some { s with recv := { s.recv with life := (s.recv.life.finishLocked false).endOpLocked, pullPending := false },
+          some { s with recv := { s.recv with life := s.recv.life.endOpLocked, pullPending := false },
                         pullWaiting := false } := by
-        simp [step, recvStep, Recv.step, Recv.pullReply, hq]
-      exact ⟨.recv (.pullReply false), _, hs₁, by simp, rfl, by simp [Recv.drainRank, hq]⟩
+        simp [step, recvStep, Recv.step, Recv.pullReply, hq, hdr]
+      exact ⟨.recv (.pullReply false), _, hs₁, by simp [hdr], rfl, by simp [Recv.drainRank, hq]⟩
     · by_cases hpend : 0 < s.recv.pending
       · obtain ⟨l, _, hpl⟩ := h.chk_h2dPending.exists_true hpend
         have hs₁ : step s (.h2dIssue l true) =

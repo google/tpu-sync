@@ -42,7 +42,7 @@ structure Pipeline where
   /-- ghost: layers whose H2D copy has finished -/
   h2dReadyL : List Bool
   reclaimed : Bool := false
-  /-- Whether `NotifyForRead` has registered the offer in `send_sessions_[uuid]`. -/
+  /-- Whether `NotifyForRead` has registered the offer in `sessions_[uuid]`. -/
   registered : Bool := true
   /-- Whether `HandlePullStream` arrived before `NotifyForRead` and is waiting in `cv_.WaitWithTimeout`. -/
   pullWaiting : Bool := false
@@ -67,7 +67,7 @@ def init (n : Nat) : Pipeline :=
     h2dReadyL := List.replicate n false }
 
 /-- An `n`-layer transfer before `NotifyForRead` has registered the offer in
-`send_sessions_[uuid]`: models the `PullAheadOfRegistration` grace-wait and
+`sessions_[uuid]`: models the `PullAheadOfRegistration` grace-wait and
 unregistered-pull rejection paths in `KVCacheManagerWithTransfer::HandlePullStream`. -/
 def initUnregistered (n : Nat) : Pipeline :=
   { init n with registered := false }
@@ -89,7 +89,7 @@ inductive Ev where
   deriving Repr, DecidableEq
 
 /-- `KVCacheManagerWithTransfer::NotifyForRead` registers the send session under
-`transfer_uuid` in `send_sessions_` (`send_sessions_.try_emplace(uuid, session)`)
+`transfer_uuid` in `sessions_` (`sessions_.try_emplace(uuid, SessionEntry{session, req_id, SessionRole::kTransfer})`)
 and calls `cv_.SignalAll()`. -/
 def notifyForRead (s : Pipeline) : Option Pipeline :=
   if s.registered = false then
@@ -106,7 +106,7 @@ def pullWait (s : Pipeline) : Option Pipeline :=
 /-- A send event with no memory effect. The two that move data are the
 layer-indexed `d2hReady l` / `h2hDone l ok` and are disabled here. `beginPull`
 (`session->ValidateAndBeginPull` in `HandlePullStream`) requires the offer to be registered in
-`send_sessions_` (`s.registered = true`) and clears any grace-wait state
+`sessions_` (`s.registered = true`) and clears any grace-wait state
 (`pullWaiting := false`). `wake` gets the per-layer guard the counter model
 cannot state: `SendNextLayer(woken)` waits on layer `woken`'s own future
 (`d2hReadyL[woken]? = some true`), unless layer `woken` was never issued
@@ -168,7 +168,8 @@ def recvStep (s : Pipeline) (e : Recv.Ev) : Option Pipeline :=
     else none
   | _ => (Recv.step s.recv e).map fun rcv => { s with recv := rcv }
 
-/-- `OnLayerReceived(l)` → `ExecuteLayerH2d(l)` up to its first unlock: fires
+/-- `KVCacheManagerBase::OnLayerReceived(l)` → `TransferReceiveSession::OnDataReceived(l, {}, {})`
+→ `ExecuteLayerH2d(l)` up to its first unlock: fires
 once per layer (A1), after layer `l` landed (`if (array_complete && !progress.on_layer_received_called)` in `CompleteIncomingPush`). -/
 def h2dBegin (s : Pipeline) (l : Nat) : Option Pipeline :=
   if s.landedL[l]? = some true ∧ s.claimedL[l]? = some false then
@@ -179,9 +180,11 @@ def h2dBegin (s : Pipeline) (l : Nat) : Option Pipeline :=
   else none
 
 /-- `ExecuteLayerH2d(l)` from the `if (done_ || draining_)` re-check through
-`h2d_futures_.push_back(future)`: consumes
+`h2d_futures_.push_back(future)` and the closing `dispatched_layers_.insert(layer_idx)`: consumes
 layer `l`'s pending claim from `h2dBegin l` and, if the session is still active
-and dispatch succeeds (`ok = true`), marks layer `l`'s copy as issued. -/
+and dispatch succeeds (`ok = true`), marks layer `l`'s copy as issued (the
+`Recv` step also sets `network_completed_` when this was the last layer,
+`Recv.netIssued`). -/
 def h2dIssue (s : Pipeline) (l : Nat) (ok : Bool) : Option Pipeline :=
   if s.h2dPendingL[l]? = some true then
     (Recv.step s.recv (.h2dIssue ok)).map fun rcv =>

@@ -55,9 +55,8 @@ def view (s : S) : View :=
 #guard search (cfgDeclared 2 1 2 true) 40 = .safe
 #guard search (cfgDeclared 2 2 2 true) 60 = .safe
 
-/-- Honest run, chunk-count contract, two layers of two streams: both layers
-dispatched once, the network completes exactly when the last stream lands,
-the table is retired, and the second callback settles the receive with OK. -/
+/-- Honest chunk-count run (`2` layers, `2` streams each): dispatches each layer
+once, retires the progress table, and settles OK. -/
 theorem trace_honest_chunk :
     ((sys (cfgChunk 2 1 2 true)).run
       [.stream 0 0, .stream 0 0, .stream 1 0, .stream 1 0, .h2dDone 0 true, .h2dDone 1 true]).map
@@ -65,8 +64,8 @@ theorem trace_honest_chunk :
     some (⟨true, true, true, [1, 1], [0, 0]⟩, 4, [none, none]) := by
   decide
 
-/-- Honest run, sender-declared contract, two senders: a layer is dispatched
-only when both senders' streams have landed. -/
+/-- Honest sender-declared run (`2` senders): dispatches each layer only after
+both senders' streams have landed. -/
 theorem trace_honest_declared :
     ((sys (cfgDeclared 2 2 1 true)).run [.stream 0 0, .stream 1 0]).map
       (fun s => s.layers.map (·.dispatched)) = some [0, 0] ∧
@@ -75,8 +74,7 @@ theorem trace_honest_declared :
       view = some ⟨true, true, true, [1, 1], [0, 0]⟩ := by
   decide
 
-/-- A failed copy fails the receive once every op has returned; the poll never
-publishes it. -/
+/-- A failed H2D copy settles the receive failed once all ops end; `publish` is disabled. -/
 theorem trace_failed_copy :
     ((sys (cfgChunk 2 1 1 true)).run
       [.stream 0 0, .stream 1 0, .h2dDone 0 false, .h2dDone 1 true]).map view =
@@ -85,12 +83,8 @@ theorem trace_failed_copy :
       [.stream 0 0, .stream 1 0, .h2dDone 0 false, .publish] = none := by
   decide
 
-/-- **Out of contract: chunk-count with two senders.** `Cfg.WF.chunkSingle`
-excludes this instance; the trace shows why. `expected_chunks` is the stream
-count one sender declared (`header.reserved`), so sender 1's single stream
-completes each layer on its own, the table is retired once sender 1 has
-covered both layers, and sender 0's first (honest) stream for layer 0 then
-starts a fresh entry and dispatches layer 0 a second time. -/
+/-- Out of contract (`Cfg.WF.chunkSingle` violated): on chunk-count with two
+senders, sender 1 retires the table alone and sender 0 re-dispatches layer 0. -/
 theorem trace_chunk_two_senders :
     ((sys (cfgChunk 2 2 1 true)).run [.stream 1 1, .stream 0 1, .stream 0 0]).map
       (fun s => s.layers.map (·.dispatched)) = some [2, 1] := by
@@ -98,13 +92,8 @@ theorem trace_chunk_two_senders :
 
 /-! ### Without A4: one extra stream -/
 
-/-- **Chunk-count contract, before retirement.** Layer 0 (one declared stream)
-lands twice; layer 1 never arrives. The duplicate is absorbed
-(`completed_chunks = 2 ≠ 1`, no second dispatch, no error) but still reported
-through `OnBlockShardsReceived`, so `network_completed_` is reached with
-layer 1's blocks never received. Once layer 0's copy lands, `IsReadyToComplete`
-is true, the poll's `Finish()` settles at once (`in_flight_ == 0`) and the
-receive is published in `done_recving_` with layer 1 never copied. -/
+/-- Dishonest chunk-count before retirement: a duplicate layer-0 stream bumps
+`RecordBlockShards` to `network_completed_`, publishing `done_recving` with layer 1 uncopied. -/
 theorem trace_dup_chunk_publishes_missing_layer :
     ((sys (cfgChunk 2 1 1 false)).run
       [.stream 0 0, .stream 0 0, .h2dDone 0 true, .publish]).map
@@ -113,15 +102,8 @@ theorem trace_dup_chunk_publishes_missing_layer :
     some (true, true, [1, 0]) := by
   decide
 
-/-- **Either contract, after retirement.** Both layers land and the table
-entries are erased (`if (all_layers_called)` in `CompleteIncomingPush`). An
-extra stream for layer 0 then creates a fresh entry whose first stream
-completes it: `OnLayerReceived` fires again and a second copy of layer 0 is
-issued while the first may still run (`dispatched = [2, 1]`). The session is
-not fooled about settlement — `in_flight_` holds `done_` off until every copy
-has returned — but `num_completed_layers_` reaches `num_layers()` after the two
-layer-0 callbacks, so the receive starts draining with layer 1's copy still
-pending, and settles with OK once it returns. -/
+/-- Dishonest post-retirement push (either contract): after `all_layers_called`
+retires the push session, an extra stream seats a fresh table and dispatches layer 0 twice. -/
 theorem trace_dup_after_retirement :
     ((sys (cfgChunk 2 1 1 false)).run
       [.stream 0 0, .stream 1 0, .stream 0 0, .h2dDone 0 true, .h2dDone 0 true]).map view =
@@ -136,10 +118,8 @@ theorem trace_dup_after_retirement :
     some ⟨true, true, true, [2, 1], [0, 0]⟩ := by
   decide
 
-/-- The redundant copy can also fail the receive: `FinishLocked` records the
-first error even when already draining (`if (!status.ok() && status_.ok())`),
-so a duplicate copy that fails after the honest copies succeeded turns a
-complete transfer into `failed_recving`. -/
+/-- Post-retirement duplicate whose redundant H2D copy fails flips an otherwise
+complete transfer to `failed_recving`. -/
 theorem trace_dup_copy_fails_late :
     ((sys (cfgChunk 2 1 1 false)).run
       [.stream 0 0, .stream 1 0, .stream 0 0, .h2dDone 0 true, .h2dDone 1 true,
@@ -147,10 +127,8 @@ theorem trace_dup_copy_fails_late :
     some ⟨true, true, false, [2, 1], [0, 0]⟩ := by
   decide
 
-/-- **Sender-declared contract, before retirement.** The same duplicate is
-rejected (`else if (streams.landed > streams.declared)` in
-`CompleteIncomingPush`), the push fails and the receive is finished with an
-error: loud, not silent. -/
+/-- Sender-declared before retirement: `CompleteIncomingPush` rejects `streams.landed > streams.declared`
+and fails the receive loudly. -/
 theorem trace_dup_declared_rejected :
     ((sys (cfgDeclared 2 1 1 false)).run [.stream 0 0, .stream 0 0]).map view =
       some ⟨true, false, false, [1, 0], [1, 0]⟩ ∧
@@ -160,18 +138,10 @@ theorem trace_dup_declared_rejected :
 #guard foundCounterexample (cfgChunk 2 1 1 false) 6
 #guard foundCounterexample (cfgDeclared 2 1 1 false) 6
 
-/-! ### Candidate hardening
+/-! ### Candidate hardening (`stepHardened`, non-shipping)
 
-Two small changes close every trace above without touching the honest
-behaviour: (1) the chunk-count contract rejects a stream beyond the declared
-count, as the other two contracts already do (`if (plan_pushes > expected_chunks)`
-and `else if (streams.landed > streams.declared)` in `CompleteIncomingPush`);
-(2) `ExecuteLayerH2d` keeps a per-layer once-latch of its own, so a dispatch
-after the transport retired its entries is a no-op. `stepHardened` is `step`
-with exactly those two edits. The dishonest state space stays infinite (after
-retirement a fresh entry's first stream is within the declared count and is
-accepted, so the block count is unbounded), so the searches below are bounded:
-no violation within the depth, where the unhardened step finds one at depth 4. -/
+Adds chunk-count over-count rejection (`completed > numStreams`) and a
+session-side per-layer once-latch (`L.dispatched = 0`) in `ExecuteLayerH2d`. -/
 
 def completePushHardened (c : Cfg) (p : Progress) (sender : Nat) : Progress × Bool × Bool :=
   if c.declared then completePush c p sender
@@ -233,23 +203,9 @@ theorem trace_hardened_dups :
     some ⟨false, false, true, [1, 1], [0, 1]⟩ := by
   decide
 
-/-! ## Replay of upstream transport tests
+/-! ## Replay of C++ transport tests -/
 
-The transport unit tests drive `CompleteIncomingPush` through mock delegates
-(`MockSessionDelegate` in `block_transport_session_test.cc`, `MockDelegate` and
-`MultiSenderReceiverDelegate` in `block_transport_test.cc`) with no
-`TransferReceiveSession`, so what they observe is the table: `OnLayerReceived`
-calls (`dispatched`), retirement (`entry = none`), and rejected push streams
-(where `CompleteIncomingPush` returns `AlreadyExistsError` or
-`FailedPreconditionError` and `StartStream` drops the stream before the 1-byte
-ack, recorded on `step` as `life.statusOk = false`). The traces below replay
-them on `step` with those projections. -/
-
-/-- `BlockTransportServerPushSessionTest.LifecycleAndStreamCompletion`: one
-layer, one sender declaring two streams (`num_streams = 2`), chunk-count
-contract. The first stream completes nothing; the second fires
-`OnLayerReceived` once (`layers_received() == 1`) and, every layer now called,
-retires the table (`IsDone()`, `on_completed_`). -/
+/-- Model-only (`cfgChunk 1 1 2 true`): two streams complete and retire one layer. -/
 def tr_session_two_streams_complete : List Ev := [.stream 0 0, .stream 0 0]
 
 theorem trace_session_two_streams_complete :
@@ -261,13 +217,8 @@ theorem trace_session_two_streams_complete :
       some ([1], [false]) := by
   decide
 
-/-- `BlockTransportTest.LayerCompletesOnlyAfterEveryDeclaredSender`: two
-layers, two declared senders (`ExpectSenders(kUuid, 2)`), one stream each. A
-layer completes only when both senders' streams have landed, in either order
-(`layer_completion_count()` 0, 1, 1, 2); once both layers are called the uuid's
-progress is retired, and the same two senders complete layer 0 again on a fresh
-entry (count 3). The reuse after retirement is a stream beyond each sender's
-per-layer declaration, so the run is on `honest = false`. -/
+/-- `BlockTransportTest.LayerCompletesOnlyAfterEveryDeclaredSender`: two declared
+senders complete both layers, retire the push session, and re-dispatch layer 0 on reuse. -/
 def tr_declared_senders_then_reuse : List Ev :=
   [.stream 0 0, .stream 0 1, .stream 1 1, .stream 1 0, .stream 0 0, .stream 0 1]
 
@@ -288,12 +239,8 @@ theorem trace_declared_senders_then_reuse :
       (fun s => s.layers.map (·.dispatched)) = some [2, 1] := by
   decide
 
-/-- `BlockTransportTest.SenderOverDeliveryIsRejected`: two layers, two declared
-senders, one stream each. Both senders complete layer 0; layer 1 is still open,
-so the uuid's progress is live, and a second stream from sender 0 for layer 0
-exceeds the one stream it declared: `CompleteIncomingPush` rejects the push
-stream (`else if (streams.landed > streams.declared)`, recorded on `step` as
-`life.statusOk = false`) and does not dispatch the layer again. -/
+/-- `BlockTransportTest.SenderOverDeliveryIsRejected`: while layer 1 is still
+open, a second stream from sender 0 for layer 0 is rejected (`statusOk = false`). -/
 def tr_sender_over_delivery_rejected : List Ev := [.stream 0 0, .stream 0 1, .stream 0 0]
 
 theorem trace_sender_over_delivery_rejected :
@@ -304,14 +251,8 @@ theorem trace_sender_over_delivery_rejected :
       (fun s => (s.layers.map (·.dispatched), s.life.statusOk)) = some ([1, 0], false) := by
   decide
 
-/-- `BlockTransportTest.UndeclaredUuidKeepsHeaderDeclaredCompletion`: one
-layer, two senders, but `ExpectSenders` was called for another uuid, so
-`ExpectedPushSenders` is `nullopt` and the layer runs the chunk-count contract
-with `expected_chunks = 1`: each sender's single stream completes the layer by
-itself (`layer_completion_count()` 1 then 2), the first retiring the entry the
-second recreates. This is `trace_chunk_two_senders`'s out-of-contract instance
-(`Cfg.WF.chunkSingle`), produced here by a test that deliberately leaves the
-uuid undeclared. -/
+/-- `BlockTransportTest.UndeclaredUuidKeepsHeaderDeclaredCompletion`: an
+undeclared uuid runs chunk-count (`expected_chunks = 1`), so two senders dispatch layer 0 twice. -/
 def tr_undeclared_uuid_chunk_count : List Ev := [.stream 0 0, .stream 0 1]
 
 theorem trace_undeclared_uuid_chunk_count :
@@ -321,24 +262,5 @@ theorem trace_undeclared_uuid_chunk_count :
       (fun s => s.layers.map (·.dispatched)) = some [2] := by
   decide
 
-/-! Sibling push-progress tests whose stimulus is outside this model's event set:
-- `BlockTransportTest.DeclaredSendersEachCompleteTheirOwnParallelism` (sender 0
-  declares two streams and sender 1 one for the same layer) and
-  `BlockTransportTest.SenderChangingDeclaredStreamCountIsRejected` (one sender
-  declares one stream and then two, `else if (streams.declared != num_streams)`):
-  both vary per-sender declarations, which A3 fixes to one `numStreams`.
-- `BlockTransportServerPushSessionTest.Cancel` (`BlockTransportServerPushSession::Cancel`
-  on a push session with no receive session behind it) and
-  `BlockTransportTest.ForgetPushProgressAllowsUuidReuse` (clearing a partial
-  generation with `BlockTransport::ForgetPushProgress` before checking
-  auto-retirement across a full generation): `cancel` here is the receive
-  session's `Finish(error)`, while push-session cancellation / `ForgetPushProgress`
-  is not an event (`Transport.lean` §"Lock scopes").
-- `BlockTransportTest.PushSplitBySourceNumaCompletesPlanDeclaredPool`,
-  `BlockTransportTest.PoolProgressWaitsForEveryStreamOfEveryDeclaredPoolAndRetires`,
-  and `BlockTransportTest.ForgetPushProgressResetsPartialPoolGeneration` exercise
-  the plan-declared pool contract (`Reshard/Pipeline.lean` `landStream`), and
-  `PeregrineRecvCompleteTest` exercises `OnPeregrinePostComplete` and the
-  `is_peregrine = true` shard-bitmask branch of `CompleteIncomingPush`. -/
 
 end TpuSyncVerify.Transfer.PrefillDecode.Transport

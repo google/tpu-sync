@@ -38,24 +38,15 @@ def trace2LayersOutOfOrder : List Ev :=
    .recv .pushBegin, .land 0, .h2dBegin 0, .h2dIssue 0 true, .recv .netAccount, .recv .pushEnd,
    .h2dReady 1, .h2dReady 0, .recv (.h2dDone true), .recv (.h2dDone true), .recv .publish]
 
-/-- **Trace 1 (`SendLifecycleTest.DuplicateBlocksAreRejectedAtRegistration` in
-`kv_cache_manager_with_transfer_send_drain_test.cc`):**
-`PopulateRegisteredBlocks` rejects the registration `{5, 9, 5}` at `NotifyForRead`
-(the test expects `std::invalid_argument` naming block 5 at positions 0 and 2
-of 3, `has_send(15) == false`, nothing reported); the
-duplicate-free `{0, 1, 2}` conjunct is the registration of
-`ControlHandshakeTest.UniqueRegisteredSubsetIsAcknowledged`. -/
+/-- `SendLifecycleTest.DuplicateBlocksAreRejectedAtRegistration` and
+`ControlHandshakeTest.UniqueRegisteredSubsetIsAcknowledged`: `PopulateRegisteredBlocks`
+rejects `{5, 9, 5}` and accepts `{0, 1, 2}`. -/
 theorem trace_duplicate_registration_rejected :
     validateRegistration [5, 9, 5] = false ∧
     validateRegistration [0, 1, 2] = true := by decide
 
-/-- **Trace 2 (`ControlHandshakeTest.UniqueRegisteredSubsetIsAcknowledged` in
-`kv_cache_manager_with_transfer_control_test.cc`):**
-`NotifyForRead` registers `{0, 1, 2}`; `PullStream` requests the reordered
-subset `source_blocks = {2, 0}` into `destination_blocks = {6, 7}`.
-`ValidateAndBeginPull` accepts the subset (the test asserts the handshake
-`status == 0`); model-only beyond the test, the transfer delivers
-`decodeHbm[0][6] = .kv 0 2` and `decodeHbm[0][7] = .kv 0 0`. -/
+/-- `ControlHandshakeTest.UniqueRegisteredSubsetIsAcknowledged`: reordered subset
+`{2, 0}` of registered `{0, 1, 2}` into local `{6, 7}` delivers `.kv 0 2` and `.kv 0 0`. -/
 theorem trace_subset_pull_acknowledged :
     ((BlockPipeline.sys 1 8 2 [0, 1, 2] [⟨2, 6, 0⟩, ⟨0, 7, 1⟩]).run trace1Layer).map
       (fun s => (s.pipe.recv.published,
@@ -65,12 +56,8 @@ theorem trace_subset_pull_acknowledged :
     some (some true, some (BlockCell.kv 0 2), some (BlockCell.kv 0 0), some BlockCell.blank) := by
   decide
 
-/-- **Trace 3 (`ControlHandshakeTest.PullOfUnregisteredBlockIsRejected` in
-`kv_cache_manager_with_transfer_control_test.cc`):**
-`NotifyForRead` registers `{0, 1}`; `PullStream` requests `{0, 2}`.
-`ValidateAndBeginPull` (`.send .beginPull`) is rejected (`none`) — the test
-checks the producer's response — and, model-only, the consumer's pull fails
-(`.recv (.pullReply false)`) with `pullStarted = false`. -/
+/-- `ControlHandshakeTest.PullOfUnregisteredBlockIsRejected`: requesting `{0, 2}`
+against registered `{0, 1}` is rejected by `ValidateAndBeginPull`. -/
 theorem trace_unregistered_block_rejected :
     let sys := BlockPipeline.sys 1 4 2 [0, 1] [⟨0, 0, 0⟩, ⟨2, 1, 1⟩]
     sys.run [.send .beginPull] = none ∧
@@ -79,38 +66,28 @@ theorem trace_unregistered_block_rejected :
     some (false, some false) := by
   decide
 
-/-- **Trace 4 (`ControlHandshakeTest.PullWithDuplicateSourceBlockIsRejected` in
-`kv_cache_manager_with_transfer_control_test.cc`):**
-`NotifyForRead` registers `{0, 1}`; `PullStream` requests duplicate source
-blocks `{0, 0}`. `ValidateAndBeginPull` (`.send .beginPull`) is rejected. -/
+/-- `ControlHandshakeTest.PullWithDuplicateSourceBlockIsRejected`: duplicate
+requested source blocks `{0, 0}` are rejected by `ValidateAndBeginPull`. -/
 theorem trace_duplicate_source_block_rejected :
     (BlockPipeline.sys 1 4 2 [0, 1] [⟨0, 0, 0⟩, ⟨0, 1, 1⟩]).run [.send .beginPull] = none := by
   decide
 
-/-- **Trace 5 (`ControlHandshakeTest.EmptyPullIsRejected` in
-`kv_cache_manager_with_transfer_control_test.cc`):**
-`NotifyForRead` registers `{0}`; `PullStream` requests `{}`.
-`ValidateAndBeginPull` (`.send .beginPull`) is rejected. -/
+/-- `ControlHandshakeTest.EmptyPullIsRejected`: an empty block request `{}` is
+rejected by `ValidateAndBeginPull`. -/
 theorem trace_empty_pull_rejected :
     (BlockPipeline.sys 1 4 2 [0] []).run [.send .beginPull] = none := by
   decide
 
-/-- **Trace 6 (`KVCacheManagerWithTransferTest.LocalOrchestratedTransfer` in
-`kv_cache_manager_with_transfer_test.cc`):**
-Pull remote block `0` into local device block `1`: `decodeHbmB[0][1] = .kv 0 0`
-while local device block `0` remains untouched (`.blank`). -/
+/-- `KVCacheManagerWithTransferTest.LocalOrchestratedTransfer`: pulling remote
+block `0` into local block `1` leaves local block `0` `.blank`. -/
 theorem trace_local_orchestrated_transfer :
     ((BlockPipeline.sys 1 2 2 [0] [⟨0, 1, 0⟩]).run trace1Layer).map
       (fun s => (s.pipe.recv.published, s.decodeHbmB)) =
     some (some true, [[BlockCell.blank, BlockCell.kv 0 0]]) := by
   decide
 
-/-- **Trace 7 (`KVCacheManagerWithTransferTest.LocalOrchestratedTransferToCustomHostBlock`
-in `kv_cache_manager_with_transfer_test.cc`):**
-Pull remote block `0` into local device block `1` using custom host block `4`
-out of `6` host blocks (`allocateStagingForLoad [1] (.customHost [4]) = some [4]`):
-- Device block `1` receives `.kv 0 0` while device block `0` stays `.blank`.
-- Custom host block `4` receives `.kv 0 0` while host block `5` stays `.blank`. -/
+/-- `KVCacheManagerWithTransferTest.LocalOrchestratedTransferToCustomHostBlock`:
+lands remote block `0` in custom host block `4` (leaving `5` `.blank`) and local block `1`. -/
 theorem trace_custom_host_block_transfer :
     allocateStagingForLoad [1] (.customHost [4]) = some [4] ∧
     ((BlockPipeline.sys 1 2 6 [0] [⟨0, 1, 4⟩]).run trace1Layer).map
@@ -122,12 +99,8 @@ theorem trace_custom_host_block_transfer :
           some (BlockCell.kv 0 0), some BlockCell.blank) := by
   decide
 
-/-- **Trace 8 (`def test_non_contiguous_blocks` in
-`tpu_sync/api/jax/tests/kv_cache_manager_transfer_test.py` and
-`tpu_sync/api/torch/tests/kv_cache_manager_transfer_test.py`):**
-2 layers completing out of order; `registered = [0, 2]`, `remote = [0, 2]`,
-`local = [0, 1]` out of `3` blocks. For both layers `l ∈ {0, 1}`,
-`decodeHbmB[l] = [.kv l 0, .kv l 2, .blank]` (local block `2` stays untouched). -/
+/-- `test_non_contiguous_blocks` (JAX/Torch): 2 out-of-order layers gather
+`remote = [0, 2]` into `local = [0, 1]`, leaving block `2` `.blank`. -/
 theorem trace_non_contiguous_blocks :
     ((BlockPipeline.sys 2 3 2 [0, 2] [⟨0, 0, 0⟩, ⟨2, 1, 1⟩]).run trace2LayersOutOfOrder).map
       (fun s => (s.pipe.recv.published, s.decodeHbmB)) =
@@ -135,12 +108,8 @@ theorem trace_non_contiguous_blocks :
                       [BlockCell.kv 1 0, BlockCell.kv 1 2, BlockCell.blank]]) := by
   decide
 
-/-- **Trace 9 (`def test_host_reordering` in
-`tpu_sync/api/jax/tests/kv_cache_manager_transfer_test.py` and
-`tpu_sync/api/torch/tests/kv_cache_manager_transfer_test.py`):**
-2 layers completing out of order; `registered = [0, 1]`, `remote = [1, 0]`
-(reversed), `local = [0, 1]`. Both layers deliver `[.kv l 1, .kv l 0]` in
-`decodeHbmB[l]` (`local[0] ← remote[1]`, `local[1] ← remote[0]`). -/
+/-- `test_host_reordering` (JAX/Torch): 2 out-of-order layers with reversed
+`remote = [1, 0]` into `local = [0, 1]` deliver `[.kv l 1, .kv l 0]`. -/
 theorem trace_host_reordering :
     ((BlockPipeline.sys 2 2 2 [0, 1] [⟨1, 0, 0⟩, ⟨0, 1, 1⟩]).run trace2LayersOutOfOrder).map
       (fun s => (s.pipe.recv.published, s.decodeHbmB)) =
@@ -148,24 +117,14 @@ theorem trace_host_reordering :
                       [BlockCell.kv 1 1, BlockCell.kv 1 0]]) := by
   decide
 
-/-- The 10-block non-contiguous reversed transfer configuration from
-`def test_large_complex_non_contiguous_and_reorder` in
-`tpu_sync/api/jax/tests/kv_cache_manager_transfer_test.py` and
-`tpu_sync/api/torch/tests/kv_cache_manager_transfer_test.py`. -/
+/-- Configuration for `test_large_complex_non_contiguous_and_reorder` (JAX/Torch). -/
 def largeComplexRegistered : List Nat := [0, 2, 3, 5, 6, 7, 9, 11, 12, 14]
 def largeComplexRemote : List Nat := largeComplexRegistered.reverse
 def largeComplexLocal : List Nat := List.range 10
 def largeComplexHost : List Nat := List.range 10
 
-/-- **Trace 10 (`def test_large_complex_non_contiguous_and_reorder` in
-`tpu_sync/api/jax/tests/kv_cache_manager_transfer_test.py` and
-`tpu_sync/api/torch/tests/kv_cache_manager_transfer_test.py`):**
-16 blocks per layer, 2 layers completing out of order; `registered = [0, 2, 3, 5, 6, 7, 9, 11, 12, 14]`,
-`remote = reversed(registered)`, `local = [0..9]`.
-- `BuildCoalescedCopySpec` compresses the 10 sorted producer D2H blocks into 6
-  contiguous DMA runs (`[0]`, `[2, 3]`, `[5, 6, 7]`, `[9]`, `[11, 12]`, `[14]`).
-- For every layer `l ∈ {0, 1}`, local blocks `0..9` receive `.kv l remote[i]`
-  and untouched local blocks `10..15` remain `.blank`. -/
+/-- `test_large_complex_non_contiguous_and_reorder` (JAX/Torch): coalesces 10
+blocks into 6 DMA runs and delivers reversed `remote` into `local = [0..9]`. -/
 theorem trace_large_complex_non_contiguous_and_reorder :
     let plan := buildLoadCopyPlan largeComplexRemote largeComplexLocal largeComplexHost
     let triples := zipTriples largeComplexRemote largeComplexLocal largeComplexHost
@@ -177,15 +136,10 @@ theorem trace_large_complex_non_contiguous_and_reorder :
            (largeComplexRemote.map (BlockCell.kv 1)) ++ List.replicate 6 BlockCell.blank]) := by
   decide
 
-/-! ### Mutant: Mismatched Transport Order (`BuildLoadCopyPlan`)
+/-! ### Mutant: mismatched transport order (`buildBuggyCopyPlan`)
 
-If `TransferReceiveSession::BuildLoadCopyPlan` sorted `producer_remote_block_ids`
-by `remote_order` (`plan.producer_remote_block_ids.push_back(remote_block_ids[idx])`)
-without applying the same `remote_order` permutation to
-`transport_host_block_ids` (`plan.transport_host_block_ids.push_back(local_host_block_ids[idx])`),
-then on `test_host_reordering` (`remote = [1, 0], local = [0, 1]`), `decodeHbm`
-silently receives the un-permuted blocks `[.kv 0 0, .kv 0 1]` instead of
-`[.kv 0 1, .kv 0 0]`. -/
+Omitting `remote_order` on `transport_host_block_ids` in `BuildLoadCopyPlan`
+delivers `[.kv 0 0, .kv 0 1]` instead of `[.kv 0 1, .kv 0 0]` on `test_host_reordering`. -/
 
 def buildBuggyCopyPlan (triples : List BlockTriple) : CopyPlan :=
   let base := buildCopyPlanFromTriples triples

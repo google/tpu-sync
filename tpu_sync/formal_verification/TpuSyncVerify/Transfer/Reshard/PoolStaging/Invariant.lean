@@ -502,13 +502,15 @@ theorem step_reserveBeforeLease_inv {s s' : RegState} {e : RegEv}
     dsimp only [RegState.step] at hstep
     split at hstep
     · cases hstep
-    split at hstep
-    · cases hstep
-    rename_i hno_flt
+    rename_i hact
     injection hstep with hs'; subst hs'
-    simp only [beq_self_eq_true, Bool.true_and, Bool.not_eq_true] at hno_flt
-    have hflt_ne : ∀ a ∈ s.inFlightArms, a.uuid ≠ uuid :=
-      not_hasInFlightUuid_of_false hno_flt
+    simp only [Bool.not_eq_true, Bool.not_eq_false'] at hact
+    obtain ⟨p_act, hp_act, hp_uuid⟩ := List.any_eq_true.mp hact
+    have hp_eq : p_act.1 = uuid := beq_iff_eq.mp hp_uuid
+    have hflt_ne : ∀ a ∈ s.inFlightArms, a.uuid ≠ uuid := by
+      intro a ha
+      rw [← hp_eq]
+      exact hinv.activeDisjointArms p_act hp_act a ha
     refine ⟨?_, ?_, ?_, hinv.armsSameUuidSameCall, hinv.armsSameCallSameSpec⟩
     · intro p hp b hb
       simp only [List.mem_filter, bne_iff_ne] at hp

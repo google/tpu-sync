@@ -286,6 +286,7 @@ class StageBroadcastGroup:
   canonical_variable_plans: dict[RaidenId, dict[int, dict[int, list[Any]]]]
   canonical_relay_plans: dict[int, dict[int, list[tuple[int, int, int]]]]
   data_addresses: dict[RaidenId, list[str]]
+  unit_host_ids: dict[RaidenId, str] = dataclasses.field(default_factory=dict)
   cached_hop_schedules: dict[Any, Any] = dataclasses.field(
       default_factory=dict, repr=False, compare=False
   )
@@ -477,6 +478,38 @@ def _extract_host_ip(addr: str) -> str:
   if ":" in addr:
     return addr.rsplit(":", 1)[0]
   return addr
+
+
+def resolve_unit_host_id(
+    unit: RaidenId,
+    *,
+    unit_host_ids: Optional[Mapping[RaidenId, str]] = None,
+    rpc_addresses: Optional[Mapping[RaidenId, str]] = None,
+    data_addresses: Optional[Mapping[RaidenId, Sequence[str]]] = None,
+) -> str:
+  """Resolves physical host identity for a work unit.
+
+  Checks explicit `unit_host_ids` first, then the unit's control-plane RPC
+  endpoint IP (which remains shared across multi-NIC workers on the same
+  physical node even when data-plane NICs rotate), and finally falls back to the
+  first registered data-plane address IP.
+  """
+  if unit_host_ids:
+    explicit = (unit_host_ids.get(unit) or "").strip()
+    if explicit:
+      return explicit
+  if rpc_addresses:
+    rpc_ep = rpc_addresses.get(unit, "")
+    if rpc_ep:
+      first_ep = str(rpc_ep).split(",", 1)[0].strip()
+      rpc_ip = _extract_host_ip(first_ep)
+      if rpc_ip:
+        return rpc_ip
+  if data_addresses:
+    u_addrs = data_addresses.get(unit, ())
+    if u_addrs and u_addrs[0]:
+      return _extract_host_ip(u_addrs[0])
+  return ""
 
 
 def compute_shard_host_ranks(

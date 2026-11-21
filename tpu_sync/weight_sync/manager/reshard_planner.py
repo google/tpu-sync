@@ -630,7 +630,7 @@ class ReshardPlanner:
         if broadcast_host_ratio is None or broadcast_host_ratio <= 0.0
         else float(broadcast_host_ratio)
     )
-    return (
+    base_key = (
         tuple(src_units),
         tuple(dst_units),
         group_size,
@@ -640,6 +640,9 @@ class ReshardPlanner:
         effective_ratio,
         int(broadcast_pipeline_stages),
     )
+    if broadcast_engine.per_host_dedup_enabled():
+      return base_key + ("per_host_dedup",)
+    return base_key
 
   @classmethod
   def build_default_1d_plan(
@@ -733,9 +736,31 @@ class ReshardPlanner:
 
     if not src_units:
       raise ValueError("src_units must not be empty")
-    total_src_hosts = sum(
-        _count_hosts_for_shards(resolve_shards_locked(u)) for u in src_units
-    )
+    per_host_dedup = broadcast_engine.per_host_dedup_enabled()
+    unit_host_ids: dict[RaidenId, str] = {}
+    for u in src_units:
+      u_shards = resolve_shards_locked(u)
+      h_id = controller_types.resolve_unit_host_id(
+          u,
+          rpc_addresses=worker_endpoints,
+          data_addresses={u: u_shards},
+      )
+      if h_id:
+        unit_host_ids[u] = h_id
+    if per_host_dedup:
+      src_unique_hosts = {unit_host_ids[u] for u in src_units if u in unit_host_ids}
+      total_src_hosts = (
+          max(1, len(src_unique_hosts))
+          if src_unique_hosts
+          else sum(
+              _count_hosts_for_shards(resolve_shards_locked(u))
+              for u in src_units
+          )
+      )
+    else:
+      total_src_hosts = sum(
+          _count_hosts_for_shards(resolve_shards_locked(u)) for u in src_units
+      )
     num_src_hosts = total_src_hosts
 
     if dst_metadata:
@@ -1077,6 +1102,17 @@ class ReshardPlanner:
           dst_shards_by_unit[m_unit] = (
               list(meta.shards) if meta.shards else ["127.0.0.1:8000"]
           )
+        if m_unit not in unit_host_ids:
+          ctrl_rpc = getattr(meta, "control_plane_rpc_address", "") or (
+              worker_endpoints.get(m_unit, "") if worker_endpoints else ""
+          )
+          d_h_id = controller_types.resolve_unit_host_id(
+              m_unit,
+              rpc_addresses={m_unit: ctrl_rpc} if ctrl_rpc else None,
+              data_addresses={m_unit: dst_shards_by_unit[m_unit]},
+          )
+          if d_h_id:
+            unit_host_ids[m_unit] = d_h_id
         dst_job_replicas_by_job.setdefault(meta.unit.job_name, set()).add(
             meta.unit.job_replica_id
         )
@@ -1165,7 +1201,49 @@ class ReshardPlanner:
         )
 
       max_eq_class_len = max((len(c) for c in dst_eq_classes), default=0)
-      if len(dst_eq_classes) > 1 and max_eq_class_len > 0:
+      if per_host_dedup and max_eq_class_len > 0:
+        replica_hosts = {
+            unit_host_ids.get(c[0]) or _extract_host_ip(s)
+            for c in dst_eq_classes
+            if c
+            for s in dst_shards_by_unit[c[0]]
+            if (unit_host_ids.get(c[0]) or _extract_host_ip(s))
+        }
+        num_dst_hosts_per_replica = (
+            max(1, len(replica_hosts))
+            if replica_hosts
+            else sum(
+                _count_hosts_for_shards(dst_shards_by_unit[c[0]])
+                for c in dst_eq_classes
+                if c
+            )
+        )
+        max_unique_dst_hosts_in_eq = max(
+            (
+                len({
+                    unit_host_ids.get(u)
+                    or _extract_host_ip(dst_shards_by_unit[u][0])
+                    for u in c
+                    if dst_shards_by_unit.get(u)
+                    and (
+                        unit_host_ids.get(u)
+                        or _extract_host_ip(dst_shards_by_unit[u][0])
+                    )
+                })
+                or len(c)
+                for c in dst_eq_classes
+                if c
+            ),
+            default=max_eq_class_len,
+        )
+        num_dst_hosts_per_unit = max(1, num_dst_hosts_per_replica)
+        n_seed = compute_bandwidth_matched_seed(
+            broadcast_host_ratio=broadcast_host_ratio,
+            num_src_hosts=total_src_hosts,
+            num_dst_hosts_per_unit=num_dst_hosts_per_unit,
+            num_dst_units=max_unique_dst_hosts_in_eq,
+        )
+      elif len(dst_eq_classes) > 1 and max_eq_class_len > 0:
         num_dst_hosts_per_replica = sum(
             _count_hosts_for_shards(dst_shards_by_unit[c[0]])
             for c in dst_eq_classes
@@ -1764,6 +1842,7 @@ class ReshardPlanner:
               canonical_variable_plans=eq_var_plans,
               canonical_relay_plans=eq_relay_plans,
               data_addresses=dict(data_addresses),
+              unit_host_ids=dict(unit_host_ids),
           )
           broadcast_groups[(eq_idx, lg_idx)] = stage_group
         for d_u in eq_dst_units:

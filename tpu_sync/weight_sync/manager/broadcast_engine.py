@@ -19,9 +19,10 @@ import collections
 import functools
 import heapq
 import itertools
+import os
 import random
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 from absl import logging
 
@@ -31,6 +32,33 @@ from tpu_sync.weight_sync.manager import controller_types
 
 _PIPELINE_TARGET_STAGES: int = 4
 _RELAY_MAX_COALESCED_CHUNK_BYTES: int = 4 * 1024 * 1024
+
+
+def per_host_dedup_enabled() -> bool:
+  """Returns True when per-host deduplicated broadcast tree is enabled."""
+  val = (os.environ.get("TPU_SYNC_PER_HOST_DEDUP") or "0").strip()
+  return val in ("1", "true", "TRUE", "yes", "YES", "on", "ON")
+
+
+def partition_dst_units_by_host(
+    dst_units: Sequence[RaidenId],
+    get_unit_host_id: Callable[[RaidenId], str],
+) -> tuple[list[RaidenId], dict[RaidenId, list[RaidenId]]]:
+  """Partitions destination units into 1 leader per physical host + followers."""
+  leaders: list[RaidenId] = []
+  followers_by_leader: dict[RaidenId, list[RaidenId]] = {}
+  leader_by_key: dict[str, RaidenId] = {}
+  for u in dst_units:
+    host_id = get_unit_host_id(u)
+    host_key = host_id if host_id else f"__unit__:{u}"
+    leader = leader_by_key.get(host_key)
+    if leader is None:
+      leader_by_key[host_key] = u
+      leaders.append(u)
+      followers_by_leader[u] = []
+    else:
+      followers_by_leader[leader].append(u)
+  return leaders, followers_by_leader
 
 
 def _coalesce_contiguous_relay_entries(
@@ -256,6 +284,7 @@ def _coalesce_pipeline_groups(
                   canonical_variable_plans=merged_canonical_vars,
                   canonical_relay_plans=merged_canonical_relays,
                   data_addresses=dict(first.data_addresses),
+                  unit_host_ids=dict(first.unit_host_ids),
                   cached_hop_schedules=first.cached_hop_schedules,
               )
           )
@@ -278,8 +307,10 @@ def _coalesce_pipeline_groups(
         merged_dst_units: list[RaidenId] = []
         seen_dst: set[RaidenId] = set()
         merged_data_addresses: dict[RaidenId, list[str]] = {}
+        merged_unit_host_ids: dict[RaidenId, str] = {}
         for g in eq_groups:
           merged_data_addresses.update(g.data_addresses)
+          merged_unit_host_ids.update(g.unit_host_ids)
           for d in g.dst_units:
             if d not in seen_dst:
               seen_dst.add(d)
@@ -304,6 +335,7 @@ def _coalesce_pipeline_groups(
                 canonical_variable_plans=first.canonical_variable_plans,
                 canonical_relay_plans={},
                 data_addresses=merged_data_addresses,
+                unit_host_ids=merged_unit_host_ids,
                 cached_hop_schedules=first.cached_hop_schedules,
                 eq_class_groups=eq_groups,
             )
@@ -359,17 +391,61 @@ def _coalesce_pipeline_groups(
   return coalesced
 
 
+def _stage_group_needs_host_dedup_relay(
+    sg: controller_types.StageBroadcastGroup, n_seed: int
+) -> bool:
+  """Returns True if StageBroadcastGroup needs intra-host or inter-host relays."""
+
+  def _host_of(u: RaidenId) -> str:
+    return controller_types.resolve_unit_host_id(
+        u,
+        unit_host_ids=sg.unit_host_ids,
+        data_addresses=sg.data_addresses,
+    )
+
+  leaders, followers = partition_dst_units_by_host(sg.dst_units, _host_of)
+  if len(leaders) > n_seed:
+    return True
+  return any(bool(v) for v in followers.values())
+
+
 def _groups_need_multi_hop(groups_list: list[Any], n_seed: int) -> bool:
   """Returns True if any stage group fans out to more than n_seed receivers."""
+  dedup = per_host_dedup_enabled()
   for g in groups_list:
     if not g:
       continue
     if isinstance(g, controller_types.StageBroadcastGroup):
       sub_groups = getattr(g, "eq_class_groups", None)
       if sub_groups:
-        if any(len(sub.dst_units) > n_seed for sub in sub_groups):
+        if dedup:
+          if any(
+              _stage_group_needs_host_dedup_relay(sub, n_seed)
+              for sub in sub_groups
+          ):
+            return True
+        elif any(len(sub.dst_units) > n_seed for sub in sub_groups):
+          return True
+      elif dedup:
+        if _stage_group_needs_host_dedup_relay(g, n_seed):
           return True
       elif len(g.dst_units) > n_seed:
+        return True
+    elif dedup:
+      ip_by_unit: dict[RaidenId, str] = {}
+      unit_order: list[RaidenId] = []
+      for _, targets in g:
+        for t in targets:
+          u = t[0]
+          if u not in ip_by_unit:
+            unit_order.append(u)
+            ip_by_unit[u] = (
+                controller_types.extract_host_ip(t[1]) if t[1] else ""
+            )
+      leaders, followers = partition_dst_units_by_host(
+          unit_order, lambda u, m=ip_by_unit: m.get(u, "")
+      )
+      if len(leaders) > n_seed or any(bool(v) for v in followers.values()):
         return True
     elif len({t[0] for _, targets in g for t in targets}) > n_seed:
       return True
@@ -398,6 +474,15 @@ def _coalesce_pipeline_groups_cached(
   Returns:
     (effective_target_stages, coalesced_groups_list).
   """
+  dedup = per_host_dedup_enabled()
+  dedup_stages_env = (
+      os.environ.get("TPU_SYNC_DEDUP_PIPELINE_STAGES") or ""
+  ).strip()
+  requested_stages = (
+      max(1, int(dedup_stages_env))
+      if (dedup and dedup_stages_env)
+      else pipeline_target_stages
+  )
   memo: Optional[dict[Any, Any]] = None
   memo_key = None
   if groups_list and isinstance(
@@ -407,8 +492,9 @@ def _coalesce_pipeline_groups_cached(
     if memo is not None:
       memo_key = (
           "__coalesced_pipeline__",
-          pipeline_target_stages,
+          requested_stages,
           n_seed,
+          dedup,
           len(groups_list),
           id(groups_list[-1]),
       )
@@ -417,7 +503,7 @@ def _coalesce_pipeline_groups_cached(
         return cached
 
   effective_target_stages = (
-      pipeline_target_stages
+      requested_stages
       if _groups_need_multi_hop(groups_list, n_seed)
       else 1
   )
@@ -809,15 +895,59 @@ class BroadcastEngine:
         if not added and u_str not in dests[0]:
           dests[0].append(u_str)
 
-      while next_idx < n:
+      def _unit_host_id(
+          u: RaidenId, cur_g: _GroupBroadcastState = g
+      ) -> str:
+        rpc_addrs = (
+            final_plan.worker_rpc_addresses
+            if final_plan is not None and final_plan.worker_rpc_addresses
+            else None
+        )
+        if cur_g.stage_group is not None:
+          return controller_types.resolve_unit_host_id(
+              u,
+              unit_host_ids=cur_g.stage_group.unit_host_ids,
+              rpc_addresses=rpc_addrs,
+              data_addresses=cur_g.stage_group.data_addresses,
+          )
+        if rpc_addrs:
+          rpc_host = controller_types.resolve_unit_host_id(
+              u, rpc_addresses=rpc_addrs
+          )
+          if rpc_host:
+            return rpc_host
+        idxs = cur_g.dst_unit_to_indices.get(u, ())
+        if idxs:
+          peer = cur_g.ref_targets[idxs[0]][1]
+          return controller_types.extract_host_ip(peer) if peer else ""
+        return ""
+
+      use_host_dedup = per_host_dedup_enabled()
+      if use_host_dedup:
+        inter_host_dsts, followers_by_leader = partition_dst_units_by_host(
+            dst_units, _unit_host_id
+        )
+        has_intra_host_relays = any(
+            bool(v) for v in followers_by_leader.values()
+        )
+      else:
+        inter_host_dsts = list(dst_units)
+        followers_by_leader = {}
+        has_intra_host_relays = False
+
+      tree_dst_units = inter_host_dsts if has_intra_host_relays else dst_units
+      m_tree = len(tree_dst_units)
+      leader_hop_by_unit: dict[RaidenId, _HopTask] = {}
+
+      while next_idx < m_tree:
         new_round_hops: list[_HopTask] = []
 
         # 1. All previously populated samplers each send 1:1 to 1 new sampler
         #    (ordered newest-first so partial final rounds use earliest-free TX NICs).
         for parent_hop in reversed(populated_hops):
-          if next_idx >= n:
+          if next_idx >= m_tree:
             break
-          d = dst_units[next_idx]
+          d = tree_dst_units[next_idx]
           child_hop = _HopTask(
               group=g,
               sender=parent_hop.receiver,
@@ -829,20 +959,27 @@ class BroadcastEngine:
           sender_child_count[parent_hop.receiver] += 1
           parent_hop.children.append(child_hop)
           new_round_hops.append(child_hop)
+          leader_hop_by_unit[d] = child_hop
           _record_hop_destinations(parent_hop.receiver, d, round_idx)
           next_idx += 1
 
         # 2. Trainer sends to up to n_seed new samplers in this round.
-        is_coalesced_1hop = g.stage_group is not None and bool(
-            getattr(g.stage_group, "eq_class_groups", None)
+        is_coalesced_1hop = (
+            not has_intra_host_relays
+            and g.stage_group is not None
+            and bool(getattr(g.stage_group, "eq_class_groups", None))
         )
         k_train = (
-            (n - next_idx) if is_coalesced_1hop else min(n_seed, n - next_idx)
+            (m_tree - next_idx)
+            if is_coalesced_1hop
+            else min(n_seed, m_tree - next_idx)
         )
         train_child_order = sender_child_count[g.primary_src_unit]
         if g.stage_group is not None:
           if k_train > 0:
-            round_train_dsts = [dst_units[next_idx + i] for i in range(k_train)]
+            round_train_dsts = [
+                tree_dst_units[next_idx + i] for i in range(k_train)
+            ]
             seed_hops = []
             combined_dst_indices = []
             for d in round_train_dsts:
@@ -856,6 +993,7 @@ class BroadcastEngine:
               )
               seed_hops.append(s_hop)
               new_round_hops.append(s_hop)
+              leader_hop_by_unit[d] = s_hop
               combined_dst_indices.extend(g.dst_unit_to_indices[d])
               _record_hop_destinations(g.primary_src_unit, d, round_idx)
             trainer_hop = _HopTask(
@@ -884,7 +1022,7 @@ class BroadcastEngine:
             sender_child_count[g.primary_src_unit] += 1
         else:
           for _ in range(k_train):
-            d = dst_units[next_idx]
+            d = tree_dst_units[next_idx]
             s_hop = _HopTask(
                 group=g,
                 sender=g.primary_src_unit,
@@ -894,6 +1032,7 @@ class BroadcastEngine:
                 child_order=train_child_order,
             )
             new_round_hops.append(s_hop)
+            leader_hop_by_unit[d] = s_hop
             if diag_vlog:
               s_hop.enqueued_time = time.monotonic()
             heapq.heappush(
@@ -912,6 +1051,38 @@ class BroadcastEngine:
 
         populated_hops.extend(new_round_hops)
         round_idx += 1
+
+      if has_intra_host_relays:
+        for leader in inter_host_dsts:
+          f_units = followers_by_leader.get(leader, [])
+          if not f_units:
+            continue
+          root_hop = leader_hop_by_unit[leader]
+          host_hops: list[_HopTask] = [root_hop]
+          f_idx = 0
+          h_round = root_hop.round_idx + 1
+          while f_idx < len(f_units):
+            new_host_hops: list[_HopTask] = []
+            for parent_hop in reversed(host_hops):
+              if f_idx >= len(f_units):
+                break
+              d = f_units[f_idx]
+              child_hop = _HopTask(
+                  group=g,
+                  sender=parent_hop.receiver,
+                  receiver=d,
+                  dst_indices=g.dst_unit_to_indices[d],
+                  round_idx=h_round,
+                  child_order=sender_child_count[parent_hop.receiver],
+              )
+              sender_child_count[parent_hop.receiver] += 1
+              parent_hop.children.append(child_hop)
+              new_host_hops.append(child_hop)
+              populated_hops.append(child_hop)
+              _record_hop_destinations(parent_hop.receiver, d, h_round)
+              f_idx += 1
+            host_hops.extend(new_host_hops)
+            h_round += 1
 
       # Accumulate full-transfer receiver chunk expectations across stages so
       # OnLayerDataReceived fires once per layer and OnDataReceived fires only

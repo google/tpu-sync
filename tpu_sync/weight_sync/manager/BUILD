@@ -44,6 +44,22 @@ py_test(
     ],
 )
 
+py_test(
+    name = "per_host_dedup_test",
+    srcs = ["per_host_dedup_test.py"],
+    tags = ["no_oss"],
+    deps = [
+        ":broadcast_engine",
+        ":controller_types",
+        ":job_entity",
+        ":reshard_planner",
+        "//tpu_sync/api:common",
+        "//tpu_sync/rpc:raiden_controller",
+        "//tpu_sync/rpc:raiden_service_py_pb2",
+        "@com_google_absl_py//absl/testing:absltest",
+    ],
+)
+
 py_library(
     name = "controller_types",
     srcs = ["controller_types.py"],

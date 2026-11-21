@@ -32,7 +32,6 @@
 #include <map>
 #include <memory>
 #include <optional>
-#include <set>
 #include <stdexcept>
 #include <string>
 #include <system_error>  // NOLINT(build/c++11)
@@ -53,7 +52,6 @@
 #include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
-#include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
@@ -85,6 +83,7 @@
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/transport/block_transport.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
+#include "tpu_sync/transport/block_transport_session.h"
 #include "tpu_sync/transport/peer_endpoint.h"
 #include "tpu_sync/transport/transfer_session.h"
 
@@ -1087,6 +1086,18 @@ KVCacheManagerBase::~KVCacheManagerBase() {
   push_pool_.reset();
   dma_pool_.reset();
   pull_pool_.reset();
+  {
+    // Drain and destroy secondary backends outside `backends_mu_` BEFORE
+    // `buffer_holds_.clear()` unpins device HBM so direct-storage backends
+    // drain in-flight BAR2 DMA I/O and deregister `dma-buf` handles while the
+    // underlying `ExternalDmaInfo` HBM pins in `buffer_holds_` are still alive.
+    absl::flat_hash_map<std::string, std::shared_ptr<backends::KVBackend>>
+        backends_to_destroy;
+    {
+      absl::MutexLock lock(backends_mu_);
+      backends_to_destroy = std::move(backends_);
+    }
+  }
   buffer_holds_.clear();
   layers_ = StagingArena();
   host_block_manager_.reset();
@@ -2057,7 +2068,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hDirect(
       auto futures,
       DispatchD2hChunks(src_offsets, dst_offsets, copy_sizes,
                         /*slot_idx=*/std::nullopt, /*layer_idx=*/std::nullopt,
-                        /*shard_idx=*/std::nullopt, device_id));
+                        /*host_layer_idx=*/std::nullopt, device_id));
   std::optional<size_t> single_shard;
   if (device_id >= 0) {
     single_shard = static_cast<size_t>(device_id);
@@ -3819,6 +3830,20 @@ bool KVCacheManagerBase::InitializeSingleSecondaryBackend(
     LOG(FATAL) << "[Worker] failed to initialize host memory on " << config.type
                << " backend: " << status.message();
   }
+  if (backend->SupportsDeviceTransfer()) {
+    // Query PJRT `AcquireExternalDmaAccess` on every `(layer, shard)` KV tensor
+    // and pre-register their PCIe BAR2 `dma-buf` apertures with `backend` once
+    // before publishing `backend` into `backends_`. If registration fails (e.g.
+    // on XLA CPU or hosts without BAR2 `dma-buf` `mmap` support), record
+    // `reg_status` so non-strict routes can fall back to aligned host bounce
+    // buffers while strict DMA routes surface `reg_status` on transfer.
+    absl::Status reg_status = RegisterDeviceBuffersWithBackend(backend.get());
+    if (!reg_status.ok()) {
+      LOG(WARNING) << "[Worker] RegisterDeviceMemory on " << config.type
+                   << " failed: " << reg_status;
+      backend->SetStartupDmaError(std::move(reg_status));
+    }
+  }
   {
     absl::MutexLock lock(backends_mu_);
     backends_[canonical_name] = std::move(backend);
@@ -3847,6 +3872,16 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hWriteToBackend(
   auto backend = backends.empty() ? nullptr : backends.front();
   if (backend == nullptr) {
     return absl::InvalidArgumentError("Secondary backend is null");
+  }
+  // Normally `D2hWriteToBackend` runs a two-hop pipeline (`TPU HBM -> Host DRAM
+  // StagingArena slot -> Storage`). When `dst_host_block_ids` is empty on a
+  // backend that `SupportsDeviceTransfer()`, bypass the Host DRAM
+  // `StagingArena` completely and hand the HBM block slices directly to
+  // `backend` (works even when `host_blocks_to_allocate = 0`).
+  if (dst_host_block_ids.empty() && !block_keys.empty() &&
+      backend->SupportsDeviceTransfer()) {
+    return TransferDeviceWithBackend(backend.get(), block_keys,
+                                     src_device_block_ids, /*is_write=*/true);
   }
 
   size_t num_chunks = block_keys.size();
@@ -3951,6 +3986,15 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dReadFromBackend(
   auto backend = backends.empty() ? nullptr : backends.front();
   if (backend == nullptr) {
     return absl::InvalidArgumentError("Secondary backend is null");
+  }
+  // Normally `H2dReadFromBackend` stages through Host DRAM (`Storage -> Host
+  // DRAM StagingArena slot -> TPU HBM`). When `src_host_block_ids` is empty on
+  // a backend that `SupportsDeviceTransfer()`, bypass the Host DRAM
+  // `StagingArena` and read directly into `dst_device_block_ids` via `backend`.
+  if (src_host_block_ids.empty() && !block_keys.empty() &&
+      backend->SupportsDeviceTransfer()) {
+    return TransferDeviceWithBackend(backend.get(), block_keys,
+                                     dst_device_block_ids, /*is_write=*/false);
   }
 
   size_t num_chunks = block_keys.size();
@@ -4079,6 +4123,129 @@ KVCacheManagerBase::ResolveBlockSlices(int staging_block_id) const {
       desc.offset = (base_fd >= 0 && base_ptr != nullptr)
                         ? (base_fd_offset + (ptr - base_ptr))
                         : 0;
+      slices.push_back(desc);
+    }
+  }
+  return slices;
+}
+
+// Dispatches a batch of Direct Storage transfers (`HBM -> Storage` when
+// `is_write` is true, `Storage -> HBM` when false) through `backend` without
+// allocating slots from the worker's Host DRAM `StagingArena`.
+//
+// Device synchronization:
+//   - Before offload (`is_write = true`), the caller ensures TPU compute
+//     writing `device_block_ids` has finished before calling `Save()`, and
+//     `backend` completes either its BAR2 P2P batch or PJRT D2H + storage write
+//     before invoking `done`.
+//   - During recall (`is_write = false`), `backend` completes either its BAR2
+//     P2P read into HBM or storage read + PJRT H2D before invoking `done`, so
+//     awaiting the returned `PjRtCopyFuture` (via `WorkerServiceImpl` ->
+//     `PollLoadStatus()`) guarantees the recalled bytes are visible in TPU HBM
+//     before the next TPU compute step reads them.
+absl::StatusOr<raiden::PjRtCopyFuture>
+KVCacheManagerBase::TransferDeviceWithBackend(
+    backends::KVBackend* backend,
+    const std::vector<backends::BlockKey>& block_keys,
+    const std::vector<int64_t>& device_block_ids, bool is_write) {
+  const size_t num_chunks = block_keys.size();
+  if (device_block_ids.size() != num_chunks) {
+    return absl::InvalidArgumentError(
+        "Mismatch between block_keys and device_block_ids sizes");
+  }
+  // Resolve and bounds-check every block's HBM slices up front so an invalid
+  // `device_block_id` fails synchronously before any async I/O starts.
+  std::vector<std::vector<backends::DeviceBufferDescriptor>> chunk_slices(
+      num_chunks);
+  for (size_t i = 0; i < num_chunks; ++i) {
+    chunk_slices[i] = ResolveDeviceBlockSlices(device_block_ids[i]);
+    if (chunk_slices[i].empty()) {
+      return absl::FailedPreconditionError(
+          absl::StrCat("No device block ", device_block_ids[i]));
+    }
+  }
+
+  auto [promise, aggregate_future] = xla::MakePromise();
+  auto state = std::make_shared<TransferPipelinedState>(
+      num_chunks, std::move(promise), /*holds=*/raiden::BufferHolders{});
+  for (size_t i = 0; i < num_chunks; ++i) {
+    auto done = [state](absl::Status s) {
+      if (!s.ok()) state->SetError(s);
+      state->MarkChunkComplete();
+    };
+    if (is_write) {
+      backend->WriteDeviceAsync(block_keys[i], chunk_slices[i],
+                                std::move(done));
+    } else {
+      backend->ReadDeviceAsync(block_keys[i], chunk_slices[i], std::move(done));
+    }
+  }
+  return raiden::PjRtCopyFuture(std::move(aggregate_future), /*holds=*/{});
+}
+
+// Stages all `(layer, shard)` `ExternalDmaInfo` handles locally before moving
+// them into `buffer_holds_` so startup BAR2 registration is all-or-nothing: if
+// any buffer lacks `AcquireExternalDmaAccess` or fails `RegisterDeviceMemory`
+// (for example, `mmap` fails on `dma_buf_fd`), destroying `staged` releases all
+// already-acquired PJRT HBM compaction pins and leaves `external_dma_infos`
+// empty across every layer.
+absl::Status KVCacheManagerBase::RegisterDeviceBuffersWithBackend(
+    backends::KVBackend* backend) {
+  std::vector<std::vector<raiden::ExternalDmaInfo>> staged(
+      buffer_holds_.size());
+  for (size_t l = 0; l < buffer_holds_.size(); ++l) {
+    staged[l].reserve(buffer_holds_[l].holds.size());
+    for (size_t s = 0; s < buffer_holds_[l].holds.size(); ++s) {
+      auto ext = buffer_holds_[l].holds[s].AcquireExternalDmaAccess();
+      if (!ext.has_value()) {
+        return absl::FailedPreconditionError("AcquireExternalDmaAccess failed");
+      }
+      ABSL_RETURN_IF_ERROR(backend->RegisterDeviceMemory(
+          ext->dma_buf_fd, ext->offset, ext->size));
+      staged[l].push_back(*std::move(ext));
+    }
+  }
+  for (size_t l = 0; l < buffer_holds_.size(); ++l) {
+    buffer_holds_[l].external_dma_infos = std::move(staged[l]);
+  }
+  return absl::OkStatus();
+}
+
+// Builds the canonical layer-major list of on-device HBM slices (`layer` outer,
+// `shard` inner) for `device_block_id`.
+//
+// Offset math for `(layer l, shard s)`:
+//   - Within that PJRT buffer, logical block `device_block_id` occupies
+//     `slice_bytes = block_bytes(l)` bytes starting at `off = device_block_id *
+//     slice_bytes`.
+//   - When startup BAR2 registration succeeded (`external_dma_infos` is
+//     non-empty), the PJRT buffer itself begins at byte `ext.offset` inside the
+//     TPU chip's BAR2 `dma_buf_fd`, so this block's slice inside `dma_buf_fd`
+//     starts at `dma_buf_offset = ext.offset + off`.
+//   - Otherwise `dma_buf_fd` stays `-1`, signaling the backend to use
+//     `buffer_handle` + `buffer_offset` via aligned host bounce buffers.
+std::vector<backends::DeviceBufferDescriptor>
+KVCacheManagerBase::ResolveDeviceBlockSlices(int64_t device_block_id) const {
+  if (device_block_id < 0 || buffer_holds_.empty()) return {};
+  std::vector<backends::DeviceBufferDescriptor> slices;
+  slices.reserve(num_layers_ * num_shards_);
+  for (size_t l = 0; l < num_layers_; ++l) {
+    const size_t slice_bytes = block_bytes(l);
+    const int64_t off = device_block_id * static_cast<int64_t>(slice_bytes);
+    for (size_t s = 0; s < num_shards_; ++s) {
+      if (static_cast<size_t>(off) + slice_bytes >
+          layers_[l].shards[s].device_size) {
+        return {};
+      }
+      backends::DeviceBufferDescriptor desc{
+          .buffer_handle = &buffer_holds_[l].holds[s],
+          .buffer_offset = off,
+          .size = slice_bytes};
+      if (s < buffer_holds_[l].external_dma_infos.size()) {
+        const auto& ext = buffer_holds_[l].external_dma_infos[s];
+        desc.dma_buf_fd = ext.dma_buf_fd;
+        desc.dma_buf_offset = ext.offset + static_cast<size_t>(off);
+      }
       slices.push_back(desc);
     }
   }

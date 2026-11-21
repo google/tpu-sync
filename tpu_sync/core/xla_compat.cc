@@ -88,6 +88,11 @@ void DestroyPjrtError(const PJRT_Api* c_api, PJRT_Error* error) {
   c_api->PJRT_Error_Destroy(&destroy_args);
 }
 
+}  // namespace
+
+// Extracts the message and status code from `error` and destroys it. `c_api`
+// may be null when `error` originates from an in-process `CommonPjRtBuffer`
+// `PJRT_RawBuffer` vtable rather than a C-API plugin.
 absl::Status ConsumePjrtError(const PJRT_Api* c_api, PJRT_Error* error) {
   if (error == nullptr) {
     return absl::OkStatus();
@@ -124,8 +129,6 @@ absl::Status ConsumePjrtError(const PJRT_Api* c_api, PJRT_Error* error) {
   DestroyPjrtError(c_api, error);
   return absl::Status(status_code, message);
 }
-
-}  // namespace
 
 BufferKind ClassifyBuffer(const xla::PjRtBuffer* buffer) {
   if (dynamic_cast<const xla::CommonPjRtBuffer*>(buffer) != nullptr) {

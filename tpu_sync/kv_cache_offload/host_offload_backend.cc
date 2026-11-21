@@ -491,7 +491,17 @@ bool HostOffloadBackend::InsertBestEffortUpdate(
         evicted = lru_cache_.Put(hash, RaidenBlockId());
       }
       if (evicted.has_value()) {
-        evicted_hashes.push_back(std::move(evicted->first));
+        // When `lru_cache_.Put` overflows capacity, it moves the displaced
+        // entry to its eviction-candidate list so `Evict()` can later reclaim
+        // its Host DRAM slot. Entries in `BlockStatus::HBM` (such as blocks
+        // under TDS Direct Storage mode) own no Host DRAM slot and were never
+        // registered in the global peer registry, so erase them immediately
+        // instead of leaving unreclaimable candidates behind.
+        if (evicted->second.status == BlockStatus::HBM) {
+          lru_cache_.Erase(evicted->first);
+        } else {
+          evicted_hashes.push_back(std::move(evicted->first));
+        }
       }
     }
     client = registry_client_;
@@ -570,11 +580,17 @@ bool HostOffloadBackend::InsertAndPin(
         ClearMetadataEntry(*stale);
       }
     }
+    std::optional<std::pair<std::string, RaidenBlockId>> evicted;
     if (i < slices.size()) {
-      lru_cache_.Put(hash, slices[i]);
+      evicted = lru_cache_.Put(hash, slices[i]);
       SetMetadataEntry(hash, slices[i]);
     } else {
-      lru_cache_.Put(hash, RaidenBlockId());
+      evicted = lru_cache_.Put(hash, RaidenBlockId());
+    }
+    // Erase displaced HBM-only entries immediately because they own no Host
+    // DRAM block for `Evict()` to reclaim.
+    if (evicted.has_value() && evicted->second.status == BlockStatus::HBM) {
+      lru_cache_.Erase(evicted->first);
     }
   }
 
@@ -639,9 +655,12 @@ bool HostOffloadBackend::InsertAdmitStrict(
       return false;
     }
     SetMetadataEntry(hash, slices[i]);
-    // Displaced entries move to eviction candidates and keep their host
-    // blocks.
-    (void)evicted;
+    // Displaced host-backed entries move to eviction candidates and keep their
+    // Host DRAM slots until `Evict()` reclaims them; HBM-only entries hold no
+    // Host DRAM slot and are erased immediately.
+    if (evicted.has_value() && evicted->second.status == BlockStatus::HBM) {
+      lru_cache_.Erase(evicted->first);
+    }
   }
   return true;
 }

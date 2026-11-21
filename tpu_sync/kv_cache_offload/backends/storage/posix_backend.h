@@ -278,6 +278,11 @@ class PosixKVCacheStoreBackend : public KVCacheStoreBackend {
 
   std::string name() const override { return name_; }
 
+  bool IsDirectStorage() const override {
+    return storage_backend_ != nullptr &&
+           storage_backend_->SupportsDeviceTransfer();
+  }
+
   const std::string& dp_rank() const { return dp_rank_; }
 
   size_t lookup_batch_size() const { return lookup_batch_size_; }

@@ -1027,6 +1027,11 @@ KVCacheStore::~KVCacheStore() {
   }
 }
 
+bool KVCacheStore::UsesDirectStorage() const {
+  return backends_.size() > 1 && backends_[1] != nullptr &&
+         backends_[1]->IsDirectStorage();
+}
+
 absl::StatusOr<BlockSliceList> KVCacheStore::Lookup(
     const std::vector<std::string>& block_hashes, bool enable_global,
     bool pin_found) {
@@ -1068,14 +1073,26 @@ absl::StatusOr<BlockSliceList> KVCacheStore::Lookup(
   BlockSliceList accumulated_results;
   accumulated_results.reserve(block_hashes.size());
 
+  const bool direct_storage = UsesDirectStorage();
   size_t start_idx = 0;
   for (size_t tier_idx = 0; tier_idx < backends_.size(); ++tier_idx) {
     const auto& backend = backends_[tier_idx];
     if (start_idx >= block_hashes.size()) break;
     if (!backend) continue;
 
+    LookupOptions tier_options = options;
+    if (direct_storage && tier_idx == 0) {
+      // Under Direct Storage mode, Host DRAM is bypassed (the worker may have
+      // zero Host DRAM staging slots), so peer-DRAM (`enable_global`) and
+      // interleaved local/remote DRAM lookups cannot be served. Query Tier 0
+      // strictly for local `BlockStatus::HBM` residency before cascading the
+      // remaining suffix to Tier 1 shared storage.
+      tier_options.enable_global = false;
+      tier_options.enable_interleaved_lookup = false;
+    }
+
     auto lookup_result = backend->Lookup(
-        absl::MakeSpan(block_hashes).subspan(start_idx), options);
+        absl::MakeSpan(block_hashes).subspan(start_idx), tier_options);
     if (!lookup_result.ok()) {
       if (!accumulated_results.empty() &&
           absl::IsNotFound(lookup_result.status())) {
@@ -1093,9 +1110,34 @@ absl::StatusOr<BlockSliceList> KVCacheStore::Lookup(
     }
 
     const auto& res = *lookup_result;
-    for (const auto& pair : res) {
-      accumulated_results.push_back(pair);
-      ++start_idx;
+    if (direct_storage && tier_idx == 0) {
+      // Accept only the leading prefix of on-device `HBM` entries from Tier 0;
+      // any `HOST` entry stops the Tier-0 prefix so the remaining hashes fall
+      // through to Tier 1 storage. Because `backend->Lookup` already pinned
+      // every entry in `res` when `tier_options.pin_found` is set, hand back
+      // the pins on any rejected tail entries so they do not leak.
+      size_t accepted = 0;
+      for (const auto& pair : res) {
+        if (pair.second.status != BlockStatus::HBM) {
+          break;
+        }
+        accumulated_results.push_back(pair);
+        ++start_idx;
+        ++accepted;
+      }
+      if (tier_options.pin_found && accepted < res.size()) {
+        std::vector<std::string> unaccepted_hashes;
+        unaccepted_hashes.reserve(res.size() - accepted);
+        for (size_t i = accepted; i < res.size(); ++i) {
+          unaccepted_hashes.push_back(res[i].first);
+        }
+        backend->Release(unaccepted_hashes);
+      }
+    } else {
+      for (const auto& pair : res) {
+        accumulated_results.push_back(pair);
+        ++start_idx;
+      }
     }
   }
 
@@ -1219,58 +1261,77 @@ absl::Status KVCacheStore::SaveLocal(
     save_tracker_.AddPending(block_hashes);
   }
 
-  absl::StatusOr<std::vector<int>> host_blocks =
-      AllocateBlockIds(block_hashes.size());
-  if (!host_blocks.ok()) {
-    IncrementKvSaveBlocks(dp_rank_str_,
-                          telemetry::metric_labels::kTierLocalDram,
-                          absl::IsResourceExhausted(host_blocks.status())
-                              ? telemetry::metric_labels::kOutcomeRejected
-                              : telemetry::metric_labels::kOutcomeFailed,
-                          block_hashes.size());
-    save_tracker_.RemovePending(block_hashes);
-    return host_blocks.status();
-  }
-  const auto& host_block_ids = *host_blocks;
-
   std::shared_ptr<KVCacheStoreBackend> secondary_backend = nullptr;
   std::string secondary_backend_name;
   if (backends_.size() > 1 && backends_[1] != nullptr) {
     secondary_backend = backends_[1];
     secondary_backend_name = secondary_backend->name();
   }
+  const bool direct_storage = UsesDirectStorage();
+
+  // Indirect Save (`!direct_storage`) stages through Host DRAM (`TPU HBM ->
+  // Host DRAM slot -> Storage`) and retains those Host DRAM slots as the
+  // tier-0 `HOST_AND_HBM` copy. Direct Save (`direct_storage`) leaves
+  // `host_block_ids` empty so the worker moves blocks directly from TPU HBM to
+  // storage without requiring a Host DRAM pool.
+  std::vector<int> host_block_ids;
+  if (!direct_storage) {
+    absl::StatusOr<std::vector<int>> host_blocks =
+        AllocateBlockIds(block_hashes.size());
+    if (!host_blocks.ok()) {
+      IncrementKvSaveBlocks(dp_rank_str_,
+                            telemetry::metric_labels::kTierLocalDram,
+                            absl::IsResourceExhausted(host_blocks.status())
+                                ? telemetry::metric_labels::kOutcomeRejected
+                                : telemetry::metric_labels::kOutcomeFailed,
+                            block_hashes.size());
+      save_tracker_.RemovePending(block_hashes);
+      return host_blocks.status();
+    }
+    host_block_ids = *std::move(host_blocks);
+  }
 
   if (secondary_backend != nullptr && !secondary_backend_name.empty()) {
     ::tpu_sync::proto::BackendTransferSpec spec;
     spec.set_name(secondary_backend_name);
 
-    // OFFLOAD: the HBM side is the source and the host-DRAM staging side is
-    // the destination. The staging blocks are deliberately retained on
-    // success -- they become the tier-0 host-resident copy below.
+    // `OFFLOAD` reads from `src_device_block_ids` in TPU HBM. When `host_ids`
+    // is non-empty, the worker stages into Host DRAM first and writes to
+    // storage; when `host_ids` is empty (`direct_storage`), the worker writes
+    // directly from TPU HBM to storage.
     const std::vector<int64_t> host_ids(host_block_ids.begin(),
                                         host_block_ids.end());
     tsl::Future<> future = raiden_controller_->TransferBackendBuffers(
         ::tpu_sync::proto::TRANSFER_DIR_OFFLOAD, block_hashes,
         /*hbm_block_ids=*/src_device_block_ids,
         /*host_block_ids=*/host_ids, {spec});
-    // Captures are copies only -- no `this`. The store can be destroyed while
-    // this transfer is in flight, so every touch of it goes through the
-    // lifetime fence. The fence is held only across the member accesses: the
-    // registry work further down runs on captured copies and must not block
-    // ~KVCacheStore behind a network round trip.
+    // Capture copies only (never `this`): `~KVCacheStore` can run while the
+    // offload RPC is in flight, so member accesses go through `lifetime->mu`
+    // and network/registry work runs outside that lock.
     future.OnReady([lifetime = lifetime_, wt_state = wt_state_,
                     host_ram_backend = backend(),
                     registry_client = registry_client_, raiden_id = raiden_id_,
-                    block_hashes, host_block_ids,
+                    direct_storage, block_hashes, host_block_ids,
                     src_device_block_ids](absl::Status status) {
-      if (!status.ok()) {
+      // Both failures and successful Direct Storage saves finish here: direct
+      // saves created no Host DRAM copy to publish as `HOST_AND_HBM` or
+      // advertise to peers in `registry_client`, so on success we mark the save
+      // complete, release the caller's HBM pin, and leave the tier-0 entry in
+      // `BlockStatus::HBM`.
+      if (!status.ok() || direct_storage) {
         {
           absl::MutexLock lock(lifetime->mu);
           if (KVCacheStore* self = lifetime->store; self != nullptr) {
-            self->DeallocateBlockIds(host_block_ids);
-            MarkSaveFailed(self->save_tracker_, self->dp_rank_str_,
+            if (!status.ok()) {
+              self->DeallocateBlockIds(host_block_ids);
+              MarkSaveFailed(self->save_tracker_, self->dp_rank_str_,
+                             telemetry::metric_labels::kTierLocalDram,
+                             block_hashes);
+            } else {
+              MarkSaveDone(self->save_tracker_, self->dp_rank_str_,
                            telemetry::metric_labels::kTierLocalDram,
                            block_hashes);
+            }
           }
         }
         if (host_ram_backend != nullptr)
@@ -1522,29 +1583,37 @@ void KVCacheStore::LoadFromSecondaryBackend(
   // backend name carried in its slice.
   const std::shared_ptr<KVCacheStoreBackend>& secondary_backend = backends_[1];
   const RecallClock::time_point start_ts = RecallClock::now();
+  const bool direct_storage = UsesDirectStorage();
 
-  // Host staging blocks for the recall. May evict UNPINNED entries if short,
-  // never pinned ones. Failure is logged and reported through the tracker.
-  absl::StatusOr<std::vector<int>> allocated =
-      AllocateBlockIds(block_hashes.size());
-  if (!allocated.ok()) {
-    LOG(WARNING) << "No host staging blocks for storage recall: "
-                 << allocated.status();
-    absl::MutexLock lock(mutex_);
-    MarkRecallFailed(load_tracker_, dp_rank_str_,
-                     telemetry::metric_labels::kTierSharedStorage,
-                     telemetry::metric_labels::kOutcomeStagingExhausted,
-                     block_hashes, start_ts);
-    return;
+  // Indirect Load (`!direct_storage`) allocates Host DRAM staging blocks for
+  // the recall (`Storage -> Host DRAM slot -> TPU HBM`), evicting unpinned
+  // entries if short (never pinned ones). Direct Load (`direct_storage`) skips
+  // Host DRAM allocation and leaves `staging_host_block_ids` empty so the
+  // worker reads directly from storage into TPU HBM.
+  std::vector<int> staging_host_block_ids;
+  if (!direct_storage) {
+    absl::StatusOr<std::vector<int>> allocated =
+        AllocateBlockIds(block_hashes.size());
+    if (!allocated.ok()) {
+      LOG(WARNING) << "No host staging blocks for storage recall: "
+                   << allocated.status();
+      absl::MutexLock lock(mutex_);
+      MarkRecallFailed(load_tracker_, dp_rank_str_,
+                       telemetry::metric_labels::kTierSharedStorage,
+                       telemetry::metric_labels::kOutcomeStagingExhausted,
+                       block_hashes, start_ts);
+      return;
+    }
+    staging_host_block_ids = *std::move(allocated);
   }
-  const std::vector<int>& staging_host_block_ids = *allocated;
 
   ::tpu_sync::proto::BackendTransferSpec spec;
   spec.set_name(secondary_backend->name());
 
-  // RECALL: the host-DRAM staging side is the SOURCE and the HBM side is the
-  // destination -- the reverse of OFFLOAD. Both lists are block slot indices
-  // of the same type, so the labels below are what keeps them straight.
+  // `RECALL` lands blocks in `hbm_ids` on TPU HBM, reversing `OFFLOAD`. When
+  // `host_ids` is non-empty, the worker reads into Host DRAM first and copies
+  // H2D; when `host_ids` is empty (`direct_storage`), the worker reads directly
+  // into `hbm_ids`.
   const std::vector<int64_t> host_ids(staging_host_block_ids.begin(),
                                       staging_host_block_ids.end());
   const std::vector<int64_t> hbm_ids(device_block_ids.begin(),
@@ -1553,77 +1622,76 @@ void KVCacheStore::LoadFromSecondaryBackend(
       ::tpu_sync::proto::TRANSFER_DIR_RECALL, block_hashes,
       /*hbm_block_ids=*/hbm_ids, /*host_block_ids=*/host_ids, {spec});
 
-  // Captures are copies only -- no `this`, no reference to a member tracker.
-  // The store can be destroyed while this transfer is in flight, so every
-  // touch of it goes through the lifetime fence below.
-  future.OnReady([lifetime = lifetime_, host_ram_backend = backend(),
-                  secondary_backend, raiden_id = raiden_id_, start_ts,
-                  block_hashes = std::vector<std::string>(block_hashes.begin(),
-                                                          block_hashes.end()),
-                  staging_host_block_ids =
-                      std::vector<int>(staging_host_block_ids.begin(),
-                                       staging_host_block_ids.end()),
-                  device_block_ids = std::vector<int>(device_block_ids.begin(),
-                                                      device_block_ids.end())](
-                     absl::Status status) {
-    if (!status.ok()) {
-      // Lookup may have answered from a stale existence cache, or a later
-      // chunk may have been missing behind an earlier error: drop the
-      // entries on every recall failure so the next Lookup re-probes.
-      secondary_backend->Delete(block_hashes);
-      // TODO: revisit returning every staging block and failing the whole
-      // batch on a recall error. The transfer reports a single status, so
-      // a partial storage failure (some blocks landed in HBM) is treated
-      // the same as a total one.
-      absl::MutexLock lock(lifetime->mu);
-      if (KVCacheStore* self = lifetime->store; self != nullptr) {
-        self->DeallocateBlockIds(staging_host_block_ids);
-        MarkRecallFailed(self->load_tracker_, self->dp_rank_str_,
+  // Capture copies only (never `this`) and guard member touches with
+  // `lifetime->mu` in case `~KVCacheStore` runs while the recall is in flight.
+  future.OnReady(
+      [lifetime = lifetime_, host_ram_backend = backend(), secondary_backend,
+       raiden_id = raiden_id_, start_ts, direct_storage,
+       block_hashes =
+           std::vector<std::string>(block_hashes.begin(), block_hashes.end()),
+       staging_host_block_ids = std::vector<int>(staging_host_block_ids.begin(),
+                                                 staging_host_block_ids.end()),
+       device_block_ids = std::vector<int>(
+           device_block_ids.begin(), device_block_ids.end())](
+          absl::Status status) {
+        if (!status.ok()) {
+          // Lookup may have answered from a stale existence cache, or a later
+          // chunk may have been missing behind an earlier error: drop the
+          // entries on every recall failure so the next Lookup re-probes.
+          secondary_backend->Delete(block_hashes);
+          absl::MutexLock lock(lifetime->mu);
+          if (KVCacheStore* self = lifetime->store; self != nullptr) {
+            self->DeallocateBlockIds(staging_host_block_ids);
+            MarkRecallFailed(
+                self->load_tracker_, self->dp_rank_str_,
+                telemetry::metric_labels::kTierSharedStorage,
+                absl::IsNotFound(status)
+                    ? telemetry::metric_labels::kOutcomeNotFound
+                    : telemetry::metric_labels::kOutcomeTransferFailed,
+                block_hashes, start_ts);
+          }
+          return;
+        }
+        // Update Tier-0 (`backends_[0]`) residency metadata now that all
+        // blocks have landed in `device_block_ids` on TPU HBM:
+        //   - Under Direct Storage (`direct_storage`), no Host DRAM copy exists
+        //     (`host_block_id = -1`), so record each block as
+        //     `BlockStatus::HBM` via `kBestEffortUpdate` so subsequent
+        //     `Lookup` calls hit in HBM instead of going back to storage.
+        //   - Under staged storage (`!direct_storage`), admit each block one by
+        //     one as unpinned `BlockStatus::HOST_AND_HBM` via `kAdmitStrict`,
+        //     returning any staging Host DRAM slot rejected due to duplicates
+        //     or full unpinned capacity.
+        std::vector<RaidenBlockId> update_slices;
+        update_slices.reserve(block_hashes.size());
+        for (size_t i = 0; i < block_hashes.size(); ++i) {
+          update_slices.emplace_back(
+              raiden_id, direct_storage ? -1 : staging_host_block_ids[i],
+              device_block_ids[i],
+              direct_storage ? BlockStatus::HBM : BlockStatus::HOST_AND_HBM);
+        }
+        std::vector<int> to_return;
+        if (direct_storage) {
+          host_ram_backend->Insert(block_hashes, update_slices,
+                                   InsertOption::kBestEffortUpdate);
+        } else {
+          for (size_t i = 0; i < block_hashes.size(); ++i) {
+            if (!host_ram_backend->Insert({block_hashes[i]}, {update_slices[i]},
+                                          InsertOption::kAdmitStrict)) {
+              to_return.push_back(staging_host_block_ids[i]);
+            }
+          }
+        }
+        absl::MutexLock lock(lifetime->mu);
+        if (KVCacheStore* self = lifetime->store; self != nullptr) {
+          if (!to_return.empty()) self->DeallocateBlockIds(to_return);
+          // Mark the load complete even if Tier 0 declined to cache a Host DRAM
+          // copy: the transfer already placed all requested blocks into HBM.
+          MarkRecallDone(self->load_tracker_, self->dp_rank_str_,
                          telemetry::metric_labels::kTierSharedStorage,
-                         absl::IsNotFound(status)
-                             ? telemetry::metric_labels::kOutcomeNotFound
-                             : telemetry::metric_labels::kOutcomeTransferFailed,
                          block_hashes, start_ts);
-      }
-      return;
-    }
-    // Publish recalled blocks into the primary host-RAM backend
-    // (`backends_[0]`) as unpinned HOST_AND_HBM entries owned by this
-    // store.
-    std::vector<std::string> update_hashes;
-    std::vector<RaidenBlockId> update_slices;
-    update_hashes.reserve(block_hashes.size());
-    update_slices.reserve(block_hashes.size());
-    for (size_t i = 0; i < block_hashes.size(); ++i) {
-      update_hashes.push_back(block_hashes[i]);
-      update_slices.emplace_back(raiden_id, staging_host_block_ids[i],
-                                 device_block_ids[i],
-                                 BlockStatus::HOST_AND_HBM);
-    }
-
-    // Admit recalled blocks one by one without pinning (`kAdmitStrict`);
-    // fails per block if the hash is already present or unpinned space is
-    // full.
-    std::vector<int> to_return;
-    for (size_t i = 0; i < update_hashes.size(); ++i) {
-      if (!host_ram_backend->Insert({update_hashes[i]}, {update_slices[i]},
-                                    InsertOption::kAdmitStrict)) {
-        // Return staging blocks that were not admitted into the host-RAM
-        // cache.
-        to_return.push_back(staging_host_block_ids[i]);
-      }
-    }
-
-    absl::MutexLock lock(lifetime->mu);
-    if (KVCacheStore* self = lifetime->store; self != nullptr) {
-      if (!to_return.empty()) self->DeallocateBlockIds(to_return);
-      // MarkDone, not MarkFailed: the transfer landed all N blocks in HBM,
-      // so the Load succeeded even if the host-RAM tier refused a copy.
-      MarkRecallDone(self->load_tracker_, self->dp_rank_str_,
-                     telemetry::metric_labels::kTierSharedStorage, block_hashes,
-                     start_ts);
-    }
-  });
+        }
+      });
 }
 
 absl::Status KVCacheStore::Load(absl::Span<const std::string> block_hashes,

@@ -14,11 +14,19 @@
 
 #include "tpu_sync/core/raw_transfer_core.h"
 
+#include <optional>
 #include <vector>
 
 #include "tpu_sync/core/tpu_utils.h"
+#include "tpu_sync/transport/block_transport_delegate.h"
 
 namespace raiden {
+
+std::optional<ExternalDmaInfo> RaidenBufferHandle::AcquireExternalDmaAccess()
+    const {
+  std::optional<ExternalDmaInfo> result;
+  return result;
+}
 
 std::vector<int> DetectNumaNodes(
     const std::vector<std::vector<RaidenBufferHandle>>& layer_buffers) {

@@ -228,6 +228,10 @@ class KVCacheStoreBackend {
   // "HostOffloadBackend", "posix").
   virtual std::string name() const = 0;
 
+  // Returns true when this secondary storage backend transfers blocks directly
+  // between device HBM and storage without staging through Host DRAM slots.
+  virtual bool IsDirectStorage() const { return false; }
+
   // Queries cached block hashes according to `options` (see LookupOptions for
   // prefix vs. subset/snapshot matching, host-residency filtering, and
   // pinning). Custom implementations must honor `options.match_mode`,

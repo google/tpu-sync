@@ -158,12 +158,15 @@ message BackendTransferSpec {
 
 // Transfers a set of KV blocks between HBM and one or more storage backends.
 //
-// Addressing is strictly BLOCK-GRANULAR: block_hashes, hbm_block_ids and
-// host_block_ids are parallel and of equal length, and entry i describes
-// exactly one block. There is deliberately no byte offset and no run-length
-// dimension on the wire -- one block maps to exactly one backend key, and the
-// worker derives the byte-level scatter/gather layout locally (see
-// KVCacheManagerBase::ResolveBlockSlices).
+// Addressing is strictly BLOCK-GRANULAR: block_hashes and hbm_block_ids are
+// parallel and of equal length, and entry i describes exactly one block. For
+// Host-DRAM-staged backends, host_block_ids is also parallel and of equal
+// length; for single-backend Direct Storage transfers
+// (`KVBackend::SupportsDeviceTransfer()`), host_block_ids is empty so blocks
+// move directly between HBM and storage. There is deliberately no byte offset
+// and no run-length dimension on the wire -- one block maps to exactly one
+// backend key, and the worker derives the byte-level scatter/gather layout
+// locally (see KVCacheManagerBase::ResolveBlockSlices).
 message TransferBackendBuffersRequest {
   TransferDirection direction = 1;
 
@@ -175,7 +178,8 @@ message TransferBackendBuffersRequest {
   repeated int64 hbm_block_ids = 3;
 
   // Host-DRAM staging block slot indices (NOT byte offsets).
-  // Destination for OFFLOAD, source for RECALL. Parallel to block_hashes.
+  // Destination for OFFLOAD, source for RECALL. Parallel to block_hashes when
+  // staging through Host DRAM; empty for Direct Storage transfers.
   repeated int64 host_block_ids = 4;
 
   // Backends to write (OFFLOAD) or read (RECALL).

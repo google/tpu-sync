@@ -102,6 +102,13 @@ absl::StatusOr<PJRT_RawBuffer*> CreateCApiRawAlias(
 const PJRT_RawBuffer_Extension* GetRawBufferExtension(
     const xla::PjRtBuffer* buffer, const PJRT_Api** out_c_api = nullptr);
 
+// Converts a heap-allocated `PJRT_Error*` returned by a PJRT C-API call (such
+// as `PJRT_Client_DmaMap` or `PJRT_RawBuffer::acquire_external_dma_access`)
+// into an `absl::Status`, preserving its canonical status code via `c_api` when
+// available (defaulting to `kInternal` if `c_api` is null) and destroying
+// `error` before returning. Returns `OkStatus()` if `error` is null.
+absl::Status ConsumePjrtError(const PJRT_Api* c_api, PJRT_Error* error);
+
 // C-API-only PjRtClient helpers that dispatch strictly through the PJRT_Api C
 // function table on xla::PjRtCApiClient with no C++ virtual fallback on
 // xla::PjRtClient, avoiding vtable layout skew across XLA builds.

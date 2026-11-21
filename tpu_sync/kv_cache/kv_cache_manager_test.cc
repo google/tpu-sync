@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>  // NOLINT
 #include <cstddef>
 #include <cstdint>
@@ -54,11 +55,14 @@
 #include "absl/types/span.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/plugin/xla_cpu/xla_cpu_pjrt_client.h"
-#include "xla/tsl/platform/statusor.h"
+#include "xla/shape.h"
+#include "xla/shape_util.h"
+#include "xla/tsl/concurrency/ref_count.h"
 #include "tpu_sync/core/raiden_manager_base.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/kv_cache/pool_layout.h"
 #include "tpu_sync/kv_cache_offload/backends/backend.h"
 #include "tpu_sync/kv_cache_offload/backends/plugin/mock_storage_plugin_loader.h"
 #include "tpu_sync/kv_cache_offload/backends/storage/posix_backend.h"
@@ -69,6 +73,8 @@
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/telemetry/mock_metrics_backend.h"
 #include "tpu_sync/transport/block_transport.h"
+#include "tpu_sync/transport/block_transport_delegate.h"
+#include "tpu_sync/transport/block_transport_session.h"
 #include "tpu_sync/transport/peer_endpoint.h"
 #include "tpu_sync/transport/transfer_session.h"
 

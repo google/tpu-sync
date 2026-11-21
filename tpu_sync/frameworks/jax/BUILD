@@ -40,6 +40,7 @@ cc_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
+        ":jax_utils",
         ":utils",
         "//tpu_sync/core:buffer_utils",
         "//tpu_sync/core:host_memory_allocator",
@@ -185,6 +186,7 @@ nanobind_extension(
         "//tpu_sync/telemetry/python:telemetry_binding",
         "//tpu_sync/weight_sync:weight_synchronizer_base",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
@@ -634,6 +636,7 @@ py_test(
     deps = [
         ":_tpu_raiden_jax",
         ":jax_test_utils",  # buildcleaner: keep
+        "//tpu_sync/api/jax:kv_cache_manager_jax_py",
         "@com_google_absl_py//absl/flags",
         "@com_google_absl_py//absl/testing:absltest",
         "@com_google_absl_py//absl/testing:parameterized",

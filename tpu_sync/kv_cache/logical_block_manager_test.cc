@@ -14,7 +14,6 @@
 
 #include "tpu_sync/kv_cache/logical_block_manager.h"
 
-#include <optional>
 #include <vector>
 
 #include <gmock/gmock.h>
@@ -22,7 +21,7 @@
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
-#include "xla/tsl/platform/statusor.h"
+#include "xla/tsl/platform/statusor.h"  // IWYU pragma: keep
 
 namespace tpu_raiden {
 namespace kv_cache {
@@ -30,8 +29,6 @@ namespace {
 
 using ::absl_testing::StatusIs;
 using ::testing::ElementsAre;
-using ::testing::Eq;
-using ::testing::Optional;
 
 TEST(LogicalBlockManagerTest, InitialState) {
   LogicalBlockManager manager(5);

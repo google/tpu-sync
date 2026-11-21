@@ -106,8 +106,10 @@ void ApplyPeregrineEnv(BlockTransport::Config& config) {
   }
 }
 
-BlockTransport::Config ReadConfigFromEnv(bool socket_only_transport) {
+BlockTransport::Config ReadConfigFromEnv(bool socket_only_transport,
+                                         MajorOrder major_order) {
   BlockTransport::Config config;
+  config.major_order = major_order;
   if (const char* val =
           std::getenv("TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S");
       val != nullptr && val[0] != '\0') {
@@ -300,10 +302,11 @@ std::vector<ShardGroup> ShardGroupsByNuma(absl::Span<const ShardInfo> shards,
 
 BlockTransport::BlockTransport(BlockTransportDelegate* delegate, int local_port,
                                const std::vector<std::string>& local_ips,
-                               int parallelism, bool socket_only_transport)
+                               int parallelism, bool socket_only_transport,
+                               MajorOrder major_order)
     : block_delegate_(delegate),
       parallelism_(parallelism),
-      config_(ReadConfigFromEnv(socket_only_transport)),
+      config_(ReadConfigFromEnv(socket_only_transport, major_order)),
       peregrine_adapter_(StartPeregrineIfConfigured(local_ips)),
       raw_transport_(
           delegate, local_port, local_ips,

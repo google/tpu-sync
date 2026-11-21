@@ -70,7 +70,8 @@ class BlockTransport final {
   // Peregrine transport fails to start.
   BlockTransport(BlockTransportDelegate* delegate, int local_port,
                  const std::vector<std::string>& local_ips = {},
-                 int parallelism = 1, bool socket_only_transport = false);
+                 int parallelism = 1, bool socket_only_transport = false,
+                 MajorOrder major_order = MajorOrder::kLayerMajor);
 
   // Destructor closes all sockets and joins all threads.
   ~BlockTransport();

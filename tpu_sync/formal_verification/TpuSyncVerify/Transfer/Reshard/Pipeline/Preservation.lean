@@ -124,7 +124,27 @@ theorem step_send_inv {s s' : Pipeline} {e : Send.Ev} (h : Inv s)
   have hlen_srcStg := h.len_srcStg
   have hlen_w := h.len_wire
   have hlen_sent := h.len_sent
-  rcases e with ⟨p, ok⟩ | _ | ⟨p, ok⟩ | ⟨p, ok⟩ | _ | _
+  rcases e with _ | ⟨p, ok⟩ | _ | ⟨p, ok⟩ | ⟨p, ok⟩ | _ | _
+  · simp only [sendStep, Option.map_eq_some_iff] at hs
+    obtain ⟨snd, hsnd, rfl⟩ := hs
+    have hsndInv := Send.step_inv h.sendInv hsnd
+    have hpub_m : s.send.published ≠ none → snd.published ≠ none :=
+      send_step_published_ne_none hsnd
+    have hdone_m : snd.life.done = false → s.send.life.done = false := by
+      intro hnd; cases hd : s.send.life.done
+      · rfl
+      · have := send_step_done_mono hsnd hd; simp [hnd] at this
+    have hpools_eq : snd.pools = s.send.pools := by
+      simp only [Send.step, Send.startFail] at hsnd
+      split at hsnd <;> simp at hsnd; subst hsnd; simp
+    refine ⟨hsndInv, h.recvInv, h.num_pos, h.len_peers, by rw [hpools_eq]; exact h.len_send,
+      h.len_recv, h.len_srcHbm, h.len_srcStg, h.len_wire, h.len_dstStg, h.len_dstHbm,
+      h.len_sent, h.len_landed, by rw [hpools_eq]; exact h.peers_match,
+      h.srcHbm_ok, fun hr => hpub_m (h.reclaimed_pub hr),
+      fun hnd => by rw [hpools_eq]; exact h.srcStg_ok (hdone_m hnd),
+      by rw [hpools_eq]; exact h.sent_bound,
+      h.wire_ok, h.landed_le_sent, h.dstStg_ok, h.recv_stage_landed,
+      h.done_intact, fun ha => by rw [hpools_eq]; exact h.unarmed_send ha, h.unarmed_recv⟩
   · simp only [sendStep] at hs
     split at hs <;> try cases hs
     rename_i hguard
@@ -203,7 +223,7 @@ theorem step_send_inv {s s' : Pipeline} {e : Send.Ev} (h : Inv s)
       · have := send_step_done_mono hsnd hd; simp [hnd] at this
     have hpools_eq : snd.pools = s.send.pools := by
       simp only [Send.step, Send.execFinish] at hsnd
-      split at hsnd <;> simp at hsnd; subst hsnd; rfl
+      split at hsnd <;> simp at hsnd; subst hsnd; simp
     refine ⟨hsndInv, h.recvInv, h.num_pos, h.len_peers, by rw [hpools_eq]; exact h.len_send,
       h.len_recv, h.len_srcHbm, h.len_srcStg, h.len_wire, h.len_dstStg, h.len_dstHbm,
       h.len_sent, h.len_landed, by rw [hpools_eq]; exact h.peers_match,
@@ -558,7 +578,6 @@ theorem recv_other_stage_pres {r rcv : Recv} {e : Recv.Ev}
   | pushEnd ok =>
     simp only [Recv.step, Recv.pushEnd] at hrcv
     split at hrcv <;> try cases hrcv
-    simp only [Recv.maybeUnregisterSettled_pools] at hget'
     exact ⟨pool', hget', id, id, id⟩
   | h2dIssue p ok =>
     simp only [Recv.step, Recv.h2dIssue] at hrcv
@@ -600,10 +619,6 @@ theorem recv_other_stage_pres {r rcv : Recv} {e : Recv.Ev}
       exact ⟨pool, hget, by simp, fun hw => by simp [his] at hw, by simp⟩
     · rw [List.getElem?_set_ne hpq] at hget'
       exact ⟨pool', hget', id, id, id⟩
-  | pollReady =>
-    simp only [Recv.step, Recv.pollReady] at hrcv
-    split at hrcv <;> try cases hrcv
-    exact ⟨pool', hget', id, id, id⟩
   | cancel =>
     simp only [Recv.step, Recv.cancel, Option.some.injEq] at hrcv
     subst hrcv; exact ⟨pool', hget', id, id, id⟩
@@ -634,10 +649,6 @@ theorem recv_other_pushes_zero {r rcv : Recv} {e : Recv.Ev}
   | h2dReady p =>
     simp only [Recv.step, Recv.h2dReady] at hrcv
     split at hrcv <;> try cases hrcv
-    split at hrcv <;> try cases hrcv
-    exact hp0
-  | pollReady =>
-    simp only [Recv.step, Recv.pollReady] at hrcv
     split at hrcv <;> try cases hrcv
     exact hp0
   | cancel =>
@@ -840,10 +851,6 @@ theorem step_recv_inv {s s' : Pipeline} {e : Recv.Ev} (h : Inv s)
     obtain ⟨rcv, hrcv, rfl⟩ := hs
     exact step_recv_other_inv h hrcv (fun h => by cases h) (fun _ h => by cases h) (fun _ _ h => by cases h)
   | h2dReady p =>
-    simp only [recvStep, Option.map_eq_some_iff] at hs
-    obtain ⟨rcv, hrcv, rfl⟩ := hs
-    exact step_recv_other_inv h hrcv (fun h => by cases h) (fun _ h => by cases h) (fun _ _ h => by cases h)
-  | pollReady =>
     simp only [recvStep, Option.map_eq_some_iff] at hs
     obtain ⟨rcv, hrcv, rfl⟩ := hs
     exact step_recv_other_inv h hrcv (fun h => by cases h) (fun _ h => by cases h) (fun _ _ h => by cases h)

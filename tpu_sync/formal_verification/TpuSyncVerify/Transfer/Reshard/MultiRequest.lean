@@ -3,103 +3,58 @@ import TpuSyncVerify.Transfer.Reshard.Pipeline
 /-!
 # Multi-request reshard system and top-level properties across transfers
 
-The C++ names and file aliases below are those of `Pipeline.lean`, which this
-module composes.
+Concurrent, overlapped, and recycled reshard transfers (`reqs : List Pipeline`)
+over `Reshard/Pipeline.lean` (`docs/transfer/reshard.md`; multi-window sub-plan
+chaining is `Reshard/SubPlanChain.lean`). Host staging (`srcStaging`,
+`dstStaging`) returns on session settlement (`hasStaging = false`:
+`ReshardSendSession::SettleLocked`, `ReshardReceiveSession::ReleaseStagingLocked`,
+`Reshard/PoolStaging.lean`, `Transfer/LayerStaging.lean`), while device HBM
+(`srcHbm`, `dstHbm`) returns on `CompleteReadWithDetails` publication
+(`send.published ≠ none`, `recv.published ≠ none`).
 
-Multiple reshard transfers $R_0, R_1, R_2, \dots$ (`reqs : List Pipeline`) run
-concurrently and recycle the four caller- and arena-visible memories (`srcHbm`,
-`srcStaging`, `dstStaging`, `dstHbm`) across two ownership boundaries:
-- **Host staging (`srcStaging`, `dstStaging`)** is owned by `PoolStagingStorage`
-  and is returned to the bounded staging arena by `Lifecycle.settleLocked`
-  (`ReshardSendSession::SettleLocked` / `ReshardSendSession::ReleaseLeasesLocked`
-  and `ReshardReceiveSession::ReleaseStagingLocked`) as soon as each session
-  settles (`hasStaging = false`).
-- **TPU HBM (`srcHbm`, `dstHbm`)** is owned by the serving engines and
-  is handed back to the caller when `KVCacheManagerWithTransfer::CompleteReadWithDetails`
-  publishes the session outcome (`send.published ≠ none`, `recv.published ≠ none`).
+File aliases: `reshard_send.cc` = `tpu_sync/kv_cache/reshard_send_session.cc`,
+`reshard_recv.cc` = `tpu_sync/kv_cache/reshard_receive_session.cc`,
+`coord.cc` = `tpu_sync/kv_cache/reshard/reshard_coordinator.cc`.
 
-Each `Pipeline` in `reqs` is one plan (one engine `uuid`; `Pipeline.lean`
-§"Scope: one plan"). The sub-plans of a windowed request
-(`ReshardCoordinator::StartChain`) are therefore separate entries here, each
-started by its own `ReshardCoordinator::RunSubPlan` call and recycled through
-`.recycleSrc` / `.nextRequest` like any other transfer: the chain runs them one
-after another over the same destination window, and the destination's bounded
-staging arena is what makes a later sub-plan wait for the earlier one's leases
-(`ArmRefusedForBusyStaging`, re-armed by `RunSubPlan`). Multi-window chain
-coordination and the request-level terminal the worker reports for the whole
-chain (`KVCacheManagerWithTransfer::RecordPoolReshardTerminalLocked`,
-`SweepSubPlanChainsLocked`) are modelled in `Reshard/SubPlanChain.lean`.
+## State and events
 
-The multi-request transition systems `multiSys` (post-Phase-1 armed transfers)
-and `multiSysUnarmed` (pre-Phase-1 unarmed transfers requiring
-`KVCacheManagerWithTransfer::PoolReshardRegisterRecv` before
-`KVCacheManagerWithTransfer::PoolReshardPush`, as driven by
-`ReshardCoordinator::RunSubPlan`) model both **read-after-release** and
-**write-after-release** across transfers on all four buffers, as well as
-**overlapped execution** where a later transfer recycles source HBM and sender
-staging while an earlier transfer's receive side is still running:
-- **Read-after-release:** Once a transfer releases a buffer, recycling overwrites
-  that transfer's copy of the buffer with `.junk` (via `.reclaim`,
-  `.reseatSrcStaging`, `.reseatDstStaging`, `.recycleSrc`, or `.nextRequest`;
-  `recycleAllBufs` retains `r.dstHbm` so post-publication quietness of `r` can
-  be observed), so any straggling read (`d2hDone`, `landStream`, `h2dDone` in
-  `ReshardReceiveSession::FinishPoolH2d`) would copy `.junk`.
-- **Write-after-release:** On every transfer step (`reqStep idx e`),
-  `wroteReleased` checks each of the four buffers individually against its own
-  release condition (`send.published ≠ none`, `!send.life.hasStaging`,
-  `!recv.life.hasStaging`, `recv.published ≠ none`). If any transfer ever
-  modifies a buffer it has already released, `multiStep` corrupts every
-  transfer's buffers in `ms.reqs` with `.junk` (`corruptBuffers`).
-
-The top-level system theorems establish for **every** transfer `idx` (under both
-`multiSys` and `multiSysUnarmed`):
-1. `system_data_correct` and `system_attention_safe` (and their `multiSysUnarmed`
-   counterparts): across any reachable multi-transfer state and any number of
-   concurrent or recycled transfers, whenever transfer `idx` publishes
-   `done_recving`, its `dstHbm` holds `good ranks.length` (no within-transfer
-   aliased-page rank clobbering and no straggling reads from recycled buffers)
-   and remains `good ranks.length` across all subsequent multi-transfer
-   transitions (no post-publication writes by `idx` and no write-after-release
-   by any concurrent or recycled transfer `j`).
-2. `system_progress` (and `system_unarmed_progress`): from any reachable
-   multi-transfer state and any transfer `idx`, a finite trace drains all
-   in-flight operations of `idx`, returns both staging leases to
-   `PoolStagingStorage`, and publishes both HBM outcomes via
-   `CompleteReadWithDetails` (`HandedOff`), enabling both `.recycleSrc idx`
-   and `.nextRequest idx`.
-
-## Assumptions
-
-* **A1 — Cross-transfer destination page disjointness (`dstHbm` per transfer):**
-  Each transfer `r ∈ ms.reqs` owns its own `dstHbm` vector while in flight, and
-  aliased-page rank ordering (`writePoolHbm`, `AliasedPageCorrect`) is enforced
-  within each `ReshardReceiveSession` (`CollectEligiblePoolH2dsLocked`). Across
-  concurrent transfers, destination physical pages are disjoint:
-  - On any shared storage (`PoolSpec::storage_index`), all pools declared for
-    bounded pool staging agree on `block_stride_bytes` and `num_blocks`
-    (`KVCacheManagerBase::ConfigurePoolStaging`), and `ComputePoolBlockCopyExtents`
-    places every region of block $b$ of pool $P$ at device offset
-    $\text{base\_offset\_bytes} + b \cdot \text{block\_stride\_bytes} + \text{region\_offset} \in [b \cdot S, (b + 1) \cdot S)$
-    when each pool's `base_offset_bytes + region.extent_end_bytes()` fits within
-    one storage page $S = \text{block\_stride\_bytes}$ (`PoolSpec::Validate(storage_bytes)`
-    with `storage_bytes = num_blocks * block_stride_bytes`, and the caller's
-    manifest builder). Two pool blocks $b$ and $b'$ on the same storage
-    therefore overlap in device HBM bytes only when $b = b'$.
-  - On the host staging side, `KVCacheManagerBase::AcquirePoolStagingLease`
-    allocates disjoint host arena slots to distinct concurrent `uuid`s
-    (`PoolStaging.no_slot_aliasing_between_distinct_uuids`).
-  - Above `tpu_sync`, the serving engine's unified KV-cache block allocator
-    draws block IDs from a single `[0, num_blocks)` free pool shared across all
-    KV-cache groups (full-attention and state/linear-attention groups alike) and
-    excludes shared prefix-cached blocks from `dst_device_block_ids`, so two
-    concurrent transfers never target the same uncached destination `block_id` $b$.
+| Field / Event | C++ | Role |
+|---|---|---|
+| `MultiState.reqs` | concurrent/recycled `Pipeline` instances | started armed (`multiSys`) or unarmed (`multiSysUnarmed`, `RunSubPlan`) |
+| `reqStep idx e` | `Pipeline.step` on `reqs[idx]` + `wroteReleased` check | corrupts all buffers (`corruptBuffers`) on any write-after-release |
+| `recycleSrc idx` | caller/arena reuse of `srcHbm` and `srcStaging` once `SrcReleased` | overwrites released source buffers with `.junk` and spawns a fresh transfer |
+| `nextRequest idx` | caller/arena reuse of all released buffers once `HandedOff` | overwrites `srcHbm`, `srcStaging`, `dstStaging` (retaining `dstHbm` to check quietness) and spawns a fresh transfer |
 
 ## Lock scopes
 
 | Event | Scopes | Between them |
 |---|---|---|
-| `reqStep idx e` | `Pipeline.step` scopes on `ms.reqs[idx]` (`Pipeline.lean` §"Lock scopes") | `wroteReleased` checks `ms.reqs[idx]`'s post-step buffers against its pre-state release flags (`send.published`, `send.life.hasStaging`, `recv.life.hasStaging`, `recv.published`) |
-| `recycleSrc idx`, `nextRequest idx` | 0 (caller engine and `PoolStagingStorage` after release, then `ReshardCoordinator::RunSubPlan` to spawn a fresh transfer or the next sub-plan of a chain) | enabled only after `SettleLocked` / `ReleaseLeasesLocked` and `ReleaseStagingLocked` have released the `PoolStagingLease` under session `mu_` and `staging_mu_`, and after `CompleteReadWithDetails` has published the session outcome under manager `mu_` |
+| `reqStep idx e` | `Pipeline.step` scopes on `reqs[idx]` (`Pipeline.lean` §"Lock scopes") | `wroteReleased` checks post-step buffers against pre-state release flags |
+| `recycleSrc idx`, `nextRequest idx` | 0 (caller engine and `PoolStagingStorage` after release, then `RunSubPlan`) | enabled only after session staging release and `CompleteReadWithDetails` publication |
+
+## Assumptions
+
+* **A1 — Cross-transfer page and host-staging disjointness.** Concurrent transfers occupy
+  disjoint destination device pages (uniform-stride blocks `[b * S, (b + 1) * S)` and distinct
+  engine `dst_device_block_ids`, or caller layout on non-uniform full-mirror fallback) and
+  disjoint host staging bytes: via disjoint `PoolStagingLease` slots
+  (`PoolStaging.no_slot_aliasing_between_distinct_uuids`) or device offsets under
+  `!HostLayersBounded()`, and assuming per-session `StagingLayerManager` buffers do not collide
+  across concurrent sessions under `HostLayersBounded()` (`docs/transfer/reshard.md` §Boundaries).
+* **A2 — Intra-transfer host-staging disjointness and no same-rank device overlap (`Pipeline.lean` A1).**
+  Each `Pipeline` keeps one `srcStaging` / `dstStaging` cell per pool and `clobberHigherRanks`
+  clobbers strictly higher `order_rank`s only, covering device-overlapping pools across distinct
+  `order_rank`s under `HostLayersBounded()` (subject to A1).
+
+## Properties
+
+* **`system_data_correct`, `system_unarmed_data_correct`**: in every reachable state of `multiSys`
+  or `multiSysUnarmed`, any transfer `idx` with `recv.published = some true` holds
+  `dstHbm = good ranks.length` (no read- or write-after-release across concurrent/recycled transfers).
+* **`system_attention_safe`, `system_unarmed_attention_safe`**: once `recv.published = some true`,
+  `reqs[idx].dstHbm` remains `good ranks.length` across every subsequent `MultiEv` sequence.
+* **`system_progress`, `system_unarmed_progress`**: from any reachable state, any transfer `idx`
+  can drain to `HandedOff` in finitely many steps, enabling `.recycleSrc idx` and `.nextRequest idx`.
 
 ## Source map
 
@@ -108,14 +63,9 @@ Generated by `tools/resolve_anchors.py`.
 <!-- source-map:begin -->
 | File | Symbol / anchor | Lines |
 |---|---|---|
-| `reshard_send.cc` | `ReshardSendSession::ReleaseLeasesLocked` | `:470-474` |
-| `reshard_send.cc` | `ReshardSendSession::SettleLocked` | `:476-481` |
-| `reshard_recv.cc` | `ReshardReceiveSession::ReleaseStagingLocked` | `:463-467` |
-| `reshard_recv.cc` | `ReshardReceiveSession::FinishPoolH2d` | `:670-708` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardPush` | `:833-871` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::PoolReshardRegisterRecv` | `:873-910` |
-| `mgr.cc` | `KVCacheManagerWithTransfer::CompleteReadWithDetails` | `:1151-1292` |
-| `coord.cc` | `ReshardCoordinator::RunSubPlan` (`const int64_t receiver_arm_start_ns = MonotonicNs();` .. `if (!status.ok()) return status;`) | `:741-877` |
+| `reshard_send.cc` | `ReshardSendSession::SettleLocked` | `:791-798` |
+| `reshard_recv.cc` | `ReshardReceiveSession::ReleaseStagingLocked` | `:645-650` |
+| `coord.cc` | `ReshardCoordinator::RunSubPlan` (`const int64_t receiver_arm_start_ns = MonotonicNs();` .. `if (!status.ok()) return status;`) | `:744-880` |
 <!-- source-map:end -->
 -/
 
@@ -319,7 +269,13 @@ theorem multiInv_data_correct {ranks peerCounts : List Nat} {ms : MultiState}
 In any reachable multi-transfer state — across any number of concurrent,
 overlapped, succeeded, failed, or cancelled reshard transfers — whenever any
 transfer `r` at index `idx` publishes `done_recving`, its `dstHbm` holds
-`good ranks.length`. -/
+`good ranks.length`. Each transfer has one host staging cell per pool and
+clobbers strictly higher `order_rank`s only (assumption A2): for pools of
+different `order_rank`s whose declared-live regions overlap on a shared storage,
+the statement applies only when each concurrently staged pool has an isolated host
+layer buffer (`HostLayersBounded()`, subject to A1's caveat that concurrent
+sessions do not collide in shared host layer buffers); same-rank device overlap
+is outside the model. -/
 theorem system_data_correct {ranks peerCounts : List Nat} {ms : MultiState}
     {idx : Nat} {r : Pipeline}
     (hvalid : validConfig ranks peerCounts = true)
@@ -330,7 +286,8 @@ theorem system_data_correct {ranks peerCounts : List Nat} {ms : MultiState}
   multiInv_data_correct (reachable_multiInv hvalid h) hreq hp
 
 /-- **Publication correctness across unarmed transfers (`multiSysUnarmed`):**
-Same guarantee when every initial and recycled transfer starts unarmed before
+Same guarantee (under the same A1/A2 host-staging and distinct-`order_rank`
+overlap scope) when every initial and recycled transfer starts unarmed before
 Phase 1 of `ReshardCoordinator::RunSubPlan` (`initUnarmed`). -/
 theorem system_unarmed_data_correct {ranks peerCounts : List Nat} {ms : MultiState}
     {idx : Nat} {r : Pipeline}
@@ -428,11 +385,12 @@ theorem multiRunFrom_dstHbm_quiet {ranks peerCounts : List Nat} {idx : Nat} :
 
 /-- **Post-publication HBM safety across transfers (`multiSys`):**
 Once any transfer `r` at index `idx` publishes `done_recving`, its `dstHbm`
-holds `good ranks.length` (from within-transfer aliased-page rank-wave ordering
-and read-before-release) and stays equal to `good ranks.length` across any
-subsequent sequence of multi-transfer transitions `evs` (including steps of
-`idx`, steps of earlier or later concurrent transfers checked by
-`wroteReleased`, and buffer recycling via `recycleSrc` or `nextRequest`). -/
+holds `good ranks.length` (within A1/A2's disjoint-host-staging and
+distinct-`order_rank` device-overlap scope) and stays equal to
+`good ranks.length` across any subsequent sequence of multi-transfer transitions
+`evs` (including steps of `idx`, steps of earlier or later concurrent transfers
+checked by `wroteReleased`, and buffer recycling via `recycleSrc` or
+`nextRequest`). -/
 theorem system_attention_safe {ranks peerCounts : List Nat} {ms ms' : MultiState}
     {idx : Nat} {r : Pipeline}
     (hvalid : validConfig ranks peerCounts = true)
@@ -448,7 +406,8 @@ theorem system_attention_safe {ranks peerCounts : List Nat} {ms ms' : MultiState
   exact ⟨r', hreq', hd.trans (system_data_correct hvalid h hreq hp)⟩
 
 /-- **Post-publication HBM safety across unarmed transfers (`multiSysUnarmed`):**
-Same post-publication invariance when every transfer starts unarmed (`initUnarmed`). -/
+Same post-publication invariance (under the same A1/A2 scope) when every
+transfer starts unarmed (`initUnarmed`). -/
 theorem system_unarmed_attention_safe {ranks peerCounts : List Nat} {ms ms' : MultiState}
     {idx : Nat} {r : Pipeline}
     (hvalid : validConfig ranks peerCounts = true)
@@ -540,20 +499,14 @@ theorem system_unarmed_progress {ranks peerCounts : List Nat} {ms : MultiState}
 
 /-! ## Concrete multi-transfer traces and write-after-release mutant -/
 
-/-- Two-pool producer trace (`ranks = [0, 1]`, `peerCounts = [1, 2]`): issues D2H
-for pool 0 (1 peer) and pool 1 (2 peers), finishes `ExecutePush`, completes all
-3 peer pushes onto the wire, and publishes `done_sending`. -/
+/-- Producer trace on `ranks = [0, 1]`, `peerCounts = [1, 2]` completing D2H, all 3 pushes, and `done_sending`. -/
 def sendProducer2 : List Ev :=
   [ .send (.d2hIssue 0 true), .send (.d2hIssue 1 true), .send .execFinish,
     .send (.d2hDone 0 true), .send (.d2hDone 1 true),
     .send (.pushDone 0 true), .send (.pushDone 1 true), .send (.pushDone 1 true),
     .send .publish ]
 
-/-- Two-pool out-of-order aliased-page consumer trace (`ranks = [0, 1]`,
-`peerCounts = [1, 2]`): pool 1 (rank 1, 2 streams) lands all streams and calls
-`onPoolReceived 1` before pool 0 (rank 0, 1 stream) lands; Wave 0 H2D for pool 0
-then runs before Wave 1 H2D for pool 1, and `publish` reports `done_recving`
-with `dstHbm = [.kv 0, .kv 1]`. -/
+/-- Out-of-order consumer trace on `ranks = [0, 1]`, `peerCounts = [1, 2]` publishing `done_recving` with `[.kv 0, .kv 1]`. -/
 def recvConsumer2OutOfOrder : List Ev :=
   [ .recv .pushBegin,
     .landStream 1, .landStream 1, .recv (.onPoolReceived 1),
@@ -562,12 +515,7 @@ def recvConsumer2OutOfOrder : List Ev :=
     .recv (.h2dIssue 1 true), .recv (.h2dReady 1), .recv (.h2dDone 1 true),
     .recv (.pushEnd true), .recv .publish ]
 
-/-- Multi-request trace: transfer $R_0$ starts on 2 aliased pools (`ranks = [0, 1]`,
-`peerCounts = [1, 2]`), cancels mid-flight while pool 0 D2H is in flight, drains
-its in-flight op, releases both staging leases, and publishes failed outcomes
-(`HandedOff`); `.nextRequest 0` recycles the buffers to `.junk` and spawns
-transfer $R_1$, which completes the out-of-order aliased-page transfer and
-publishes `done_recving` with `dstHbm = [.kv 0, .kv 1]`. -/
+/-- Cancelled transfer $R_0$ drains to `HandedOff`, `.nextRequest 0` recycles buffers, and $R_1$ publishes `[.kv 0, .kv 1]`. -/
 theorem trace_multi_request :
     ((multiSys [0, 1] [1, 2]).run
       (([ .send (.d2hIssue 0 true), .send .cancel, .recv .cancel,
@@ -579,14 +527,7 @@ theorem trace_multi_request :
     some [(some false, [.junk, .junk]), (some true, [.kv 0, .kv 1])] := by
   decide
 
-/-- Overlapped multi-request trace: transfer $R_0$ finishes its send side
-(`sendProducer2`), `.recycleSrc 0` immediately recycles $R_0$'s source HBM and
-sender staging (overwriting them with `.junk`) and starts transfer $R_1$ while
-$R_0$'s receive side has not even started yet; $R_1$'s send side
-(`sendProducer2`) and $R_0$'s out-of-order aliased-page receive side
-(`recvConsumer2OutOfOrder`) then run concurrently, followed by $R_1$'s receive
-side (`recvConsumer2OutOfOrder`), and both $R_0$ and $R_1$ publish `done_recving`
-with `dstHbm = [.kv 0, .kv 1]`. -/
+/-- Overlapped execution: `.recycleSrc 0` recycles $R_0$'s source buffers and runs $R_1$ while $R_0$'s receive is still pending. -/
 theorem trace_overlapped_requests :
     ((multiSys [0, 1] [1, 2]).run
       ((sendProducer2.map (MultiEv.reqStep 0)) ++
@@ -599,10 +540,7 @@ theorem trace_overlapped_requests :
           (false, [.kv 0, .kv 1], some true, [.kv 0, .kv 1])] := by
   decide
 
-/-- Unarmed multi-request trace (`multiSysUnarmed`, `ReshardCoordinator::RunSubPlan`):
-both the initial transfer $R_0$ and the recycled transfer $R_1$ spawned by
-`.recycleSrc 0` start with `armed = false`, reject premature sender D2H before
-`.armRecv`, and complete once `.armRecv` runs. -/
+/-- Unarmed transfers (`multiSysUnarmed`, `ReshardCoordinator::RunSubPlan`): $R_0$ and recycled $R_1$ reject D2H before `.armRecv` and succeed after. -/
 theorem trace_unarmed_multi_request :
     let sysU := multiSysUnarmed [0] [1]
     let send1 : List Ev :=
@@ -628,9 +566,7 @@ theorem trace_unarmed_multi_request :
     some [(true, some true, [.kv 0]), (true, some true, [.kv 0])] := by
   decide
 
-/-- Mutant step: sender staging lease is released at `execFinish` while D2H is
-still in flight (`hasStaging := false` before `d2hDone`), so the subsequent
-`d2hDone 0 true` writes `srcStaging` after release (`wroteReleased = true`). -/
+/-- Mutant step releasing `srcStaging` early at `execFinish` while D2H is still in flight. -/
 def stepReleaseStagingEarly (s : Pipeline) : Ev → Option Pipeline
   | .send .execFinish =>
     (step s (.send .execFinish)).map fun s' =>
@@ -653,10 +589,7 @@ def multiStepReleaseStagingEarly (ms : MultiState) : MultiEv → Option MultiSta
 def multiSysReleaseStagingEarly (ranks peerCounts : List Nat) : System MultiState MultiEv :=
   ⟨multiInit ranks peerCounts true, multiStepReleaseStagingEarly⟩
 
-/-- Mutant check: if a transfer releases `srcStaging` at `execFinish` while its
-D2H copy is still in flight, the straggling `d2hDone 0 true` commits a
-write-after-release (`wroteReleased = true`), triggering `corruptBuffers` in
-`multiStep` and clobbering every transfer's buffers to `.junk`. -/
+/-- Mutant check: releasing `srcStaging` at `execFinish` triggers `wroteReleased` on `d2hDone` and corrupts all buffers. -/
 theorem trace_mutant_write_after_release_corrupts_all :
     ((multiSysReleaseStagingEarly [0] [1]).run
       [ .reqStep 0 (.send (.d2hIssue 0 true)),

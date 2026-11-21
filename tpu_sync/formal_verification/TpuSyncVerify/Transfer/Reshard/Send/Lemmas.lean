@@ -249,6 +249,34 @@ theorem exists_op_of_poolOps_pos :
       obtain ⟨p, hlt, pool', hget, hp'⟩ := exists_op_of_poolOps_pos hps
       exact ⟨p + 1, by simp; omega, pool', hget, hp'⟩
 
+/-- Pools the pipeline has not reached hold no op. -/
+theorem poolOps_eq_zero_of_allPending :
+    ∀ {ps : List SendPool}, allPending ps = true → poolOps ps = 0
+  | [], _ => rfl
+  | p :: ps, h => by
+    simp only [allPending, List.all_cons, Bool.and_eq_true, beq_iff_eq] at h
+    simp only [poolOps, h.1, SendStage.opCount, Nat.zero_add]
+    exact poolOps_eq_zero_of_allPending h.2
+
+/-- A non-empty schedule none of whose pools was reached has pushed nothing. -/
+theorem allPushed_eq_false_of_allPending {ps : List SendPool}
+    (hne : ps.isEmpty = false) (h : allPending ps = true) : allPushed ps = false := by
+  cases ps with
+  | nil => simp at hne
+  | cons p ps =>
+    simp only [allPending, List.all_cons, Bool.and_eq_true, beq_iff_eq] at h
+    simp [allPushed, h.1]
+
+/-- Pools the pipeline has not reached have not aborted. -/
+theorem noAborted_of_allPending :
+    ∀ {ps : List SendPool}, allPending ps = true → noAborted ps = true
+  | [], _ => rfl
+  | p :: ps, h => by
+    simp only [allPending, List.all_cons, Bool.and_eq_true, beq_iff_eq] at h
+    simp only [noAborted, List.all_cons, Bool.and_eq_true, h.1, bne_iff_ne, ne_eq,
+      reduceCtorEq, not_false_eq_true, true_and]
+    exact noAborted_of_allPending h.2
+
 end Send
 
 end TpuSyncVerify.Transfer.Reshard

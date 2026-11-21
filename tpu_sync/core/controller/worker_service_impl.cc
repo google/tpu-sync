@@ -390,12 +390,23 @@ grpc::Status WorkerServiceImpl::TransferBackendBuffers(
     return grpc::Status::OK;
   }
 
-  // block_hashes, hbm_block_ids and host_block_ids are parallel by contract;
-  // entry i describes exactly one block. The equivalent check used to live in
-  // RaidenController::BuildTransferBuffersRequest, which this RPC bypasses
-  // entirely, so it is enforced server-side here instead.
+  const std::string backend_name = spec.name();
+  // Mirror `RaidenController::BuildTransferBackendBuffersRequest`: normally
+  // `block_hashes`, `hbm_block_ids`, and `host_block_ids` are parallel arrays
+  // of length `num_blocks` (one Host DRAM staging slot per block). Because this
+  // RPC does not go through `RaidenController::BuildTransferBuffersRequest`,
+  // that parallel-array invariant is enforced server-side here.
+  //
+  // Only the `"tds"` (TPUDirect Storage) backend may omit `host_block_ids`, and
+  // only as a completely empty list: an empty `host_block_ids` tells
+  // `KVCacheManagerBase::D2hWriteToBackend` / `H2dReadFromBackend` below to
+  // bypass Host DRAM staging and move `hbm_block_ids` directly between TPU HBM
+  // and storage.
+  const bool allow_empty_host_ids = (backend_name == "tds");
+
   if (request->hbm_block_ids_size() != num_blocks ||
-      request->host_block_ids_size() != num_blocks) {
+      (request->host_block_ids_size() != num_blocks &&
+       !(allow_empty_host_ids && request->host_block_ids().empty()))) {
     LOG(ERROR) << "[Worker] Block id count mismatch: hbm_block_ids ("
                << request->hbm_block_ids_size() << "), host_block_ids ("
                << request->host_block_ids_size() << "), block_hashes ("
@@ -410,7 +421,6 @@ grpc::Status WorkerServiceImpl::TransferBackendBuffers(
     return grpc::Status::OK;
   }
 
-  const std::string backend_name = spec.name();
   std::shared_ptr<kv_cache::backends::KVBackend> driver =
       transfer_manager_.GetKVBackend(backend_name);
   if (!driver) {

@@ -844,8 +844,24 @@ RaidenController::BuildTransferBackendBuffersRequest(
     return absl::InvalidArgumentError(
         "block_hashes must specify at least one block hash");
   }
+  // Secondary-storage transfers flow as a single `TransferBackendBuffers` RPC
+  // carrying `(direction, block_hashes, hbm_block_ids, host_block_ids)` rather
+  // than pairing separate D2H/H2D and host-transport steps. Normally,
+  // `block_hashes`, `hbm_block_ids`, and `host_block_ids` are parallel arrays
+  // of equal length because block `i` stages through Host DRAM slot
+  // `host_block_ids[i]` (`HBM -> Host DRAM -> Storage` on `OFFLOAD`, and
+  // `Storage -> Host DRAM -> HBM` on `RECALL`).
+  //
+  // The sole exception is a single-spec `"tds"` request: in Direct Storage
+  // mode, `KVCacheStore` allocates no Host DRAM slots and passes a completely
+  // empty (never partial) `host_block_ids` list, which tells
+  // `WorkerServiceImpl::TransferBackendBuffers` to transfer `hbm_block_ids`
+  // directly between TPU HBM and storage.
+  const bool allow_empty_host_ids =
+      backend_specs.size() == 1 && backend_specs[0].name() == "tds";
   if (hbm_block_ids.size() != block_hashes.size() ||
-      host_block_ids.size() != block_hashes.size()) {
+      (host_block_ids.size() != block_hashes.size() &&
+       !(allow_empty_host_ids && host_block_ids.empty()))) {
     return absl::InvalidArgumentError(absl::StrCat(
         "block_hashes (", block_hashes.size(), "), hbm_block_ids (",
         hbm_block_ids.size(), ") and host_block_ids (", host_block_ids.size(),

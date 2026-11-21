@@ -38,7 +38,7 @@ class PeregrineTransportAdapter : public TransportAdapter {
   struct RecvHooks {
     using OnPostComplete = absl::AnyInvocable<absl::Status(
         const PostMetadata&, const absl::Status&) const>;
-    using ResolveAddr = absl::AnyInvocable<uint8_t*(
+    using ResolveAddr = absl::AnyInvocable<absl::Span<uint8_t>(
         const PostMetadata&, const RequestMetadata&) const>;
     OnPostComplete on_post_complete;
     ResolveAddr resolve_addr;

@@ -154,12 +154,12 @@ using OnPostComplete = PeregrineTransportAdapter::RecvHooks::OnPostComplete;
     std::shared_ptr<OnPostComplete> done) {
   return [hook = std::move(hook), done = std::move(done)](
              const MetadataBytes& post_bytes,
-             const MetadataBytes& req_bytes) -> uint8_t* {
+             const MetadataBytes& req_bytes) -> absl::Span<uint8_t> {
     absl::StatusOr<PostMetadata> post = DecodePostMetadata(post_bytes);
     if (!post.ok()) {
       LOG(ERROR) << "Rejecting Peregrine Post with undecodable metadata: "
                  << post.status();
-      return nullptr;
+      return {};
     }
     absl::StatusOr<RequestMetadata> req =
         DecodeRequestMetadata(*post, req_bytes);
@@ -176,7 +176,7 @@ using OnPostComplete = PeregrineTransportAdapter::RecvHooks::OnPostComplete;
                     "Undecodable request metadata: ", req.status().message())))
             .IgnoreError();
       }
-      return nullptr;
+      return {};
     }
     return hook(*post, *req);
   };

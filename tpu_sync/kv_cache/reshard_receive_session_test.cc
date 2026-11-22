@@ -458,6 +458,47 @@ TEST(ReshardReceiveSessionTest, GroupScopesDestinationBlocks) {
                 "outside its group");
 }
 
+// Pools of different groups may hold different numbers of blocks (e.g. a
+// window-sized private pool beside the global block pool): each destination
+// block id is bounded by the pools of its own group only.
+TEST(ReshardReceiveSessionTest, ChecksBlockIdsAgainstOwnGroupPools) {
+  kv_cache::KVCacheManagerBase base = MakeTestBase();
+  kv_cache::PoolSpec small = DensePool("window", 64);
+  small.num_blocks = 2;
+  ASSERT_TRUE(base.RegisterPools({DensePool("fa", 128), small}).ok());
+  auto make_plan = [](int64_t fa_block, int64_t window_block) {
+    StartTransferRequest plan = ValidPlan(
+        /*uuid=*/1110, /*dtype_tags=*/{"bf16", "bf16"},
+        /*transferred_pools=*/{0, 1});
+    plan.clear_pool_groups();
+    plan.mutable_shard_push_schedules()->at(0).clear_entries();
+    AddEntry(plan, 0, fa_block, /*dst_offset=*/0, /*size=*/16,
+             /*group_idx=*/0);
+    AddEntry(plan, 0, window_block, /*dst_offset=*/0, /*size=*/8,
+             /*group_idx=*/1);
+    auto* fa_group = plan.add_pool_groups();
+    fa_group->add_pool_indices(0);
+    fa_group->add_dst_device_block_ids(fa_block);
+    fa_group->set_expected_pushes(1);
+    fa_group->add_dst_expected_extent_bytes(16);
+    auto* window_group = plan.add_pool_groups();
+    window_group->add_pool_indices(1);
+    window_group->add_dst_device_block_ids(window_block);
+    window_group->set_expected_pushes(1);
+    window_group->add_dst_expected_extent_bytes(8);
+    window_group->set_order_rank(1);
+    return plan;
+  };
+
+  // Block 3 exists in the 4-block FA pool though not in the 2-block window
+  // pool, which only its own group's block 1 addresses.
+  EXPECT_TRUE(
+      CreateStatus(base, make_plan(3, 1), std::vector<int64_t>{3, 1}).ok());
+  ExpectInvalid(
+      CreateStatus(base, make_plan(1, 3), std::vector<int64_t>{1, 3}),
+      "out of range for pool 1");
+}
+
 TEST(ReshardReceiveSessionTest, BoundedStagingSlotAcquisitionAndRelease) {
   FakeH2dBase base(
       /*num_layers=*/2, /*num_shards=*/1,

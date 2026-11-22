@@ -34,16 +34,16 @@ inductive CoordPhase where
 
 /-- Per-destination-unit receiver state (`KVCacheListener::HandleControlRequest`,
 `KVCacheManagerWithTransfer::PoolReshardRegisterRecv`,
-`ReshardReceiveSession::Create`, `ReshardReceiveSession::AcquireStagingLeases`,
+`CreateReshardReceiveSession`, `ReshardReceiveSession::AcquireStagingLeases`,
 `ReshardReceiveSession::ReleaseStaging`). -/
 structure DstUnitState where
-  /-- Destination unit ID (`UnitKey`). -/
+  /-- Destination unit ID (`RaidenId`). -/
   unit : Nat
-  /-- True while `ReshardReceiveSession` is registered in
-      `active_pool_reshard_recvs_` with an armed plan in `active_plans_`. -/
+  /-- True while the `ReshardReceiveSession` is in `sessions_` and not
+      `Done()` (its `plan()` resolvable through `GetSession`). -/
   sessionArmed : Bool
   /-- True while the `PoolStagingLease` acquired by `AcquireStagingLeases`
-      (`ReshardReceiveSession::Create` and `ReshardReceiveSession::AcquireStagingLeases`) is held. -/
+      (`CreateReshardReceiveSession` and `ReshardReceiveSession::AcquireStagingLeases`) is held. -/
   stagingLeaseHeld : Bool
   /-- Set of `src_unit` IDs whose `PoolReshardPush` has arrived. -/
   pushesReceived : List Nat
@@ -64,7 +64,7 @@ def init (unit : Nat) : DstUnitState :=
 
 /-- Arm this destination unit via `PoolReshardRegisterRecv`
 (`KVCacheManagerWithTransfer::PoolReshardRegisterRecv`,
-`ReshardReceiveSession::Create`). -/
+`CreateReshardReceiveSession`). -/
 def arm (d : DstUnitState) : DstUnitState :=
   { d with
     sessionArmed := true

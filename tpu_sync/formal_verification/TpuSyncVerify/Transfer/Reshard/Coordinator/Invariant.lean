@@ -59,7 +59,7 @@ def AllArmedInDispatching (s : CoordState) : Prop :=
 
 /-- **Staging Lease Matches Session Armed (`LeaseMatchesSession`,
 `KVCacheManagerWithTransfer::PoolReshardRegisterRecv`,
-`ReshardReceiveSession::Create`, `ReshardReceiveSession::AcquireStagingLeases`,
+`CreateReshardReceiveSession`, `ReshardReceiveSession::AcquireStagingLeases`,
 `ReshardReceiveSession::ReleaseStaging`)**:
 For every destination unit, its `PoolStagingLease` is held if and only if its
 `ReshardReceiveSession` is currently armed. -/

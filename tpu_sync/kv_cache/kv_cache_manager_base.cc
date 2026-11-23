@@ -94,6 +94,7 @@ namespace {
 
 constexpr int64_t kHostMemorySampleIntervalNs = 5'000'000'000LL;
 constexpr int64_t kHostNumaMemorySampleIntervalNs = 5'000'000'000LL;
+constexpr absl::string_view kUnknownLocalRank = "unknown";
 
 static_assert(std::atomic<int64_t>::is_always_lock_free,
               "std::atomic<int64_t> must be lock-free");
@@ -3738,13 +3739,32 @@ size_t KVCacheManagerBase::GetAllocatedHostDramBytes() const {
 }
 
 void KVCacheManagerBase::UpdateAllocatedOccupancyMetric() const {
-  if (!telemetry::RaidenMetricStore::GetGlobalMetricStore().HasBackends()) {
+  telemetry::RaidenMetricStore& store =
+      telemetry::RaidenMetricStore::GetGlobalMetricStore();
+  if (!store.HasBackends()) {
     return;
   }
   const size_t total_host_dram = GetAllocatedHostDramBytes();
-  telemetry::RaidenMetricStore::GetGlobalMetricStore().SetGauge(
-      telemetry::metric_names::kBufferAllocatedBytes, {},
-      static_cast<double>(total_host_dram));
+  const absl::Span<const std::string> ranks = shard_local_ranks();
+  const size_t shard_count = std::min(num_shards(), ranks.size());
+  if (shard_count == 0) {
+    const telemetry::MetricLabel labels[] = {
+        {telemetry::metric_labels::kLocalRank, kUnknownLocalRank}};
+    store.SetGauge(telemetry::metric_names::kBufferAllocatedBytes, labels,
+                   static_cast<double>(total_host_dram));
+  } else {
+    // Each layer allocates uniform host buffers across shards, so dividing
+    // `total_host_dram` across active shard ranks emits one gauge series per
+    // `local_rank` while preserving their sum as total host DRAM capacity.
+    const double per_shard_bytes =
+        static_cast<double>(total_host_dram) / static_cast<double>(shard_count);
+    for (size_t i = 0; i < shard_count; ++i) {
+      const telemetry::MetricLabel labels[] = {
+          {telemetry::metric_labels::kLocalRank, ranks[i]}};
+      store.SetGauge(telemetry::metric_names::kBufferAllocatedBytes, labels,
+                     per_shard_bytes);
+    }
+  }
   UpdateHostMemoryBreakdownMetrics(*this, total_host_dram);
   MaybeRecordHostNumaMemoryMetrics(*this);
 }

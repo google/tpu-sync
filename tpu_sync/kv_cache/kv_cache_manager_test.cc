@@ -2221,19 +2221,30 @@ TEST(KVCacheManagerTest, D2hWritePipelinedTelemetryBatchObservation) {
   ABSL_EXPECT_OK(res.Await());
 }
 
+auto LocalRankLabel(absl::string_view local_rank) {
+  return testing::ElementsAre(testing::FieldsAre(
+      telemetry::metric_labels::kLocalRank, std::string(local_rank)));
+}
+
 TEST(KVCacheManagerTest, BufferAllocatedHostDramTelemetry) {
+  ScopedUnsetLocalRank unset_local_rank;
   auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
   telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
   telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
 
   // Expect initial gauge sets in constructor:
   // num_layers = 2, num_shards = 2, slice_byte_size = 128, host_blocks = 4
-  // total allocated host dram = 2 * 2 * (4 * 128) = 2048 bytes
+  // total allocated host dram = 2 * 2 * (4 * 128) = 2048 bytes (1024/shard).
   EXPECT_CALL(
       *raw_mock,
       SetGauge(testing::Eq(telemetry::metric_names::kBufferAllocatedBytes),
-               testing::IsEmpty(), testing::DoubleEq(2048.0)))
-      .Times(testing::AtLeast(1));
+               LocalRankLabel("0"), testing::DoubleEq(1024.0)))
+      .Times(1);
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kBufferAllocatedBytes),
+               LocalRankLabel("1"), testing::DoubleEq(1024.0)))
+      .Times(1);
   EXPECT_CALL(
       *raw_mock,
       SetGauge(testing::Eq(telemetry::metric_names::kHostMemoryBreakdownBytes),
@@ -2252,7 +2263,41 @@ TEST(KVCacheManagerTest, BufferAllocatedHostDramTelemetry) {
   EXPECT_EQ(manager.GetAllocatedHostDramBytes(), 2048);
 }
 
+TEST(KVCacheManagerTest, BufferAllocatedHostDramTelemetrySingleShardLocalRank) {
+  ScopedUnsetLocalRank restore_local_rank;
+  setenv(telemetry::kLocalRankEnvVar, "3", 1);
+
+  auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+  telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+  // num_layers = 2, num_shards = 1, slice_byte_size = 128, host_blocks = 4
+  // total allocated host dram = 2 * 1 * (4 * 128) = 1024 bytes on rank "3".
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kBufferAllocatedBytes),
+               LocalRankLabel("3"), testing::DoubleEq(1024.0)))
+      .Times(1);
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kHostMemoryBreakdownBytes),
+               testing::_, testing::Ge(0.0)))
+      .Times(testing::AnyNumber());
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kHostNumaMemoryBytes),
+               testing::_, testing::_))
+      .Times(testing::AnyNumber());
+
+  TestKVCacheManager manager(/*num_layers=*/2, /*num_shards=*/1,
+                             /*slice_byte_size=*/128,
+                             /*host_blocks=*/4);
+
+  EXPECT_EQ(manager.GetAllocatedHostDramBytes(), 1024);
+}
+
 TEST(KVCacheManagerTest, BufferAllocatedHostDramMaintenance) {
+  ScopedUnsetLocalRank unset_local_rank;
   auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
   telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
   telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
@@ -2263,11 +2308,17 @@ TEST(KVCacheManagerTest, BufferAllocatedHostDramMaintenance) {
                testing::_, testing::Ge(0.0)))
       .Times(testing::AnyNumber());
 
-  // Initial gauge set in constructor (2 * 2 * 4 * 128 = 2048 bytes).
+  // Initial gauge set in constructor (2 * 2 * 4 * 128 = 2048 bytes ->
+  // 1024/shard).
   EXPECT_CALL(
       *raw_mock,
       SetGauge(testing::Eq(telemetry::metric_names::kBufferAllocatedBytes),
-               testing::IsEmpty(), testing::DoubleEq(2048.0)))
+               LocalRankLabel("0"), testing::DoubleEq(1024.0)))
+      .Times(1);
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kBufferAllocatedBytes),
+               LocalRankLabel("1"), testing::DoubleEq(1024.0)))
       .Times(1);
   EXPECT_CALL(
       *raw_mock,
@@ -2282,11 +2333,16 @@ TEST(KVCacheManagerTest, BufferAllocatedHostDramMaintenance) {
   EXPECT_EQ(manager.GetAllocatedHostDramBytes(), 2048);
 
   // Calling RegisterPools grows layer 0 host mirror from 4*128 to 8*128 bytes
-  // per shard (2 shards = +1024 bytes -> 3072 bytes total).
+  // per shard (2 shards = +1024 bytes -> 3072 bytes total -> 1536/shard).
   EXPECT_CALL(
       *raw_mock,
       SetGauge(testing::Eq(telemetry::metric_names::kBufferAllocatedBytes),
-               testing::IsEmpty(), testing::DoubleEq(3072.0)))
+               LocalRankLabel("0"), testing::DoubleEq(1536.0)))
+      .Times(1);
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kBufferAllocatedBytes),
+               LocalRankLabel("1"), testing::DoubleEq(1536.0)))
       .Times(1);
   manager.SetLayerPhysicalSizeForTest(/*layer_idx=*/0,
                                       /*physical_size=*/1024,
@@ -2297,11 +2353,16 @@ TEST(KVCacheManagerTest, BufferAllocatedHostDramMaintenance) {
   EXPECT_EQ(manager.GetAllocatedHostDramBytes(), 3072);
 
   // Subsequent call to UpdateAllocatedOccupancyMetric maintains and reports
-  // the running value (3072).
+  // the running value (3072 bytes total -> 1536/shard).
   EXPECT_CALL(
       *raw_mock,
       SetGauge(testing::Eq(telemetry::metric_names::kBufferAllocatedBytes),
-               testing::IsEmpty(), testing::DoubleEq(3072.0)))
+               LocalRankLabel("0"), testing::DoubleEq(1536.0)))
+      .Times(1);
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kBufferAllocatedBytes),
+               LocalRankLabel("1"), testing::DoubleEq(1536.0)))
       .Times(1);
   manager.UpdateAllocatedOccupancyMetric();
 }
@@ -2354,7 +2415,11 @@ TEST(KVCacheManagerTest, AllocatedOccupancyMetricEmitsHostMemoryBreakdown) {
   EXPECT_CALL(
       *raw_mock,
       SetGauge(testing::Eq(telemetry::metric_names::kBufferAllocatedBytes),
-               testing::IsEmpty(), testing::DoubleEq(2048.0)));
+               LocalRankLabel("0"), testing::DoubleEq(1024.0)));
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Eq(telemetry::metric_names::kBufferAllocatedBytes),
+               LocalRankLabel("1"), testing::DoubleEq(1024.0)));
   EXPECT_CALL(*raw_mock,
               SetGauge(telemetry::metric_names::kHostMemoryBreakdownBytes,
                        HostMemoryComponentLabel(
@@ -2398,7 +2463,7 @@ TEST(KVCacheManagerTest, HostMemoryBreakdownMetricsSkippedWhenMeminfoMissing) {
   EXPECT_CALL(
       *raw_mock,
       SetGauge(testing::Eq(telemetry::metric_names::kBufferAllocatedBytes),
-               testing::IsEmpty(), testing::DoubleEq(512.0)));
+               LocalRankLabel("0"), testing::DoubleEq(512.0)));
   EXPECT_CALL(
       *raw_mock,
       SetGauge(testing::Eq(telemetry::metric_names::kHostMemoryBreakdownBytes),
@@ -2428,7 +2493,7 @@ TEST(KVCacheManagerTest, HostMemoryBreakdownMetricsSkippedOnNonZeroLocalRank) {
   EXPECT_CALL(
       *raw_mock,
       SetGauge(testing::Eq(telemetry::metric_names::kBufferAllocatedBytes),
-               testing::IsEmpty(), testing::DoubleEq(512.0)));
+               LocalRankLabel("1"), testing::DoubleEq(512.0)));
   EXPECT_CALL(
       *raw_mock,
       SetGauge(testing::Eq(telemetry::metric_names::kHostMemoryBreakdownBytes),

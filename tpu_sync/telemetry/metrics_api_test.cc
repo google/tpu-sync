@@ -262,7 +262,8 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
             "staging "
             "across all layers and shards.");
   EXPECT_EQ(metric_metadata::kBufferAllocatedBytes.type, MetricType::kGauge);
-  EXPECT_THAT(metric_metadata::kBufferAllocatedBytes.label_names, IsEmpty());
+  EXPECT_THAT(metric_metadata::kBufferAllocatedBytes.label_names,
+              ElementsAre(metric_labels::kLocalRank));
 
   // StorageBytesTotal
   EXPECT_EQ(metric_names::kStorageBytesTotal, "storage_bytes_total");

@@ -661,14 +661,14 @@ raiden::PjRtCopyFuture JoinAndRecordTelemetry(
   const size_t end_shard = std::min(num_shards, single_shard_idx.has_value()
                                                     ? (*single_shard_idx + 1)
                                                     : num_shards);
-  absl::Span<const std::string> active_local_ranks;
+  std::vector<std::string> active_local_ranks;
   if (bytes_per_shard > 0 && end_shard > start_shard) {
     const absl::Span<const std::string> shard_ranks =
         manager.shard_local_ranks();
     const size_t clamped_start = std::min(start_shard, shard_ranks.size());
     const size_t clamped_end = std::min(end_shard, shard_ranks.size());
-    active_local_ranks =
-        shard_ranks.subspan(clamped_start, clamped_end - clamped_start);
+    active_local_ranks.assign(shard_ranks.begin() + clamped_start,
+                              shard_ranks.begin() + clamped_end);
   }
   const absl::string_view dma_time_metric =
       (time_metric_name == telemetry::metric_names::kH2dTransferTimeMs)
@@ -677,7 +677,8 @@ raiden::PjRtCopyFuture JoinAndRecordTelemetry(
   joined_future.OnReady(
       [start_time, time_metric = time_metric_name, dma_metric = dma_time_metric,
        bytes_metric = bytes_metric_name, bytes = bytes_per_shard,
-       host_ip = manager.local_ip(), local_ranks = active_local_ranks](
+       host_ip = manager.local_ip(),
+       local_ranks = std::move(active_local_ranks)](
           const absl::StatusOr<raiden::BufferHolders>& result) {
         if (result.ok()) {
           auto& store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
@@ -3881,10 +3882,8 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hWriteToBackend(
     int64_t dst_block_idx = dst_host_block_ids[i];
 
     TF_ASSIGN_OR_RETURN(
-        auto chunk_futures,
-        DispatchD2hChunks({src_block_idx}, {dst_block_idx}, {1}));
-    raiden::PjRtCopyFuture d2h_fut =
-        raiden::JoinPjRtCopyFutures(absl::MakeSpan(chunk_futures));
+        raiden::PjRtCopyFuture d2h_fut,
+        D2hSyncDispatch({src_block_idx}, {dst_block_idx}, {1}));
     for (const auto& h : d2h_fut.holds) {
       all_holds.push_back(h);
     }

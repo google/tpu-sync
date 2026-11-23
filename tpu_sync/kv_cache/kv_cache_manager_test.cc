@@ -54,6 +54,7 @@
 #include "absl/types/span.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/plugin/xla_cpu/xla_cpu_pjrt_client.h"
+#include "xla/tsl/concurrency/future.h"
 #include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/core/raiden_manager_base.h"
 #include "tpu_sync/core/raw_transfer_core.h"
@@ -3815,6 +3816,176 @@ TEST(KVCacheManagerTest,
       raiden::PjRtCopyFuture read_fail,
       manager.H2dReadFromBackend({fail_backend}, keys, block_ids, block_ids));
   EXPECT_THAT(read_fail.Await(), StatusIs(absl::StatusCode::kNotFound));
+}
+
+auto PcieTransferLabels(absl::string_view host_ip,
+                        absl::string_view local_rank) {
+  return testing::ElementsAre(
+      testing::FieldsAre(telemetry::metric_labels::kHostIp,
+                         std::string(host_ip)),
+      testing::FieldsAre(telemetry::metric_labels::kLocalRank,
+                         std::string(local_rank)));
+}
+
+TEST(KVCacheManagerTest, D2hWriteToBackendEmitsD2hDmaTelemetry) {
+  ScopedEnvVar restore_local_rank(telemetry::kLocalRankEnvVar, "3");
+
+  // 2 layers * 128 bytes/slice = 256 bytes per shard per block.
+  TestKVCacheManager single_shard_manager(/*num_layers=*/2, /*num_shards=*/1,
+                                          /*slice_byte_size=*/128,
+                                          /*host_blocks=*/2);
+  TestKVCacheManager multi_shard_manager(/*num_layers=*/2, /*num_shards=*/2,
+                                         /*slice_byte_size=*/128,
+                                         /*host_blocks=*/2);
+
+  auto mock_backend =
+      std::make_unique<testing::NiceMock<telemetry::MockMetricsBackend>>();
+  telemetry::MockMetricsBackend* raw_mock_backend = mock_backend.get();
+
+  EXPECT_CALL(*raw_mock_backend,
+              IncrementCounter(
+                  testing::Ne(telemetry::metric_names::kD2hBytesTotal),
+                  testing::_, testing::_))
+      .Times(testing::AnyNumber());
+  EXPECT_CALL(
+      *raw_mock_backend,
+      ObserveHistogram(
+          testing::AllOf(
+              testing::Ne(telemetry::metric_names::kD2hDmaTimeMs),
+              testing::Ne(telemetry::metric_names::kD2hTransferTimeMs)),
+          testing::_, testing::_))
+      .Times(testing::AnyNumber());
+
+  const auto valid_duration_ms =
+      testing::AllOf(testing::Ge(0.0), testing::Lt(60'000.0));
+
+  // 2 blocks -> 2 D2hSyncDispatch calls per manager (256 bytes/block/shard).
+  EXPECT_CALL(*raw_mock_backend,
+              ObserveHistogram(telemetry::metric_names::kD2hTransferTimeMs,
+                               testing::IsEmpty(), valid_duration_ms))
+      .Times(4);
+  EXPECT_CALL(*raw_mock_backend,
+              ObserveHistogram(
+                  telemetry::metric_names::kD2hDmaTimeMs,
+                  PcieTransferLabels(single_shard_manager.local_ip(), "3"),
+                  valid_duration_ms))
+      .Times(2);
+  EXPECT_CALL(*raw_mock_backend,
+              IncrementCounter(
+                  telemetry::metric_names::kD2hBytesTotal,
+                  PcieTransferLabels(single_shard_manager.local_ip(), "3"),
+                  256))
+      .Times(2);
+  for (absl::string_view rank : {"0", "1"}) {
+    EXPECT_CALL(*raw_mock_backend,
+                ObserveHistogram(
+                    telemetry::metric_names::kD2hDmaTimeMs,
+                    PcieTransferLabels(multi_shard_manager.local_ip(), rank),
+                    valid_duration_ms))
+        .Times(2);
+    EXPECT_CALL(*raw_mock_backend,
+                IncrementCounter(
+                    telemetry::metric_names::kD2hBytesTotal,
+                    PcieTransferLabels(multi_shard_manager.local_ip(), rank),
+                    256))
+        .Times(2);
+  }
+
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+  auto fake_backend = std::make_shared<ConfigurableFakeKVBackend>();
+  const std::vector<backends::BlockKey> keys = {
+      {.block_hash = "k0", .resolved_key = "/tmp/k0"},
+      {.block_hash = "k1", .resolved_key = "/tmp/k1"}};
+  const std::vector<int64_t> block_ids = {0, 1};
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      raiden::PjRtCopyFuture single_shard_write_future,
+      single_shard_manager.D2hWriteToBackend({fake_backend}, keys, block_ids,
+                                             block_ids));
+  ABSL_EXPECT_OK(single_shard_write_future.Await());
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      raiden::PjRtCopyFuture multi_shard_write_future,
+      multi_shard_manager.D2hWriteToBackend({fake_backend}, keys, block_ids,
+                                            block_ids));
+  ABSL_EXPECT_OK(multi_shard_write_future.Await());
+}
+
+TEST(KVCacheManagerTest,
+     D2hWriteToBackendTelemetrySurvivesManagerDestructionAndSkipsWhenDisabled) {
+  auto fake_backend = std::make_shared<ConfigurableFakeKVBackend>();
+  const std::vector<backends::BlockKey> keys = {
+      {.block_hash = "k0", .resolved_key = "/tmp/k0"},
+      {.block_hash = "k1", .resolved_key = "/tmp/k1"}};
+  const std::vector<int64_t> block_ids = {0, 1};
+
+  {
+    telemetry::RaidenMetricStore::GetGlobalMetricStore().SetBackends({});
+    TestKVCacheManager disabled_telemetry_manager(
+        /*num_layers=*/1, /*num_shards=*/1, /*slice_byte_size=*/128,
+        /*host_blocks=*/2);
+    TF_ASSERT_OK_AND_ASSIGN(
+        raiden::PjRtCopyFuture write_future,
+        disabled_telemetry_manager.D2hWriteToBackend({fake_backend}, keys,
+                                                     block_ids, block_ids));
+    ABSL_EXPECT_OK(write_future.Await());
+  }
+
+  // Chunk 0 returns a pending DMA future attached to JoinAndRecordTelemetry,
+  // chunk 1 fails synchronously in DispatchD2hChunks, and the manager is
+  // destroyed before chunk 0 completes. Telemetry must fire without UAF.
+  auto [pending_promise, pending_future] = tsl::MakePromise<>();
+  class PartialDispatchKVCacheManager : public TestKVCacheManager {
+   public:
+    explicit PartialDispatchKVCacheManager(tsl::Future<> first_future)
+        : TestKVCacheManager(/*num_layers=*/1, /*num_shards=*/2,
+                             /*slice_byte_size=*/128, /*host_blocks=*/2),
+          first_future_(std::move(first_future)) {}
+
+    absl::StatusOr<std::vector<raiden::PjRtCopyFuture>> DispatchD2hChunks(
+        const std::vector<int64_t>&, const std::vector<int64_t>&,
+        const std::vector<int64_t>&, std::optional<int64_t>,
+        std::optional<size_t>, std::optional<size_t>, std::optional<size_t>,
+        int64_t) override {
+      if (dispatch_call_count_++ == 0) {
+        std::vector<raiden::PjRtCopyFuture> futures;
+        futures.push_back(raiden::PjRtCopyFuture(std::move(first_future_), {}));
+        return futures;
+      }
+      return absl::InternalError("simulated partial dispatch failure");
+    }
+
+   private:
+    int dispatch_call_count_ = 0;
+    tsl::Future<> first_future_;
+  };
+
+  auto mock_backend =
+      std::make_unique<testing::NiceMock<telemetry::MockMetricsBackend>>();
+  const auto valid_duration_ms =
+      testing::AllOf(testing::Ge(0.0), testing::Lt(60'000.0));
+  EXPECT_CALL(*mock_backend,
+              ObserveHistogram(telemetry::metric_names::kD2hTransferTimeMs,
+                               testing::IsEmpty(), valid_duration_ms))
+      .Times(1);
+  EXPECT_CALL(*mock_backend,
+              ObserveHistogram(telemetry::metric_names::kD2hDmaTimeMs,
+                               testing::_, valid_duration_ms))
+      .Times(2);
+  EXPECT_CALL(*mock_backend,
+              IncrementCounter(telemetry::metric_names::kD2hBytesTotal,
+                               testing::_, 128))
+      .Times(2);
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+  {
+    PartialDispatchKVCacheManager manager(std::move(pending_future));
+    EXPECT_THAT(manager.D2hWriteToBackend({fake_backend}, keys, block_ids,
+                                          block_ids),
+                StatusIs(absl::StatusCode::kInternal));
+  }  // `manager` is destroyed while chunk 0's telemetry callback is pending.
+  pending_promise.Set(absl::OkStatus());
 }
 
 void AdvanceSteadyClock(std::chrono::nanoseconds delta) {

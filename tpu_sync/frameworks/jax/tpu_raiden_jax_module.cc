@@ -51,7 +51,13 @@
 #include "tpu_sync/kv_cache_offload/kv_cache_store.h"
 #include "tpu_sync/kv_cache_offload/kv_cache_store_backend_factory.h"
 #include "tpu_sync/kv_cache_offload/kv_cache_store_wrapper.h"
+#include "tpu_sync/solutions/mooncake/jax/mooncake_provider_bindings.h"
+#include "tpu_sync/solutions/mooncake/mooncake_provider.h"
 #include "tpu_sync/telemetry/python/telemetry_binding.h"
+#ifdef RAIDEN_WHEEL_BUILD
+#include "tpu_sync/frameworks/jax/kv_cache_manager_ffi_bindings.h"
+#include "tpu_sync/frameworks/jax/weight_synchronizer_ffi_bindings.h"
+#endif
 
 namespace nb = nanobind;
 
@@ -76,6 +82,16 @@ std::vector<std::string> ToStdStringVector(
 }  // namespace tpu_raiden
 
 using ::tpu_raiden::kv_cache::ToStdStringVector;
+
+// Mooncake dlopen()s this extension to serve the handles that its
+// mooncake_provider submodule exports, so the entry point is defined here, in
+// the extension's own sources; marked weak so binaries statically linking both
+// _tpu_raiden_jax and _tpu_raiden_torch merge the identical definitions
+// cleanly. See tpu_sync/solutions/mooncake/mooncake_provider.h.
+extern "C" __attribute__((weak)) int mc_tpu_buffer_provider_get(
+    raiden::mooncake::ProviderTable* out) {
+  return raiden::mooncake::GetProviderTable(out);
+}
 
 NB_MODULE(_tpu_raiden_jax, m) {
   // =========================================================================
@@ -924,4 +940,24 @@ NB_MODULE(_tpu_raiden_jax, m) {
   m.attr("kv_cache_store_supports_per_worker_kv_transfer_spec") = true;
 
   tpu_raiden::telemetry::BindTelemetryApi(m);
+
+  // TPU buffer provider for Mooncake TENT. Mounted here, mirroring
+  // _tpu_raiden_torch, so the wheel needs no second JAX-linked .so.
+  nb::module_ mooncake_provider = m.def_submodule(
+      "mooncake_provider", "TPU buffer provider for Mooncake TENT.");
+  raiden::mooncake::BindJaxMooncakeProvider(mooncake_provider);
+
+#ifdef RAIDEN_WHEEL_BUILD
+  // Consolidate the JAX FFI modules into _tpu_raiden_jax for wheel builds so
+  // multi-ABI wheels ship a single .so per JAX release instead of three static
+  // copies of the XLA/gRPC runtime. Non-wheel builds keep the standalone
+  // _kv_cache_manager_ffi and _weight_synchronizer_ffi extensions.
+  nb::module_ kv_cache_manager_ffi = m.def_submodule(
+      "kv_cache_manager_ffi", "FFI controls for JAX KVCacheManager.");
+  tpu_raiden::kv_cache::BindKvCacheManagerFfi(kv_cache_manager_ffi);
+
+  nb::module_ weight_synchronizer_ffi = m.def_submodule(
+      "weight_synchronizer_ffi", "FFI controls for JAX WeightSynchronizer.");
+  tpu_raiden::weight_sync::BindWeightSynchronizerFfi(weight_synchronizer_ffi);
+#endif
 }

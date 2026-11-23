@@ -18,6 +18,11 @@ load("@rules_python//python:defs.bzl", "py_library", "py_test")
 
 package(default_visibility = ["//visibility:public"])
 
+config_setting(
+    name = "wheel_build",
+    values = {"define": "raiden_wheel_build=true"},
+)
+
 _X86_MARCH_COPTS = select({
     "@platforms//cpu:x86_64": ["-march=x86-64-v2"],
     "//conditions:default": [],
@@ -166,7 +171,10 @@ nanobind_extension(
         "-fexceptions",
         "-frtti",
         "-fvisibility=hidden",
-    ] + _X86_MARCH_COPTS,
+    ] + _X86_MARCH_COPTS + select({
+        ":wheel_build": ["-DRAIDEN_WHEEL_BUILD"],
+        "//conditions:default": [],
+    }),
     features = [
         "-use_header_modules",
     ],
@@ -182,6 +190,8 @@ nanobind_extension(
         "//tpu_sync/kv_cache_offload:kv_cache_store_backend_factory",
         "//tpu_sync/kv_cache_offload:kv_cache_store_wrapper",
         "//tpu_sync/kv_cache_offload/backends:backend",
+        "//tpu_sync/solutions/mooncake:mooncake_provider",
+        "//tpu_sync/solutions/mooncake/jax:mooncake_provider_bindings",
         "//tpu_sync/telemetry/python:telemetry_binding",
         "//tpu_sync/weight_sync:weight_synchronizer_base",
         "@com_google_absl//absl/status",
@@ -193,7 +203,13 @@ nanobind_extension(
         "@rules_python//python/cc:current_py_cc_headers",
         "@xla//xla:future",
         "@xla//xla/pjrt:status_casters",
-    ],
+    ] + select({
+        ":wheel_build": [
+            ":kv_cache_manager_ffi_bindings",
+            ":weight_synchronizer_ffi_bindings",
+        ],
+        "//conditions:default": [],
+    }),
 )
 
 cc_library(
@@ -227,6 +243,25 @@ cc_library(
     alwayslink = 1,
 )
 
+cc_library(
+    name = "kv_cache_manager_ffi_bindings",
+    srcs = ["kv_cache_manager_ffi_bindings.cc"],
+    hdrs = ["kv_cache_manager_ffi_bindings.h"],
+    copts = [
+        "-fexceptions",
+        "-frtti",
+    ] + _X86_MARCH_COPTS,
+    features = [
+        "-use_header_modules",
+    ],
+    deps = [
+        ":kv_cache_manager_ffi",
+        "//tpu_sync/kv_cache:kv_cache_manager_with_transfer",
+        "@nanobind",
+        "@xla//xla/stream_executor/host:host_platform",
+    ],
+)
+
 nanobind_extension(
     name = "_kv_cache_manager_ffi",
     srcs = [
@@ -243,9 +278,8 @@ nanobind_extension(
     linkopts = ["-Wl,--exclude-libs,ALL"],
     visibility = ["//visibility:public"],
     deps = [
-        ":kv_cache_manager_ffi",
-        ":kv_cache_manager_jax",
-        "@xla//xla/stream_executor/host:host_platform",
+        ":kv_cache_manager_ffi_bindings",
+        "@nanobind",
     ],
 )
 
@@ -293,6 +327,28 @@ cc_library(
     alwayslink = 1,
 )
 
+cc_library(
+    name = "weight_synchronizer_ffi_bindings",
+    srcs = ["weight_synchronizer_ffi_bindings.cc"],
+    hdrs = ["weight_synchronizer_ffi_bindings.h"],
+    copts = [
+        "-fexceptions",
+        "-frtti",
+    ] + _X86_MARCH_COPTS,
+    features = [
+        "-use_header_modules",
+    ],
+    tags = [
+        "manual",
+        "nobuilder",
+    ],
+    deps = [
+        ":weight_synchronizer_ffi",
+        "//tpu_sync/weight_sync:weight_synchronizer_base",
+        "@nanobind",
+    ],
+)
+
 nanobind_extension(
     name = "_weight_synchronizer_ffi",
     srcs = [
@@ -311,8 +367,7 @@ nanobind_extension(
     ],
     visibility = ["//visibility:public"],
     deps = [
-        ":weight_synchronizer_ffi",
-        ":weight_synchronizer_jax",
+        ":weight_synchronizer_ffi_bindings",
         "@nanobind",
     ],
 )
@@ -651,12 +706,14 @@ py_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
-        ":_weight_synchronizer_ffi",
         "@com_google_absl_py//absl/logging",
         "@jax//jax",
         "@jax//jax/experimental:compute_on",
         "@pypi//numpy",
-    ],
+    ] + select({
+        ":wheel_build": [":_tpu_raiden_jax"],  # buildcleaner: keep
+        "//conditions:default": [":_weight_synchronizer_ffi"],  # buildcleaner: keep
+    }),
 )
 
 # Runs the pure-Python helper tests of weight_synchronizer_ffi_test.py on 8

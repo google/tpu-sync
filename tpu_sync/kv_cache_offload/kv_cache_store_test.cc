@@ -9442,6 +9442,13 @@ TEST_F(SecondaryBackendTopologyTest,
               testing::FieldsAre(telemetry::metric_labels::kResult,
                                  telemetry::metric_labels::kResultStatMiss)),
           1));
+  EXPECT_CALL(
+      *raw_backend,
+      ObserveHistogram(
+          telemetry::metric_names::kStorageLookupDurationMs,
+          testing::ElementsAre(
+              testing::FieldsAre(telemetry::metric_labels::kDpRank, "7")),
+          testing::AllOf(testing::Ge(0.0), testing::Lt(60'000.0))));
   telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
   TF_ASSERT_OK_AND_ASSIGN(BlockSliceList result, store_->Lookup({"missing"}));
   EXPECT_TRUE(result.empty());

@@ -2935,6 +2935,12 @@ auto MetadataCheckLabels(absl::string_view dp_rank, absl::string_view result) {
                          std::string(result)));
 }
 
+auto LookupDurationLabels(absl::string_view dp_rank) {
+  return testing::ElementsAre(
+      testing::FieldsAre(telemetry::metric_labels::kDpRank,
+                         std::string(dp_rank)));
+}
+
 TEST_F(MetadataCacheTest, EmitsStatHitAndStatMissWhenCacheDisabled) {
   Env env = CreateEnv(MetadataCacheOptions{}, /*batch_size=*/8, /*tp_size=*/2);
   env.CreateAllShards("a");
@@ -2954,6 +2960,11 @@ TEST_F(MetadataCacheTest, EmitsStatHitAndStatMissWhenCacheDisabled) {
           telemetry::metric_names::kStorageMetadataCheckTotal,
           MetadataCheckLabels("0", telemetry::metric_labels::kResultStatMiss),
           3));
+  EXPECT_CALL(*raw_backend,
+              ObserveHistogram(
+                  telemetry::metric_names::kStorageLookupDurationMs,
+                  LookupDurationLabels("0"),
+                  testing::AllOf(testing::Ge(0.0), testing::Lt(60'000.0))));
 
   telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
   // 6 shards in one chunk: a_r0, a_r1, b_r0 exist (3 stat_hits); b_r1, c_r0,
@@ -2977,6 +2988,10 @@ TEST_F(MetadataCacheTest,
             telemetry::metric_names::kStorageMetadataCheckTotal,
             MetadataCheckLabels("0", telemetry::metric_labels::kResultStatHit),
             2));
+    EXPECT_CALL(*mock_backend,
+                ObserveHistogram(
+                    telemetry::metric_names::kStorageLookupDurationMs,
+                    LookupDurationLabels("0"), testing::Ge(0.0)));
     telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
     EXPECT_EQ(env.LookupCount({"a", "b"}), 2);
   }
@@ -2997,6 +3012,10 @@ TEST_F(MetadataCacheTest,
             telemetry::metric_names::kStorageMetadataCheckTotal,
             MetadataCheckLabels("0", telemetry::metric_labels::kResultStatMiss),
             1));
+    EXPECT_CALL(*mock_backend,
+                ObserveHistogram(
+                    telemetry::metric_names::kStorageLookupDurationMs,
+                    LookupDurationLabels("0"), testing::Ge(0.0)));
     telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
     EXPECT_EQ(env.LookupCount({"a", "b", "c"}), 2);
   }
@@ -3017,6 +3036,10 @@ TEST_F(MetadataCacheTest,
             telemetry::metric_names::kStorageMetadataCheckTotal,
             MetadataCheckLabels("0", telemetry::metric_labels::kResultStatHit),
             1));
+    EXPECT_CALL(*mock_backend,
+                ObserveHistogram(
+                    telemetry::metric_names::kStorageLookupDurationMs,
+                    LookupDurationLabels("0"), testing::Ge(0.0)));
     telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
     EXPECT_EQ(env.LookupCount({"a", "b", "c"}), 3);
   }
@@ -3039,6 +3062,10 @@ TEST_F(MetadataCacheTest,
             telemetry::metric_names::kStorageMetadataCheckTotal,
             MetadataCheckLabels("0", telemetry::metric_labels::kResultStatMiss),
             1));
+    EXPECT_CALL(*mock_backend,
+                ObserveHistogram(
+                    telemetry::metric_names::kStorageLookupDurationMs,
+                    LookupDurationLabels("0"), testing::Ge(0.0)));
     telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
     EXPECT_EQ(env.LookupCount({"a", "b", "c"}), 1);
   }
@@ -3053,6 +3080,10 @@ TEST_F(MetadataCacheTest,
             telemetry::metric_names::kStorageMetadataCheckTotal,
             MetadataCheckLabels("0", telemetry::metric_labels::kResultStatHit),
             1));
+    EXPECT_CALL(*mock_backend,
+                ObserveHistogram(
+                    telemetry::metric_names::kStorageLookupDurationMs,
+                    LookupDurationLabels("0"), testing::Ge(0.0)));
     telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
     EXPECT_EQ(env.LookupCount({"a"}), 1);
   }
@@ -3097,6 +3128,11 @@ TEST_F(MetadataCacheTest, PropagatesCustomDpRankViaConstructorAndFactory) {
           telemetry::metric_names::kStorageMetadataCheckTotal,
           MetadataCheckLabels("3", telemetry::metric_labels::kResultStatMiss),
           1));
+  EXPECT_CALL(*raw_backend,
+              ObserveHistogram(
+                  telemetry::metric_names::kStorageLookupDurationMs,
+                  LookupDurationLabels("3"),
+                  testing::AllOf(testing::Ge(0.0), testing::Lt(60'000.0))));
   EXPECT_CALL(*raw_backend,
               SetGauge(telemetry::metric_names::kStorageFilesystemBytes,
                        testing::_, testing::_))

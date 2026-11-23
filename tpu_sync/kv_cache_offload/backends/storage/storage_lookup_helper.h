@@ -38,8 +38,9 @@ namespace storage {
 // into the storage keys that must all exist for the block to be available,
 // and one probes a batch of keys on storage. The helper does the rest:
 // LookupOptions handling, batched probing, the storage_metadata_check_total
-// counter, and the SHARED_STORAGE results. A backend that keeps a cache of
-// confirmed keys passes two more callables, so that Lookup uses its cache.
+// counter, the storage_lookup_duration_ms histogram, and the SHARED_STORAGE
+// results. A backend that keeps a cache of confirmed keys passes two more
+// callables, so that Lookup uses its cache.
 //
 // Thread-safe. The helper holds no mutable state.
 class StorageLookupHelper {
@@ -65,7 +66,8 @@ class StorageLookupHelper {
       absl::FunctionRef<void(absl::Span<const BlockKey* const> keys)>;
 
   // `data_name` is the RaidenId::data_name of every block Lookup returns.
-  // `dp_rank` labels the storage_metadata_check_total counter.
+  // `dp_rank` labels storage_metadata_check_total and
+  // storage_lookup_duration_ms.
   // `lookup_batch_size` is the number of keys per probe and must be > 0.
   StorageLookupHelper(std::string data_name, std::string dp_rank,
                       size_t lookup_batch_size);

@@ -466,6 +466,24 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_THAT(metric_metadata::kStorageMetadataCheckTotal.label_names,
               ElementsAre(metric_labels::kDpRank, metric_labels::kResult));
 
+  // Storage Lookup Duration Metrics
+  EXPECT_EQ(metric_names::kStorageLookupDurationMs,
+            "storage_lookup_duration_ms");
+  EXPECT_EQ(metric_descriptions::kStorageLookupDurationMs,
+            "Duration in milliseconds of secondary storage metadata existence "
+            "probing per Lookup call across all probe chunks.");
+  EXPECT_EQ(metric_metadata::kStorageLookupDurationMs.name,
+            "storage_lookup_duration_ms");
+  EXPECT_EQ(metric_metadata::kStorageLookupDurationMs.description,
+            "Duration in milliseconds of secondary storage metadata existence "
+            "probing per Lookup call across all probe chunks.");
+  EXPECT_EQ(metric_metadata::kStorageLookupDurationMs.type,
+            MetricType::kHistogram);
+  EXPECT_THAT(metric_metadata::kStorageLookupDurationMs.buckets,
+              ElementsAreArray(kDefaultHistogramBuckets));
+  EXPECT_THAT(metric_metadata::kStorageLookupDurationMs.label_names,
+              ElementsAre(metric_labels::kDpRank));
+
   // Direction Labels
   EXPECT_EQ(metric_labels::kDirection, "direction");
   EXPECT_EQ(metric_labels::kDirectionPush, "push");
@@ -634,6 +652,7 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
           metric_metadata::kHostNumaMemoryBytes,
           metric_metadata::kStorageFilesystemBytes,
           metric_metadata::kStorageMetadataCheckTotal,
+          metric_metadata::kStorageLookupDurationMs,
           metric_metadata::kStorageIoTimeMs,
           metric_metadata::kHostPoolBlocks,
           metric_metadata::kWeightSyncSentBytesTotal,

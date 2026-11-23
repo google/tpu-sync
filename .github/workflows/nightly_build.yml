@@ -16,6 +16,10 @@
 # asked. Wheels above the PyPI file limit are skipped, not fatal, so the
 # registry always gets every wheel and PyPI gets the ones that fit.
 #
+# The jax wheels are multi-ABI (one consolidated _tpu_raiden_jax_<ver>.so per
+# supported JAX release) and built per supported Python minor version (3.12,
+# 3.13) via build_jax_wheels.yml.
+#
 # The torch wheel needs no torch_tpu checkout: the build resolves the
 # torch_tpu module from shims/torch_tpu, backed by the torch_tpu
 # wheel named in torch_tpu.version, and ships one extension variant per
@@ -39,10 +43,15 @@ on:
     - cron: "0 8 * * *"  # 08:00 UTC daily
   workflow_dispatch:
     inputs:
-      jax_version:
-        description: "JAX version the jax wheel builds against (empty = DEFAULT_VERSION in third_party/jax/versions.bzl)"
+      jax_abis:
+        description: "JAX releases bundled in each jax wheel, space-separated (empty = WHEEL_ABIS in third_party/jax/versions.bzl)"
         required: false
         default: ""
+        type: string
+      python_versions:
+        description: "Python minor versions for jax wheels, space-separated (e.g. '3.12 3.13')"
+        required: false
+        default: "3.12 3.13"
         type: string
       upload_to_registry:
         description: "Upload wheels to the tpu-sync Artifact Registry?"
@@ -114,13 +123,20 @@ jobs:
           retention-days: 90
           if-no-files-found: error
 
-  build:
-    name: "Build ${{ matrix.framework }} wheel"
+  jax-wheels:
+    name: "Build and pack jax wheels"
     needs: version
-    strategy:
-      fail-fast: false
-      matrix:
-        framework: [jax, torch]
+    uses: ./.github/workflows/build_jax_wheels.yml
+    with:
+      jax_abis: ${{ inputs.jax_abis || '' }}
+      python_versions: ${{ inputs.python_versions || '3.12 3.13' }}
+      wheel_version_extras: ${{ needs.version.outputs.wheel_version_extras }}
+      use_remote_cache: ${{ inputs.use_remote_cache || 'yes' }}
+      artifact_prefix: nightly-wheel-jax
+
+  build-torch:
+    name: "Build torch wheel"
+    needs: version
     runs-on: linux-x86-n2-32
     container:
       image: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:9644db6e0e969079b138547dd99818c02e6ab51d892c4675cf2f4edf02a1e71a
@@ -140,8 +156,7 @@ jobs:
         shell: bash
         working-directory: tpu-sync
         env:
-          BUILD_MODE: ${{ matrix.framework }}
-          RAIDEN_JAX_VERSION: ${{ matrix.framework == 'jax' && inputs.jax_version || '' }}
+          BUILD_MODE: torch
           WHEEL_VERSION_EXTRAS: ${{ needs.version.outputs.wheel_version_extras }}
           EXTRA_BAZEL_FLAGS: ${{ (inputs.use_remote_cache || 'yes') == 'yes' && '--config=ci' || '' }}
         run: |
@@ -152,34 +167,11 @@ jobs:
         env:
           WHEEL_VERSION_EXTRAS: ${{ needs.version.outputs.wheel_version_extras }}
         run: uv run --isolated --with twine twine check dist/*"${WHEEL_VERSION_EXTRAS}"-*.whl
-      # The JAX-stack coupling (jax/jaxlib/libtpu) is enforced through the
-      # wheel's own Requires-Dist pins; extract them so each build records the
-      # stack it must run with.
-      - name: Record JAX stack pins
-        if: matrix.framework == 'jax'
-        working-directory: tpu-sync
-        run: |
-          python3 - <<'PY'
-          import glob, re, zipfile
-          whl = sorted(glob.glob('dist/tpu_sync_jax-*.whl'))[-1]
-          with zipfile.ZipFile(whl) as z:
-              meta = next(n for n in z.namelist() if n.endswith('.dist-info/METADATA'))
-              text = z.read(meta).decode()
-          pins = [l.removeprefix('Requires-Dist: ') for l in text.splitlines()
-                  if re.match(r'Requires-Dist: (jax|jaxlib|libtpu)\b', l)]
-          assert pins, f'no jax/jaxlib/libtpu pins found in {whl} METADATA'
-          open('dist/jax_pins.txt', 'w').write('\n'.join(pins) + '\n')
-          print('\n'.join(pins))
-          PY
-          echo "JAX stack pins:" >> "$GITHUB_STEP_SUMMARY"
-          cat dist/jax_pins.txt >> "$GITHUB_STEP_SUMMARY"
       - name: Upload wheel artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
-          name: nightly-wheel-${{ matrix.framework }}
-          path: |
-            tpu-sync/dist/*${{ needs.version.outputs.wheel_version_extras }}-*.whl
-            tpu-sync/dist/jax_pins.txt
+          name: nightly-wheel-torch
+          path: tpu-sync/dist/*${{ needs.version.outputs.wheel_version_extras }}-*.whl
           if-no-files-found: error
       - name: Summarize
         working-directory: tpu-sync
@@ -192,7 +184,7 @@ jobs:
 
   upload:
     name: "Upload wheels to Artifact Registry"
-    needs: [version, build]
+    needs: [version, jax-wheels, build-torch]
     # Scheduled nightlies always publish; manual dispatches only on request.
     if: github.event_name == 'schedule' || inputs.upload_to_registry == 'yes'
     runs-on: linux-x86-n2-32
@@ -223,7 +215,7 @@ jobs:
 
   publish:
     name: "Publish"
-    needs: [version, build]
+    needs: [version, jax-wheels, build-torch]
     if: github.event_name == 'schedule' || inputs.publish_to_pypi == 'yes'
     uses: ./.github/workflows/publish_pypi.yml
     with:

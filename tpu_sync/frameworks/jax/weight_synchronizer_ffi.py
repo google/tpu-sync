@@ -16,6 +16,7 @@
 
 import collections
 import dataclasses
+import importlib
 import os
 import socket
 import struct
@@ -29,7 +30,16 @@ from jax.experimental import xla_metadata
 import jax.numpy as jnp
 import numpy as np
 
-from tpu_sync.frameworks.jax import _weight_synchronizer_ffi
+try:
+  _weight_synchronizer_ffi = importlib.import_module(
+      "._weight_synchronizer_ffi", __package__
+  )
+except ModuleNotFoundError as exc:
+  if exc.name != f"{__package__}._weight_synchronizer_ffi":
+    raise
+  _weight_synchronizer_ffi = importlib.import_module(
+      "._tpu_raiden_jax", __package__
+  ).weight_synchronizer_ffi
 
 ENDPOINTS_API_VERSION: int = 1
 

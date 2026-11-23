@@ -108,6 +108,7 @@ jobs:
         run: |
           python3 - <<'PY'
           import glob, json, re, zipfile
+          seen = set()
           packages = []
           for whl in sorted(glob.glob('release/*.whl')):
               with zipfile.ZipFile(whl) as z:
@@ -115,7 +116,10 @@ jobs:
                   fields = dict(l.split(': ', 1) for l in z.read(meta).decode().splitlines()
                                 if l.startswith(('Name: ', 'Version: ')))
               name = re.sub(r'[-_.]+', '-', fields['Name']).lower()
-              packages.append({'name': name, 'version': fields['Version']})
+              key = (name, fields['Version'])
+              if key not in seen:
+                  seen.add(key)
+                  packages.append({'name': name, 'version': fields['Version']})
           manifest = {'publish_all': False, 'publishing_groups': [{'packages': packages}]}
           open('release/manifest.json', 'w').write(json.dumps(manifest, indent=2) + '\n')
           print(json.dumps(manifest, indent=2))

@@ -1,0 +1,178 @@
+# Builds and packs multi-ABI, multi-Python tpu_sync_jax wheels.
+#
+# Called by nightly_build.yml and release_wheels.yml. Each (jax_version,
+# python_version) leg compiles in parallel inside ml-build because each JAX
+# release overrides @xla and @rules_ml_toolchain; a lightweight pack job then
+# combines the staged extensions into one wheel per Python version via
+# ci/pack_jax_wheel.py.
+
+name: Build JAX Wheels
+
+on:
+  workflow_call:
+    inputs:
+      jax_abis:
+        description: "Space-separated JAX releases bundled in each wheel (empty = WHEEL_ABIS in third_party/jax/versions.bzl)"
+        required: false
+        default: ""
+        type: string
+      python_versions:
+        description: "Space-separated Python minor versions (e.g. '3.12 3.13')"
+        required: false
+        default: "3.12 3.13"
+        type: string
+      wheel_version_extras:
+        description: "Suffix appended to pyproject.toml base version (empty for release)"
+        required: false
+        default: ""
+        type: string
+      use_remote_cache:
+        description: "Use the remote bazel cache (--config=ci): 'yes' or 'no'"
+        required: false
+        default: "yes"
+        type: string
+      artifact_prefix:
+        description: "Prefix for uploaded wheel artifacts (e.g. 'nightly-wheel-jax')"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  matrix:
+    name: "Plan JAX wheel matrix"
+    runs-on: ubuntu-latest
+    outputs:
+      build_matrix: ${{ steps.plan.outputs.build_matrix }}
+      python_versions: ${{ steps.plan.outputs.python_versions }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          persist-credentials: false
+      - id: plan
+        env:
+          INPUT_JAX_ABIS: ${{ inputs.jax_abis }}
+          INPUT_PYTHON_VERSIONS: ${{ inputs.python_versions }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          jax_abis = os.environ.get("INPUT_JAX_ABIS", "").split()
+          if not jax_abis:
+              ns = {}
+              with open("third_party/jax/versions.bzl") as f:
+                  exec(compile(f.read(), "third_party/jax/versions.bzl", "exec"), {}, ns)
+              jax_abis = list(ns["WHEEL_ABIS"])
+          assert jax_abis, "WHEEL_ABIS must not be empty"
+          py_versions = os.environ.get("INPUT_PYTHON_VERSIONS", "").split() or ["3.12", "3.13"]
+          legs = [
+              {
+                  "jax_version": jv,
+                  "python_version": py,
+                  "stage_role": "wheel" if idx == 0 else "ext",
+              }
+              for py in py_versions
+              for idx, jv in enumerate(jax_abis)
+          ]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write("build_matrix=" + json.dumps(legs) + "\n")
+              out.write("python_versions=" + json.dumps(py_versions) + "\n")
+          print("JAX build legs:", legs)
+          PY
+
+  build-jax:
+    name: "Build jax ${{ matrix.jax_version }} (py${{ matrix.python_version }})"
+    needs: matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.matrix.outputs.build_matrix) }}
+    runs-on: linux-x86-n2-32
+    container:
+      image: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:9644db6e0e969079b138547dd99818c02e6ab51d892c4675cf2f4edf02a1e71a
+    timeout-minutes: 300
+    steps:
+      - name: Checkout tpu-sync
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          persist-credentials: false
+          path: tpu-sync
+      # Git security patch (CVE-2022-24765) blocks root from operating on
+      # runner-owned directories. Tell Git explicitly to trust the workspace
+      # inside this ephemeral container.
+      - name: Fix Git Workspace Ownership
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE/tpu-sync"
+      - name: Build JAX leg
+        shell: bash
+        working-directory: tpu-sync
+        env:
+          BUILD_MODE: jax
+          RAIDEN_JAX_ABIS: ${{ matrix.jax_version }}
+          RAIDEN_JAX_STAGE_ONLY: ${{ matrix.stage_role }}
+          HERMETIC_PYTHON_VERSION: ${{ matrix.python_version }}
+          WHEEL_VERSION_EXTRAS: ${{ inputs.wheel_version_extras }}
+          EXTRA_BAZEL_FLAGS: ${{ inputs.use_remote_cache == 'yes' && '--config=ci' || '' }}
+        run: |
+          export BAZEL_CACHE_DIR="${RUNNER_TEMP}/bazel_cache"
+          bash ci/build_wheel_impl.sh
+      - name: Upload staged JAX artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: jax-stage-py${{ matrix.python_version }}-${{ matrix.jax_version }}
+          path: tpu-sync/dist/stage/*
+          retention-days: 1
+          if-no-files-found: error
+
+  pack-jax:
+    name: "Pack jax wheel (py${{ matrix.python_version }})"
+    needs: [matrix, build-jax]
+    strategy:
+      fail-fast: false
+      matrix:
+        python_version: ${{ fromJSON(needs.matrix.outputs.python_versions) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout tpu-sync
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          persist-credentials: false
+          path: tpu-sync
+      - name: Download staged JAX legs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          pattern: jax-stage-py${{ matrix.python_version }}-*
+          merge-multiple: true
+          path: stage
+      - name: Pack multi-ABI JAX wheel
+        run: |
+          python3 tpu-sync/ci/pack_jax_wheel.py \
+            --stage-dir stage \
+            --output-dir tpu-sync/dist \
+            --pins-file tpu-sync/dist/jax_pins.txt
+          echo "JAX stack pins (py${{ matrix.python_version }}):" >> "$GITHUB_STEP_SUMMARY"
+          cat tpu-sync/dist/jax_pins.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: Check wheel metadata
+        working-directory: tpu-sync
+        env:
+          WHEEL_VERSION_EXTRAS: ${{ inputs.wheel_version_extras }}
+        run: |
+          python3 -m venv /tmp/twine-venv
+          /tmp/twine-venv/bin/pip install -q twine
+          /tmp/twine-venv/bin/twine check dist/*"${WHEEL_VERSION_EXTRAS}"-*.whl
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: ${{ inputs.artifact_prefix }}-py${{ matrix.python_version }}
+          path: |
+            tpu-sync/dist/*${{ inputs.wheel_version_extras }}-*.whl
+            tpu-sync/dist/jax_pins.txt
+          if-no-files-found: error
+      - name: Summarize
+        working-directory: tpu-sync
+        env:
+          WHEEL_VERSION_EXTRAS: ${{ inputs.wheel_version_extras }}
+        run: |
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          ls -lh dist/*"${WHEEL_VERSION_EXTRAS}"-*.whl >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

@@ -50,6 +50,11 @@ raiden_jax_default_version() {
   raiden_jax_read_bzl_value "${1}/third_party/jax/versions.bzl" DEFAULT_VERSION
 }
 
+# Default JAX ABIs bundled into multi-ABI wheels from versions.bzl.
+raiden_jax_wheel_abis() {
+  raiden_jax_read_bzl_value "${1}/third_party/jax/versions.bzl" WHEEL_ABIS
+}
+
 # Existing version directories under third_party/jax/.
 raiden_jax_entry_versions() {
   local workspace="$1" d

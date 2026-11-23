@@ -42,22 +42,22 @@ import os
 
 import jax
 
-from tpu_sync.solutions.mooncake.jax import _mooncake_provider
+from tpu_sync.frameworks.jax import _tpu_raiden_jax as _extension
 
 # Importing jax registered JAX's own atexit handler, which can destroy the PJRT
 # client that dma_map and dma_unmap call. atexit runs handlers in reverse order
 # of registration, so this one runs first and makes them stop calling PJRT.
-atexit.register(_mooncake_provider.mark_process_exiting)
+atexit.register(_extension.mooncake_provider.mark_process_exiting)
 
 
 def library_path() -> str:
   """Returns the path of the library exporting ``mc_tpu_buffer_provider_get``.
 
-  It is the extension module that this module has already imported, so when
-  Mooncake dlopen()s the path it gets the loaded image back, and with it the
-  handles that export_shards() created.
+  It is the _tpu_raiden_jax extension that this module has already loaded, so
+  when Mooncake dlopen()s the path it gets the loaded image back, and with it
+  the handles that export_shards() created.
   """
-  return os.path.realpath(_mooncake_provider.__file__)
+  return os.path.realpath(_extension.__file__)
 
 
 def export_shards(array: jax.Array) -> list[int]:
@@ -98,7 +98,7 @@ def export_shards(array: jax.Array) -> list[int]:
       device: index
       for index, device in enumerate(jax.local_devices(backend="tpu"))
   }
-  return _mooncake_provider.export_buffers(
+  return _extension.mooncake_provider.export_buffers(
       [(shard.data, device_indices[shard.device]) for shard in shards]
   )
 

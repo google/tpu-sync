@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Shared py_wheel template for the per-framework tpu_sync wheels, so the
-# tpu_sync_jax and tpu_sync_torch wheels stay identical except for their
-# distribution name, requires list, and package contents.
+"""Shared py_wheel template for the per-framework tpu_sync wheels.
+
+Keeps the tpu_sync_jax and tpu_sync_torch wheels identical except for their
+distribution name, requires list, and package contents.
+"""
 
 load("@rules_python//python:packaging.bzl", "py_wheel")
 
@@ -24,6 +26,10 @@ def raiden_framework_wheel(
         package,
         requires,
         version,
+        python_tag = "cp312",
+        abi = "cp312",
+        python_requires = ">=3.12",
+        python_classifiers = ("Programming Language :: Python :: 3.12",),
         entry_points = {}):
     """A tpu_raiden wheel for a single framework (jax or torch).
 
@@ -33,18 +39,22 @@ def raiden_framework_wheel(
       package: the py_package target whose tpu_raiden files go in the wheel.
       requires: runtime dependency list for the wheel metadata.
       version: wheel version (typically @raiden_version//:WHEEL_VERSION).
+      python_tag: PEP 425 Python tag (e.g. "cp312", "cp313").
+      abi: PEP 425 ABI tag (e.g. "cp312", "cp313").
+      python_requires: PEP 440 Requires-Python specifier.
+      python_classifiers: Trove Python version classifiers for the wheel.
       entry_points: py_wheel entry_points dict, e.g.
         {"console_scripts": ["name = module:func"]}.
     """
     py_wheel(
         entry_points = entry_points,
         name = name,
-        abi = "cp312",
+        abi = abi,
         author = "TPU Raiden team",
         classifiers = [
             "Development Status :: 3 - Alpha",
             "License :: OSI Approved :: Apache Software License",
-            "Programming Language :: Python :: 3.12",
+        ] + list(python_classifiers) + [
             "Topic :: Scientific/Engineering :: Artificial Intelligence",
         ],
         description_file = "//:README.md",
@@ -52,8 +62,8 @@ def raiden_framework_wheel(
         homepage = "https://github.com/google/tpu-raiden",
         license = "Apache 2.0",
         platform = "manylinux_2_31_x86_64",
-        python_requires = ">=3.12",
-        python_tag = "cp312",
+        python_requires = python_requires,
+        python_tag = python_tag,
         requires = requires,
         summary = "High-bandwidth PJRT raw-transfer / KV-cache DMA engine for TPU.",
         tags = ["manual"],

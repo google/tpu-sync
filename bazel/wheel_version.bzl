@@ -50,13 +50,28 @@ def _raiden_version_repo_impl(ctx):
     suffix = ctx.os.environ.get("WHEEL_VERSION_EXTRAS", "")
     full_version = version + suffix
 
+    py_version = ctx.os.environ.get("HERMETIC_PYTHON_VERSION", "3.12").strip() or "3.12"
+    py_parts = py_version.split(".")
+    if len(py_parts) != 2 or not py_parts[0].isdigit() or not py_parts[1].isdigit():
+        fail("HERMETIC_PYTHON_VERSION must be 'MAJOR.MINOR' (e.g. '3.12' or '3.13'), got '{}'".format(py_version))
+    py_tag = "cp{}{}".format(py_parts[0], py_parts[1])
+
     ctx.file("BUILD.bazel", "")
-    ctx.file("version.bzl", "WHEEL_VERSION = '{}'\n".format(full_version))
+    ctx.file(
+        "version.bzl",
+        "\n".join([
+            "WHEEL_VERSION = '{}'".format(full_version),
+            "WHEEL_PYTHON_VERSION = '{}'".format(py_version),
+            "WHEEL_PYTHON_TAG = '{}'".format(py_tag),
+            "WHEEL_ABI_TAG = '{}'".format(py_tag),
+            "",
+        ]),
+    )
 
 raiden_version_repo = repository_rule(
     implementation = _raiden_version_repo_impl,
     attrs = {
         "pyproject_toml": attr.label(mandatory = True, allow_single_file = True),
     },
-    environ = ["WHEEL_VERSION_EXTRAS"],
+    environ = ["WHEEL_VERSION_EXTRAS", "HERMETIC_PYTHON_VERSION"],
 )

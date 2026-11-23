@@ -13,7 +13,12 @@
 # (--define=TORCH_SOURCE=local). See //ci/build_wheel.sh.
 
 load("@nanobind_bazel//:build_defs.bzl", "nanobind_extension")
-load("@raiden_version//:version.bzl", "WHEEL_VERSION")
+load(
+    "@raiden_version//:version.bzl",
+    "WHEEL_ABI_TAG",
+    "WHEEL_PYTHON_TAG",
+    "WHEEL_VERSION",
+)
 load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
 load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 load("@rules_python//python:packaging.bzl", "py_package")
@@ -73,20 +78,20 @@ COMMON_DEPS = [
     "//tpu_sync/rpc:raiden_controller",
 ]
 
-# JAX native extensions + wrappers + public API. (TransferEngine was merged into
-# KVCacheManager upstream, so there is no _transfer_engine target.)
+# JAX native extension + wrappers + public API. Under raiden_wheel_build=true,
+# kv_cache_manager_ffi, weight_synchronizer_ffi, and mooncake_provider are
+# consolidated as submodules inside _tpu_raiden_jax so multi-ABI wheels ship a
+# single .so per JAX release.
 JAX_DEPS = [
     "//tpu_sync/frameworks/jax:_tpu_raiden_jax",
-    "//tpu_sync/frameworks/jax:_kv_cache_manager_ffi",
-    "//tpu_sync/frameworks/jax:_weight_synchronizer_ffi",
     "//tpu_sync/frameworks/jax:weight_synchronizer_ffi_py",
     "//tpu_sync/frameworks/jax:resharding_planner",
     "//tpu_sync/frameworks/jax:jax_test_utils",
     "//tpu_sync/api/jax:kv_cache_manager_jax_py",
     "//tpu_sync/api/jax:weight_synchronizer_jax_py",
     # TPU buffer provider that Mooncake imports as
-    # tpu_sync.solutions.mooncake.jax.mooncake_provider; brings
-    # _mooncake_provider.so.
+    # tpu_sync.solutions.mooncake.jax.mooncake_provider; submodule of
+    # _tpu_raiden_jax (no extra .so).
     "//tpu_sync/solutions/mooncake/jax:mooncake_provider",
 ]
 # Excluded (non-OSS internal grpc / global registry):
@@ -148,8 +153,15 @@ py_package(
 
 raiden_framework_wheel(
     name = "raiden_jax_wheel",
+    abi = WHEEL_ABI_TAG,
     distribution = "tpu_sync_jax",
     package = ":raiden_jax_package",
+    python_classifiers = [
+        "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
+    ],
+    python_requires = ">=3.12,<3.14",
+    python_tag = WHEEL_PYTHON_TAG,
     requires = JAX_REQUIRES,
     version = WHEEL_VERSION,
 )

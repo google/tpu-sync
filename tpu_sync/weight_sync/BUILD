@@ -40,6 +40,41 @@ cc_library(
 )
 
 cc_library(
+    name = "logical_shape",
+    srcs = ["logical_shape.cc"],
+    hdrs = ["logical_shape.h"],
+    deps = [
+        "//tpu_sync/rpc:weight_transfer_worker_service_cc_proto",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
+        "@xla//xla:shape_util",
+        "@xla//xla:xla_data_proto_cc",
+    ],
+)
+
+cc_test(
+    name = "logical_shape_test",
+    srcs = ["logical_shape_test.cc"],
+    tags = ["no_oss"],
+    deps = [
+        ":logical_shape",
+        "//tpu_sync/rpc:weight_transfer_worker_service_cc_proto",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
+        "@xla//xla:shape_util",
+        "@xla//xla:xla_data_proto_cc",
+    ],
+)
+
+cc_library(
     name = "weight_version",
     srcs = ["weight_version.cc"],
     hdrs = ["weight_version.h"],

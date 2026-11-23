@@ -89,7 +89,7 @@ enum StagingLayout {
 }
 
 // Logical shape of a shard.
-message LogicalShape {
+message LogicalShapeProto {
   // xla::PrimitiveType.
   int32 element_type = 1;
   // Dimension sizes.
@@ -111,7 +111,7 @@ message ShardExtent {
   StagingLayout layout = 5;
   // Recorded by the version's writer, else derived from the bound device shape;
   // unset if neither.
-  LogicalShape logical_shape = 6;
+  LogicalShapeProto logical_shape = 6;
 }
 
 // Per-layer chunk counts sent by one sender to one receiver.

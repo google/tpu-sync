@@ -960,6 +960,27 @@ cc_test(
 )
 
 cc_test(
+    name = "raiden_manager_base_teardown_test",
+    srcs = ["raiden_manager_base_teardown_test.cc"],
+    copts = [
+        "-fno-strict-aliasing",
+        "-fexceptions",
+    ],
+    features = ["-use_header_modules"],
+    tags = ["no_oss"],
+    deps = [
+        ":raiden_manager_base",
+        "//tpu_sync/transport:block_transport_delegate",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
     name = "raw_transfer_core_test",
     srcs = ["raw_transfer_core_test.cc"],
     copts = [

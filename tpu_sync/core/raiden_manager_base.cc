@@ -129,10 +129,14 @@ RaidenManagerBase::~RaidenManagerBase() {
 }
 
 void RaidenManagerBase::StopTransportServer() {
-  absl::MutexLock lock(server_init_mu_);
-  if (server_) {
-    server_.reset();
+  std::unique_ptr<tpu_raiden::transport::BlockTransport> server;
+  {
+    absl::MutexLock lock(server_init_mu_);
+    server = std::move(server_);
   }
+  // ~BlockTransport joins the transport's threads, whose receive callbacks may
+  // take server_init_mu_; destroy it unlocked.
+  server.reset();
 }
 
 grpc::Service* RaidenManagerBase::peregrine_control_service() {
@@ -489,6 +493,8 @@ absl::Status RaidenManagerBase::RegisterExpectedLayerChunks(
 }
 
 void RaidenManagerBase::ForgetPushProgress(uint64_t uuid) {
+  absl::ReaderMutexLock lock(server_init_mu_);
+  if (!server_) return;
   server_->ForgetPushProgress(uuid);
 }
 

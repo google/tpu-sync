@@ -129,13 +129,21 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
       uint64_t uuid,
       const absl::flat_hash_map<size_t, uint32_t>& expected_layer_chunks);
 
+  // Clears transport push-progress tracking for `uuid`. Safe to call during and
+  // after StopTransportServer() (acquires `server_init_mu_` shared; no-op once
+  // stopped).
   virtual void ForgetPushProgress(uint64_t uuid);
 
   void SetTestOnlyRateLimiters(
       std::shared_ptr<peregrine::v1::TestOnlyRateLimiter> egress,
       std::shared_ptr<peregrine::v1::TestOnlyRateLimiter> ingress);
 
-  // Stops and joins the underlying raw transport server if active.
+  // Stops and joins the underlying raw transport server if active. Moves
+  // `server_` out under `server_init_mu_` and destroys it unlocked so receive
+  // callbacks finishing during teardown do not deadlock on `server_init_mu_`.
+  // Sequentially idempotent only: callers must not invoke it concurrently with
+  // another StopTransportServer() (a concurrent call returns without waiting
+  // for the in-progress join) or with InitTransportServer().
   void StopTransportServer();
 
   // Returns the transport-owned PeregrineService, for registration on a host
@@ -231,9 +239,36 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
   std::vector<std::string> local_ips_;
   const bool socket_only_transport_;
 
+  // Creates the transport server if none is active. Caller precondition: must
+  // not run concurrently with StopTransportServer() (which moves `server_` out
+  // under `server_init_mu_` and destroys it unlocked, so a concurrent call
+  // could bind a second transport while the first is still shutting down).
   tpu_raiden::transport::BlockTransport* InitTransportServer(
       std::vector<HostNicAddress> host_nics = {});
 
+  // Protects `server_` transitions in InitTransportServer() and
+  // StopTransportServer() and the teardown-safe accessors below.
+  //
+  // `server_` accessor contract:
+  // - ForgetPushProgress() takes `server_init_mu_` shared and becomes a no-op
+  //   once StopTransportServer() has moved `server_` out; it is the only
+  //   transport accessor safe to call during and after StopTransportServer().
+  // - peregrine_control_service() and psp_tcp_required() lock `server_init_mu_`
+  //   and CHECK that `server_` is non-null.
+  // - Every other transport accessor (local_port, local_ip, local_ips,
+  //   peregrine_local_port, PushWeightsChunk(s), PullBuffer,
+  //   RegisterExpected*, transport setters, H2h*) reads `server_` unlocked and
+  //   requires a running transport (callers must finish before
+  //   StopTransportServer()). RegisterExpected* must not hold `server_init_mu_`
+  //   across the call because registration can synchronously fire
+  //   already-arrived receive callbacks on the calling thread, which may
+  //   re-enter `server_init_mu_`.
+  //
+  // Lock order: `server_init_mu_` (shared) -> `BlockTransport` internal locks
+  // (`raw_progress_mu_`, `server_sessions_mu_`).
+  //
+  // `server_` is intentionally not annotated ABSL_GUARDED_BY(server_init_mu_)
+  // because the running-transport accessors read it unlocked by contract.
   mutable absl::Mutex server_init_mu_;
   std::unique_ptr<tpu_raiden::transport::BlockTransport> server_;
 

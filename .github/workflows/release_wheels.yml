@@ -17,6 +17,10 @@
 # publish_pypi.yml does that part. A release refuses to publish if any wheel
 # is above the PyPI file limit, so the gate never publishes half of a release.
 #
+# The jax wheels are multi-ABI (one consolidated _tpu_raiden_jax_<ver>.so per
+# supported JAX release) and built per supported Python minor version (3.12,
+# 3.13) via build_jax_wheels.yml.
+#
 # The torch wheel needs no torch_tpu checkout: the build resolves the
 # torch_tpu module from shims/torch_tpu, backed by the torch_tpu
 # wheel named in torch_tpu.version, and the extension binds torch_tpu's
@@ -46,10 +50,15 @@ on:
         required: false
         default: "jax torch"
         type: string
-      jax_version:
-        description: "JAX version the jax wheel builds against (empty = DEFAULT_VERSION in third_party/jax/versions.bzl)"
+      jax_abis:
+        description: "JAX releases bundled in each jax wheel, space-separated (empty = WHEEL_ABIS in third_party/jax/versions.bzl)"
         required: false
         default: ""
+        type: string
+      python_versions:
+        description: "Python minor versions for jax wheels, space-separated (e.g. '3.12 3.13')"
+        required: false
+        default: "3.12 3.13"
         type: string
       torch_abis:
         description: "torch releases the torch wheel ships an extension variant for, space-separated, primary first (a single release builds a single-ABI wheel)"
@@ -125,13 +134,22 @@ jobs:
           print("wheels to build:", selected)
           PY
 
-  build:
-    name: "Build ${{ matrix.framework }} wheel"
+  jax-wheels:
+    name: "Build and pack jax wheels"
     needs: verify
-    strategy:
-      fail-fast: false
-      matrix:
-        framework: ${{ fromJSON(needs.verify.outputs.frameworks) }}
+    if: contains(fromJSON(needs.verify.outputs.frameworks), 'jax')
+    uses: ./.github/workflows/build_jax_wheels.yml
+    with:
+      jax_abis: ${{ github.event_name == 'workflow_dispatch' && inputs.jax_abis || '' }}
+      python_versions: ${{ github.event_name == 'workflow_dispatch' && inputs.python_versions || '3.12 3.13' }}
+      wheel_version_extras: ${{ needs.verify.outputs.wheel_version_extras }}
+      use_remote_cache: ${{ inputs.use_remote_cache || 'yes' }}
+      artifact_prefix: release-wheel-jax
+
+  build-torch:
+    name: "Build torch wheel"
+    needs: verify
+    if: contains(fromJSON(needs.verify.outputs.frameworks), 'torch')
     runs-on: linux-x86-n2-32
     container:
       image: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:9644db6e0e969079b138547dd99818c02e6ab51d892c4675cf2f4edf02a1e71a
@@ -151,26 +169,19 @@ jobs:
         shell: bash
         working-directory: tpu-sync
         env:
-          BUILD_MODE: ${{ matrix.framework }}
+          BUILD_MODE: torch
           WHEEL_VERSION_EXTRAS: ${{ needs.verify.outputs.wheel_version_extras }}
-          INPUT_JAX_VERSION: ${{ inputs.jax_version }}
           INPUT_TORCH_ABIS: ${{ inputs.torch_abis }}
           EXTRA_BAZEL_FLAGS: ${{ (inputs.use_remote_cache || 'yes') == 'yes' && '--config=ci' || '' }}
         run: |
           export BAZEL_CACHE_DIR="${RUNNER_TEMP}/bazel_cache"
-          # Tag builds take the script's default JAX version and torch release
-          # list; a dispatch may override them.
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            if [[ "${BUILD_MODE}" == "jax" && -n "${INPUT_JAX_VERSION}" ]]; then
-              export RAIDEN_JAX_VERSION="${INPUT_JAX_VERSION}"
-            fi
             export RAIDEN_TORCH_ABIS="${INPUT_TORCH_ABIS}"
           fi
           bash ci/build_wheel_impl.sh
       # The torch wheel pairs with a torch_tpu wheel; record the version the
       # release was validated with so the release notes carry it.
       - name: Record torch_tpu pairing
-        if: matrix.framework == 'torch'
         working-directory: tpu-sync
         run: |
           tr -d '\r\n ' < torch_tpu.version > dist/torch_tpu_version.txt
@@ -180,35 +191,13 @@ jobs:
         env:
           WHEEL_VERSION_EXTRAS: ${{ needs.verify.outputs.wheel_version_extras }}
         run: uv run --isolated --with twine twine check dist/*"${WHEEL_VERSION_EXTRAS}"-*.whl
-      # The JAX-stack coupling (jax/jaxlib/libtpu) is enforced through the
-      # wheel's own Requires-Dist pins; extract them so the release records the
-      # stack it must run with, mirroring torch_tpu_version.txt on the torch side.
-      - name: Record JAX stack pins
-        if: matrix.framework == 'jax'
-        working-directory: tpu-sync
-        run: |
-          python3 - <<'PY'
-          import glob, re, zipfile
-          whl = sorted(glob.glob('dist/tpu_sync_jax-*.whl'))[-1]
-          with zipfile.ZipFile(whl) as z:
-              meta = next(n for n in z.namelist() if n.endswith('.dist-info/METADATA'))
-              text = z.read(meta).decode()
-          pins = [l.removeprefix('Requires-Dist: ') for l in text.splitlines()
-                  if re.match(r'Requires-Dist: (jax|jaxlib|libtpu)\b', l)]
-          assert pins, f'no jax/jaxlib/libtpu pins found in {whl} METADATA'
-          open('dist/jax_pins.txt', 'w').write('\n'.join(pins) + '\n')
-          print('\n'.join(pins))
-          PY
-          echo "JAX stack pins:" >> "$GITHUB_STEP_SUMMARY"
-          cat dist/jax_pins.txt >> "$GITHUB_STEP_SUMMARY"
       - name: Upload wheel artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
-          name: release-wheel-${{ matrix.framework }}
+          name: release-wheel-torch
           path: |
             tpu-sync/dist/*${{ needs.verify.outputs.wheel_version_extras }}-*.whl
             tpu-sync/dist/torch_tpu_version.txt
-            tpu-sync/dist/jax_pins.txt
           if-no-files-found: error
       - name: Summarize
         working-directory: tpu-sync
@@ -221,16 +210,26 @@ jobs:
 
   publish:
     name: "Publish"
-    needs: [verify, build]
-    if: startsWith(github.ref, 'refs/tags/') || inputs.publish == 'yes'
+    needs: [verify, jax-wheels, build-torch]
+    if: >-
+      always() &&
+      needs.verify.result == 'success' &&
+      (!contains(fromJSON(needs.verify.outputs.frameworks), 'jax') || needs.jax-wheels.result == 'success') &&
+      (!contains(fromJSON(needs.verify.outputs.frameworks), 'torch') || needs.build-torch.result == 'success') &&
+      (startsWith(github.ref, 'refs/tags/') || inputs.publish == 'yes')
     uses: ./.github/workflows/publish_pypi.yml
     with:
       artifact_pattern: release-wheel-*
 
   github_release:
     name: "Create GitHub Release"
-    needs: [verify, build, publish]
-    if: startsWith(github.ref, 'refs/tags/')
+    needs: [verify, jax-wheels, build-torch, publish]
+    if: >-
+      startsWith(github.ref, 'refs/tags/') &&
+      needs.verify.result == 'success' &&
+      needs.jax-wheels.result == 'success' &&
+      needs.build-torch.result == 'success' &&
+      needs.publish.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:

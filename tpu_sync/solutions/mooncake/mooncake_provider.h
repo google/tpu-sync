@@ -165,10 +165,11 @@ int GetProviderTable(ProviderTable* out);
 
 // The entry point Mooncake looks up by this exact name, in the shared object
 // of the extension that exported the handles. Each such extension defines it
-// in its own sources, as `return raiden::mooncake::GetProviderTable(out);`.
-// Defined in a dependency, it could be missing from that shared object:
-// google3 links an extension's dependencies into the Python binary, and
-// -Wl,--exclude-libs,ALL hides their symbols.
+// in its own sources as `__attribute__((weak))` returning
+// `raiden::mooncake::GetProviderTable(out)`: keeping it in the extension's own
+// sources prevents `-Wl,--exclude-libs,ALL` from hiding it in standalone `.so`
+// builds, while weak linkage lets binaries that statically link both
+// `_tpu_raiden_jax` and `_tpu_raiden_torch` merge the identical wrappers.
 extern "C" __attribute__((visibility("default"))) int
 mc_tpu_buffer_provider_get(raiden::mooncake::ProviderTable* out);
 

@@ -26,3 +26,14 @@ py_test(
     srcs = ["run_in_tpu_env_test.py"],
     deps = [":run_in_tpu_env"],
 )
+
+py_library(
+    name = "pack_jax_wheel",
+    srcs = ["pack_jax_wheel.py"],
+)
+
+py_test(
+    name = "pack_jax_wheel_test",
+    srcs = ["pack_jax_wheel_test.py"],
+    deps = [":pack_jax_wheel"],
+)

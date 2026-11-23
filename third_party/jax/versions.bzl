@@ -16,6 +16,12 @@
 
 DEFAULT_VERSION = "0.11.2"
 
+# JAX releases bundled into multi-ABI tpu_sync_jax wheels by default.
+WHEEL_ABIS = [
+    "0.11.2",
+    "0.12.0",
+]
+
 SUPPORTED_VERSIONS = [
     "0.12.0",
     "0.11.2",

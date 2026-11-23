@@ -66,6 +66,43 @@ cc_test(
 )
 
 cc_library(
+    name = "staging_buffer_guard",
+    srcs = ["staging_buffer_guard.cc"],
+    hdrs = ["staging_buffer_guard.h"],
+    deps = [
+        ":weight_version",
+        "//tpu_sync/rpc:weight_transfer_worker_service_cc_proto",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+    ],
+)
+
+cc_test(
+    name = "staging_buffer_guard_test",
+    srcs = ["staging_buffer_guard_test.cc"],
+    tags = ["no_oss"],
+    deps = [
+        ":staging_buffer_guard",
+        ":weight_version",
+        "//tpu_sync/rpc:weight_transfer_worker_service_cc_proto",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "weight_synchronizer_base",
     srcs = [
         "weight_synchronizer_base.cc",

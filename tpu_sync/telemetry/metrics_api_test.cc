@@ -484,6 +484,22 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
   EXPECT_THAT(metric_metadata::kStorageLookupDurationMs.label_names,
               ElementsAre(metric_labels::kDpRank));
 
+  // Storage I/O Error Metrics
+  EXPECT_EQ(metric_names::kStorageIoErrorsTotal, "storage_io_errors_total");
+  EXPECT_EQ(metric_descriptions::kStorageIoErrorsTotal,
+            "Cumulative count of secondary storage I/O failures by rank, "
+            "direction, and status code.");
+  EXPECT_EQ(metric_metadata::kStorageIoErrorsTotal.name,
+            "storage_io_errors_total");
+  EXPECT_EQ(metric_metadata::kStorageIoErrorsTotal.description,
+            "Cumulative count of secondary storage I/O failures by rank, "
+            "direction, and status code.");
+  EXPECT_EQ(metric_metadata::kStorageIoErrorsTotal.type, MetricType::kCounter);
+  EXPECT_THAT(metric_metadata::kStorageIoErrorsTotal.label_names,
+              ElementsAre(metric_labels::kLocalRank,
+                          metric_labels::kDirection,
+                          metric_labels::kErrorCode));
+
   // Direction Labels
   EXPECT_EQ(metric_labels::kDirection, "direction");
   EXPECT_EQ(metric_labels::kDirectionPush, "push");
@@ -654,6 +670,7 @@ TEST_F(MetricsApiTest, MetricMetadataConstants) {
           metric_metadata::kStorageMetadataCheckTotal,
           metric_metadata::kStorageLookupDurationMs,
           metric_metadata::kStorageIoTimeMs,
+          metric_metadata::kStorageIoErrorsTotal,
           metric_metadata::kHostPoolBlocks,
           metric_metadata::kWeightSyncSentBytesTotal,
           metric_metadata::kWeightSyncReceivedBytesTotal,

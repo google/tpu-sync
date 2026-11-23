@@ -233,6 +233,7 @@ cc_library(
         "//tpu_sync/kv_cache_offload/backends:backend",
         "//tpu_sync/kv_cache_offload/backends/storage:posix_backend",
         "//tpu_sync/rpc:raiden_service_cc_proto",
+        "//tpu_sync/telemetry:label_util",
         "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/telemetry:metrics_backend",
         "//tpu_sync/transport:block_transport",

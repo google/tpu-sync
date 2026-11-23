@@ -81,6 +81,7 @@
 #include "tpu_sync/kv_cache_offload/kv_backend_factory.h"
 #include "tpu_sync/kv_cache_offload/kv_cache_store_backend_factory.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
+#include "tpu_sync/telemetry/label_util.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/transport/block_transport.h"
@@ -639,6 +640,35 @@ void RecordStorageIoTimeMs(absl::Span<const std::string> shard_local_ranks,
         {telemetry::metric_labels::kDirection, direction}};
     store.ObserveHistogram(telemetry::metric_names::kStorageIoTimeMs, labels,
                            io_time_ms);
+  }
+}
+
+void RecordStorageIoError(absl::Span<const std::string> shard_local_ranks,
+                          absl::string_view direction,
+                          absl::StatusCode status_code) {
+  telemetry::RaidenMetricStore& store =
+      telemetry::RaidenMetricStore::GetGlobalMetricStore();
+  if (!store.HasBackends()) {
+    return;
+  }
+  const absl::string_view error_code =
+      absl::StatusCodeToStringView(status_code);
+  if (shard_local_ranks.empty()) {
+    const telemetry::MetricLabel labels[] = {
+        {telemetry::metric_labels::kLocalRank, telemetry::kDefaultLabelValue},
+        {telemetry::metric_labels::kDirection, direction},
+        {telemetry::metric_labels::kErrorCode, error_code}};
+    store.IncrementCounter(telemetry::metric_names::kStorageIoErrorsTotal,
+                           labels, 1);
+    return;
+  }
+  for (absl::string_view local_rank : shard_local_ranks) {
+    const telemetry::MetricLabel labels[] = {
+        {telemetry::metric_labels::kLocalRank, local_rank},
+        {telemetry::metric_labels::kDirection, direction},
+        {telemetry::metric_labels::kErrorCode, error_code}};
+    store.IncrementCounter(telemetry::metric_names::kStorageIoErrorsTotal,
+                           labels, 1);
   }
 }
 // Joins the given PjRtCopyFutures and records transfer latency and per-device
@@ -3919,6 +3949,9 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hWriteToBackend(
               key, slices, total_bytes,
               [state, bytes_per_shard](absl::Status s) {
                 if (!s.ok()) {
+                  RecordStorageIoError(
+                      state->shard_local_ranks,
+                      telemetry::metric_labels::kDirectionWrite, s.code());
                   state->SetError(s);
                 } else {
                   state->completed_bytes_per_shard.fetch_add(
@@ -3998,6 +4031,9 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dReadFromBackend(
         [this, state, staging_block_idx, device_block_idx,
          bytes_per_shard](absl::Status read_status) {
           if (!read_status.ok()) {
+            RecordStorageIoError(state->shard_local_ranks,
+                                 telemetry::metric_labels::kDirectionRead,
+                                 read_status.code());
             state->SetError(read_status);
             state->MarkChunkComplete();
             return;

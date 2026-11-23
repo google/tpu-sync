@@ -185,7 +185,26 @@ struct IncomingPushSpec {
 
 absl::StatusOr<IncomingPushSpec> ResolveIncomingPushSpec(
     BlockTransportDelegate* delegate, uint32_t local_id,
-    bool is_explicit_dst_push, uint64_t uuid) {
+    bool is_explicit_dst_push, uint64_t uuid,
+    MajorOrder major_order = MajorOrder::kLayerMajor) {
+  if (major_order == MajorOrder::kBlockMajor) {
+    if (!is_explicit_dst_push || local_id == lib::kUnspecifiedLocalId ||
+        local_id > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "MajorOrder::kBlockMajor push requires explicit destination block "
+          "ID (op=6, local_id=",
+          local_id, ", uuid=", uuid, ")"));
+    }
+    if (!delegate->AcceptsPlanlessExplicitPush(uuid)) {
+      return absl::FailedPreconditionError(
+          absl::StrCat("explicit-destination push for uuid ", uuid,
+                       " has no registered plan on this pool-mode worker"));
+    }
+    return IncomingPushSpec{
+        .pool_progress_spec = std::nullopt,
+        .target_major_dim_indices = {static_cast<int>(local_id)},
+    };
+  }
   std::vector<int> target_major_dim_indices;
   if (local_id == lib::kUnspecifiedLocalId) {
     target_major_dim_indices.resize(delegate->num_block_arrays());
@@ -511,7 +530,7 @@ absl::Status BlockTransportServerPushSession::StartStream(
 // ---------------------------------------------------------------------------
 absl::Status BlockTransportServerPushSession::AdmitPush(
     const lib::PostMetadata& post) {
-  const uint32_t layer = post.local_id;
+  const uint32_t major_dim_idx = post.local_id;
 
   std::shared_ptr<PostLease> lease;
   {
@@ -545,15 +564,15 @@ absl::Status BlockTransportServerPushSession::AdmitPush(
   }
   absl::StatusOr<std::shared_ptr<TransferSession>> session =
       [&]() -> absl::StatusOr<std::shared_ptr<TransferSession>> {
-    if (layer == lib::kUnspecifiedLocalId) {
+    if (major_dim_idx == lib::kUnspecifiedLocalId) {
       return absl::InvalidArgumentError(
-          "Peregrine post requires an explicit layer/pool index");
+          "Peregrine post requires an explicit major dimension index");
     }
     ABSL_RETURN_IF_ERROR(
         ShardsFromMask(post.shard_mask, delegate_->num_shards()).status());
-    ABSL_RETURN_IF_ERROR(ResolveIncomingPushSpec(delegate_, layer,
+    ABSL_RETURN_IF_ERROR(ResolveIncomingPushSpec(delegate_, major_dim_idx,
                                                  /*is_explicit_dst_push=*/true,
-                                                 uuid_)
+                                                 uuid_, config_.major_order)
                              .status());
     return BeginIncomingPush(delegate_, uuid_);
   }();
@@ -593,7 +612,8 @@ BlockTransportServerPushSession::ResolveRecvBuffer(
   ABSL_RETURN_IF_ERROR(AdmitPush(post));
   absl::StatusOr<uint8_t* absl_nonnull> addr =
       [&]() -> absl::StatusOr<uint8_t* absl_nonnull> {
-    const uint32_t layer = post.local_id;
+    const bool is_block_major = config_.major_order == MajorOrder::kBlockMajor;
+    const uint32_t major_dim_idx = post.local_id;
     // A request must address one of the shards its Post declared.
     const bool shard_in_post =
         req.shard < delegate_->num_shards() &&
@@ -602,14 +622,20 @@ BlockTransportServerPushSession::ResolveRecvBuffer(
           ((post.shard_mask >> req.shard) & 1u)));
     if (!shard_in_post || req.block_id < 0 || req.len == 0) {
       return absl::InvalidArgumentError(
-          !shard_in_post ? "shard not in post" : "invalid block_id or len");
+          !shard_in_post ? "shard not in post" : "invalid minor index or len");
     }
-    const int64_t block_id = req.block_id;
+    const size_t layer_idx =
+        is_block_major ? static_cast<size_t>(req.block_id) : major_dim_idx;
+    const int64_t block_id =
+        is_block_major ? static_cast<int64_t>(major_dim_idx) : req.block_id;
+    if (is_block_major && layer_idx >= delegate_->num_block_arrays()) {
+      return absl::OutOfRangeError("layer_id out of range");
+    }
     // Full block: the same chunk list the sender resolved, so `chunk_idx`
     // means the same on both ends.
     std::vector<BlockChunk> chunks = delegate_->GetBlockChunks(
-        layer, req.shard, absl::MakeConstSpan(&block_id, 1),
-        delegate_->block_bytes(layer), uuid_,
+        layer_idx, req.shard, absl::MakeConstSpan(&block_id, 1),
+        delegate_->block_bytes(layer_idx), uuid_,
         static_cast<int64_t>(post.remote_id), /*peer=*/"", req.src_block_id);
     if (req.chunk_idx >= chunks.size() ||
         chunks[req.chunk_idx].ptr == nullptr) {
@@ -619,7 +645,7 @@ BlockTransportServerPushSession::ResolveRecvBuffer(
       return absl::InvalidArgumentError("chunk length mismatch");
     }
     ABSL_RETURN_IF_ERROR(
-        ValidateChunks(delegate_, layer, req.shard, uuid_, chunks));
+        ValidateChunks(delegate_, layer_idx, req.shard, uuid_, chunks));
     return chunks[req.chunk_idx].ptr;
   }();
   if (!addr.ok()) {
@@ -689,7 +715,7 @@ absl::Status BlockTransportServerPushSession::OnPeregrinePostComplete(
     ABSL_RETURN_IF_ERROR(post_status);
     if (post.local_id == lib::kUnspecifiedLocalId) {
       return absl::InvalidArgumentError(
-          "OnRecvComplete requires an explicit layer/pool index in post "
+          "OnRecvComplete requires an explicit major dimension index in post "
           "metadata");
     }
     // Shards this Post carried: every shard for a legacy push, one NUMA
@@ -697,18 +723,23 @@ absl::Status BlockTransportServerPushSession::OnPeregrinePostComplete(
     ABSL_ASSIGN_OR_RETURN(
         const std::vector<int> shards,
         ShardsFromMask(post.shard_mask, delegate_->num_shards()));
-    ABSL_ASSIGN_OR_RETURN(
-        IncomingPushSpec push_spec,
-        ResolveIncomingPushSpec(delegate_, post.local_id,
-                                /*is_explicit_dst_push=*/true, uuid_));
+    ABSL_ASSIGN_OR_RETURN(IncomingPushSpec push_spec,
+                          ResolveIncomingPushSpec(delegate_, post.local_id,
+                                                  /*is_explicit_dst_push=*/true,
+                                                  uuid_, config_.major_order));
     // A Post whose addresses the sender supplied takes the op here.
     if (!held) {
       ABSL_ASSIGN_OR_RETURN(session, BeginIncomingPush(delegate_, uuid_));
     }
-    return CompleteIncomingPush(
+    ABSL_RETURN_IF_ERROR(CompleteIncomingPush(
         session, post.local_id, post.remote_id, /*num_streams=*/1,
         post.shard_mask == 0 ? 0 : shards.size(), push_spec.pool_progress_spec,
-        /*is_peregrine=*/true);
+        /*is_peregrine=*/true, config_.major_order));
+    if (config_.major_order == MajorOrder::kBlockMajor) {
+      ABSL_RETURN_IF_ERROR(delegate_->OnBlockShardsReceived(
+          {static_cast<int>(post.local_id)}, shards, uuid_));
+    }
+    return absl::OkStatus();
   }();
   return EndIncomingPush(session, status);
 }
@@ -727,7 +758,7 @@ absl::Status BlockTransportServerPushSession::CompleteIncomingPush(
     std::shared_ptr<TransferSession> session, uint32_t local_id,
     uint32_t remote_id, size_t num_streams, size_t landed_shards,
     const std::optional<PoolPushProgressSpec>& pool_progress_spec,
-    bool is_peregrine) {
+    bool is_peregrine, MajorOrder major_order) {
   // Unified receive accounting: one progress map and one increment path for
   // both contracts; only the expectation source and the completion callback
   // differ. Plan-declared mode counts every sender's streams against the
@@ -735,8 +766,9 @@ absl::Status BlockTransportServerPushSession::CompleteIncomingPush(
   // complete; header-declared (legacy) mode counts this push's parallelism
   // from num_streams and retires the uuid when all constructor major units
   // complete.
+  const bool is_block_major = major_order == MajorOrder::kBlockMajor;
   const int major_dim_idx =
-      (local_id == lib::kUnspecifiedLocalId) ? 0 : static_cast<int>(local_id);
+      local_id == lib::kUnspecifiedLocalId ? 0 : static_cast<int>(local_id);
   const bool plan_declared = pool_progress_spec.has_value();
   const size_t expected_chunks =
       plan_declared ? pool_progress_spec->expected_pushes : num_streams;
@@ -857,27 +889,21 @@ absl::Status BlockTransportServerPushSession::CompleteIncomingPush(
     if (array_complete && !progress.on_major_unit_completed) {
       progress.on_major_unit_completed = true;
       trigger_completion = true;
-      if (plan_declared) {
-        size_t completed_pools = 0;
-        for (const auto& [pool_id, pool_progress] : major_dimension_progress_) {
-          if (pool_progress.on_major_unit_completed) {
-            ++completed_pools;
+      // TODO: Retire planless kBlockMajor sessions once expected block counts
+      // are plumbed via a receive plan; until then, callers retire them via
+      // ForgetPushProgress() so multi-block transfers on one uuid are not
+      // marked done after the first block completes.
+      if (plan_declared || !is_block_major) {
+        size_t completed_major_units = 0;
+        for (const auto& [unit_id, unit_progress] : major_dimension_progress_) {
+          if (unit_progress.on_major_unit_completed) {
+            ++completed_major_units;
           }
         }
-        if (completed_pools == pool_progress_spec->expected_pools) {
-          done_ = true;
-        }
-      } else {
-        bool all_layers_called = true;
-        for (size_t layer = 0; layer < delegate_->num_layers(); ++layer) {
-          auto it = major_dimension_progress_.find(layer);
-          if (it == major_dimension_progress_.end() ||
-              !it->second.on_major_unit_completed) {
-            all_layers_called = false;
-            break;
-          }
-        }
-        if (all_layers_called) {
+        const size_t expected_major_units =
+            plan_declared ? pool_progress_spec->expected_pools
+                          : delegate_->num_layers();
+        if (completed_major_units >= expected_major_units) {
           done_ = true;
         }
       }
@@ -891,9 +917,11 @@ absl::Status BlockTransportServerPushSession::CompleteIncomingPush(
       ABSL_RETURN_IF_ERROR(session->OnDataReceived(
           static_cast<size_t>(major_dim_idx),
           /*minor_dimension_indices=*/{}, /*shard_ids=*/{}));
-    } else {
+    } else if (!is_block_major) {
       ABSL_RETURN_IF_ERROR(delegate_->OnLayerReceived(major_dim_idx, uuid_));
     }
+    // TODO: Wire block-major unit completion to TransferSession once
+    // TransferReceiveSession supports block-major H2D.
   }
   return absl::OkStatus();
 }

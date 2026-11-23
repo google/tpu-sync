@@ -14,6 +14,7 @@
 
 #include "tpu_sync/transport/block_transport_session.h"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -30,7 +31,9 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
+#include "absl/types/optional.h"
 #include "absl/types/span.h"
+#include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/transport/lib/adapter/transport_adapter.h"
 #include "tpu_sync/transport/lib/chunk.h"
@@ -41,6 +44,7 @@ namespace transport {
 namespace {
 
 using ::absl_testing::IsOk;
+using ::absl_testing::IsOkAndHolds;
 using ::absl_testing::StatusIs;
 using ::testing::Eq;
 using ::testing::HasSubstr;
@@ -84,7 +88,10 @@ class MockSessionDelegate : public BlockTransportDelegate {
   }
 
   bool AcceptsPlanlessExplicitPush(uint64_t uuid) const override {
-    return true;
+    return accepts_planless_explicit_push_;
+  }
+  void set_accepts_planless_explicit_push(bool accepts) {
+    accepts_planless_explicit_push_ = accepts;
   }
 
   size_t num_layers() const override { return num_layers_; }
@@ -121,7 +128,25 @@ class MockSessionDelegate : public BlockTransportDelegate {
 
   absl::StatusOr<std::shared_ptr<TransferSession>> GetSession(
       uint64_t uuid) const override {
+    if (registered_session_ != nullptr && uuid == registered_uuid_) {
+      return registered_session_;
+    }
     return absl::NotFoundError("Session not found");
+  }
+
+  void RegisterSession(uint64_t uuid,
+                       std::shared_ptr<TransferSession> session) {
+    registered_uuid_ = uuid;
+    registered_session_ = std::move(session);
+  }
+
+  absl::Status OnBlockShardsReceived(const std::vector<int>& block_ids,
+                                     absl::Span<const int> shard_ids,
+                                     uint64_t uuid) override {
+    received_block_shards_.push_back(
+        {block_ids, std::vector<int>(shard_ids.begin(), shard_ids.end()),
+         uuid});
+    return absl::OkStatus();
   }
 
   std::vector<BlockChunk> GetBlockChunks(
@@ -129,6 +154,7 @@ class MockSessionDelegate : public BlockTransportDelegate {
       size_t expected_size = 0, uint64_t uuid = 0, int64_t remote_node_id = -1,
       absl::string_view peer = "", int64_t src_block_id = -1,
       int64_t dst_block_id = -1) override {
+    last_src_block_id_ = src_block_id;
     std::vector<BlockChunk> chunks;
     chunks.reserve(block_ids.size());
     for (int64_t b : block_ids) {
@@ -143,7 +169,16 @@ class MockSessionDelegate : public BlockTransportDelegate {
     return chunks;
   }
 
+  struct BlockShardsReport {
+    std::vector<int> block_ids;
+    std::vector<int> shard_ids;
+    uint64_t uuid = 0;
+  };
   int layers_received() const { return layers_received_; }
+  int64_t last_src_block_id() const { return last_src_block_id_; }
+  const std::vector<BlockShardsReport>& received_block_shards() const {
+    return received_block_shards_;
+  }
 
  private:
   const size_t slice_size_;
@@ -152,6 +187,11 @@ class MockSessionDelegate : public BlockTransportDelegate {
   const size_t num_shards_;
   std::vector<std::vector<uint8_t>> buffers_;
   int layers_received_ = 0;
+  int64_t last_src_block_id_ = -1;
+  bool accepts_planless_explicit_push_ = true;
+  uint64_t registered_uuid_ = 0;
+  std::shared_ptr<TransferSession> registered_session_;
+  std::vector<BlockShardsReport> received_block_shards_;
 };
 
 TEST(BlockTransportServerPushSessionTest, LifecycleAndPostCompletion) {
@@ -242,6 +282,141 @@ TEST(BlockTransportServerPushSessionTest,
   EXPECT_FALSE(session->HasAdmittedPosts());
 }
 
+TEST(BlockTransportServerPushSessionTest,
+     PeregrineBlockMajorResolveAndComplete) {
+  constexpr size_t kSliceSize = 1024;
+  constexpr size_t kMaxBlocks = 5;
+  constexpr size_t kNumLayers = 2;
+  constexpr size_t kNumShards = 1;
+  MockSessionDelegate delegate(kSliceSize, kMaxBlocks, kNumLayers, kNumShards);
+  BlockTransportConfig config;
+  config.major_order = MajorOrder::kBlockMajor;
+
+  auto session = std::make_shared<BlockTransportServerPushSession>(
+      /*uuid=*/0, &delegate, config);
+  const lib::PostMetadata post{
+      .uuid = 0,
+      .remote_id = 7,
+      .local_id = 3,  // dst_block_id >= kNumLayers
+      .shard_mask = 0,
+      .op = lib::TransferOp::kBlockPushExplicit,
+  };
+  const lib::RequestMetadata req{
+      .shard = 0,
+      .block_id = 1,      // layer_id
+      .src_block_id = 2,  // sender's source block_id
+      .chunk_idx = 0,
+      .len = kSliceSize,
+  };
+
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> host, delegate.GetHostBuffer(1, 0));
+  EXPECT_THAT(session->ResolveRecvBuffer(post, req),
+              IsOkAndHolds(host.data() + 3 * kSliceSize));
+  EXPECT_THAT(delegate.last_src_block_id(), Eq(2));
+  ABSL_EXPECT_OK(session->OnPeregrinePostComplete(post, {}, absl::OkStatus()));
+  // Without a receive plan, completing one block does not retire the session,
+  // so subsequent blocks on the same uuid can still be admitted and completed.
+  EXPECT_FALSE(session->IsDone());
+  EXPECT_THAT(delegate.layers_received(), Eq(0));
+
+  lib::PostMetadata post2 = post;
+  post2.local_id = 4;
+  EXPECT_THAT(session->ResolveRecvBuffer(post2, req),
+              IsOkAndHolds(host.data() + 4 * kSliceSize));
+  ABSL_EXPECT_OK(session->OnPeregrinePostComplete(post2, {}, absl::OkStatus()));
+  EXPECT_FALSE(session->IsDone());
+
+  // Out-of-range layer_id is rejected under kBlockMajor.
+  auto bad_session = std::make_shared<BlockTransportServerPushSession>(
+      /*uuid=*/0, &delegate, config);
+  lib::RequestMetadata bad_req = req;
+  bad_req.block_id = kNumLayers;
+  EXPECT_THAT(bad_session->ResolveRecvBuffer(post, bad_req),
+              StatusIs(absl::StatusCode::kOutOfRange));
+
+  // Pool-mode workers that reject planless explicit pushes reject kBlockMajor.
+  delegate.set_accepts_planless_explicit_push(false);
+  auto pool_mode_session = std::make_shared<BlockTransportServerPushSession>(
+      /*uuid=*/0, &delegate, config);
+  EXPECT_THAT(pool_mode_session->ResolveRecvBuffer(post, req),
+              StatusIs(absl::StatusCode::kFailedPrecondition));
+}
+
+TEST(BlockTransportServerPushSessionTest,
+     PeregrineBlockMajorWithSessionReportsBlockShardsOnly) {
+  class StubTransferSession final : public TransferSession {
+   public:
+    absl::Status Start() override { return absl::OkStatus(); }
+    bool Done() const override { return false; }
+    void Finish(const absl::Status& status) override { status_ = status; }
+    bool TryBeginOp() override { return true; }
+    void EndOp() override {}
+    absl::Status GetStatus() const override { return status_; }
+    absl::Status AwaitForDone() override { return status_; }
+    bool IsDraining() const override { return false; }
+    absl::StatusOr<size_t> ResolveStagingSlot(size_t) override {
+      return absl::NotFoundError("no staging");
+    }
+    absl::Status OnDataReceived(size_t, absl::Span<const int>,
+                                absl::Span<const int>) override {
+      ++unit_completed_calls;
+      return absl::FailedPreconditionError(
+          "OnDataReceived must not be called with dst_block_id as unit");
+    }
+    tsl::Future<> GetDataReadyFuture(size_t) override {
+      return tsl::Future<>(absl::OkStatus());
+    }
+    absl::optional<std::shared_ptr<const TransferPlan>> plan() const override {
+      return absl::nullopt;
+    }
+    std::chrono::steady_clock::time_point deadline() const override {
+      return std::chrono::steady_clock::time_point::max();
+    }
+
+    int unit_completed_calls = 0;
+    absl::Status status_;
+  };
+
+  constexpr uint64_t kUuid = 99;
+  constexpr size_t kSliceSize = 1024;
+  constexpr size_t kMaxBlocks = 5;
+  constexpr size_t kNumLayers = 2;
+  constexpr size_t kNumShards = 1;
+  MockSessionDelegate delegate(kSliceSize, kMaxBlocks, kNumLayers, kNumShards);
+  auto transfer_session = std::make_shared<StubTransferSession>();
+  delegate.RegisterSession(kUuid, transfer_session);
+
+  BlockTransportConfig config;
+  config.major_order = MajorOrder::kBlockMajor;
+  auto session = std::make_shared<BlockTransportServerPushSession>(
+      kUuid, &delegate, config);
+
+  const lib::PostMetadata post{
+      .uuid = kUuid,
+      .remote_id = 7,
+      .local_id = 3,  // dst_block_id >= kNumLayers
+      .shard_mask = 0,
+      .op = lib::TransferOp::kBlockPushExplicit,
+  };
+  const lib::RequestMetadata req{
+      .shard = 0,
+      .block_id = 1,
+      .src_block_id = 2,
+      .chunk_idx = 0,
+      .len = kSliceSize,
+  };
+
+  TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> host, delegate.GetHostBuffer(1, 0));
+  EXPECT_THAT(session->ResolveRecvBuffer(post, req),
+              IsOkAndHolds(host.data() + 3 * kSliceSize));
+  ABSL_EXPECT_OK(session->OnPeregrinePostComplete(post, {}, absl::OkStatus()));
+  EXPECT_THAT(transfer_session->unit_completed_calls, Eq(0));
+  EXPECT_THAT(delegate.layers_received(), Eq(0));
+  ASSERT_EQ(delegate.received_block_shards().size(), 1u);
+  EXPECT_EQ(delegate.received_block_shards()[0].block_ids, std::vector<int>{3});
+  EXPECT_EQ(delegate.received_block_shards()[0].shard_ids, std::vector<int>{0});
+  EXPECT_EQ(delegate.received_block_shards()[0].uuid, kUuid);
+}
 TEST(BlockTransportServerPullSessionTest, InvalidArgumentsRejected) {
   MockSessionDelegate delegate;
   BlockTransportConfig config;

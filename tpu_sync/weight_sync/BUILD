@@ -101,6 +101,30 @@ cc_test(
 )
 
 cc_library(
+    name = "host_tiling_validation",
+    hdrs = ["host_tiling_validation.h"],
+    deps = [
+        "//tpu_sync/rpc:raiden_service_cc_proto",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_test(
+    name = "host_tiling_validation_test",
+    srcs = ["host_tiling_validation_test.cc"],
+    tags = ["no_oss"],
+    deps = [
+        ":host_tiling_validation",
+        "//tpu_sync/rpc:raiden_service_cc_proto",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "shard_push_entry",
     srcs = ["shard_push_entry.cc"],
     hdrs = ["shard_push_entry.h"],
@@ -147,6 +171,7 @@ cc_library(
     features = ["-use_header_modules"],
     visibility = ["//visibility:public"],
     deps = [
+        ":host_tiling_validation",
         ":shard_push_entry",
         ":tiling_utils",
         ":weight_version",

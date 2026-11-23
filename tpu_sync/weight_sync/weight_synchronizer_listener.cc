@@ -46,6 +46,7 @@
 #include "tpu_sync/common/control_pipe/control_pipe_types.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/rpc/weight_transfer_worker_service.pb.h"
+#include "tpu_sync/weight_sync/host_tiling_validation.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 #include "tpu_sync/weight_sync/weight_version.h"
 
@@ -153,6 +154,9 @@ absl::Status CheckDirectPush(absl::string_view push_name,
         push_name, " sets direct.receive_timeout_ms=",
         direct.receive_timeout_ms(), ", less than timeout_ms=", timeout_ms));
   }
+  ABSL_RETURN_IF_ERROR(
+      CheckKnownHostTilingMode(push_name, "direct.receiver_host_tiling_mode",
+                               direct.receiver_host_tiling_mode()));
   return absl::OkStatus();
 }
 
@@ -299,6 +303,9 @@ absl::Status RegisterIncomingTransfer(
                      expected_block_count, "; got ", layer_counts_proto.size(),
                      " layer(s) summing to ", total_layer_chunks));
   }
+  ABSL_RETURN_IF_ERROR(CheckKnownHostTilingMode(
+      absl::StrCat("COMMAND_START_TRANSFER (uuid=", uuid, ")"),
+      "host_tiling_mode", start_req.host_tiling_mode()));
   engine.StoreSkipTiling(uuid, start_req);
 
   absl::flat_hash_map<size_t, uint32_t> layer_counts;
@@ -594,6 +601,9 @@ WeightSynchronizerListener::HandlePrepareWeightReceive(
     return absl::InvalidArgumentError(absl::StrCat(
         "PrepareWeightReceive requires a positive uuid; got ", req.uuid()));
   }
+  ABSL_RETURN_IF_ERROR(CheckKnownHostTilingMode(
+      absl::StrCat("PrepareWeightReceive (uuid=", req.uuid(), ")"),
+      "host_tiling_mode", req.host_tiling_mode()));
   // TODO(raiden-eng): Commit the version into the staging buffer once the
   // buffer tracks versions; until then nothing on the worker reads it.
   ABSL_RETURN_IF_ERROR(
@@ -657,6 +667,8 @@ WeightSynchronizerListener::HandleStartWeightPush(
     return absl::InvalidArgumentError(
         absl::StrCat(push_name, " sets no mode; set coordinated or direct"));
   }
+  ABSL_RETURN_IF_ERROR(CheckKnownHostTilingMode(push_name, "host_tiling_mode",
+                                                req.host_tiling_mode()));
   const ::tpu_sync::rpc::CoordinatedPush& coordinated = req.coordinated();
   // Without StartTransferRequest.src_units, PushWeightsResharded() cannot
   // infer the layer of an entry.

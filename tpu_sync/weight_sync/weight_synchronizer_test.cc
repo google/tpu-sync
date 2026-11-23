@@ -68,7 +68,33 @@ ABSL_DECLARE_FLAG(size_t, raiden_weight_sync_host_buffer_scratchpad_size);
 
 namespace tpu_raiden {
 namespace weight_sync {
+
+// Gives the tests access to WeightSynchronizerBase's private tiling state.
+class WeightSynchronizerBaseTestPeer {
+ public:
+  static bool IsTilingSkipped(WeightSynchronizerBase& ws, size_t layer_idx,
+                              uint64_t uuid) {
+    return ws.IsTilingSkipped(layer_idx, uuid);
+  }
+  static tpu_sync::rpc::HostTilingMode GetReceiverTiling(
+      WeightSynchronizerBase& ws, uint64_t uuid) {
+    return ws.GetReceiverTiling(uuid);
+  }
+  static bool LayerArmedForRawH2d(WeightSynchronizerBase& ws,
+                                  size_t layer_idx) {
+    absl::MutexLock lock(ws.tile_ready_mu_);
+    return layer_idx < ws.layer_tile_ready_.size() &&
+           ws.layer_tile_ready_[layer_idx] != nullptr;
+  }
+  static bool HasPendingH2dState(WeightSynchronizerBase& ws, uint64_t uuid) {
+    absl::MutexLock lock(ws.pending_h2d_mu_);
+    return ws.pending_h2d_states_.contains(uuid);
+  }
+};
+
 namespace {
+
+using ::absl_testing::StatusIs;
 
 class WeightSynchronizerTest : public ::testing::Test {
  protected:
@@ -803,6 +829,86 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedEmptySchedule) {
 
   absl::Status status = ws_source->PushWeightsResharded(request);
   EXPECT_TRUE(status.ok()) << status.message();
+}
+
+TEST_F(WeightSynchronizerTest,
+       PushWeightsReshardedRejectsUnknownHostTilingModeBeforeStoringIt) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> ws,
+      WeightSynchronizerBase::Create(/*num_layers=*/1, /*num_shards=*/1,
+                                     /*slice_byte_size=*/256,
+                                     /*local_port=*/0));
+  // Rejected before StoreSkipTilingLocal records skip_tiling and the
+  // receiver's tiling mode.
+  tpu_sync::rpc::StartTransferRequest legacy_req;
+  legacy_req.set_is_sender(false);
+  legacy_req.set_uuid(33);
+  legacy_req.set_skip_d2h(true);
+  legacy_req.set_host_tiling_mode(
+      static_cast<tpu_sync::rpc::HostTilingMode>(7));
+  (*legacy_req.mutable_skip_tiling())[0] = true;
+  EXPECT_THAT(
+      ws->PushWeightsResharded(legacy_req),
+      StatusIs(
+          absl::StatusCode::kInvalidArgument,
+          "PushWeightsResharded (uuid=33) sets unknown host_tiling_mode=7"));
+  EXPECT_FALSE(WeightSynchronizerBaseTestPeer::IsTilingSkipped(*ws, 0, 33));
+  EXPECT_EQ(WeightSynchronizerBaseTestPeer::GetReceiverTiling(*ws, 33),
+            tpu_sync::rpc::HOST_TILING_MODE_DEFERRED);
+
+  // The same empty push with a known mode records both.
+  legacy_req.set_uuid(34);
+  legacy_req.set_host_tiling_mode(tpu_sync::rpc::HOST_TILING_MODE_ON_ARRIVAL);
+  ABSL_EXPECT_OK(ws->PushWeightsResharded(legacy_req));
+  EXPECT_TRUE(WeightSynchronizerBaseTestPeer::IsTilingSkipped(*ws, 0, 34));
+  EXPECT_EQ(WeightSynchronizerBaseTestPeer::GetReceiverTiling(*ws, 34),
+            tpu_sync::rpc::HOST_TILING_MODE_ON_ARRIVAL);
+}
+
+TEST_F(WeightSynchronizerTest,
+       ReceiverCallbacksRejectUnknownStoredHostTilingMode) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> ws,
+      WeightSynchronizerBase::Create(/*num_layers=*/2, /*num_shards=*/1,
+                                     /*slice_byte_size=*/256,
+                                     /*local_port=*/0));
+  tpu_sync::rpc::StartTransferRequest req;
+  req.set_is_sender(false);
+  req.set_host_tiling_mode(static_cast<tpu_sync::rpc::HostTilingMode>(7));
+  ws->StoreSkipTiling(/*uuid=*/40, req);
+  ASSERT_EQ(WeightSynchronizerBaseTestPeer::GetReceiverTiling(*ws, 40),
+            static_cast<tpu_sync::rpc::HostTilingMode>(7));
+
+  EXPECT_THAT(ws->RegisterExpectedLayerChunks(/*uuid=*/40, {{0, 1}}),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       "RegisterExpectedLayerChunks (uuid=40) sets unknown "
+                       "host_tiling_mode=7"));
+  EXPECT_FALSE(WeightSynchronizerBaseTestPeer::LayerArmedForRawH2d(*ws, 0));
+  EXPECT_FALSE(WeightSynchronizerBaseTestPeer::HasPendingH2dState(*ws, 40));
+
+  EXPECT_THAT(ws->OnLayerDataReceived(/*layer_idx=*/1, /*uuid=*/40),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       "OnLayerDataReceived (uuid=40) sets unknown "
+                       "host_tiling_mode=7"));
+  EXPECT_FALSE(WeightSynchronizerBaseTestPeer::LayerArmedForRawH2d(*ws, 1));
+  EXPECT_FALSE(WeightSynchronizerBaseTestPeer::HasPendingH2dState(*ws, 40));
+
+  // Positive control: known modes arm raw H2D on both registration and direct
+  // layer-arrival callbacks.
+  req.set_host_tiling_mode(tpu_sync::rpc::HOST_TILING_MODE_ON_ARRIVAL);
+  ws->StoreSkipTiling(/*uuid=*/41, req);
+  ABSL_ASSERT_OK(ws->RegisterExpectedLayerChunks(/*uuid=*/41, {{0, 1}}));
+  EXPECT_TRUE(WeightSynchronizerBaseTestPeer::LayerArmedForRawH2d(*ws, 0));
+  EXPECT_TRUE(WeightSynchronizerBaseTestPeer::HasPendingH2dState(*ws, 41));
+  ABSL_ASSERT_OK(ws->OnLayerDataReceived(/*layer_idx=*/0, /*uuid=*/41));
+  ABSL_EXPECT_OK(ws->OnDataReceived(/*uuid=*/41));
+
+  req.set_host_tiling_mode(tpu_sync::rpc::HOST_TILING_MODE_PRE_TILED);
+  ws->StoreSkipTiling(/*uuid=*/42, req);
+  ABSL_ASSERT_OK(ws->OnLayerDataReceived(/*layer_idx=*/1, /*uuid=*/42));
+  EXPECT_TRUE(WeightSynchronizerBaseTestPeer::LayerArmedForRawH2d(*ws, 1));
+  EXPECT_TRUE(WeightSynchronizerBaseTestPeer::HasPendingH2dState(*ws, 42));
+  ABSL_EXPECT_OK(ws->OnDataReceived(/*uuid=*/42));
 }
 
 TEST_F(WeightSynchronizerTest, PushWeightsReshardedFallbackByNameSuccess) {

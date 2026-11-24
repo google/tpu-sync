@@ -877,6 +877,62 @@ TEST_P(BlockTransportTest, PushSplitBySourceNumaDeliversEachShardGroup) {
   }
 }
 
+TEST_P(BlockTransportTest,
+       BlockMajorPushSplitBySourceNumaDeliversAllShardsAndReportsOnce) {
+  constexpr size_t kSlice = 256;
+  constexpr int kBlocks = 5;
+  constexpr size_t kLayers = 4;
+  constexpr size_t kShards = 4;
+  TwoNumaSenderDelegate sender_delegate(kSlice, kBlocks, kLayers, kShards);
+  BlockShardsReceivedRecordingDelegate receiver_delegate(kSlice, kBlocks,
+                                                         kLayers, kShards);
+  for (size_t l = 0; l < kLayers; ++l) {
+    for (size_t sh = 0; sh < kShards; ++sh) {
+      for (int b = 0; b < kBlocks; ++b) {
+        std::memset(sender_delegate.block_data(b, l, sh),
+                    static_cast<int>(0x20 * l + 0x04 * sh + b), kSlice);
+        std::memset(receiver_delegate.block_data(b, l, sh), 0, kSlice);
+      }
+    }
+  }
+
+  BlockTransport sender(&sender_delegate, 0, /*local_ips=*/{"127.0.0.1"},
+                        /*parallelism=*/2);
+  BlockTransport receiver(&receiver_delegate, 0);
+  BindControlChannels(&sender, &sender_delegate, &receiver, &receiver_delegate);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  // 2 NUMA shard groups x parallelism 2 = 4 streams carrying dst_block_id=3
+  // across layer subset {0, 2, 3}. OnBlockShardsReceived must fire once after
+  // all 4 streams have landed.
+  const absl::StatusOr<std::vector<int>> pushed =
+      sender
+          .AsyncPush({absl::StrCat("localhost:", receiver.local_port())},
+                     /*src_block_id=*/1, /*dst_block_id=*/3,
+                     /*layer_ids=*/{0, 2, 3}, /*parallelism=*/2, /*uuid=*/9)
+          .Await();
+  ASSERT_THAT(pushed, IsOkAndHolds(ElementsAre(0, 2, 3)));
+
+  EXPECT_THAT(
+      receiver_delegate.reports(),
+      ::testing::ElementsAre(::testing::Pair(
+          ::testing::ElementsAre(3), ::testing::ElementsAre(0, 1, 2, 3))));
+
+  for (size_t l = 0; l < kLayers; ++l) {
+    for (size_t sh = 0; sh < kShards; ++sh) {
+      for (int b = 0; b < kBlocks; ++b) {
+        const bool should_be_written = (b == 3) && (l == 0 || l == 2 || l == 3);
+        const uint8_t expected =
+            should_be_written ? static_cast<uint8_t>(0x20 * l + 0x04 * sh + 1)
+                              : 0;
+        const uint8_t* dst = receiver_delegate.block_data(b, l, sh);
+        EXPECT_EQ(dst[0], expected) << l << "/" << sh << "/" << b;
+        EXPECT_EQ(dst[kSlice - 1], expected) << l << "/" << sh << "/" << b;
+      }
+    }
+  }
+}
+
 TEST_P(BlockTransportTest, PushWithoutDestinationIdsIsNotSplitByNuma) {
   constexpr size_t kSlice = 256;
   constexpr int kBlocks = 4;
@@ -1875,13 +1931,14 @@ TEST_P(BlockTransportTest, MultiShardPushBlockMajor) {
   BindControlChannels(&sender, &sender_delegate, &receiver,
                       &receiver_delegate);
 
-  ABSL_ASSERT_OK(
-      sender
-          .AsyncPush({absl::StrCat("localhost:", receiver.local_port())},
-                     /*src_block_ids=*/{0, 1, 2}, /*dst_block_ids=*/{0, 1, 2},
-                     /*parallelism=*/1, MajorOrder::kBlockMajor, /*uuid=*/0,
-                     /*layer_idx=*/-1)
-          .Await());
+  const std::string peer = absl::StrCat("localhost:", receiver.local_port());
+  for (int b = 0; b < kNumBlocks; ++b) {
+    ABSL_ASSERT_OK(sender
+                       .AsyncPush({peer}, /*src_block_id=*/b,
+                                  /*dst_block_id=*/b, /*layer_ids=*/{0, 1},
+                                  /*parallelism=*/1, /*uuid=*/0)
+                       .Await());
+  }
 
   for (size_t l = 0; l < kNumLayers; ++l) {
     for (size_t sh = 0; sh < kNumShards; ++sh) {
@@ -1920,18 +1977,181 @@ TEST_P(BlockTransportTest, MultiShardPushBlockMajorMoreLayersThanBlocks) {
   BlockTransport receiver(&receiver_delegate, 0);
   BindControlChannels(&sender, &sender_delegate, &receiver, &receiver_delegate);
 
-  ABSL_ASSERT_OK(
-      sender
-          .AsyncPush({absl::StrCat("localhost:", receiver.local_port())},
-                     /*src_block_ids=*/{0, 1}, /*dst_block_ids=*/{0, 1},
-                     /*parallelism=*/2, MajorOrder::kBlockMajor, /*uuid=*/0,
-                     /*layer_idx=*/-1)
-          .Await());
+  const std::string peer = absl::StrCat("localhost:", receiver.local_port());
+  for (int b = 0; b < kNumBlocks; ++b) {
+    ABSL_ASSERT_OK(sender
+                       .AsyncPush({peer}, /*src_block_id=*/b,
+                                  /*dst_block_id=*/b,
+                                  /*layer_ids=*/{0, 1, 2, 3},
+                                  /*parallelism=*/2, /*uuid=*/0)
+                       .Await());
+  }
 
   for (size_t l = 0; l < kNumLayers; ++l) {
     for (size_t sh = 0; sh < kNumShards; ++sh) {
       for (int b = 0; b < kNumBlocks; ++b) {
         int expected = static_cast<int>(0x10 + l * 0x20 + sh * 0x08 + b);
+        EXPECT_EQ(receiver_delegate.block_data(b, l, sh)[0], expected);
+        EXPECT_EQ(receiver_delegate.block_data(b, l, sh)[kBlockSize - 1],
+                  expected);
+      }
+    }
+  }
+}
+
+TEST_P(BlockTransportTest, BlockMajorAsyncPushSubsetOfArraysAndRemappedBlock) {
+  constexpr size_t kBlockSize = 256;
+  constexpr int kNumBlocks = 5;
+  constexpr size_t kNumLayers = 4;
+  constexpr size_t kNumShards = 2;
+
+  MockDelegate sender_delegate(kBlockSize, kNumBlocks, kNumLayers, kNumShards);
+  MockDelegate receiver_delegate(kBlockSize, kNumBlocks, kNumLayers,
+                                 kNumShards);
+
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    for (size_t sh = 0; sh < kNumShards; ++sh) {
+      for (int b = 0; b < kNumBlocks; ++b) {
+        std::memset(sender_delegate.block_data(b, l, sh),
+                    static_cast<int>(0x10 + l * 0x20 + sh * 0x08 + b),
+                    kBlockSize);
+        std::memset(receiver_delegate.block_data(b, l, sh), 0, kBlockSize);
+      }
+    }
+  }
+
+  BlockTransport sender(&sender_delegate, 0);
+  BlockTransport receiver(&receiver_delegate, 0);
+  BindControlChannels(&sender, &sender_delegate, &receiver, &receiver_delegate);
+
+  // dst_block_id (4) >= kNumLayers (4) and != src_block_id (1), transferring
+  // only arrays {1, 3} split across 2 streams.
+  const absl::StatusOr<std::vector<int>> pushed =
+      sender
+          .AsyncPush({absl::StrCat("localhost:", receiver.local_port())},
+                     /*src_block_id=*/1, /*dst_block_id=*/4,
+                     /*layer_ids=*/{1, 3}, /*parallelism=*/2, /*uuid=*/0)
+          .Await();
+  ASSERT_THAT(pushed, IsOkAndHolds(ElementsAre(1, 3)));
+
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    for (size_t sh = 0; sh < kNumShards; ++sh) {
+      for (int b = 0; b < kNumBlocks; ++b) {
+        const bool should_be_written = (b == 4) && (l == 1 || l == 3);
+        const int expected =
+            should_be_written
+                ? static_cast<int>(0x10 + l * 0x20 + sh * 0x08 + 1)
+                : 0;
+        EXPECT_EQ(receiver_delegate.block_data(b, l, sh)[0], expected);
+        EXPECT_EQ(receiver_delegate.block_data(b, l, sh)[kBlockSize - 1],
+                  expected);
+      }
+    }
+  }
+}
+
+TEST_P(BlockTransportTest, BlockMajorAsyncPushValidationErrors) {
+  MockDelegate sender_delegate(256, /*max_blocks=*/3, /*num_layers=*/2,
+                               /*num_shards=*/1);
+  MockDelegate receiver_delegate(256, /*max_blocks=*/3, /*num_layers=*/2,
+                                 /*num_shards=*/1);
+  BlockTransport sender(&sender_delegate, 0);
+  BlockTransport receiver(&receiver_delegate, 0);
+  BindControlChannels(&sender, &sender_delegate, &receiver, &receiver_delegate);
+  const std::string peer = absl::StrCat("localhost:", receiver.local_port());
+
+  EXPECT_THAT(sender
+                  .AsyncPush({peer}, /*src_block_id=*/-1, /*dst_block_id=*/0,
+                             /*layer_ids=*/{0})
+                  .Await(),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(sender
+                  .AsyncPush({peer}, /*src_block_id=*/0, /*dst_block_id=*/-1,
+                             /*layer_ids=*/{0})
+                  .Await(),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(sender
+                  .AsyncPush({peer}, /*src_block_id=*/0, /*dst_block_id=*/0,
+                             /*layer_ids=*/{})
+                  .Await(),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(sender
+                  .AsyncPush({peer}, /*src_block_id=*/0, /*dst_block_id=*/0,
+                             /*layer_ids=*/{2})
+                  .Await(),
+              StatusIs(absl::StatusCode::kOutOfRange));
+  EXPECT_THAT(sender
+                  .AsyncPush({peer}, /*src_block_ids=*/{0},
+                             /*dst_block_ids=*/{0}, /*parallelism=*/1,
+                             MajorOrder::kBlockMajor)
+                  .Await(),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+}
+
+TEST_P(BlockTransportTest,
+       PeregrineBlockMajorAsyncPushSubsetOfLayersAndRemappedBlock) {
+  auto cleanup =
+      absl::MakeCleanup([] { unsetenv("TPU_RAIDEN_ENABLE_PEREGRINE"); });
+  setenv("TPU_RAIDEN_ENABLE_PEREGRINE", "6", 1);
+
+  constexpr size_t kBlockSize = 256;
+  constexpr int kNumBlocks = 5;
+  constexpr size_t kNumLayers = 4;
+  constexpr size_t kNumShards = 2;
+
+  MockDelegate sender_delegate(kBlockSize, kNumBlocks, kNumLayers, kNumShards);
+  MockDelegate receiver_delegate(kBlockSize, kNumBlocks, kNumLayers,
+                                 kNumShards);
+
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    for (size_t sh = 0; sh < kNumShards; ++sh) {
+      for (int b = 0; b < kNumBlocks; ++b) {
+        std::memset(sender_delegate.block_data(b, l, sh),
+                    static_cast<int>(0x10 + l * 0x20 + sh * 0x08 + b),
+                    kBlockSize);
+        std::memset(receiver_delegate.block_data(b, l, sh), 0, kBlockSize);
+      }
+    }
+  }
+
+  BlockTransport sender(&sender_delegate, 0, {"127.0.0.1"}, /*parallelism=*/2,
+                        /*socket_only_transport=*/false,
+                        MajorOrder::kBlockMajor);
+  BlockTransport receiver(&receiver_delegate, 0, {"127.0.0.1"},
+                          /*parallelism=*/2, /*socket_only_transport=*/false,
+                          MajorOrder::kBlockMajor);
+  BindControlChannels(&sender, &sender_delegate, &receiver, &receiver_delegate);
+  ASSERT_GT(receiver.peregrine_local_port(), 0);
+
+  const PeerEndpoint peer{
+      absl::StrCat("127.0.0.1:", receiver.local_port()),
+      absl::StrCat("127.0.0.1:", receiver.peregrine_local_port()),
+  };
+  const absl::StatusOr<std::vector<int>> pushed =
+      sender
+          .AsyncPush({peer}, /*src_block_id=*/1, /*dst_block_id=*/4,
+                     /*layer_ids=*/{1, 3}, /*parallelism=*/2, /*uuid=*/0)
+          .Await();
+  ASSERT_THAT(pushed, IsOkAndHolds(ElementsAre(1, 3)));
+
+  // Calling the layer-major overload on a kBlockMajor Peregrine transport is
+  // rejected because PostMetadataV1 relies on out-of-band major_order config.
+  EXPECT_THAT(sender
+                  .AsyncPush({peer}, /*src_block_ids=*/{0},
+                             /*dst_block_ids=*/{0}, /*parallelism=*/1,
+                             MajorOrder::kLayerMajor, /*uuid=*/0,
+                             /*layer_idx=*/0)
+                  .Await(),
+              StatusIs(absl::StatusCode::kFailedPrecondition));
+
+  for (size_t l = 0; l < kNumLayers; ++l) {
+    for (size_t sh = 0; sh < kNumShards; ++sh) {
+      for (int b = 0; b < kNumBlocks; ++b) {
+        const bool should_be_written = (b == 4) && (l == 1 || l == 3);
+        const int expected =
+            should_be_written
+                ? static_cast<int>(0x10 + l * 0x20 + sh * 0x08 + 1)
+                : 0;
         EXPECT_EQ(receiver_delegate.block_data(b, l, sh)[0], expected);
         EXPECT_EQ(receiver_delegate.block_data(b, l, sh)[kBlockSize - 1],
                   expected);

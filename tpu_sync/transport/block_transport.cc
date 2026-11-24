@@ -545,8 +545,47 @@ tsl::Future<std::vector<int>> BlockTransport::AsyncPush(
     const std::vector<int>& dst_block_ids, int parallelism,
     MajorOrder major_order, uint64_t uuid, int layer_idx,
     std::optional<int> wire_layer_idx) {
+  if (major_order == MajorOrder::kBlockMajor) {
+    absl::Status err = absl::InvalidArgumentError(
+        "Use AsyncPush(peers, src_block_id, dst_block_id, layer_ids, ...) for "
+        "MajorOrder::kBlockMajor transfers");
+    RecordTransferFailure(err, metric_labels::kDirectionPush);
+    return tsl::Future<std::vector<int>>(std::move(err));
+  }
   return AsyncPushInternal(peers, src_block_ids, dst_block_ids, parallelism,
                            major_order, uuid, layer_idx, wire_layer_idx);
+}
+
+tsl::Future<std::vector<int>> BlockTransport::AsyncPush(
+    const std::vector<PeerEndpoint>& peers, int src_block_id, int dst_block_id,
+    const std::vector<int>& layer_ids, int parallelism, uint64_t uuid) {
+  auto fail = [](absl::Status err) {
+    RecordTransferFailure(err, metric_labels::kDirectionPush);
+    return tsl::Future<std::vector<int>>(std::move(err));
+  };
+  if (src_block_id < 0 || dst_block_id < 0) {
+    return fail(absl::InvalidArgumentError(
+        absl::StrCat("Block-major AsyncPush requires non-negative block IDs "
+                     "(src_block_id=",
+                     src_block_id, ", dst_block_id=", dst_block_id, ")")));
+  }
+  if (layer_ids.empty()) {
+    return fail(absl::InvalidArgumentError(
+        "Block-major AsyncPush requires non-empty layer_ids"));
+  }
+  const size_t num_arrays = block_delegate_->num_block_arrays();
+  for (int layer_id : layer_ids) {
+    if (layer_id < 0 || static_cast<size_t>(layer_id) >= num_arrays) {
+      return fail(absl::OutOfRangeError(
+          absl::StrCat("Block-major AsyncPush layer_id ", layer_id,
+                       " out of range [0, ", num_arrays, ")")));
+    }
+  }
+  return AsyncPushInternal(peers, /*src_minor_dim_indices=*/layer_ids,
+                           /*dst_minor_dim_indices=*/layer_ids, parallelism,
+                           MajorOrder::kBlockMajor, uuid,
+                           /*major_dim_idx=*/src_block_id,
+                           /*wire_major_dim_idx=*/dst_block_id);
 }
 
 tsl::Future<std::vector<int>> BlockTransport::AsyncPushInternal(
@@ -561,6 +600,19 @@ tsl::Future<std::vector<int>> BlockTransport::AsyncPushInternal(
                                  : lib::TransferOp::kBlockPushExplicit;
   const TransportBackend backend = BackendForTransfer(op, peers);
   if (backend == TransportBackend::kPeregrine) {
+    // Peregrine's PostMetadataV1 does not carry major_order on the wire; sender
+    // and receiver agree on config_.major_order out of band (e.g. via
+    // controller / handshake configuration). Reject mismatches here so a
+    // default kLayerMajor transport cannot silently misroute a kBlockMajor push
+    // (or vice versa) over Peregrine.
+    if (major_order != config_.major_order) {
+      absl::Status err = absl::FailedPreconditionError(absl::StrCat(
+          "Peregrine push major_order (", static_cast<int>(major_order),
+          ") does not match configured BlockTransportConfig::major_order (",
+          static_cast<int>(config_.major_order), ")"));
+      RecordTransferFailure(err, metric_labels::kDirectionPush);
+      return tsl::Future<std::vector<int>>(std::move(err));
+    }
     absl::StatusOr<lib::TransportAdapter*> adapter = AdapterForBackend(backend);
     if (!adapter.ok()) {
       RecordTransferFailure(adapter.status(), metric_labels::kDirectionPush);
@@ -868,23 +920,31 @@ absl::StatusOr<std::vector<lib::Request>> BlockTransport::BuildBlockRequests(
           const int src_minor_dim_idx =
               src_minor_dim_indices[minor_dim_offset + k];
 
-          const int64_t block_id_val = src_minor_dim_idx;
           const int64_t dst_minor_dim_idx =
               minor_dim_offset + k < dst_minor_dim_indices.size()
                   ? static_cast<int64_t>(
                         dst_minor_dim_indices[minor_dim_offset + k])
                   : -1;
+          const bool is_block_major = major_order == MajorOrder::kBlockMajor;
+          const size_t layer_idx =
+              is_block_major ? static_cast<size_t>(src_minor_dim_idx) : l;
+          const int64_t block_id_val =
+              is_block_major ? static_cast<int64_t>(l) : src_minor_dim_idx;
+          const int64_t dst_block_id_val =
+              is_block_major
+                  ? static_cast<int64_t>(wire_major_dim_idx.value_or(l))
+                  : dst_minor_dim_idx;
           std::vector<BlockChunk> chunks = block_delegate_->GetBlockChunks(
-              l, sh, absl::MakeConstSpan(&block_id_val, 1),
-              block_delegate_->block_bytes(l), uuid, -1, peer,
-              /*src_block_id=*/-1, /*dst_block_id=*/dst_minor_dim_idx);
+              layer_idx, sh, absl::MakeConstSpan(&block_id_val, 1),
+              block_delegate_->block_bytes(layer_idx), uuid, -1, peer,
+              /*src_block_id=*/-1, /*dst_block_id=*/dst_block_id_val);
           if (chunks.empty()) {
             return absl::NotFoundError(
                 absl::StrCat("No transfer chunks found for block ",
-                             src_minor_dim_idx, " and uuid ", uuid));
+                             block_id_val, " and uuid ", uuid));
           }
           ABSL_RETURN_IF_ERROR(
-              ValidateChunks(block_delegate_, l, sh, uuid, chunks));
+              ValidateChunks(block_delegate_, layer_idx, sh, uuid, chunks));
 
           // What the receiver needs to handle these chunks. Uses
           // `wire_major_dim_idx` when set (the receiver's array index),
@@ -904,7 +964,8 @@ absl::StatusOr<std::vector<lib::Request>> BlockTransport::BuildBlockRequests(
                 request_id, uuid, buffer_id, parallelism, major_order,
                 remote_id, local_id, stream_idx,
                 /*on_block_received=*/nullptr, shard_mask, total_streams,
-                static_cast<int32_t>(dst_minor_dim_idx), src_minor_dim_idx,
+                static_cast<int32_t>(dst_minor_dim_idx),
+                static_cast<int32_t>(block_id_val),
                 static_cast<uint16_t>(chunk_idx)));
           }
           ++request_id;

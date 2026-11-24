@@ -38,7 +38,6 @@
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "xla/pjrt/pjrt_client.h"
-#include "xla/stream_executor/stream.h"
 #include "tpu_sync/core/host_memory_allocator.h"
 #include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/core/raiden_manager_base.h"
@@ -79,13 +78,6 @@ namespace tpu_raiden {
 // If a third uuid source is ever added, it MUST stay below 2^63 or this
 // sentinel loses its meaning silently.
 inline constexpr uint64_t kLeaseAuthorizedPullUuid = 0xFFFFFFFFFFFFFFFFull;
-
-struct BlockMetadata {
-  int block_id;
-  void* data_ptr;
-  std::string address;
-  xla::PjRtClient* pjrt_client = nullptr;
-};
 
 namespace kv_cache {
 
@@ -331,30 +323,6 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
           tpu_raiden::transport::MajorOrder::kLayerMajor,
       tpu_raiden::transport::BlockReceivedCallback on_block_received = {});
 
-  // Pure StreamExecutor H2D copy using raw C++ device pointers
-  absl::Status H2dDirect(stream_executor::Stream* stream,
-                         const std::vector<uint8_t*>& device_buffers,
-                         const std::vector<int64_t>& src_offsets,
-                         const std::vector<int64_t>& dst_offsets,
-                         const std::vector<int64_t>& copy_sizes);
-
-  // Pure StreamExecutor D2H copy using raw C++ device pointers
-  absl::Status D2hDirect(stream_executor::Stream* stream,
-                         const std::vector<uint8_t*>& device_buffers,
-                         const std::vector<int64_t>& src_offsets,
-                         const std::vector<int64_t>& dst_offsets,
-                         const std::vector<int64_t>& copy_sizes);
-
-  absl::StatusOr<raiden::PjRtCopyFuture> H2dDirect(
-      const std::vector<int64_t>& src_offsets = {},
-      const std::vector<int64_t>& dst_offsets = {},
-      const std::vector<int64_t>& copy_sizes = {}, int64_t device_id = -1);
-
-  absl::StatusOr<raiden::PjRtCopyFuture> D2hDirect(
-      const std::vector<int64_t>& src_offsets = {},
-      const std::vector<int64_t>& dst_offsets = {},
-      const std::vector<int64_t>& copy_sizes = {}, int64_t device_id = -1);
-
   // Layer-wise copies using caller-owned host buffers. The raw copy operation
   // captures the supplied address when issued, so independent calls can overlap
   // across layers.
@@ -367,9 +335,6 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
 
   absl::StatusOr<KVCacheHostSpan> HostSpan(size_t layer_idx, size_t shard_idx,
                                            int64_t slot_idx, int64_t num_major);
-
-  void SetExternalHostBuffer(
-      const std::vector<raiden::BufferHoldAndAlias>& buffer_holds);
 
   // Registers an existing whole-pool host virtual memory mapping for TPU DMA.
   // The caller owns the memory lifetime and must keep it page-locked until
@@ -498,14 +463,6 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
       const std::vector<uint8_t*>& host_block_bases, size_t num_ranks,
       size_t page_nbytes, int64_t rank_id, bool is_h2d,
       std::shared_ptr<void> keep_alive);
-
-  // Tracks an external in-flight copy future so it is drained before
-  // unmapping.  Fails if the pool is no longer mapped, in which case the
-  // future is dropped rather than silently queued against a dead mapping.
-  //
-  // Prefer AcquireExternalCopyLease + Commit, which additionally keeps the
-  // registration alive across the submission itself.
-  absl::Status TrackExternalCopy(raiden::PjRtCopyFuture future);
 
   // Test helpers to simulate shared memory mapping state in unit tests without
   // requiring hardware DMA support.  `page_nbytes` defaults to
@@ -682,12 +639,6 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   // FailedPrecondition for a pool-addressed plan.
   absl::StatusOr<std::vector<HostBlockId>> PlanHostBlocks(
       uint64_t uuid, const std::vector<DeviceBlockId>& block_ids) const;
-
-  virtual absl::Status RegisterRecv(uint64_t uuid, const std::string& req_id,
-                                    int64_t expected_block_count) {
-    return absl::UnimplementedError(
-        "RegisterRecv not implemented in base class");
-  }
 
   // Resolves the host memory pointers (BlockChunks) for the given block_ids.
   // If `src_block_id` is provided (not -1), it is used to filter the active
@@ -915,7 +866,7 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
       std::optional<size_t> shard_idx = std::nullopt);
 
   // Lazily materializes one implicit pool per storage when RegisterPools was
-  // never called (or the host buffers were replaced since).
+  // never called.
   void EnsureImplicitPools() const;
 
   // Resolves the host layer buffer index backing |block_array_idx| for

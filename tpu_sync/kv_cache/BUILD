@@ -254,7 +254,6 @@ cc_library(
         "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:optional",
         "@com_google_absl//absl/types:span",
-        "@xla//xla/stream_executor:device_address",
         "@xla//xla/tsl/concurrency:future",
     ],
     alwayslink = 1,

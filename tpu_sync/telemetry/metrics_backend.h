@@ -365,6 +365,7 @@ inline constexpr absl::string_view kP2pTransferTimeLabels[] = {kSrcIp, kDstIp,
                                                                kLocalRank};
 inline constexpr absl::string_view kPcieTransferLabels[] = {kHostIp,
                                                             kLocalRank};
+inline constexpr absl::string_view kBufferAllocatedBytesLabels[] = {kLocalRank};
 inline constexpr absl::string_view kKvRecallBlocksLabels[] = {kDpRank, kTier,
                                                               kOutcome};
 inline constexpr absl::string_view kKvSaveBlocksLabels[] = {kDpRank, kTier,
@@ -390,6 +391,7 @@ inline constexpr absl::string_view kHostPoolBlocksLabels[] = {kDpRank, kState};
 
 namespace metric_metadata {
 
+using metric_labels::kBufferAllocatedBytesLabels;
 using metric_labels::kDirectionLabels;
 using metric_labels::kHostMemoryBreakdownLabels;
 using metric_labels::kHostNumaMemoryLabels;
@@ -476,7 +478,8 @@ inline constexpr MetricMetadata kD2hDmaTimeMs{
 inline constexpr MetricMetadata kBufferAllocatedBytes{
     .name = metric_names::kBufferAllocatedBytes,
     .description = metric_descriptions::kBufferAllocatedBytes,
-    .type = MetricType::kGauge};
+    .type = MetricType::kGauge,
+    .label_names = kBufferAllocatedBytesLabels};
 
 inline constexpr MetricMetadata kKvRecallBlocksTotal{
     .name = metric_names::kKvRecallBlocksTotal,

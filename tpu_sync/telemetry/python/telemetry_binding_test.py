@@ -249,7 +249,9 @@ class TelemetryBindingTest(absltest.TestCase):
         metrics_by_name["d2h_dma_time_ms"].label_names,
         ["host_ip", "local_rank"],
     )
-    self.assertEqual(metrics_by_name["buffer_allocated_bytes"].label_names, [])
+    self.assertEqual(
+        metrics_by_name["buffer_allocated_bytes"].label_names, ["local_rank"]
+    )
     self.assertEqual(
         metrics_by_name["storage_bytes_total"].label_names,
         ["local_rank", "direction"],

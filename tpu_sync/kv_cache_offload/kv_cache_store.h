@@ -272,10 +272,11 @@ class KVCacheStore {
       const std::vector<std::string>& block_hashes, bool enable_global = false,
       bool pin_found = true);
 
-  // Queries cached block hashes using `options`. `kSubset` and
-  // `host_resident_only` queries target tier 0 directly; `kPrefix` cascades
-  // across tiers. Note that `LookupOptions` defaults `pin_found` to false and
-  // `enable_global` to true.
+  // Queries cached block hashes using `options`. `host_resident_only` queries
+  // and `kSubset` full-snapshot queries (empty `block_hashes`) target host RAM
+  // directly; `kPrefix` and non-empty `kSubset` queries cascade across host RAM
+  // and secondary storage tiers. Note that `LookupOptions` defaults `pin_found`
+  // to false and `enable_global` to true.
   absl::StatusOr<BlockSliceList> Lookup(
       const std::vector<std::string>& block_hashes,
       const LookupOptions& options);

@@ -1045,20 +1045,26 @@ absl::StatusOr<BlockSliceList> KVCacheStore::Lookup(
 }
 
 // Lookup routing across tiers:
-// - `kSubset` and `host_resident_only` queries delegate directly to tier 0
-//   (`backends_[0]`).
+// - `host_resident_only` queries and `kSubset` full-snapshot queries (empty
+//   `block_hashes`) delegate directly to host RAM (`backends_[0]`).
+// - `kSubset` queries with non-empty `block_hashes` cascade across host RAM
+//   and secondary storage tiers for unresolved hashes, merging all hits in
+//   original `block_hashes` order. Pin acquisition is all-or-nothing on error:
+//   if a secondary storage tier returns a non-NotFound error, any host RAM
+//   pins acquired under `pin_found=true` are released before returning.
 // - `kPrefix` queries cascade across tiers in recall-priority order:
-//   1. Tier 0 (`backends_[0]` - HostOffloadBackend): resolves local host DRAM
+//   1. Host RAM (`backends_[0]` - HostOffloadBackend): resolves local host DRAM
 //      (`BlockStatus::HOST` / `BlockStatus::HOST_AND_HBM`) and, when
 //      `enable_global` is set, peer RAM (`BlockStatus::REMOTE`).
-//   2. Tier 1+ (`backends_[1..]` - secondary storage, e.g., POSIX): queried
-//      for the remaining suffix (`subspan(start_idx)`) that missed tier 0,
-//      returning `BlockStatus::SHARED_STORAGE`.
+//   2. Secondary storage (`backends_[1..]` - e.g., POSIX): queried for the
+//      remaining suffix (`subspan(start_idx)`) that missed host RAM, returning
+//      `BlockStatus::SHARED_STORAGE`.
 absl::StatusOr<BlockSliceList> KVCacheStore::Lookup(
     const std::vector<std::string>& block_hashes,
     const LookupOptions& options) {
   if (options.host_resident_only ||
-      options.match_mode == LookupMatchMode::kSubset) {
+      (options.match_mode == LookupMatchMode::kSubset &&
+       block_hashes.empty())) {
     if (backends_.empty() || backends_[0] == nullptr) {
       return BlockSliceList{};
     }
@@ -1068,34 +1074,104 @@ absl::StatusOr<BlockSliceList> KVCacheStore::Lookup(
   BlockSliceList accumulated_results;
   accumulated_results.reserve(block_hashes.size());
 
-  size_t start_idx = 0;
-  for (size_t tier_idx = 0; tier_idx < backends_.size(); ++tier_idx) {
-    const auto& backend = backends_[tier_idx];
-    if (start_idx >= block_hashes.size()) break;
-    if (!backend) continue;
+  if (options.match_mode == LookupMatchMode::kSubset) {
+    std::vector<std::optional<RaidenBlockId>> resolved(block_hashes.size());
+    std::vector<size_t> unresolved_indices(block_hashes.size());
+    for (size_t i = 0; i < block_hashes.size(); ++i) {
+      unresolved_indices[i] = i;
+    }
+    size_t resolved_count = 0;
+    std::vector<std::string> pinned_local_hashes;
 
-    auto lookup_result = backend->Lookup(
-        absl::MakeSpan(block_hashes).subspan(start_idx), options);
-    if (!lookup_result.ok()) {
-      if (!accumulated_results.empty() &&
-          absl::IsNotFound(lookup_result.status())) {
-        break;
-      }
-      if (options.pin_found && !accumulated_results.empty()) {
-        std::vector<std::string> matched_hashes;
-        matched_hashes.reserve(accumulated_results.size());
-        for (const auto& pair : accumulated_results) {
-          matched_hashes.push_back(pair.first);
+    for (size_t tier_idx = 0; tier_idx < backends_.size(); ++tier_idx) {
+      const auto& backend = backends_[tier_idx];
+      if (unresolved_indices.empty()) break;
+      if (!backend) continue;
+
+      std::vector<std::string> remaining_hashes;
+      absl::Span<const std::string> query_span;
+      if (tier_idx == 0) {
+        query_span = absl::MakeConstSpan(block_hashes);
+      } else {
+        remaining_hashes.reserve(unresolved_indices.size());
+        for (size_t idx : unresolved_indices) {
+          remaining_hashes.push_back(block_hashes[idx]);
         }
-        Release(matched_hashes);
+        query_span = absl::MakeConstSpan(remaining_hashes);
       }
-      return lookup_result.status();
+
+      auto lookup_result = backend->Lookup(query_span, options);
+      if (!lookup_result.ok()) {
+        if (resolved_count > 0 && absl::IsNotFound(lookup_result.status())) {
+          break;
+        }
+        if (options.pin_found && !pinned_local_hashes.empty()) {
+          Release(pinned_local_hashes);
+        }
+        return lookup_result.status();
+      }
+
+      const auto& res = *lookup_result;
+      if (res.empty()) continue;
+
+      absl::flat_hash_map<absl::string_view, RaidenBlockId> tier_hits;
+      tier_hits.reserve(res.size());
+      for (const auto& pair : res) {
+        tier_hits.emplace(pair.first, pair.second);
+        if (tier_idx == 0 && options.pin_found) {
+          pinned_local_hashes.push_back(pair.first);
+        }
+      }
+
+      std::vector<size_t> next_unresolved;
+      next_unresolved.reserve(unresolved_indices.size());
+      for (size_t idx : unresolved_indices) {
+        auto it = tier_hits.find(block_hashes[idx]);
+        if (it != tier_hits.end()) {
+          resolved[idx] = it->second;
+          ++resolved_count;
+        } else {
+          next_unresolved.push_back(idx);
+        }
+      }
+      unresolved_indices = std::move(next_unresolved);
     }
 
-    const auto& res = *lookup_result;
-    for (const auto& pair : res) {
-      accumulated_results.push_back(pair);
-      ++start_idx;
+    for (size_t i = 0; i < block_hashes.size(); ++i) {
+      if (resolved[i].has_value()) {
+        accumulated_results.emplace_back(block_hashes[i], *resolved[i]);
+      }
+    }
+  } else {
+    size_t start_idx = 0;
+    for (size_t tier_idx = 0; tier_idx < backends_.size(); ++tier_idx) {
+      const auto& backend = backends_[tier_idx];
+      if (start_idx >= block_hashes.size()) break;
+      if (!backend) continue;
+
+      auto lookup_result = backend->Lookup(
+          absl::MakeSpan(block_hashes).subspan(start_idx), options);
+      if (!lookup_result.ok()) {
+        if (!accumulated_results.empty() &&
+            absl::IsNotFound(lookup_result.status())) {
+          break;
+        }
+        if (options.pin_found && !accumulated_results.empty()) {
+          std::vector<std::string> matched_hashes;
+          matched_hashes.reserve(accumulated_results.size());
+          for (const auto& pair : accumulated_results) {
+            matched_hashes.push_back(pair.first);
+          }
+          Release(matched_hashes);
+        }
+        return lookup_result.status();
+      }
+
+      const auto& res = *lookup_result;
+      for (const auto& pair : res) {
+        accumulated_results.push_back(pair);
+        ++start_idx;
+      }
     }
   }
 

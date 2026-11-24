@@ -9527,6 +9527,181 @@ TEST_F(SecondaryBackendTopologyTest,
   EXPECT_EQ(store_->Lookup({"host_blk"}, invalid).status().code(),
             absl::StatusCode::kInvalidArgument);
 }
+
+TEST_F(SecondaryBackendTopologyTest,
+       SubsetLookupCascadesToPosixStorageAndPreservesInputOrder) {
+  // LookupMatchMode::kSubset must cascade unresolved hashes from host RAM to
+  // the storage tier, merge hits in original input order, keep
+  // host_resident_only=true and empty-hash snapshots on host RAM only, and
+  // reject enable_global=true.
+  BackendConfig posix_cfg = PosixConfig();
+  posix_cfg.parallelism.tp_size = 1;
+  TF_ASSERT_OK_AND_ASSIGN(auto storage_tier,
+                       CreateStorageTier(posix_cfg, /*num_shards=*/1));
+  ASSERT_NE(storage_tier, nullptr);
+
+  const RaidenId rid{"topology_job", "0", "kv", /*data_replica_idx=*/0};
+  ABSL_ASSERT_OK(store_->Insert(
+      {"host_blk", "hbm_only_blk"},
+      {RaidenBlockId{rid, /*host_block_id=*/0, BlockStatus::HOST},
+       RaidenBlockId{rid, /*host_block_id=*/-1, /*device_block_id=*/1,
+                     BlockStatus::HBM}},
+      /*on_host=*/false));
+  store_->Release({"host_blk", "hbm_only_blk"});
+
+  // Seed two real blocks on the POSIX storage tier.
+  auto mapper = std::make_shared<backends::storage::PosixPathMapper>(
+      scratch_dir_, "topology_model",
+      backends::ParallelismConfig{.tp_size = 1, .tp_rank = 0});
+  for (const std::string& hash : {"storage_blk_1", "storage_blk_2"}) {
+    TF_ASSERT_OK_AND_ASSIGN(auto mapped,
+                         mapper->MapKey(hash, {.parallelism = {.tp_rank = 0}}));
+    std::filesystem::create_directories(
+        std::filesystem::path(mapped.resolved_key).parent_path());
+    std::ofstream(mapped.resolved_key) << "kv_payload_" << hash;
+  }
+
+  const std::vector<std::string> query = {"miss_0", "storage_blk_1", "host_blk",
+                                          "miss_1", "storage_blk_2"};
+
+  // Prefix mode stops at the leading miss.
+  LookupOptions prefix_opts;
+  prefix_opts.enable_global = false;
+  prefix_opts.pin_found = false;
+  prefix_opts.match_mode = LookupMatchMode::kPrefix;
+  TF_ASSERT_OK_AND_ASSIGN(BlockSliceList prefix_res,
+                       store_->Lookup(query, prefix_opts));
+  EXPECT_TRUE(prefix_res.empty());
+
+  // Subset mode cascades misses to POSIX storage and preserves input order.
+  LookupOptions subset_opts;
+  subset_opts.enable_global = false;
+  subset_opts.pin_found = false;
+  subset_opts.match_mode = LookupMatchMode::kSubset;
+  TF_ASSERT_OK_AND_ASSIGN(BlockSliceList subset_res,
+                       store_->Lookup(query, subset_opts));
+  ASSERT_EQ(subset_res.size(), 3);
+  EXPECT_EQ(subset_res[0].first, "storage_blk_1");
+  EXPECT_EQ(subset_res[0].second.status, BlockStatus::SHARED_STORAGE);
+  EXPECT_EQ(subset_res[1].first, "host_blk");
+  EXPECT_EQ(subset_res[1].second.status, BlockStatus::HOST);
+  EXPECT_EQ(subset_res[2].first, "storage_blk_2");
+  EXPECT_EQ(subset_res[2].second.status, BlockStatus::SHARED_STORAGE);
+
+  // Subset + host_resident_only skips the storage tier and excludes HBM-only.
+  {
+    auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+    auto* raw_backend = mock_backend.get();
+    EXPECT_CALL(
+        *raw_backend,
+        IncrementCounter(telemetry::metric_names::kStorageMetadataCheckTotal,
+                         ::testing::_, ::testing::_))
+        .Times(0);
+    telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+    LookupOptions host_subset = subset_opts;
+    host_subset.host_resident_only = true;
+    TF_ASSERT_OK_AND_ASSIGN(
+        BlockSliceList host_only_res,
+        store_->Lookup({"miss_0", "storage_blk_1", "host_blk", "hbm_only_blk"},
+                       host_subset));
+    ASSERT_EQ(host_only_res.size(), 1);
+    EXPECT_EQ(host_only_res[0].first, "host_blk");
+    EXPECT_EQ(host_only_res[0].second.status, BlockStatus::HOST);
+
+    // Empty block_hashes in kSubset mode snapshots host RAM without touching
+    // the storage tier.
+    TF_ASSERT_OK_AND_ASSIGN(BlockSliceList snapshot_res,
+                         store_->Lookup({}, subset_opts));
+    EXPECT_EQ(snapshot_res.size(), 2);
+  }
+
+  // Subset combined with enable_global=true must be rejected.
+  LookupOptions invalid_global = subset_opts;
+  invalid_global.enable_global = true;
+  EXPECT_EQ(store_->Lookup(query, invalid_global).status().code(),
+            absl::StatusCode::kInvalidArgument);
+}
+
+TEST_F(SecondaryBackendTopologyTest,
+       SubsetLookupPinRollbackIsAllOrNothingOnStorageError) {
+  class StatusReturningBackend final : public KVCacheStoreBackend {
+   public:
+    explicit StatusReturningBackend(absl::Status status)
+        : status_(std::move(status)) {}
+    void set_status(absl::Status status) { status_ = std::move(status); }
+    std::string name() const override { return "status_stub"; }
+    absl::StatusOr<BlockSliceList> Lookup(
+        absl::Span<const std::string> /*block_hashes*/,
+        const LookupOptions& /*options*/) override {
+      return status_;
+    }
+    bool Insert(absl::Span<const std::string> /*block_hashes*/,
+                absl::Span<const RaidenBlockId> /*slices*/,
+                InsertOption /*option*/) override {
+      return false;
+    }
+    size_t Delete(absl::Span<const std::string> /*block_hashes*/,
+                  const DeleteOptions& /*options*/) override {
+      return 0;
+    }
+    bool Pin(absl::Span<const std::string> /*block_hashes*/) override {
+      return false;
+    }
+    void Release(absl::Span<const std::string> /*block_hashes*/) override {}
+    int GetPinCount(const std::string& /*hash*/) const override { return 0; }
+    size_t GetCapacity() const override { return 0; }
+    size_t GetSize() const override { return 0; }
+    size_t GetAvailableSpace() const override { return 0; }
+
+   private:
+    absl::Status status_;
+  };
+
+  BackendConfig host_cfg;
+  host_cfg.type = "HostOffloadBackend";
+  host_cfg.capacity = 16;
+  const BackendConfig configs[] = {host_cfg};
+  const RaidenId rid{"rollback_job", "0", "kv", /*data_replica_idx=*/0};
+  TF_ASSERT_OK_AND_ASSIGN(
+      store_, KVCacheStore::Create(absl::MakeConstSpan(configs),
+                                   /*capacity=*/16,
+                                   /*global_registry_address=*/"", rid,
+                                   /*num_shards=*/1, /*shard_size_bytes=*/512,
+                                   /*store_server_ip=*/"127.0.0.1"));
+
+  auto stub_storage = std::make_shared<StatusReturningBackend>(
+      absl::InternalError("storage backend failure"));
+  KVCacheStoreTest::AddBackend(*store_, stub_storage);
+
+  ABSL_ASSERT_OK(store_->Insert(
+      {"host_blk"},
+      {RaidenBlockId{rid, /*host_block_id=*/0, BlockStatus::HOST}},
+      /*on_host=*/false));
+  store_->Release({"host_blk"});
+  ASSERT_EQ(store_->backend()->GetPinCount("host_blk"), 0);
+
+  LookupOptions pinned_subset;
+  pinned_subset.enable_global = false;
+  pinned_subset.pin_found = true;
+  pinned_subset.match_mode = LookupMatchMode::kSubset;
+
+  // Non-NotFound storage error must roll back all host RAM pins.
+  auto err_res = store_->Lookup({"miss_blk", "host_blk"}, pinned_subset);
+  EXPECT_EQ(err_res.status().code(), absl::StatusCode::kInternal);
+  EXPECT_EQ(store_->backend()->GetPinCount("host_blk"), 0);
+
+  // NotFound from storage when host RAM already matched returns the host hit
+  // and keeps its pin intact.
+  stub_storage->set_status(absl::NotFoundError("not in storage"));
+  TF_ASSERT_OK_AND_ASSIGN(BlockSliceList ok_res,
+                       store_->Lookup({"miss_blk", "host_blk"}, pinned_subset));
+  ASSERT_EQ(ok_res.size(), 1);
+  EXPECT_EQ(ok_res[0].first, "host_blk");
+  EXPECT_EQ(store_->backend()->GetPinCount("host_blk"), 1);
+  store_->Release({"host_blk"});
+  EXPECT_EQ(store_->backend()->GetPinCount("host_blk"), 0);
+}
 }  // namespace
 }  // namespace kv_cache
 }  // namespace tpu_raiden

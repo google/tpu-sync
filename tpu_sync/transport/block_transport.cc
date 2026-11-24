@@ -482,26 +482,26 @@ absl::Status BlockTransport::HandleIncomingPush(
 // ---------------------------------------------------------------------------
 // Peregrine receive path.
 // ---------------------------------------------------------------------------
-uint8_t* BlockTransport::ResolveRecvBuffer(const lib::PostMetadata& post,
-                                           const lib::RequestMetadata& req) {
+absl::Span<uint8_t> BlockTransport::ResolveRecvBuffer(
+    const lib::PostMetadata& post, const lib::RequestMetadata& req) {
   std::shared_ptr<BlockTransportServerPushSession> session =
       GetOrCreatePushSession(post.uuid);
-  absl::StatusOr<uint8_t* absl_nonnull> addr =
+  absl::StatusOr<absl::Span<uint8_t>> buf =
       session->ResolveRecvBuffer(post, req);
   if (session->IsDone()) {
     DeletePushSession(session);
   }
-  if (!addr.ok()) {
+  if (!buf.ok()) {
     LOG_EVERY_N_SEC(ERROR, 1)
         << "Peregrine request rejected: uuid=" << post.uuid
         << " remote=" << post.remote_id << " local_id=" << post.local_id
         << " shard_mask=" << post.shard_mask << " shard=" << req.shard
         << " block=" << req.block_id << " src_block=" << req.src_block_id
         << " chunk=" << req.chunk_idx << " len=" << req.len << ": "
-        << addr.status();
-    return nullptr;
+        << buf.status();
+    return {};
   }
-  return *addr;
+  return *buf;
 }
 
 absl::Status BlockTransport::OnRecvComplete(

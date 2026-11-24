@@ -606,12 +606,12 @@ absl::Status BlockTransportServerPushSession::AdmitPush(
   return admission_error;
 }
 
-absl::StatusOr<uint8_t* absl_nonnull>
+absl::StatusOr<absl::Span<uint8_t>>
 BlockTransportServerPushSession::ResolveRecvBuffer(
     const lib::PostMetadata& post, const lib::RequestMetadata& req) {
   ABSL_RETURN_IF_ERROR(AdmitPush(post));
-  absl::StatusOr<uint8_t* absl_nonnull> addr =
-      [&]() -> absl::StatusOr<uint8_t* absl_nonnull> {
+  absl::StatusOr<absl::Span<uint8_t>> buf =
+      [&]() -> absl::StatusOr<absl::Span<uint8_t>> {
     const bool is_block_major = config_.major_order == MajorOrder::kBlockMajor;
     const uint32_t major_dim_idx = post.local_id;
     // A request must address one of the shards its Post declared.
@@ -646,12 +646,13 @@ BlockTransportServerPushSession::ResolveRecvBuffer(
     }
     ABSL_RETURN_IF_ERROR(
         ValidateChunks(delegate_, layer_idx, req.shard, uuid_, chunks));
-    return chunks[req.chunk_idx].ptr;
+    return absl::MakeSpan(chunks[req.chunk_idx].ptr,
+                          chunks[req.chunk_idx].size);
   }();
-  if (!addr.ok()) {
-    RejectPost(post, addr.status());
+  if (!buf.ok()) {
+    RejectPost(post, buf.status());
   }
-  return addr;
+  return buf;
 }
 
 void BlockTransportServerPushSession::AwaitSettled(const PostLease& lease) {

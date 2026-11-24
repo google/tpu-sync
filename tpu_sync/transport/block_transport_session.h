@@ -134,10 +134,11 @@ class BlockTransportServerPushSession final
   absl::Status StartStream(int client_fd,
                            const lib::ChunkHeader& header) override;
 
-  // Receiver-side address of one incoming Peregrine request. Thread-safe across
-  // concurrent requests of the same or different Posts; admits each PostKey at
-  // most once and holds its TransferSession lease until OnPeregrinePostComplete.
-  absl::StatusOr<uint8_t* absl_nonnull> ResolveRecvBuffer(
+  // Receiver-side target buffer span of one incoming Peregrine request.
+  // Thread-safe across concurrent requests of the same or different Posts;
+  // admits each PostKey at most once and holds its TransferSession lease until
+  // OnPeregrinePostComplete.
+  absl::StatusOr<absl::Span<uint8_t>> ResolveRecvBuffer(
       const lib::PostMetadata& post, const lib::RequestMetadata& req);
 
   // Processes receiver-side completion of a Peregrine Post.

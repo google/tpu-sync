@@ -173,9 +173,9 @@ class BlockTransport final {
       absl::Span<const lib::RequestMetadata> requests,
       const absl::Status& post_status = absl::OkStatus());
 
-  // Receiver-side address resolution for incoming Peregrine request.
-  uint8_t* ResolveRecvBuffer(const lib::PostMetadata& post,
-                             const lib::RequestMetadata& req);
+  // Receiver-side target buffer resolution for incoming Peregrine request.
+  absl::Span<uint8_t> ResolveRecvBuffer(const lib::PostMetadata& post,
+                                        const lib::RequestMetadata& req);
 
   // Synchronously pushes a buffer identified by `buffer_id` to the remote
   // `peer`, by sending out a `kOpBufferPush ChunkHeader` followed by the data.

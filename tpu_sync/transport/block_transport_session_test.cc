@@ -311,7 +311,8 @@ TEST(BlockTransportServerPushSessionTest,
 
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> host, delegate.GetHostBuffer(1, 0));
   EXPECT_THAT(session->ResolveRecvBuffer(post, req),
-              IsOkAndHolds(host.data() + 3 * kSliceSize));
+              IsOkAndHolds(absl::MakeSpan(host.data() + 3 * kSliceSize,
+                                          kSliceSize)));
   EXPECT_THAT(delegate.last_src_block_id(), Eq(2));
   ABSL_EXPECT_OK(session->OnPeregrinePostComplete(post, {}, absl::OkStatus()));
   // Without a receive plan, completing one block does not retire the session,
@@ -322,7 +323,8 @@ TEST(BlockTransportServerPushSessionTest,
   lib::PostMetadata post2 = post;
   post2.local_id = 4;
   EXPECT_THAT(session->ResolveRecvBuffer(post2, req),
-              IsOkAndHolds(host.data() + 4 * kSliceSize));
+              IsOkAndHolds(absl::MakeSpan(host.data() + 4 * kSliceSize,
+                                          kSliceSize)));
   ABSL_EXPECT_OK(session->OnPeregrinePostComplete(post2, {}, absl::OkStatus()));
   EXPECT_FALSE(session->IsDone());
 
@@ -408,7 +410,8 @@ TEST(BlockTransportServerPushSessionTest,
 
   TF_ASSERT_OK_AND_ASSIGN(absl::Span<uint8_t> host, delegate.GetHostBuffer(1, 0));
   EXPECT_THAT(session->ResolveRecvBuffer(post, req),
-              IsOkAndHolds(host.data() + 3 * kSliceSize));
+              IsOkAndHolds(absl::MakeSpan(host.data() + 3 * kSliceSize,
+                                          kSliceSize)));
   ABSL_EXPECT_OK(session->OnPeregrinePostComplete(post, {}, absl::OkStatus()));
   EXPECT_THAT(transfer_session->unit_completed_calls, Eq(0));
   EXPECT_THAT(delegate.layers_received(), Eq(0));
@@ -416,6 +419,29 @@ TEST(BlockTransportServerPushSessionTest,
   EXPECT_EQ(delegate.received_block_shards()[0].block_ids, std::vector<int>{3});
   EXPECT_EQ(delegate.received_block_shards()[0].shard_ids, std::vector<int>{0});
   EXPECT_EQ(delegate.received_block_shards()[0].uuid, kUuid);
+}
+
+TEST(BlockTransportServerPushSessionTest, ResolveRecvBufferReturnsChunkSpan) {
+  MockSessionDelegate delegate(/*slice_size=*/1024, /*max_blocks=*/4);
+  BlockTransportConfig config;
+  auto session = std::make_shared<BlockTransportServerPushSession>(
+      /*uuid=*/0, &delegate, config);
+
+  const lib::PostMetadata post{.uuid = 0, .remote_id = 0, .local_id = 0};
+  const absl::StatusOr<absl::Span<uint8_t>> resolved =
+      session->ResolveRecvBuffer(
+          post, {.shard = 0, .block_id = 2, .chunk_idx = 0, .len = 1024});
+  ABSL_ASSERT_OK(resolved);
+  const absl::StatusOr<absl::Span<const uint8_t>> host_buf =
+      delegate.GetHostBuffer(0, 0);
+  ABSL_ASSERT_OK(host_buf);
+  EXPECT_EQ(resolved->data(), host_buf->data() + 2 * 1024);
+  EXPECT_EQ(resolved->size(), 1024);
+
+  EXPECT_THAT(
+      session->ResolveRecvBuffer(
+          post, {.shard = 0, .block_id = 2, .chunk_idx = 0, .len = 512}),
+      StatusIs(absl::StatusCode::kInvalidArgument));
 }
 TEST(BlockTransportServerPullSessionTest, InvalidArgumentsRejected) {
   MockSessionDelegate delegate;

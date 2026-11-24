@@ -3012,24 +3012,33 @@ TEST(PeregrineRecvCompleteTest, RejectsSenderSession) {
   EXPECT_EQ(delegate.layer_completion_count(), 0);
 }
 
+std::pair<uint8_t*, size_t> SpanPtrAndSize(absl::Span<uint8_t> span) {
+  return {span.data(), span.size()};
+}
+constexpr std::pair<uint8_t*, size_t> kNullSpan{nullptr, 0};
+
 TEST(PeregrineResolveRecvBufferTest, ResolvesBlockChunk) {
   MockDelegate delegate(/*slice_size=*/64, /*max_blocks=*/4, /*num_layers=*/2,
                         /*num_shards=*/2);
   BlockTransport transport(&delegate, 0);
   const lib::PostMetadata post{.uuid = 11, .remote_id = 1, .local_id = 1};
   // The default delegate resolves one chunk per block.
-  EXPECT_EQ(transport.ResolveRecvBuffer(post, {.shard = 1,
-                                               .block_id = 2,
-                                               .src_block_id = -1,
-                                               .chunk_idx = 0,
-                                               .len = 64}),
-            delegate.block_data(2, /*layer_idx=*/1, /*shard_idx=*/1));
-  EXPECT_EQ(transport.ResolveRecvBuffer(post, {.shard = 0,
-                                               .block_id = 3,
-                                               .src_block_id = 7,
-                                               .chunk_idx = 0,
-                                               .len = 64}),
-            delegate.block_data(3, /*layer_idx=*/1, /*shard_idx=*/0));
+  EXPECT_EQ(
+      SpanPtrAndSize(transport.ResolveRecvBuffer(post, {.shard = 1,
+                                                        .block_id = 2,
+                                                        .src_block_id = -1,
+                                                        .chunk_idx = 0,
+                                                        .len = 64})),
+      std::make_pair(delegate.block_data(2, /*layer_idx=*/1, /*shard_idx=*/1),
+                     size_t{64}));
+  EXPECT_EQ(
+      SpanPtrAndSize(transport.ResolveRecvBuffer(post, {.shard = 0,
+                                                        .block_id = 3,
+                                                        .src_block_id = 7,
+                                                        .chunk_idx = 0,
+                                                        .len = 64})),
+      std::make_pair(delegate.block_data(3, /*layer_idx=*/1, /*shard_idx=*/0),
+                     size_t{64}));
 }
 
 TEST(PeregrineResolveRecvBufferTest, ResolvesChunksOfSplitBlock) {
@@ -3039,26 +3048,26 @@ TEST(PeregrineResolveRecvBufferTest, ResolvesChunksOfSplitBlock) {
   BlockTransport transport(&delegate, 0);
   const lib::PostMetadata post{.uuid = 11, .remote_id = 1, .local_id = 0};
   uint8_t* base = delegate.data() + 2 * 128;
-  EXPECT_EQ(transport.ResolveRecvBuffer(
-                post, {.shard = 0, .block_id = 2, .chunk_idx = 0, .len = 32}),
-            base);
-  EXPECT_EQ(transport.ResolveRecvBuffer(
-                post, {.shard = 0, .block_id = 2, .chunk_idx = 1, .len = 32}),
-            base + 64);
+  EXPECT_EQ(SpanPtrAndSize(transport.ResolveRecvBuffer(
+                post, {.shard = 0, .block_id = 2, .chunk_idx = 0, .len = 32})),
+            std::make_pair(base, size_t{32}));
+  EXPECT_EQ(SpanPtrAndSize(transport.ResolveRecvBuffer(
+                post, {.shard = 0, .block_id = 2, .chunk_idx = 1, .len = 32})),
+            std::make_pair(base + 64, size_t{32}));
   // Past the chunk list; longer than the chunk; block with no chunks.
-  EXPECT_EQ(transport.ResolveRecvBuffer(
-                post, {.shard = 0, .block_id = 2, .chunk_idx = 2, .len = 32}),
-            nullptr);
-  EXPECT_EQ(transport.ResolveRecvBuffer(
-                post, {.shard = 0, .block_id = 2, .chunk_idx = 1, .len = 33}),
-            nullptr);
-  EXPECT_EQ(transport.ResolveRecvBuffer(
-                post, {.shard = 0, .block_id = 4, .chunk_idx = 0, .len = 32}),
-            nullptr);
+  EXPECT_EQ(SpanPtrAndSize(transport.ResolveRecvBuffer(
+                post, {.shard = 0, .block_id = 2, .chunk_idx = 2, .len = 32})),
+            kNullSpan);
+  EXPECT_EQ(SpanPtrAndSize(transport.ResolveRecvBuffer(
+                post, {.shard = 0, .block_id = 2, .chunk_idx = 1, .len = 33})),
+            kNullSpan);
+  EXPECT_EQ(SpanPtrAndSize(transport.ResolveRecvBuffer(
+                post, {.shard = 0, .block_id = 4, .chunk_idx = 0, .len = 32})),
+            kNullSpan);
   // A chunk list that runs past the array fails ValidateChunks.
-  EXPECT_EQ(transport.ResolveRecvBuffer(
-                post, {.shard = 0, .block_id = 3, .chunk_idx = 0, .len = 32}),
-            nullptr);
+  EXPECT_EQ(SpanPtrAndSize(transport.ResolveRecvBuffer(
+                post, {.shard = 0, .block_id = 3, .chunk_idx = 0, .len = 32})),
+            kNullSpan);
 }
 
 TEST(PeregrineResolveRecvBufferTest, RejectsOutOfRangeRequests) {
@@ -3069,47 +3078,47 @@ TEST(PeregrineResolveRecvBufferTest, RejectsOutOfRangeRequests) {
     MockDelegate delegate(/*slice_size=*/64, /*max_blocks=*/4,
                           /*num_layers=*/2, /*num_shards=*/2);
     BlockTransport transport(&delegate, 0);
-    return transport.ResolveRecvBuffer(p, req);
+    return SpanPtrAndSize(transport.ResolveRecvBuffer(p, req));
   };
-  EXPECT_NE(resolve(post, {.shard = 0, .block_id = 0, .len = 64}), nullptr);
+  EXPECT_NE(resolve(post, {.shard = 0, .block_id = 0, .len = 64}), kNullSpan);
 
   // Block array (from the Post) out of range, including the all-layer
   // sentinel.
   EXPECT_EQ(
       resolve(lib::PostMetadata{.uuid = 11, .remote_id = 1, .local_id = 2},
               {.shard = 0, .block_id = 0, .len = 64}),
-      nullptr);
+      kNullSpan);
   EXPECT_EQ(resolve(
                 lib::PostMetadata{
                     .uuid = 11, .remote_id = 1, .local_id = 0xFFFF'FFFF},
                 {.shard = 0, .block_id = 0, .len = 64}),
-            nullptr);
+            kNullSpan);
   // The sentinel is refused even when it would expand to exactly one array.
   MockDelegate one_array(/*slice_size=*/64, /*max_blocks=*/4, /*num_layers=*/1,
                          /*num_shards=*/2);
   BlockTransport one_array_transport(&one_array, 0);
-  EXPECT_EQ(one_array_transport.ResolveRecvBuffer(
+  EXPECT_EQ(SpanPtrAndSize(one_array_transport.ResolveRecvBuffer(
                 lib::PostMetadata{
                     .uuid = 11, .remote_id = 1, .local_id = 0xFFFF'FFFF},
-                {.shard = 0, .block_id = 0, .len = 64}),
-            nullptr);
-  EXPECT_NE(one_array_transport.ResolveRecvBuffer(
+                {.shard = 0, .block_id = 0, .len = 64})),
+            kNullSpan);
+  EXPECT_NE(SpanPtrAndSize(one_array_transport.ResolveRecvBuffer(
                 lib::PostMetadata{.uuid = 11, .remote_id = 1, .local_id = 0},
-                {.shard = 0, .block_id = 0, .len = 64}),
-            nullptr);
+                {.shard = 0, .block_id = 0, .len = 64})),
+            kNullSpan);
   // Shard mask addressing a shard the receiver does not have; a request
   // whose shard is outside its Post's mask (mask 0 is every shard).
   EXPECT_EQ(resolve(
                 lib::PostMetadata{
                     .uuid = 11, .remote_id = 1, .local_id = 0, .shard_mask = 4},
                 {.shard = 0, .block_id = 0, .len = 64}),
-            nullptr);
+            kNullSpan);
   const lib::PostMetadata shard0_only{
       .uuid = 11, .remote_id = 1, .local_id = 0, .shard_mask = 1};
   EXPECT_NE(resolve(shard0_only, {.shard = 0, .block_id = 0, .len = 64}),
-            nullptr);
+            kNullSpan);
   EXPECT_EQ(resolve(shard0_only, {.shard = 1, .block_id = 0, .len = 64}),
-            nullptr);
+            kNullSpan);
 }
 
 TEST(PeregrineResolveRecvBufferTest, AppliesIncomingPushAdmissionChecks) {
@@ -3117,24 +3126,25 @@ TEST(PeregrineResolveRecvBufferTest, AppliesIncomingPushAdmissionChecks) {
   // Pool-mode worker: a push whose uuid has no registered plan is refused.
   PlanRequiringDelegate pool_mode(/*slice_size=*/64, /*max_blocks=*/4);
   BlockTransport pool_transport(&pool_mode, 0);
-  EXPECT_EQ(pool_transport.ResolveRecvBuffer(
+  EXPECT_EQ(SpanPtrAndSize(pool_transport.ResolveRecvBuffer(
                 lib::PostMetadata{.uuid = 11, .remote_id = 1, .local_id = 0},
-                {.shard = 0, .block_id = 0, .len = 64}),
-            nullptr);
+                {.shard = 0, .block_id = 0, .len = 64})),
+            kNullSpan);
 
   // Plan-keyed uuid: only the pools in the plan's transfer set are writable.
   MockDelegate delegate(/*slice_size=*/64, /*max_blocks=*/4, /*num_layers=*/2);
   delegate.SetPoolPushProgress(/*uuid=*/12, /*expected_pushes_per_pool=*/1,
                                /*transfer_pool_indices=*/{1});
   BlockTransport transport(&delegate, 0);
-  EXPECT_EQ(transport.ResolveRecvBuffer(
-                lib::PostMetadata{.uuid = 12, .remote_id = 1, .local_id = 1},
-                {.shard = 0, .block_id = 0, .len = 64}),
-            delegate.block_data(0, /*layer_idx=*/1));
-  EXPECT_EQ(transport.ResolveRecvBuffer(
+  EXPECT_EQ(
+      SpanPtrAndSize(transport.ResolveRecvBuffer(
+          lib::PostMetadata{.uuid = 12, .remote_id = 1, .local_id = 1},
+          {.shard = 0, .block_id = 0, .len = 64})),
+      std::make_pair(delegate.block_data(0, /*layer_idx=*/1), size_t{64}));
+  EXPECT_EQ(SpanPtrAndSize(transport.ResolveRecvBuffer(
                 lib::PostMetadata{.uuid = 12, .remote_id = 1, .local_id = 0},
-                {.shard = 0, .block_id = 0, .len = 64}),
-            nullptr);
+                {.shard = 0, .block_id = 0, .len = 64})),
+            kNullSpan);
 }
 
 // The transfer session's in-flight op is held from a Post's first resolved
@@ -3147,20 +3157,20 @@ TEST(PeregrineResolveRecvBufferLeaseTest, HeldFromFirstRequestToCompletion) {
   BlockTransport transport(&delegate, 0);
   const lib::PostMetadata post{.uuid = 31, .remote_id = 1, .local_id = 0};
 
-  EXPECT_NE(transport.ResolveRecvBuffer(
-                post, {.shard = 0, .block_id = 0, .chunk_idx = 0, .len = 64}),
-            nullptr);
+  EXPECT_NE(SpanPtrAndSize(transport.ResolveRecvBuffer(
+                post, {.shard = 0, .block_id = 0, .chunk_idx = 0, .len = 64})),
+            kNullSpan);
   EXPECT_EQ(session->in_flight(), 1);
   // Further requests of the same Post reuse the op.
-  EXPECT_NE(transport.ResolveRecvBuffer(
-                post, {.shard = 1, .block_id = 2, .chunk_idx = 0, .len = 64}),
-            nullptr);
+  EXPECT_NE(SpanPtrAndSize(transport.ResolveRecvBuffer(
+                post, {.shard = 1, .block_id = 2, .chunk_idx = 0, .len = 64})),
+            kNullSpan);
   EXPECT_EQ(session->in_flight(), 1);
   // A different Post of the same uuid (the other layer) takes its own op.
   const lib::PostMetadata other{.uuid = 31, .remote_id = 1, .local_id = 1};
-  EXPECT_NE(transport.ResolveRecvBuffer(
-                other, {.shard = 0, .block_id = 1, .chunk_idx = 0, .len = 64}),
-            nullptr);
+  EXPECT_NE(SpanPtrAndSize(transport.ResolveRecvBuffer(
+                other, {.shard = 0, .block_id = 1, .chunk_idx = 0, .len = 64})),
+            kNullSpan);
   EXPECT_EQ(session->in_flight(), 2);
 
   // Completion releases exactly that Post's op (once per Post, not per
@@ -3191,12 +3201,12 @@ TEST(PeregrineResolveRecvBufferLeaseTest, ConcurrentRequestsAdmitOnce) {
 
   constexpr int kThreads = 16;
   std::vector<std::thread> threads;
-  std::vector<uint8_t*> addrs(kThreads, nullptr);
+  std::vector<absl::Span<uint8_t>> bufs(kThreads);
   absl::Notification go;
   for (int i = 0; i < kThreads; ++i) {
     threads.emplace_back([&, i]() {
       go.WaitForNotification();
-      addrs[i] = transport.ResolveRecvBuffer(
+      bufs[i] = transport.ResolveRecvBuffer(
           post, {.shard = static_cast<uint32_t>(i % 4),
                  .block_id = i % 4,
                  .chunk_idx = 0,
@@ -3207,8 +3217,10 @@ TEST(PeregrineResolveRecvBufferLeaseTest, ConcurrentRequestsAdmitOnce) {
   for (std::thread& t : threads) t.join();
 
   for (int i = 0; i < kThreads; ++i) {
-    EXPECT_EQ(addrs[i], delegate.block_data(i % 4, /*layer_idx=*/0,
-                                            /*shard_idx=*/i % 4))
+    EXPECT_EQ(SpanPtrAndSize(bufs[i]),
+              std::make_pair(delegate.block_data(i % 4, /*layer_idx=*/0,
+                                                 /*shard_idx=*/i % 4),
+                             size_t{64}))
         << "request " << i;
   }
   EXPECT_EQ(session->in_flight(), 1);
@@ -3223,22 +3235,22 @@ TEST(PeregrineResolveRecvBufferLeaseTest, ReleasedWhenARequestIsRefused) {
   BlockTransport transport(&delegate, 0);
   const lib::PostMetadata post{.uuid = 32, .remote_id = 1, .local_id = 0};
 
-  EXPECT_NE(transport.ResolveRecvBuffer(
-                post, {.shard = 0, .block_id = 0, .chunk_idx = 0, .len = 64}),
-            nullptr);
+  EXPECT_NE(SpanPtrAndSize(transport.ResolveRecvBuffer(
+                post, {.shard = 0, .block_id = 0, .chunk_idx = 0, .len = 64})),
+            kNullSpan);
   EXPECT_EQ(session->in_flight(), 1);
   // A bad request of an admitted Post: Peregrine drops the whole Post and
   // will never complete it, so the op is released now and the session fails.
-  EXPECT_EQ(transport.ResolveRecvBuffer(
-                post, {.shard = 0, .block_id = 9, .chunk_idx = 0, .len = 64}),
-            nullptr);
+  EXPECT_EQ(SpanPtrAndSize(transport.ResolveRecvBuffer(
+                post, {.shard = 0, .block_id = 9, .chunk_idx = 0, .len = 64})),
+            kNullSpan);
   EXPECT_EQ(session->in_flight(), 0);
   EXPECT_FALSE(session->GetStatus().ok());
   // Later requests of the refused Post re-run the gates, which the failed
   // transfer session refuses; a completion of it is not counted as a landing.
-  EXPECT_EQ(transport.ResolveRecvBuffer(
-                post, {.shard = 0, .block_id = 0, .chunk_idx = 0, .len = 64}),
-            nullptr);
+  EXPECT_EQ(SpanPtrAndSize(transport.ResolveRecvBuffer(
+                post, {.shard = 0, .block_id = 0, .chunk_idx = 0, .len = 64})),
+            kNullSpan);
   EXPECT_EQ(session->in_flight(), 0);
   EXPECT_THAT(transport.OnRecvComplete(post, {}),
               StatusIs(absl::StatusCode::kCancelled));
@@ -3247,22 +3259,24 @@ TEST(PeregrineResolveRecvBufferLeaseTest, ReleasedWhenARequestIsRefused) {
   // uuid 0 has no transfer session to fail: a refused Post must not poison
   // the next push of the same layer.
   const lib::PostMetadata legacy{.uuid = 0, .remote_id = 1, .local_id = 0};
-  EXPECT_EQ(transport.ResolveRecvBuffer(
-                legacy, {.shard = 0, .block_id = 9, .chunk_idx = 0, .len = 64}),
-            nullptr);
-  EXPECT_NE(transport.ResolveRecvBuffer(
-                legacy, {.shard = 0, .block_id = 0, .chunk_idx = 0, .len = 64}),
-            nullptr);
+  EXPECT_EQ(
+      SpanPtrAndSize(transport.ResolveRecvBuffer(
+          legacy, {.shard = 0, .block_id = 9, .chunk_idx = 0, .len = 64})),
+      kNullSpan);
+  EXPECT_NE(
+      SpanPtrAndSize(transport.ResolveRecvBuffer(
+          legacy, {.shard = 0, .block_id = 0, .chunk_idx = 0, .len = 64})),
+      kNullSpan);
 
   // Mid-Post transport failure reported through OnRecvComplete releases the
   // held op and fails the transfer session.
   auto dropped_session = std::make_shared<StubReceiveSession>();
   delegate.RegisterSession(37, dropped_session);
   const lib::PostMetadata dropped{.uuid = 37, .remote_id = 1, .local_id = 0};
-  EXPECT_NE(transport.ResolveRecvBuffer(
-                dropped,
-                {.shard = 0, .block_id = 0, .chunk_idx = 0, .len = 64}),
-            nullptr);
+  EXPECT_NE(
+      SpanPtrAndSize(transport.ResolveRecvBuffer(
+          dropped, {.shard = 0, .block_id = 0, .chunk_idx = 0, .len = 64})),
+      kNullSpan);
   EXPECT_EQ(dropped_session->in_flight(), 1);
   EXPECT_THAT(transport.OnRecvComplete(
                   dropped, /*requests=*/{},
@@ -3279,10 +3293,10 @@ TEST(PeregrineResolveRecvBufferLeaseTest, NotTakenWhenSessionIsDraining) {
   session->Finish(absl::CancelledError("draining"));
   delegate.RegisterSession(33, session);
   BlockTransport transport(&delegate, 0);
-  EXPECT_EQ(transport.ResolveRecvBuffer(
+  EXPECT_EQ(SpanPtrAndSize(transport.ResolveRecvBuffer(
                 {.uuid = 33, .remote_id = 1, .local_id = 0},
-                {.shard = 0, .block_id = 0, .chunk_idx = 0, .len = 64}),
-            nullptr);
+                {.shard = 0, .block_id = 0, .chunk_idx = 0, .len = 64})),
+            kNullSpan);
   EXPECT_EQ(session->in_flight(), 0);
 }
 
@@ -3291,10 +3305,10 @@ TEST(PeregrineResolveRecvBufferLeaseTest, ReleasedByForgetPushProgress) {
   auto session = std::make_shared<StubReceiveSession>();
   delegate.RegisterSession(34, session);
   BlockTransport transport(&delegate, 0);
-  EXPECT_NE(transport.ResolveRecvBuffer(
+  EXPECT_NE(SpanPtrAndSize(transport.ResolveRecvBuffer(
                 {.uuid = 34, .remote_id = 1, .local_id = 0},
-                {.shard = 0, .block_id = 0, .chunk_idx = 0, .len = 64}),
-            nullptr);
+                {.shard = 0, .block_id = 0, .chunk_idx = 0, .len = 64})),
+            kNullSpan);
   EXPECT_EQ(session->in_flight(), 1);
   // The transfer is torn down (failure / timeout) with the Post in flight.
   transport.ForgetPushProgress(34);
@@ -3330,9 +3344,9 @@ TEST(PeregrineResolveRecvBufferLeaseTest,
   delegate.RegisterSession(36, other);
   const lib::PostMetadata admitted{.uuid = 36, .remote_id = 1, .local_id = 0};
   EXPECT_NE(
-      transport.ResolveRecvBuffer(
-          admitted, {.shard = 0, .block_id = 0, .chunk_idx = 0, .len = 64}),
-      nullptr);
+      SpanPtrAndSize(transport.ResolveRecvBuffer(
+          admitted, {.shard = 0, .block_id = 0, .chunk_idx = 0, .len = 64})),
+      kNullSpan);
   ABSL_EXPECT_OK(transport.OnRecvComplete(
       {.uuid = 36, .remote_id = 2, .local_id = 0}, /*requests=*/{}));
   EXPECT_EQ(other->in_flight(), 1);

@@ -186,3 +186,22 @@ py_grpc_library(
     visibility = ["//visibility:public"],
     deps = [":control_pipe_py_pb2"],
 )
+
+proto_library(
+    name = "grpc_transport_service_proto",
+    srcs = ["grpc_transport_service.proto"],
+    deps = ["//tpu_sync/rpc:weight_transfer_common_proto"],
+)
+
+cc_proto_library(
+    name = "grpc_transport_service_cc_proto",
+    visibility = ["//visibility:public"],
+    deps = [":grpc_transport_service_proto"],
+)
+
+cc_grpc_library(
+    name = "grpc_transport_service_cc_grpc",
+    srcs = [":grpc_transport_service_proto"],
+    visibility = ["//visibility:public"],
+    deps = [":grpc_transport_service_cc_proto"],
+)

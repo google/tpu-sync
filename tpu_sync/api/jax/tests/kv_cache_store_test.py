@@ -410,7 +410,7 @@ class KVCacheStoreTest(absltest.TestCase):
     self.assertEqual(res[0][0], b"shared_hash")
     self.assertEqual(res[0][1].raiden_id.job_name, "local_job")
     self.assertEqual(res[0][1].raiden_id.data_replica_idx, 1)
-    mock_impl.lookup.assert_called_with([b"shared_hash"], True, True)
+    mock_impl.lookup.assert_called_with([b"shared_hash"], True, True, False)
 
     # Case 3: No local hit, only global hits.
     remote_id1 = kv_cache_store._impl.RaidenBlockId(
@@ -438,7 +438,9 @@ class KVCacheStoreTest(absltest.TestCase):
     self.assertEqual(res[1][1].raiden_id.job_name, "job2")
     self.assertEqual(res[1][1].host_block_id, 43)
     self.assertEqual(res[1][1].status, kv_cache_store.BlockStatus.REMOTE)
-    mock_impl.lookup.assert_called_with([b"global_1", b"global_2"], True, True)
+    mock_impl.lookup.assert_called_with(
+        [b"global_1", b"global_2"], True, True, False
+    )
 
   def test_global_lookup_error_ignored(self):
     # Construction requires a registry that is actually reachable
@@ -1270,6 +1272,79 @@ class KVCacheStoreLoadWithSlicesTest(absltest.TestCase):
     mock_impl.reset_mock()
     self.assertTrue(store.load(hashes, device_block_ids))
     mock_impl.load.assert_called_with(hashes, device_block_ids)
+
+
+class KVCacheStoreHostResidentOnlyLookupTest(absltest.TestCase):
+
+  def _make_store(self):
+    return kv_cache_store.KVCacheStore(
+        capacity=20, num_shards=1, store_server_ip="127.0.0.1"
+    )
+
+  def test_host_resident_only_matches_host_and_excludes_hbm_only(self):
+    store = self._make_store()
+    rid = store.raiden_id
+    self.assertTrue(
+        store.insert(
+            [b"host_blk", b"host_hbm_blk", b"hbm_only_blk"],
+            [
+                kv_cache_store.RaidenBlockId(
+                    rid, 0, kv_cache_store.BlockStatus.HOST
+                ),
+                kv_cache_store.RaidenBlockId(
+                    rid, 1, kv_cache_store.BlockStatus.HOST_AND_HBM, 1
+                ),
+                kv_cache_store.RaidenBlockId(
+                    rid, -1, kv_cache_store.BlockStatus.HBM, 2
+                ),
+            ],
+            on_host=False,
+        )
+    )
+
+    # Default lookup (host_resident_only=False) sees all three entries.
+    all_res = store.lookup(
+        [b"host_blk", b"host_hbm_blk", b"hbm_only_blk"],
+        enable_global=False,
+        pin_found=False,
+    )
+    self.assertEqual(
+        [h for h, _ in all_res], [b"host_blk", b"host_hbm_blk", b"hbm_only_blk"]
+    )
+
+    # host_resident_only=True stops before the HBM-only entry and returns only
+    # HOST / HOST_AND_HBM blocks.
+    host_res = store.lookup(
+        [b"host_blk", b"host_hbm_blk", b"hbm_only_blk"],
+        enable_global=False,
+        pin_found=False,
+        host_resident_only=True,
+    )
+    self.assertEqual([h for h, _ in host_res], [b"host_blk", b"host_hbm_blk"])
+    self.assertEqual(host_res[0][1].status, kv_cache_store.BlockStatus.HOST)
+    self.assertEqual(
+        host_res[1][1].status, kv_cache_store.BlockStatus.HOST_AND_HBM
+    )
+
+    # HBM-only block alone misses under host_resident_only=True.
+    self.assertEmpty(
+        store.lookup(
+            [b"hbm_only_blk"],
+            enable_global=False,
+            pin_found=False,
+            host_resident_only=True,
+        )
+    )
+
+  def test_host_resident_only_rejects_enable_global(self):
+    store = self._make_store()
+    with self.assertRaisesRegex(RuntimeError, "host_resident_only"):
+      store.lookup(
+          [b"any_blk"],
+          enable_global=True,
+          pin_found=False,
+          host_resident_only=True,
+      )
 
 
 if __name__ == "__main__":

@@ -238,6 +238,7 @@ class KVCacheStore:
       block_hashes: list[bytes],
       enable_global: bool = False,
       pin_found: bool = True,
+      host_resident_only: bool = False,
   ) -> list[tuple[bytes, RaidenBlockId]]:
     """Checks the LRU directory for cached block hashes.
 
@@ -266,10 +267,14 @@ class KVCacheStore:
 
     Args:
       block_hashes: Incoming block hashes to check.
-      enable_global: Whether to fallback to global registry on miss. Defaults
-        to False; the fallback is a blocking RPC.
-      pin_found: Whether to pin every local hit. Defaults to True. Pass False
-        to observe residency without acquiring anything.
+      enable_global: Whether to fallback to global registry on miss. Defaults to
+        False; the fallback is a blocking RPC.
+      pin_found: Whether to pin every local hit. Defaults to True. Pass False to
+        observe residency without acquiring anything.
+      host_resident_only: Whether to match only blocks physically resident in
+        local host DRAM (HOST / HOST_AND_HBM), excluding HBM-only entries and
+        skipping secondary storage tiers. Cannot be combined with
+        enable_global=True. Defaults to False.
 
     Returns:
       A list of tuples containing the block hash and the matching
@@ -277,9 +282,12 @@ class KVCacheStore:
 
     Raises:
       RuntimeError: if the underlying lookup failed outright (a backend
-        error, not a cache miss).
+        error, or an invalid option combination such as
+        host_resident_only=True with enable_global=True).
     """
-    raw_res = self._impl.lookup(block_hashes, enable_global, pin_found)
+    raw_res = self._impl.lookup(
+        block_hashes, enable_global, pin_found, host_resident_only
+    )
     final_res = []
     for hash_val, raw_slice in raw_res:
       final_res.append((hash_val, RaidenBlockId(impl=raw_slice)))

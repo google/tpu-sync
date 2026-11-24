@@ -9453,6 +9453,80 @@ TEST_F(SecondaryBackendTopologyTest,
   TF_ASSERT_OK_AND_ASSIGN(BlockSliceList result, store_->Lookup({"missing"}));
   EXPECT_TRUE(result.empty());
 }
+
+TEST_F(SecondaryBackendTopologyTest,
+       HostResidentOnlyLookupSkipsSecondaryPosixBackendAndExcludesHbmOnly) {
+  // LookupOptions::host_resident_only must check only host RAM (never probing
+  // the storage tier), match only HOST/HOST_AND_HBM entries, exclude HBM-only
+  // entries, and reject enable_global=true.
+  BackendConfig host_cfg;
+  host_cfg.type = "HostOffloadBackend";
+  host_cfg.capacity = 16;
+  BackendConfig posix_cfg = PosixConfig();
+  posix_cfg.parallelism.tp_size = 1;
+  const BackendConfig configs[] = {host_cfg, posix_cfg};
+
+  const RaidenId rid{"host_only_job", "0", "kv", /*data_replica_idx=*/0};
+  TF_ASSERT_OK_AND_ASSIGN(
+      store_, KVCacheStore::Create(absl::MakeConstSpan(configs),
+                                   /*capacity=*/16,
+                                   /*global_registry_address=*/"", rid,
+                                   /*num_shards=*/1, /*shard_size_bytes=*/512,
+                                   /*store_server_ip=*/"127.0.0.1"));
+  ASSERT_EQ(store_->backends().size(), 2);
+
+  // Insert one HOST block, one HOST_AND_HBM block, and one HBM-only block.
+  ABSL_ASSERT_OK(store_->Insert(
+      {"host_blk", "host_hbm_blk", "hbm_only_blk"},
+      {RaidenBlockId{rid, /*host_block_id=*/0, BlockStatus::HOST},
+       RaidenBlockId{rid, /*host_block_id=*/1, /*device_block_id=*/1,
+                     BlockStatus::HOST_AND_HBM},
+       RaidenBlockId{rid, /*host_block_id=*/-1, /*device_block_id=*/2,
+                     BlockStatus::HBM}},
+      /*on_host=*/false));
+
+  // Verify host_resident_only=true never triggers storage tier metadata checks
+  // even on misses or past an HBM-only entry.
+  auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+  auto* raw_backend = mock_backend.get();
+  EXPECT_CALL(
+      *raw_backend,
+      IncrementCounter(telemetry::metric_names::kStorageMetadataCheckTotal,
+                       ::testing::_, ::testing::_))
+      .Times(0);
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+  LookupOptions host_only;
+  host_only.enable_global = false;
+  host_only.pin_found = false;
+  host_only.host_resident_only = true;
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      BlockSliceList matched,
+      store_->Lookup({"host_blk", "host_hbm_blk", "hbm_only_blk", "missing"},
+                     host_only));
+  ASSERT_EQ(matched.size(), 2);
+  EXPECT_EQ(matched[0].first, "host_blk");
+  EXPECT_EQ(matched[0].second.status, BlockStatus::HOST);
+  EXPECT_EQ(matched[1].first, "host_hbm_blk");
+  EXPECT_EQ(matched[1].second.status, BlockStatus::HOST_AND_HBM);
+
+  // HBM-only alone must miss under host_resident_only=true.
+  TF_ASSERT_OK_AND_ASSIGN(BlockSliceList hbm_miss,
+                       store_->Lookup({"hbm_only_blk"}, host_only));
+  EXPECT_TRUE(hbm_miss.empty());
+
+  // Cold miss must also skip the storage tier.
+  TF_ASSERT_OK_AND_ASSIGN(BlockSliceList cold_miss,
+                       store_->Lookup({"missing"}, host_only));
+  EXPECT_TRUE(cold_miss.empty());
+
+  // host_resident_only=true combined with enable_global=true must be rejected.
+  LookupOptions invalid = host_only;
+  invalid.enable_global = true;
+  EXPECT_EQ(store_->Lookup({"host_blk"}, invalid).status().code(),
+            absl::StatusCode::kInvalidArgument);
+}
 }  // namespace
 }  // namespace kv_cache
 }  // namespace tpu_raiden

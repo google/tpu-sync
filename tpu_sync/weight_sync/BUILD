@@ -131,6 +131,38 @@ cc_test(
 )
 
 cc_library(
+    name = "versioned_receives",
+    srcs = ["versioned_receives.cc"],
+    hdrs = ["versioned_receives.h"],
+    deps = [
+        ":weight_version",
+        "//tpu_sync/rpc:raiden_service_cc_proto",
+        "@com_google_absl//absl/container:btree",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/time",
+    ],
+)
+
+cc_test(
+    name = "versioned_receives_test",
+    srcs = ["versioned_receives_test.cc"],
+    tags = ["no_oss"],
+    deps = [
+        ":versioned_receives",
+        ":weight_version",
+        "//tpu_sync/rpc:raiden_service_cc_proto",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/time",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "weight_synchronizer_base",
     srcs = [
         "weight_synchronizer_base.cc",

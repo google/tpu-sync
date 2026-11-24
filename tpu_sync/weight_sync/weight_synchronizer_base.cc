@@ -74,6 +74,7 @@
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/transport/buffer_push_task.h"
+#include "tpu_sync/weight_sync/shard_push_entry.h"
 #include "tpu_sync/weight_sync/tiling_utils.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_listener.h"
 
@@ -1673,7 +1674,8 @@ WeightSynchronizerBase::BuildLayerPushTasks(
     const tpu_sync::rpc::ShardPushScheduleProto& schedule =
         shard_schedule.schedule;
 
-    for (const auto& entry : schedule.entries()) {
+    for (int e_idx = 0; e_idx < schedule.entries_size(); ++e_idx) {
+      const tpu_sync::rpc::ShardPushEntryProto& entry = schedule.entries(e_idx);
       int layer_idx_to_use = -1;
       if (entry.has_layer_idx()) {
         layer_idx_to_use = entry.layer_idx();
@@ -1693,89 +1695,54 @@ WeightSynchronizerBase::BuildLayerPushTasks(
         return absl::InternalError(
             "Host pointer is null during resharded push");
       }
-      size_t shard_host_size = layers_[layer_idx_to_use].shards[i].host_size;
+      const size_t shard_host_size =
+          layers_[layer_idx_to_use].shards[i].host_size;
+      const size_t shard_device_size =
+          layers_[layer_idx_to_use].shards[i].device_size;
+      const std::string entry_ctx =
+          absl::StrCat("BuildLayerPushTasks (uuid=", request.uuid(), ") shard ",
+                       i, " entry[", e_idx, "]");
+      // For PRE_TILED relays, ShardPushEntry::FromProto() forces count=1,
+      // src_offset=dst_offset=0, and size=shard_device_size so the whole
+      // device-layout shard (including any tiling padding) is sent verbatim.
+      ABSL_ASSIGN_OR_RETURN(
+          const ShardPushEntry push_entry,
+          ShardPushEntry::FromProto(entry, entry_ctx,
+                                    {.pre_tiled = pre_tiled,
+                                     .device_size = shard_device_size,
+                                     .host_size = shard_host_size}));
 
       const std::vector<std::string> peers = PushEntryPeers(entry);
-      size_t dst_shard_idx = entry.dst_shard_idx();
-      size_t count = entry.count() > 0 ? entry.count() : 1;
-      size_t src_stride = entry.src_stride_bytes();
-      size_t dst_stride = entry.dst_stride_bytes();
-      size_t dst_offset = entry.dst_offset_bytes();
-      size_t src_offset = entry.src_offset_bytes();
-      size_t size = entry.size_bytes();
-      if (pre_tiled) {
-        // The host buffer holds device-layout bytes and the receiver has the
-        // same sharding, so relay exactly what H2D copies: the whole shard,
-        // including any tiling padding past the logical span.
-        if (entry.outer_counts_size() != 0) {
-          return absl::InvalidArgumentError(
-              "HOST_TILING_MODE_PRE_TILED entries must not be strided");
-        }
-        count = 1;
-        src_offset = dst_offset = 0;
-        size = layers_[layer_idx_to_use].shards[i].device_size;
-      }
-
-      const size_t effective_src_stride = src_stride > 0 ? src_stride : size;
-      const size_t effective_dst_stride = dst_stride > 0 ? dst_stride : size;
-      const bool is_inner_contiguous =
-          (count == 1) ||
-          (effective_src_stride == size && effective_dst_stride == size);
-
-      if (!is_inner_contiguous && effective_src_stride < size) {
-        return absl::InvalidArgumentError(
-            "Source stride cannot be smaller than slice size");
-      }
-
-      const int num_outer_dims = entry.outer_counts_size();
-      if (entry.outer_src_strides_bytes_size() != num_outer_dims ||
-          entry.outer_dst_strides_bytes_size() != num_outer_dims) {
-        return absl::InvalidArgumentError(
-            "Mismatched outer_counts, outer_src_strides_bytes, and "
-            "outer_dst_strides_bytes sizes in ShardPushEntryProto");
-      }
-
-      size_t num_outer = 1;
-      for (int d = 0; d < num_outer_dims; ++d) {
-        if (entry.outer_counts(d) <= 0) {
-          return absl::InvalidArgumentError(
-              "outer_counts entries must be positive");
-        }
-        num_outer *= static_cast<size_t>(entry.outer_counts(d));
-      }
-
-      const size_t inner_src_span =
-          is_inner_contiguous ? (count * size)
-                              : ((count - 1) * effective_src_stride + size);
-
-      for (size_t outer_idx = 0; outer_idx < num_outer; ++outer_idx) {
-        size_t curr_src_offset = src_offset;
-        size_t curr_dst_offset = dst_offset;
-        size_t temp = outer_idx;
-        for (int d = num_outer_dims - 1; d >= 0; --d) {
-          const size_t dim_size = static_cast<size_t>(entry.outer_counts(d));
-          const size_t coord = temp % dim_size;
-          temp /= dim_size;
-          curr_src_offset +=
-              coord * static_cast<size_t>(entry.outer_src_strides_bytes(d));
-          curr_dst_offset +=
-              coord * static_cast<size_t>(entry.outer_dst_strides_bytes(d));
+      const absl::Span<const uint64_t> outer_counts = push_entry.outer_counts();
+      const absl::Span<const uint64_t> outer_src_strides =
+          push_entry.outer_src_strides();
+      const absl::Span<const uint64_t> outer_dst_strides =
+          push_entry.outer_dst_strides();
+      for (uint64_t outer_idx = 0; outer_idx < push_entry.num_outer();
+           ++outer_idx) {
+        uint64_t curr_src_offset = push_entry.src_offset();
+        uint64_t curr_dst_offset = push_entry.dst_offset();
+        uint64_t temp = outer_idx;
+        for (int d = static_cast<int>(outer_counts.size()) - 1; d >= 0; --d) {
+          const uint64_t coord = temp % outer_counts[d];
+          temp /= outer_counts[d];
+          curr_src_offset += coord * outer_src_strides[d];
+          curr_dst_offset += coord * outer_dst_strides[d];
         }
 
-        if (curr_src_offset > shard_host_size ||
-            inner_src_span > shard_host_size - curr_src_offset) {
-          return absl::InvalidArgumentError("Push range out of bounds");
-        }
+        // ShardPushEntry::FromProto() already bounded
+        // curr_src_offset + push_entry.inner_src_span() <= shard_host_size.
 
-        for (const auto& peer : peers) {
-          if (is_inner_contiguous) {
+        for (const std::string& peer : peers) {
+          if (push_entry.is_inner_contiguous()) {
             tasks_by_layer[layer_idx_to_use].push_back({
                 .peer = peer,
                 .buffer_id = static_cast<size_t>(layer_idx_to_use),
-                .dst_shard_idx = dst_shard_idx,
-                .dst_offset_bytes = curr_dst_offset,
+                .dst_shard_idx =
+                    static_cast<size_t>(push_entry.dst_shard_idx()),
+                .dst_offset_bytes = static_cast<size_t>(curr_dst_offset),
                 .data_ptr = base_host_ptr + curr_src_offset,
-                .size_bytes = count * size,
+                .size_bytes = static_cast<size_t>(push_entry.inner_src_span()),
                 .dst_stride_bytes = 0,
                 .count = 1,
                 .src_stride_bytes = 0,
@@ -1784,13 +1751,16 @@ WeightSynchronizerBase::BuildLayerPushTasks(
             tasks_by_layer[layer_idx_to_use].push_back({
                 .peer = peer,
                 .buffer_id = static_cast<size_t>(layer_idx_to_use),
-                .dst_shard_idx = dst_shard_idx,
-                .dst_offset_bytes = curr_dst_offset,
+                .dst_shard_idx =
+                    static_cast<size_t>(push_entry.dst_shard_idx()),
+                .dst_offset_bytes = static_cast<size_t>(curr_dst_offset),
                 .data_ptr = base_host_ptr + curr_src_offset,
-                .size_bytes = size,
-                .dst_stride_bytes = effective_dst_stride,
-                .count = count,
-                .src_stride_bytes = effective_src_stride,
+                .size_bytes = static_cast<size_t>(push_entry.size()),
+                .dst_stride_bytes =
+                    static_cast<size_t>(push_entry.effective_dst_stride()),
+                .count = static_cast<size_t>(push_entry.count()),
+                .src_stride_bytes =
+                    static_cast<size_t>(push_entry.effective_src_stride()),
             });
           }
         }

@@ -101,6 +101,36 @@ cc_test(
 )
 
 cc_library(
+    name = "shard_push_entry",
+    srcs = ["shard_push_entry.cc"],
+    hdrs = ["shard_push_entry.h"],
+    deps = [
+        "//tpu_sync/rpc:raiden_service_cc_proto",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_test(
+    name = "shard_push_entry_test",
+    srcs = ["shard_push_entry_test.cc"],
+    tags = ["no_oss"],
+    deps = [
+        ":shard_push_entry",
+        "//tpu_sync/rpc:raiden_service_cc_proto",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
     name = "weight_synchronizer_base",
     srcs = [
         "weight_synchronizer_base.cc",
@@ -117,6 +147,7 @@ cc_library(
     features = ["-use_header_modules"],
     visibility = ["//visibility:public"],
     deps = [
+        ":shard_push_entry",
         ":tiling_utils",
         ":weight_version",
         "//tpu_sync/common:trace",

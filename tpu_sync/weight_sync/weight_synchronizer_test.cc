@@ -666,6 +666,37 @@ TEST_F(WeightSynchronizerTest, PushWeightsReshardedOutOfBoundsError) {
 }
 
 TEST_F(WeightSynchronizerTest,
+       PushWeightsReshardedRejectsMalformedEntryArithmeticNamingTheEntry) {
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<WeightSynchronizerBase> ws_source,
+                       WeightSynchronizerBase::Create(
+                           /*num_layers=*/1, /*num_shards=*/1,
+                           /*slice_byte_size=*/4096, /*local_port=*/0));
+  tpu_sync::rpc::StartTransferRequest request;
+  request.set_skip_d2h(true);
+  request.set_uuid(501);
+  tpu_sync::rpc::ShardPushScheduleProto& schedule =
+      (*request.mutable_shard_push_schedules())[0];
+  for (int i = 0; i < 2; ++i) {
+    tpu_sync::rpc::ShardPushEntryProto* entry = schedule.add_entries();
+    entry->add_dst_peers("127.0.0.1:1");
+    entry->set_size_bytes(8);
+    entry->set_layer_idx(0);
+  }
+  tpu_sync::rpc::ShardPushEntryProto& malformed = *schedule.mutable_entries(1);
+
+  // Unchecked, the source span (5 - 1) * 2^62 + 8 wraps to 8 bytes and passes
+  // the host-buffer bounds check.
+  malformed.set_count(5);
+  malformed.set_src_stride_bytes(int64_t{1} << 62);
+  EXPECT_THAT(ws_source->PushWeightsResharded(request),
+              ::absl_testing::StatusIs(
+                  absl::StatusCode::kInvalidArgument,
+                  "BuildLayerPushTasks (uuid=501) shard 0 entry[1] inner "
+                  "strided source span overflows (count=5, "
+                  "src_stride_bytes=4611686018427387904, size_bytes=8)"));
+}
+
+TEST_F(WeightSynchronizerTest,
        PushWeightsReshardedUnmappedScheduleKeysMissingGlobalIndicesFails) {
   size_t num_layers = 1;
   size_t num_shards = 1;

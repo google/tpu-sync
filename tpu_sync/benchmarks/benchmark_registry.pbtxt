@@ -51,7 +51,7 @@ benchmarks {
 
   environment_configs {
     id: "cpu-n2-32"
-    runner_label: "linux-x86-n2-32"
+    runner_label: "linux-x86-n4-32"
     container_image: "us-central1-docker.pkg.dev/tpu-prod-env-multipod/tpu-raiden/ml-build:gcc12-headers-ibverbs"
     workload_action_inputs { key: "bazel_run_flags" value: "-c opt --config=oss --config=ci" }
   }

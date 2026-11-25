@@ -22,6 +22,7 @@
 #include <memory>
 
 #include "absl/base/thread_annotations.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
@@ -77,6 +78,9 @@ class WeightReceiveSession : public ::tpu_raiden::TransferSession {
   absl::Status AwaitForDone() override;
   bool IsDraining() const override;
   absl::StatusOr<size_t> ResolveStagingSlot(size_t unit) override;
+  absl::Status OnDataReceived(size_t major_dimension_idx,
+                              absl::Span<const int> minor_dimension_indices,
+                              absl::Span<const int> shard_ids) override;
   tsl::Future<> GetDataReadyFuture(size_t major_dimension_idx) override;
   absl::optional<std::shared_ptr<const ::tpu_raiden::TransferPlan>> plan()
       const override;
@@ -84,6 +88,8 @@ class WeightReceiveSession : public ::tpu_raiden::TransferSession {
 
  protected:
   WeightReceiveSession(uint64_t uuid,
+                       absl::flat_hash_map<uint64_t, size_t> expected_per_layer,
+                       size_t total_expected_batches,
                        std::chrono::steady_clock::time_point deadline,
                        OnLayerReceivedCallback on_layer_received = nullptr);
 
@@ -96,8 +102,8 @@ class WeightReceiveSession : public ::tpu_raiden::TransferSession {
   bool TryBeginInternalOp();
   void EndInternalOp();
 
-  // Invokes |on_layer_received_| if set.
-  absl::Status NotifyLayerReceived(uint64_t layer_idx);
+  // Returns true when no expected chunk batches remain.
+  bool HasNoRemainingBatches() const;
 
   const uint64_t uuid_;
   const std::chrono::steady_clock::time_point deadline_;
@@ -109,6 +115,11 @@ class WeightReceiveSession : public ::tpu_raiden::TransferSession {
   bool draining_ ABSL_GUARDED_BY(mu_) = false;
   bool done_ ABSL_GUARDED_BY(mu_) = false;
   absl::Status status_ ABSL_GUARDED_BY(mu_);
+
+  mutable absl::Mutex progress_mu_;
+  absl::flat_hash_map<uint64_t, size_t> remaining_per_layer_
+      ABSL_GUARDED_BY(progress_mu_);
+  size_t total_remaining_ ABSL_GUARDED_BY(progress_mu_) = 0;
 };
 
 }  // namespace tpu_raiden::weight_sync

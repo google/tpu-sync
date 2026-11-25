@@ -98,13 +98,12 @@ class PullReceiveSession final : public WeightReceiveSession {
                      int max_concurrency, std::vector<PullTask> tasks,
                      absl::flat_hash_map<uint64_t, size_t> expected_per_layer,
                      WeightReceiveSessionOptions options)
-      : WeightReceiveSession(uuid, options.deadline,
+      : WeightReceiveSession(uuid, std::move(expected_per_layer), tasks.size(),
+                             options.deadline,
                              std::move(options.on_layer_received)),
         client_(client),
         tasks_(std::move(tasks)),
-        max_concurrency_(max_concurrency),
-        remaining_per_layer_(std::move(expected_per_layer)),
-        total_remaining_(tasks_.size()) {}
+        max_concurrency_(max_concurrency) {}
 
   ~PullReceiveSession() override {
     Finish(absl::CancelledError("PullReceiveSession destroyed"));
@@ -144,41 +143,6 @@ class PullReceiveSession final : public WeightReceiveSession {
   }
 
   bool TryBeginOp() override { return false; }
-
-  absl::Status OnDataReceived(size_t major_dimension_idx,
-                              absl::Span<const int> minor_dimension_indices,
-                              absl::Span<const int> shard_ids) override {
-    if (!minor_dimension_indices.empty()) {
-      return absl::OkStatus();
-    }
-    if (!TryBeginInternalOp()) {
-      absl::Status status = GetStatus();
-      return !status.ok() ? status
-                          : absl::FailedPreconditionError(
-                                "PullReceiveSession is draining or done");
-    }
-    absl::Cleanup end_op = [this]() { EndInternalOp(); };
-    const uint64_t layer_idx = static_cast<uint64_t>(major_dimension_idx);
-    bool layer_completed = false;
-    bool all_done = false;
-    {
-      absl::MutexLock lock(task_mu_);
-      ABSL_RETURN_IF_ERROR(
-          RecordLayerBatchLocked(layer_idx, remaining_per_layer_,
-                                 total_remaining_, layer_completed, all_done));
-    }
-    if (layer_completed) {
-      absl::Status cb_status = NotifyLayerReceived(layer_idx);
-      if (!cb_status.ok()) {
-        Finish(cb_status);
-        return cb_status;
-      }
-    }
-    if (all_done) {
-      Finish(absl::OkStatus());
-    }
-    return absl::OkStatus();
-  }
 
  private:
   void WorkerLoop() {
@@ -238,9 +202,6 @@ class PullReceiveSession final : public WeightReceiveSession {
 
   absl::Mutex task_mu_;
   size_t next_task_idx_ ABSL_GUARDED_BY(task_mu_) = 0;
-  absl::flat_hash_map<uint64_t, size_t> remaining_per_layer_
-      ABSL_GUARDED_BY(task_mu_);
-  size_t total_remaining_ ABSL_GUARDED_BY(task_mu_) = 0;
 
   absl::Mutex workers_mu_;
   std::vector<std::thread> workers_ ABSL_GUARDED_BY(workers_mu_);
@@ -248,17 +209,16 @@ class PullReceiveSession final : public WeightReceiveSession {
 
 // Passive weight receive session that waits for incoming PushChunks RPCs
 // matching StartTransferRequest::expected_layer_chunk_counts routed from
-// GrpcTransportServer via OnPushChunksComplete() or OnDataReceived().
+// GrpcTransportServer via OnDataReceived().
 class PushReceiveSession final : public WeightReceiveSession {
  public:
   PushReceiveSession(uint64_t uuid,
                      absl::flat_hash_map<uint64_t, size_t> expected_per_layer,
                      size_t total_expected_batches,
                      WeightReceiveSessionOptions options)
-      : WeightReceiveSession(uuid, options.deadline,
-                             std::move(options.on_layer_received)),
-        remaining_per_layer_(std::move(expected_per_layer)),
-        total_remaining_(total_expected_batches) {}
+      : WeightReceiveSession(uuid, std::move(expected_per_layer),
+                             total_expected_batches, options.deadline,
+                             std::move(options.on_layer_received)) {}
 
   ~PushReceiveSession() override = default;
 
@@ -267,75 +227,25 @@ class PushReceiveSession final : public WeightReceiveSession {
     if (!status.ok()) {
       return status;
     }
-    bool empty = false;
-    {
-      absl::MutexLock lock(progress_mu_);
-      empty = (total_remaining_ == 0);
-    }
-    if (empty) {
+    if (HasNoRemainingBatches()) {
       Finish(absl::OkStatus());
     }
     return absl::OkStatus();
   }
-
-  absl::Status OnDataReceived(size_t major_dimension_idx,
-                              absl::Span<const int> minor_dimension_indices,
-                              absl::Span<const int> shard_ids) override {
-    if (!minor_dimension_indices.empty()) {
-      return absl::OkStatus();
-    }
-    if (!TryBeginInternalOp()) {
-      absl::Status status = GetStatus();
-      return !status.ok() ? status
-                          : absl::FailedPreconditionError(
-                                "PushReceiveSession is draining or done");
-    }
-    absl::Cleanup end_op = [this]() { EndInternalOp(); };
-    if (deadline_ != std::chrono::steady_clock::time_point::max() &&
-        std::chrono::steady_clock::now() >= deadline_) {
-      absl::Status err = absl::DeadlineExceededError(
-          "PushReceiveSession deadline exceeded on incoming data");
-      Finish(err);
-      return err;
-    }
-
-    const uint64_t layer_idx = static_cast<uint64_t>(major_dimension_idx);
-    bool layer_completed = false;
-    bool all_done = false;
-    {
-      absl::MutexLock lock(progress_mu_);
-      ABSL_RETURN_IF_ERROR(
-          RecordLayerBatchLocked(layer_idx, remaining_per_layer_,
-                                 total_remaining_, layer_completed, all_done));
-    }
-    if (layer_completed) {
-      absl::Status cb_status = NotifyLayerReceived(layer_idx);
-      if (!cb_status.ok()) {
-        Finish(cb_status);
-        return cb_status;
-      }
-    }
-    if (all_done) {
-      Finish(absl::OkStatus());
-    }
-    return absl::OkStatus();
-  }
-
- private:
-  absl::Mutex progress_mu_;
-  absl::flat_hash_map<uint64_t, size_t> remaining_per_layer_
-      ABSL_GUARDED_BY(progress_mu_);
-  size_t total_remaining_ ABSL_GUARDED_BY(progress_mu_) = 0;
 };
 
 }  // namespace
 
 WeightReceiveSession::WeightReceiveSession(
-    uint64_t uuid, std::chrono::steady_clock::time_point deadline,
+    uint64_t uuid, absl::flat_hash_map<uint64_t, size_t> expected_per_layer,
+    size_t total_expected_batches,
+    std::chrono::steady_clock::time_point deadline,
     OnLayerReceivedCallback on_layer_received)
     : uuid_(uuid),
       deadline_(deadline),
-      on_layer_received_(std::move(on_layer_received)) {}
+      on_layer_received_(std::move(on_layer_received)),
+      remaining_per_layer_(std::move(expected_per_layer)),
+      total_remaining_(total_expected_batches) {}
 
 bool WeightReceiveSession::Done() const {
   absl::MutexLock lock(mu_);
@@ -397,6 +307,49 @@ absl::StatusOr<size_t> WeightReceiveSession::ResolveStagingSlot(size_t unit) {
       "WeightReceiveSession addresses host buffers in place");
 }
 
+absl::Status WeightReceiveSession::OnDataReceived(
+    size_t major_dimension_idx, absl::Span<const int> minor_dimension_indices,
+    absl::Span<const int> shard_ids) {
+  if (!minor_dimension_indices.empty()) {
+    return absl::OkStatus();
+  }
+  if (!TryBeginInternalOp()) {
+    absl::Status status = GetStatus();
+    return !status.ok() ? status
+                        : absl::FailedPreconditionError(
+                              "WeightReceiveSession is draining or done");
+  }
+  absl::Cleanup end_op = [this]() { EndInternalOp(); };
+  if (deadline_ != std::chrono::steady_clock::time_point::max() &&
+      std::chrono::steady_clock::now() >= deadline_) {
+    absl::Status err = absl::DeadlineExceededError(
+        "WeightReceiveSession deadline exceeded on incoming data");
+    Finish(err);
+    return err;
+  }
+
+  const uint64_t layer_idx = static_cast<uint64_t>(major_dimension_idx);
+  bool layer_completed = false;
+  bool all_done = false;
+  {
+    absl::MutexLock lock(progress_mu_);
+    ABSL_RETURN_IF_ERROR(RecordLayerBatchLocked(layer_idx, remaining_per_layer_,
+                                                total_remaining_,
+                                                layer_completed, all_done));
+  }
+  if (layer_completed && on_layer_received_) {
+    absl::Status cb_status = on_layer_received_(layer_idx);
+    if (!cb_status.ok()) {
+      Finish(cb_status);
+      return cb_status;
+    }
+  }
+  if (all_done) {
+    Finish(absl::OkStatus());
+  }
+  return absl::OkStatus();
+}
+
 tsl::Future<> WeightReceiveSession::GetDataReadyFuture(
     size_t major_dimension_idx) {
   return tsl::Future<>(absl::OkStatus());
@@ -425,11 +378,9 @@ absl::Status WeightReceiveSession::MarkStarted() {
   return absl::OkStatus();
 }
 
-absl::Status WeightReceiveSession::NotifyLayerReceived(uint64_t layer_idx) {
-  if (!on_layer_received_) {
-    return absl::OkStatus();
-  }
-  return on_layer_received_(layer_idx);
+bool WeightReceiveSession::HasNoRemainingBatches() const {
+  absl::MutexLock lock(progress_mu_);
+  return total_remaining_ == 0;
 }
 
 absl::StatusOr<std::shared_ptr<::tpu_raiden::TransferSession>>

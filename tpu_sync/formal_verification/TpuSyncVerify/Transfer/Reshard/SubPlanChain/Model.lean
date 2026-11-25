@@ -134,50 +134,70 @@ def planSubTransfers (args : PlanArgs) : Option SubTransferChain :=
 
 /-! ## Part II — Worker sub-plan chain folding (`KVCacheManagerWithTransfer`) -/
 
-/-- One worker's `recv_chains_[req_id]` or `send_chains_[req_id]` entry
+/-- One worker's `sub_plan_chains_[req_id]` entry
 (`KVCacheManagerWithTransfer::SubPlanChainProgress` in
-`kv_cache_manager_with_transfer.h`); `present = false` is absence from the map. -/
+`kv_cache_manager_with_transfer.h`); `present = false` is absence from the map.
+Sender workers (`SessionRole::kPoolReshardSend`) and receiver workers
+(`SessionRole::kPoolReshardReceive`) use the same per-`req_id` map; one worker
+cannot hold both roles on the same sub-plan (the worker entry points refuse at
+entry, with `ALREADY_EXISTS`, a `SubPlanUuid(uuid, index)` whose session in
+`sessions_` has not settled, and `sub_sessions[index]` holds a single pointer). -/
 structure ChainProgress where
   present : Bool := false
-  /-- `count`: the largest `sub_plan_count` seen (`std::max(progress.count, sub_plan_count)`). -/
-  count : Nat := 0
-  /-- `settled`: sub-plan indices whose session settled OK (`std::set<int32_t>`). -/
-  settled : List Nat := []
+  /-- `sub_sessions`: one slot per `sub_plan_index`, holding the session
+  registered there (its `uuid` here); `none` is a `nullptr` slot awaiting
+  registration. Cleared once the chain's terminal is reported. -/
+  subSessions : List (Option Nat) := []
+  /-- `completed`: the request's `done` terminal has been reported. -/
+  completed : Bool := false
   /-- `failed`: the request's failure has been reported. -/
   failed : Bool := false
   /-- `anchored`: sub-plan 0 of this chain registered on this worker. -/
   anchored : Bool := false
-  /-- `plan_uuids`: sub-plan UUIDs registered into this entry. -/
-  planUuids : List Nat := []
   deriving DecidableEq, Repr, Hashable
 
-/-- One session in `active_pool_reshard_recvs_` / `active_pool_reshard_sends_`
-for `req_id`, with its `sub_plan_index()` / `sub_plan_count()` and, once
-`Done()`, the status it settled with. -/
+/-- One pool-reshard session registered for `req_id` (`SessionRole::kPoolReshardSend`
+/ `kPoolReshardReceive` in `sessions_`), with the `sub_plan_index` /
+`sub_plan_count` of its `StartTransferRequest`, its `IsDraining()` and
+`in_flight_ > 0` lifecycle flags, and the status it latches / settles with.
+`RetireSettledSessionLocked` erases it from `sessions_` (`retired`); the chain
+entry keeps its `shared_ptr` and still reads its `Done()` / `GetStatus()`. -/
 structure SubSession where
   uuid : Nat
   index : Nat
   count : Nat
+  /-- `IsDraining()`: `draining_` (`ReshardReceiveSession`) or `finalizing_`
+  (`ReshardSendSession`). -/
+  draining : Bool := false
+  /-- `in_flight_ > 0`: an op is running, so `Finish` latches `draining`
+  without setting `done_` until `EndOp`. -/
+  inFlight : Bool := false
   done : Bool := false
   ok : Bool := true
+  retired : Bool := false
   deriving DecidableEq, Repr, Hashable
 
-/-- One worker's view of one `req_id`: its chain entry, its active reshard
-sessions, and the terminals it has published for the request. -/
+/-- One worker's view of one `req_id`: its chain entry, its reshard sessions,
+and the terminals it has published for the request. -/
 structure WorkerState where
   /-- Insertions of `req_id` into `done_recving_` / `done_sending_`. -/
   doneReports : Nat := 0
   /-- Insertions of `req_id` into `failed_recving_`. -/
   failReports : Nat := 0
-  /-- Ghost: for each `done` insertion, the chain `count` and `settled` set at
-  that moment (`(1, [0])` for a single-plan request). -/
+  /-- Ghost: for each `done` insertion, the number of sub-plan slots and the
+  settled slot indices at that moment (`(1, [0])` for a single-plan request). -/
   doneLog : List (Nat × List Nat) := []
   /-- Ghost: UUIDs this worker has registered for `req_id` (A2). -/
   seenUuids : List Nat := []
-  /-- `active_pool_reshard_*` entries for `req_id`, in registration order. -/
-  active : List SubSession := []
+  /-- Every reshard session registered for `req_id`, in registration order;
+  those with `retired = false` are the `sessions_` entries. -/
+  sessions : List SubSession := []
   chain : ChainProgress := {}
   deriving DecidableEq, Repr, Hashable
+
+/-- The `sessions_` entries for `req_id`. -/
+def WorkerState.active (w : WorkerState) : List SubSession :=
+  w.sessions.filter (!·.retired)
 
 /-- Events of the worker chain folding. -/
 inductive WorkerEv where
@@ -185,104 +205,193 @@ inductive WorkerEv where
   `(sub_plan_index, sub_plan_count) = (index, count)` and calls
   `NoteSubPlanRegisteredLocked`. -/
   | registerSubPlan (uuid index count : Nat)
-  /-- Session `uuid` reaches `Done()` with an OK (`ok = true`) or failed status. -/
+  /-- Session `uuid` enters `in_flight_ > 0` (`TryBeginOp` / `Start` /
+  `ExecuteEligiblePoolH2ds`). -/
+  | beginOp (uuid : Nat)
+  /-- Terminal path latches `draining_` / `finalizing_` while an op is still
+  in flight (`FinishPoolH2d` / `RecordPushCompletion` / `Finish` with
+  `in_flight_ > 0`), leaving `done_ = false` until `EndOp`. -/
+  | latchDrain (uuid : Nat) (ok : Bool)
+  /-- Session `uuid` reaches `Done()`: `EndOp` when already `draining`
+  (`ok = true` preserves `s.ok`; `ok = false` models a late `Finish(error)`
+  before `EndOp` in `ReshardReceiveSession::FinishLocked`, over-approximating
+  `ReshardSendSession::Finish` which returns early when `finalizing_`), or
+  synchronously via `Finish(status)` when idle (`in_flight_ == 0`). -/
   | settleSession (uuid : Nat) (ok : Bool)
-  /-- `CompleteReadWithDetails`: `RecordPoolReshardTerminalLocked` for every
-  `Done()` session, then `SweepSubPlanChainsLocked(now)`; `stalled = true` is
-  `now - progress.last_activity > stall`. -/
+  /-- `CompleteReadWithDetails`: the `!session->IsDraining()` deadline arm,
+  `RecordPoolReshardTerminalLocked` for every `Done()` session, then
+  `SweepSubPlanChainsLocked(now)`; `stalled = true` is
+  `now - progress.last_activity > stall` (and past `session->deadline()`). -/
   | poll (stalled : Bool)
+  /-- `CompleteReadWithDetails` where draining sessions `midSettle` finish
+  `EndOp` under `session->mu_` after `RetireSettledSessionLocked` checked
+  `Done()` and before `SweepSubPlanChainsLocked` checks `!sub_session->Done()`. -/
+  | pollMidSettle (stalled : Bool) (midSettle : List Nat)
   deriving DecidableEq, Repr
 
 /-- Which arm of `NoteSubPlanRegisteredLocked` a registration took. -/
 inductive RegisterArm where
-  /-- `if (sub_plan_count <= 1) return;` -/
+  /-- `if (sub_plan_count <= 1 || sub_plan_index < 0) { sub_plan_chains_.erase(req_id); return; }` -/
   | single
-  /-- `sub_plan_index == 0`: `chains[req_id] = SubPlanChainProgress{}; anchored = true`. -/
+  /-- `sub_plan_index == 0`: `progress = SubPlanChainProgress{}; progress.anchored = true`. -/
   | anchor
-  /-- `chains[req_id]` found for a later index. -/
+  /-- `try_emplace` found the entry for a later index. -/
   | intoEntry
-  /-- `chains[req_id]` default-constructed for a later index (`anchored = false`). -/
+  /-- `try_emplace` inserted the entry for a later index (`anchored = false`). -/
   | unanchored
   deriving DecidableEq, Repr
 
-/-- `NoteSubPlanRegisteredLocked`: nothing for `sub_plan_count <= 1`; sub-plan 0
-replaces the entry with a fresh anchored one; any other index finds or
-default-constructs the entry; then `plan_uuids.insert(uuid)` and
-`count = max(count, sub_plan_count)`. -/
+/-- `sub_sessions.resize(needed_size)`: pad with `nullptr` slots up to `n`. -/
+def growTo (slots : List (Option Nat)) (n : Nat) : List (Option Nat) :=
+  slots ++ List.replicate (n - slots.length) none
+
+/-- `NoteSubPlanRegisteredLocked`: a single-plan registration erases the entry;
+sub-plan 0 replaces it with a fresh anchored one; any other index finds or
+inserts the entry; then `sub_sessions` grows to
+`max(size, max(sub_plan_count, sub_plan_index + 1))` and
+`sub_sessions[sub_plan_index] = session`. -/
 def noteSubPlanRegistered (c : ChainProgress) (uuid index count : Nat) :
     ChainProgress × RegisterArm :=
   if count <= 1 then
-    (c, .single)
+    ({}, .single)
   else
     let (base, arm) : ChainProgress × RegisterArm :=
       if index == 0 then ({ present := true, anchored := true }, .anchor)
       else if c.present then (c, .intoEntry)
       else ({ present := true }, .unanchored)
-    ({ base with
-        planUuids := insertNodup uuid base.planUuids
-        count := max base.count count }, arm)
+    let needed := max base.subSessions.length (max count (index + 1))
+    ({ base with subSessions := (growTo base.subSessions needed).set index (some uuid) }, arm)
 
 /-- What one `RecordPoolReshardTerminalLocked` call did. -/
 inductive Terminal where
-  /-- `anchored && !plan_uuids.contains(uuid)`: a superseded chain's sub-plan, ignored. -/
+  /-- `it == sub_plan_chains_.end()`: no entry, the session's terminal is the
+  request's (`done` or `failed_recving_` by its status). -/
+  | direct (ok : Bool)
+  /-- Not in `sub_sessions` and `progress.anchored`: a superseded chain's
+  sub-plan, ignored. -/
   | supersededIgnored
-  /-- `if (progress.failed) return;`: the failure was already reported. -/
-  | failedIgnored
-  /-- `settled.insert(sub_plan_index)` short of `count`. -/
+  /-- Not in `sub_sessions` and the entry is unanchored: the session's terminal
+  is the request's. -/
+  | stray (ok : Bool)
+  /-- `if (progress.failed || progress.completed) return;` -/
+  | alreadyReported
+  /-- Settled OK with some slot not yet settled OK. -/
   | settledPartial
-  /-- `done.insert(req_id)` with the chain's `count` and `settled` at that moment. -/
-  | done (count : Nat) (settled : List Nat)
+  /-- `done.insert(req_id)` with `sub_sessions.size()` and the settled slots at
+  that moment. -/
+  | done (size : Nat) (settled : List Nat)
   /-- `failed_recving_.insert(req_id)`. -/
   | failed
   deriving DecidableEq, Repr
 
-/-- `RecordPoolReshardTerminalLocked` for one `Done()` session `s`. -/
-def recordTerminal (c : ChainProgress) (s : SubSession) : ChainProgress × Terminal :=
-  if s.count <= 1 then
-    -- A single-plan request: the session's terminal is the request's.
-    (c, if s.ok then .done 1 [s.index] else .failed)
-  else if c.present && c.anchored && !c.planUuids.contains s.uuid then
-    (c, .supersededIgnored)
+/-- `sub_session != nullptr && sub_session->Done() && sub_session->GetStatus().ok()`. -/
+def slotSettledOk (sessions : List SubSession) : Option Nat → Bool
+  | none => false
+  | some u => sessions.any fun s => s.uuid == u && s.done && s.ok
+
+/-- The slot indices whose session settled OK (`settled_count` counts them). -/
+def settledSlots (sessions : List SubSession) (slots : List (Option Nat)) : List Nat :=
+  (List.range slots.length).filter fun i => slotSettledOk sessions (slots.getD i none)
+
+/-- `sub_session != nullptr && !sub_session->Done()` for some slot. -/
+def anyOpenSlot (sessions : List SubSession) (slots : List (Option Nat)) : Bool :=
+  slots.any fun
+    | none => false
+    | some u => sessions.any fun s => s.uuid == u && !s.done
+
+/-- `RecordPoolReshardTerminalLocked` for one `Done()` session `s`; `sessions`
+are the worker's sessions (the entry reads each slot's `Done()` / `GetStatus()`). -/
+def recordTerminal (c : ChainProgress) (sessions : List SubSession) (s : SubSession) :
+    ChainProgress × Terminal :=
+  if !c.present then
+    (c, .direct s.ok)
+  else if !c.subSessions.contains (some s.uuid) then
+    if c.anchored then (c, .supersededIgnored) else (c, .stray s.ok)
+  else if c.failed || c.completed then
+    (c, .alreadyReported)
+  else if !s.ok then
+    ({ c with failed := true }, .failed)
   else
-    let c0 : ChainProgress := if c.present then c else { present := true }
-    if c0.failed then
-      (c0, .failedIgnored)
+    let settled := settledSlots sessions c.subSessions
+    if settled.length == c.subSessions.length then
+      ({ c with completed := true, subSessions := [] }, .done c.subSessions.length settled)
     else
-      let c1 := { c0 with count := max c0.count s.count }
-      if !s.ok then
-        ({ c1 with failed := true }, .failed)
-      else
-        let settled' := insertNodup s.index c1.settled
-        if settled'.length >= c1.count then
-          ({}, .done c1.count settled')
-        else
-          ({ c1 with settled := settled' }, .settledPartial)
+      (c, .settledPartial)
+
+/-- Alternative to `RecordPoolReshardTerminalLocked` (not the C++): checks
+`progress.failed || progress.completed` before the `!progress.anchored` stray
+arm so an unanchored chain whose `sub_sessions` were cleared on stall or
+completion swallows late terminals instead of reporting them as stray `done`. -/
+def recordTerminalWaitOpen (c : ChainProgress) (sessions : List SubSession) (s : SubSession) :
+    ChainProgress × Terminal :=
+  if !c.present then
+    (c, .direct s.ok)
+  else if !c.subSessions.contains (some s.uuid) then
+    if c.anchored then (c, .supersededIgnored)
+    else if c.failed || c.completed then (c, .alreadyReported)
+    else (c, .stray s.ok)
+  else if c.failed || c.completed then
+    (c, .alreadyReported)
+  else if !s.ok then
+    ({ c with failed := true }, .failed)
+  else
+    let settled := settledSlots sessions c.subSessions
+    if settled.length == c.subSessions.length then
+      ({ c with completed := true, subSessions := [] }, .done c.subSessions.length settled)
+    else
+      (c, .settledPartial)
 
 /-- What `SweepSubPlanChainsLocked` did to an entry quiet for a whole `timeout_s_`. -/
 inductive SweepOutcome where
   /-- No sweep (`now - progress.last_activity <= stall`, or no entry). -/
   | notSwept
-  /-- `if (progress.failed) chains.erase(it++)`. -/
-  | erasedFailed
-  /-- A session of `req_id` is still active: `last_activity = now`. -/
+  /-- `if (progress.failed || progress.completed) sub_plan_chains_.erase(it++)`. -/
+  | erasedReported
+  /-- A slot's session is still open (`!sub_session->Done()`): `last_activity = now`. -/
   | activeKeeps
-  /-- `failed_recving_.insert(req_id); progress.failed = true`. -/
+  /-- `failed_recving_.insert(req_id); progress.failed = true; progress.sub_sessions.clear()`. -/
   | stalled
   deriving DecidableEq, Repr
 
-/-- `SweepSubPlanChainsLocked` for an entry quiet for a whole `timeout_s_`:
-a reported failure is erased; otherwise, unless a session of `req_id` is still
-active, `failed_recving_.insert(req_id)` and `failed = true`. -/
-def sweepStalledChain (c : ChainProgress) (stillActive : List SubSession) :
+/-- `SweepSubPlanChainsLocked` for an entry quiet for a whole `timeout_s_`: a
+reported terminal is erased unconditionally; otherwise, unless a slot's session
+is still open, `failed_recving_.insert(req_id)`, `failed = true`, and the slots
+are cleared. -/
+def sweepStalledChain (c : ChainProgress) (anyOpen : Bool) :
     ChainProgress × SweepOutcome :=
   if !c.present then
     (c, .notSwept)
-  else if c.failed then
-    ({}, .erasedFailed)
-  else if !stillActive.isEmpty then
+  else if c.failed || c.completed then
+    ({}, .erasedReported)
+  else if anyOpen then
     (c, .activeKeeps)
   else
-    ({ c with failed := true }, .stalled)
+    ({ c with failed := true, subSessions := [] }, .stalled)
+
+/-- Alternative to `SweepSubPlanChainsLocked` (not the C++): keeps a `failed || completed`
+tombstone (`last_activity = now`) while `sessions_` still holds any unretired
+`kPoolReshard*` entry for `req_id` (`anyReqUnretired`), including one whose
+`EndOp` completed between `RetireSettledSessionLocked` and the sweep. -/
+def sweepStalledChainWaitOpen (c : ChainProgress) (anySlotOpen anyReqUnretired : Bool) :
+    ChainProgress × SweepOutcome :=
+  if !c.present then
+    (c, .notSwept)
+  else if c.failed || c.completed then
+    if anyReqUnretired then (c, .activeKeeps) else ({}, .erasedReported)
+  else if anySlotOpen then
+    (c, .activeKeeps)
+  else
+    ({ c with failed := true, subSessions := [] }, .stalled)
+
+/-- One iteration of `CompleteReadWithDetails`'s `if (!session->IsDraining())`
+deadline arm on a session past `deadline()`: an already-draining session is
+skipped; an in-flight session (`in_flight_ > 0`) latches `draining` with error
+while staying `!Done()`; an idle session (`in_flight_ == 0`) settles with error
+synchronously (`"One nobody pulled is reported now"`). -/
+def applyDeadlineArm (s : SubSession) : SubSession :=
+  if s.retired || s.done || s.draining then s
+  else if s.inFlight then { s with draining := true, ok := false }
+  else { s with draining := true, done := true, ok := false }
 
 namespace WorkerState
 
@@ -297,62 +406,246 @@ structure SweepAcc where
   fail : Nat := 0
   /-- Ghost `doneLog` entries. -/
   log : List (Nat × List Nat) := []
-  /-- A chained sub-plan reached `progress.last_activity = now` in this call
-  (not a single-plan or superseded one), so the entry is not quiet. -/
+  /-- A session found in `sub_sessions` reached `progress.last_activity = now`
+  in this call, so the entry is not quiet. -/
   touched : Bool := false
   deriving DecidableEq, Repr
 
-def recordStep (acc : SweepAcc) (s : SubSession) : SweepAcc :=
-  let touched := acc.touched || (s.count > 1 && (recordTerminal acc.chain s).2 != .supersededIgnored)
-  match recordTerminal acc.chain s with
+def recordStep (sessions : List SubSession) (acc : SweepAcc) (s : SubSession) : SweepAcc :=
+  let touched := acc.touched || (acc.chain.present && acc.chain.subSessions.contains (some s.uuid))
+  match recordTerminal acc.chain sessions s with
   | (c', .done k idx) => { acc with chain := c', done := acc.done + 1, log := acc.log ++ [(k, idx)], touched }
   | (c', .failed) => { acc with chain := c', fail := acc.fail + 1, touched }
+  | (c', .direct true) => { acc with chain := c', done := acc.done + 1, log := acc.log ++ [(max 1 s.count, [s.index])], touched }
+  | (c', .direct false) => { acc with chain := c', fail := acc.fail + 1, touched }
+  | (c', .stray true) => { acc with chain := c', done := acc.done + 1, log := acc.log ++ [(max 1 s.count, [s.index])], touched }
+  | (c', .stray false) => { acc with chain := c', fail := acc.fail + 1, touched }
+  | (c', _) => { acc with chain := c', touched }
+
+def recordStepWaitOpen (sessions : List SubSession) (acc : SweepAcc) (s : SubSession) : SweepAcc :=
+  let touched := acc.touched || (acc.chain.present && acc.chain.subSessions.contains (some s.uuid))
+  match recordTerminalWaitOpen acc.chain sessions s with
+  | (c', .done k idx) => { acc with chain := c', done := acc.done + 1, log := acc.log ++ [(k, idx)], touched }
+  | (c', .failed) => { acc with chain := c', fail := acc.fail + 1, touched }
+  | (c', .direct true) => { acc with chain := c', done := acc.done + 1, log := acc.log ++ [(max 1 s.count, [s.index])], touched }
+  | (c', .direct false) => { acc with chain := c', fail := acc.fail + 1, touched }
+  | (c', .stray true) => { acc with chain := c', done := acc.done + 1, log := acc.log ++ [(max 1 s.count, [s.index])], touched }
+  | (c', .stray false) => { acc with chain := c', fail := acc.fail + 1, touched }
   | (c', _) => { acc with chain := c', touched }
 
 /-- Fold `recordTerminal` over the settled sessions of one
 `CompleteReadWithDetails` call. -/
-def recordAll (c : ChainProgress) (settled : List SubSession) : SweepAcc :=
-  settled.foldl recordStep { chain := c }
+def recordAll (c : ChainProgress) (sessions settled : List SubSession) : SweepAcc :=
+  settled.foldl (recordStep sessions) { chain := c }
 
-/-- Transition function of the worker chain folding. -/
-def step (w : WorkerState) (e : WorkerEv) : Option WorkerState :=
+/-- Fold `recordTerminalWaitOpen` over the settled sessions of one
+`CompleteReadWithDetails` call. -/
+def recordAllWaitOpen (c : ChainProgress) (sessions settled : List SubSession) : SweepAcc :=
+  settled.foldl (recordStepWaitOpen sessions) { chain := c }
+
+/-- Every `uuid` in `midSettle` names an unretired session that is `draining && !done`
+when `RetireSettledSessionLocked` finishes its pass, so `EndOp` can complete in
+the `session->mu_` gap before `SweepSubPlanChainsLocked`. -/
+def validMidSettle (sessions : List SubSession) (midSettle : List Nat) : Bool :=
+  midSettle.all fun u =>
+    sessions.any fun s => s.uuid == u && !s.retired && s.draining && !s.done
+
+/-- Apply mid-poll `EndOp` settlements between `RetireSettledSessionLocked` and
+`SweepSubPlanChainsLocked`: `done` becomes `true`, while `retired` stays `false`
+because the `sessions_` retire pass already ran. -/
+def applyMidSettle (midSettle : List Nat) (s : SubSession) : SubSession :=
+  if midSettle.contains s.uuid then { s with inFlight := false, done := true } else s
+
+/-- The guards that encode A5–A7; the default value has all five on.
+
+* `deadlineArm` (A5a) is what the C++ does; `stepG { deadlineArm := false }`
+  is a mutant.
+* `noSingleWhileSeated` (A6) and `oneSessionPerSlot` (A7) are assumptions about
+  the callers of `PoolReshardRegisterRecv` / `PoolReshardPush`; nothing in the
+  C++ enforces them.
+* `noDrainingOkAtSweep` (A5b) and `noSettleBetweenRetireAndSweep` (A5c) are not
+  assumptions about callers: each excludes a timing window inside
+  `CompleteReadWithDetails` / `SweepSubPlanChainsLocked` that the C++ permits
+  with every caller well behaved.
+
+`step` has A5a, A6 and A7 on and A5b, A5c off; `stepRestricted` has all five
+on. -/
+structure Guards where
+  /-- A5a: `poll true` runs the `!session->IsDraining()` deadline arm of
+  `CompleteReadWithDetails` on every session past `deadline()`. -/
+  deadlineArm : Bool := true
+  /-- A5b (not enforced by the C++): no unretired chained session is in
+  `IsDraining() && !Done()` with `OkStatus()` when `SweepSubPlanChainsLocked`
+  erases a `failed || completed` tombstone. -/
+  noDrainingOkAtSweep : Bool := true
+  /-- A5c (not enforced by the C++): no draining session finishes `EndOp` under `session->mu_` between
+  `RetireSettledSessionLocked` (`Done()`) and `SweepSubPlanChainsLocked`
+  (`!sub_session->Done()`). -/
+  noSettleBetweenRetireAndSweep : Bool := true
+  /-- A6 (not enforced by the C++): no single-plan registration while a
+  sub-plan session of the request is still seated. -/
+  noSingleWhileSeated : Bool := true
+  /-- A7 (not enforced by the C++): a `sub_plan_index >= 1` slot is registered
+  once per entry. -/
+  oneSessionPerSlot : Bool := true
+  deriving DecidableEq, Repr
+
+/-- Core `CompleteReadWithDetails` transition with optional mid-poll `EndOp`
+settlements `midSettle` between `RetireSettledSessionLocked` and
+`SweepSubPlanChainsLocked`. -/
+def pollCore (g : Guards) (w : WorkerState) (stalled : Bool)
+    (midSettle : List Nat) : Option WorkerState :=
+  if g.noSettleBetweenRetireAndSweep && !midSettle.isEmpty then
+    none  -- A5c
+  else
+    let sessions1 :=
+      if g.deadlineArm && stalled then w.sessions.map applyDeadlineArm
+      else w.sessions
+    if !validMidSettle sessions1 midSettle then
+      none
+    else
+      let settledNow := sessions1.filter fun s => s.done && !s.retired
+      let r := recordAll w.chain sessions1 settledNow
+      let wouldEraseTombstone :=
+        stalled && !r.touched && r.chain.present && (r.chain.failed || r.chain.completed)
+      if g.noDrainingOkAtSweep && wouldEraseTombstone &&
+          sessions1.any (fun s => s.count > 1 && !s.retired && s.draining && !s.done && s.ok) then
+        none  -- A5b
+      else
+        let sessionsAfterRetire :=
+          sessions1.map fun s => if s.done then { s with retired := true } else s
+        let sessionsAfterMid := sessionsAfterRetire.map (applyMidSettle midSettle)
+        let (c2, sweep) :=
+          if stalled && !r.touched then
+            sweepStalledChain r.chain (anyOpenSlot sessionsAfterMid r.chain.subSessions)
+          else (r.chain, .notSwept)
+        some
+          { w with
+            doneReports := w.doneReports + r.done
+            failReports := w.failReports + r.fail + (if sweep == .stalled then 1 else 0)
+            doneLog := w.doneLog ++ r.log
+            sessions := sessionsAfterMid
+            chain := c2 }
+
+/-- Transition function of the worker chain folding, parametrised by `Guards`.
+A1 and A2 are guards of `registerSubPlan` in every instance. -/
+def stepG (g : Guards) (w : WorkerState) (e : WorkerEv) : Option WorkerState :=
   match e with
   | .registerSubPlan uuid index count =>
     if w.seenUuids.contains uuid then
-      none  -- A2: sub-plan UUIDs are fresh
+      none  -- A2: sub-plan UUIDs are fresh (same-UUID re-registration is not modelled)
     else if index >= max 1 count then
       none  -- A1: `0 <= sub_plan_index < max(1, sub_plan_count)`
+    else if g.noSingleWhileSeated && count <= 1 &&
+        w.sessions.any (fun s => s.count > 1 && !s.retired) then
+      none  -- A6
+    else if g.oneSessionPerSlot && count > 1 && index != 0 && w.chain.present &&
+        (w.chain.subSessions.getD index none).isSome then
+      none  -- A7
     else
       some
         { w with
           seenUuids := uuid :: w.seenUuids
-          active := w.active ++ [{ uuid := uuid, index := index, count := count }]
+          sessions := w.sessions ++ [{ uuid := uuid, index := index, count := count }]
           chain := (noteSubPlanRegistered w.chain uuid index count).1 }
 
-  | .settleSession uuid ok =>
-    if !w.active.any (fun s => s.uuid == uuid && !s.done) then
+  | .beginOp uuid =>
+    if !w.sessions.any (fun s => s.uuid == uuid && !s.retired && !s.done && !s.draining && !s.inFlight) then
       none
     else
-      some { w with active := w.active.map fun s =>
-        if s.uuid == uuid then { s with done := true, ok := ok } else s }
+      some { w with sessions := w.sessions.map fun s =>
+        if s.uuid == uuid then { s with inFlight := true } else s }
 
-  | .poll stalled =>
-    let settledNow := w.active.filter (·.done)
-    let stillActive := w.active.filter (!·.done)
-    let r := recordAll w.chain settledNow
-    -- `SweepSubPlanChainsLocked(now)` runs after the records of this call, which
-    -- set `last_activity = now`: an entry touched here is not quiet.
+  | .latchDrain uuid ok =>
+    if !w.sessions.any (fun s => s.uuid == uuid && !s.retired && !s.done && !s.draining && s.inFlight) then
+      none
+    else
+      some { w with sessions := w.sessions.map fun s =>
+        if s.uuid == uuid then { s with draining := true, ok := s.ok && ok } else s }
+
+  | .settleSession uuid ok =>
+    if !w.sessions.any (fun s => s.uuid == uuid && !s.retired && !s.done) then
+      none
+    else
+      -- `EndOp` (`ok = true`) preserves `s.ok`; `ok = false` models either
+      -- idle `Finish(error)` or a late `Finish(error)` while `draining_` on
+      -- `ReshardReceiveSession::FinishLocked` (which updates `status_` before
+      -- `if (draining_) return;`, over-approximating `ReshardSendSession`).
+      -- `ok` is fixed here; a `Finish(error)` after `done_` is not modelled.
+      some { w with sessions := w.sessions.map fun s =>
+        if s.uuid == uuid then
+          { s with
+            draining := true
+            inFlight := false
+            done := true
+            ok := s.ok && ok }
+        else s }
+
+  | .poll stalled => pollCore g w stalled []
+
+  | .pollMidSettle stalled midSettle =>
+    if midSettle.isEmpty then none else pollCore g w stalled midSettle
+
+/-- Transition function of the worker chain folding: the C++ under the caller
+assumptions A1, A2, A6 and A7 (guards of `registerSubPlan`), with the A5a
+deadline arm. A5b and A5c are off: `poll` runs when a draining-OK session is
+seated at a tombstone sweep, and `pollMidSettle` is enabled. A6 and A7 are not
+enforced by the C++, so the C++ has registrations this function refuses. -/
+def step : WorkerState → WorkerEv → Option WorkerState :=
+  stepG { noDrainingOkAtSweep := false, noSettleBetweenRetireAndSweep := false }
+
+def sys : System WorkerState WorkerEv := ⟨init, step⟩
+
+/-- `step` further restricted to executions that satisfy A5b and A5c (every
+guard of `Guards` on). Nothing in the C++ enforces A5b or A5c: no caller
+behaviour rules out the two windows, so `step` has executions this function
+refuses (`trace_draining_ok_at_sweep_reports_done_after_failure`,
+`trace_mid_poll_endop_unanchored_reports_done_after_stall`). -/
+def stepRestricted : WorkerState → WorkerEv → Option WorkerState := stepG {}
+
+def sysRestricted : System WorkerState WorkerEv := ⟨init, stepRestricted⟩
+
+/-- Core `CompleteReadWithDetails` transition of `stepSweepWaitsForOpen`
+(without A5b and without A5c). -/
+def pollWaitOpenCore (w : WorkerState) (stalled : Bool)
+    (midSettle : List Nat) : Option WorkerState :=
+  let sessions1 :=
+    if stalled then w.sessions.map applyDeadlineArm
+    else w.sessions
+  if !validMidSettle sessions1 midSettle then
+    none
+  else
+    let settledNow := sessions1.filter fun s => s.done && !s.retired
+    let r := recordAllWaitOpen w.chain sessions1 settledNow
+    let sessionsAfterRetire :=
+      sessions1.map fun s => if s.done then { s with retired := true } else s
+    let sessionsAfterMid := sessionsAfterRetire.map (applyMidSettle midSettle)
+    let anyReqUnretired := sessionsAfterMid.any fun s => !s.retired
     let (c2, sweep) :=
-      if stalled && !r.touched then sweepStalledChain r.chain stillActive else (r.chain, .notSwept)
+      if stalled && !r.touched then
+        sweepStalledChainWaitOpen r.chain (anyOpenSlot sessionsAfterMid r.chain.subSessions)
+          anyReqUnretired
+      else (r.chain, .notSwept)
     some
       { w with
         doneReports := w.doneReports + r.done
         failReports := w.failReports + r.fail + (if sweep == .stalled then 1 else 0)
         doneLog := w.doneLog ++ r.log
-        active := stillActive
+        sessions := sessionsAfterMid
         chain := c2 }
 
-def sys : System WorkerState WorkerEv := ⟨init, step⟩
+/-- Alternative (`stepSweepWaitsForOpen`, not the C++): `step` with `poll` and
+`pollMidSettle` using `recordTerminalWaitOpen` and `sweepStalledChainWaitOpen`
+(gating tombstone erasure on `!anyReqUnretired`); like `step`, it has neither
+the A5b nor the A5c guard. -/
+def stepSweepWaitsForOpen (w : WorkerState) (e : WorkerEv) : Option WorkerState :=
+  match e with
+  | .poll stalled => pollWaitOpenCore w stalled []
+  | .pollMidSettle stalled midSettle =>
+    if midSettle.isEmpty then none else pollWaitOpenCore w stalled midSettle
+  | e => stepG { noDrainingOkAtSweep := false, noSettleBetweenRetireAndSweep := false } w e
+
+def sysSweepWaitsForOpen : System WorkerState WorkerEv := ⟨init, stepSweepWaitsForOpen⟩
 
 end WorkerState
 
@@ -397,7 +690,8 @@ structure CoordChainState where
   winSrcUnits : List (List Nat)
   dstUnits : List Nat
   claimOwner : Nat
-  /-- `kChainArmAttempts`. -/
+  /-- `kChainArmAttempts` (`12` in the C++; the default here is a small bound
+  for the searches). -/
   maxArmAttempts : Nat := 2
   transferStatus : TransferStatus := .notStarted
   /-- `index` of the running `RunSubPlan(ctx, index)`. -/
@@ -419,7 +713,8 @@ structure CoordChainState where
 
 /-- Events of the coordinator chain. -/
 inductive ChainEv where
-  /-- `RequestBlockRegistry::Register` by a producer, before `Coordinate`. -/
+  /-- `RequestBlockRegistry::Register` by a producer, before
+  `ReshardCoordinator::StartPoolReshard` (A4). -/
   | registerProducer (srcUnit : Nat)
   /-- `StartPoolReshard` sets `transfer_status_[req_id] = kInProgress`. -/
   | startChainCoordination
@@ -438,8 +733,8 @@ inductive ChainEv where
   | finishWindowSend
   /-- A dispatched window's receiver on `dstUnit` settles and releases its lease. -/
   | settleDispatchedRecv (dstUnit : Nat)
-  /-- A dispatched rank's worker reports `done_sending` and the producer calls
-  `RequestBlockRegistry::Complete` (A3). -/
+  /-- The producer calls `RequestBlockRegistry::Complete` for a dispatched rank
+  after the rank's last window (A3, a caller contract). -/
   | senderVoteComplete (srcUnit : Nat)
   /-- `RequestBlockRegistry::CancelIfUnclaimed` by the producer. -/
   | cancelIfUnclaimed

@@ -16,6 +16,7 @@
 // are still running, exercised without a device: the copies complete when
 // the test says so.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -71,6 +72,7 @@ using ::absl_testing::IsOkAndHolds;
 using ::absl_testing::StatusIs;
 using ::testing::_;
 using ::testing::AllOf;
+using ::testing::AnyOf;
 using ::testing::Contains;
 using ::testing::ElementsAre;
 using ::testing::Ge;
@@ -513,6 +515,290 @@ int64_t SteadyNowNs() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
              std::chrono::steady_clock::now().time_since_epoch())
       .count();
+}
+
+constexpr size_t kLoopbackBlockBytes = 128;
+constexpr size_t kLoopbackDeviceBlocks = 4;
+// Bound on one loopback step: a pull handshake, a push, or a transfer
+// settling. Generous enough for sanitizer runs.
+constexpr absl::Duration kLoopbackWait = absl::Seconds(15);
+
+// Position-dependent block contents seeded by `seed`, so a truncated or
+// misaligned copy is caught.
+std::vector<uint8_t> BlockPattern(uint8_t seed) {
+  std::vector<uint8_t> block(kLoopbackBlockBytes);
+  for (size_t i = 0; i < kLoopbackBlockBytes; ++i) {
+    block[i] = static_cast<uint8_t>(seed + i);
+  }
+  return block;
+}
+
+std::vector<uint8_t> StagingBlock(const uint8_t* slot) {
+  return std::vector<uint8_t>(slot, slot + kLoopbackBlockBytes);
+}
+
+// Copy records and simulated device blocks, which LoopbackManager's
+// LoopbackBase touches from pull-serve and BlockTransport threads. A base
+// class listed before KVCacheManagerWithTransfer (the base-from-member idiom,
+// as TestManagerH2hState) so that it is still alive while
+// ~KVCacheManagerWithTransfer drains those threads, which matters when a test
+// exits early with a transfer in flight. ~LoopbackManager fails the pending
+// copies first, so that drain does not wait on them.
+struct LoopbackState {
+  struct Copy {
+    enum class Direction { kDeviceToHost, kHostToDevice };
+    Direction direction;
+    xla::Promise<> promise;
+    size_t device_block;
+    uint8_t* staging_ptr;
+  };
+
+  absl::Mutex copies_mu_;
+  bool shutting_down_ ABSL_GUARDED_BY(copies_mu_) = false;
+  std::vector<Copy> copies_ ABSL_GUARDED_BY(copies_mu_);
+  std::vector<std::vector<uint8_t>> device_blocks_ ABSL_GUARDED_BY(copies_mu_) =
+      std::vector<std::vector<uint8_t>>(
+          kLoopbackDeviceBlocks, std::vector<uint8_t>(kLoopbackBlockBytes, 0));
+};
+
+// One end of a device transfer over loopback control and data planes, without
+// a device: a single-layer manager whose device blocks are byte arrays and
+// whose device copies move the bytes when the test completes them. Records,
+// for each device copy, the host staging buffer it reads or writes, so a test
+// can see which staging slot a request leased and what it holds.
+class LoopbackManager : private LoopbackState,
+                        public KVCacheManagerWithTransfer {
+ public:
+  // `num_slots` staging slots of one block each. A control server is opened
+  // on a free port when `local_control_port` is 0; only a producer needs one.
+  LoopbackManager(int64_t num_slots, int64_t node_id, int local_control_port)
+      : KVCacheManagerWithTransfer(
+            std::make_unique<LoopbackBase>(num_slots, this), node_id,
+            local_control_port, /*max_blocks=*/1, num_slots,
+            /*timeout_s=*/60.0) {}
+
+  // Fails the copies still pending so the sessions waiting on them settle
+  // before ~KVCacheManagerWithTransfer awaits them; a copy dispatched after
+  // this point is refused by Record(). The promises are set outside the lock:
+  // their callbacks run inline.
+  ~LoopbackManager() override {
+    std::vector<Copy> pending;
+    {
+      absl::MutexLock lock(copies_mu_);
+      shutting_down_ = true;
+      pending = std::move(copies_);
+    }
+    for (Copy& copy : pending) {
+      if (copy.promise) {  // Not already completed by FinishCopy.
+        copy.promise.Set(absl::CancelledError("LoopbackManager shutting down"));
+      }
+    }
+  }
+
+  std::string control_endpoint() const {
+    return absl::StrCat("127.0.0.1:", local_control_port());
+  }
+
+  void FillDeviceBlock(size_t block_id, uint8_t seed) {
+    absl::MutexLock lock(copies_mu_);
+    device_blocks_.at(block_id) = BlockPattern(seed);
+  }
+
+  std::vector<uint8_t> device_block(size_t block_id) {
+    absl::MutexLock lock(copies_mu_);
+    return device_blocks_.at(block_id);
+  }
+
+  size_t copies_issued() {
+    absl::MutexLock lock(copies_mu_);
+    return copies_.size();
+  }
+
+  bool WaitForCopiesIssued(size_t expected, absl::Duration timeout) {
+    absl::MutexLock lock(copies_mu_);
+    auto cond = [this, expected]() ABSL_EXCLUSIVE_LOCKS_REQUIRED(copies_mu_) {
+      return copies_.size() >= expected;
+    };
+    return copies_mu_.AwaitWithTimeout(absl::Condition(&cond), timeout);
+  }
+
+  // Host staging buffer the `index`-th copy issued reads from or writes to.
+  uint8_t* copy_staging_ptr(size_t index) {
+    absl::MutexLock lock(copies_mu_);
+    return copies_.at(index).staging_ptr;
+  }
+
+  // Completes the `index`-th copy issued, copying its bytes first when `status`
+  // is OK. The promise is set outside the lock: its callbacks run inline.
+  void FinishCopy(size_t index, absl::Status status) {
+    xla::Promise<> promise;
+    {
+      absl::MutexLock lock(copies_mu_);
+      Copy& copy = copies_.at(index);
+      if (status.ok()) {
+        uint8_t* device = device_blocks_.at(copy.device_block).data();
+        if (copy.direction == Copy::Direction::kDeviceToHost) {
+          std::memcpy(copy.staging_ptr, device, kLoopbackBlockBytes);
+        } else {
+          std::memcpy(device, copy.staging_ptr, kLoopbackBlockBytes);
+        }
+      }
+      promise = std::move(copy.promise);
+    }
+    promise.Set(std::move(status));
+  }
+
+  void CancelSend(uint64_t uuid) {
+    std::shared_ptr<TransferSendSession> session;
+    {
+      absl::MutexLock lock(mu_);
+      session = FindSessionLocked<TransferSendSession>(uuid);
+      CHECK(session != nullptr);
+    }
+    session->Finish(absl::CancelledError("send cancelled"));
+  }
+
+  void FailRecv(uint64_t uuid, absl::Status status) {
+    std::shared_ptr<TransferReceiveSession> session;
+    {
+      absl::MutexLock lock(mu_);
+      session = FindSessionLocked<TransferReceiveSession>(uuid);
+      CHECK(session != nullptr);
+    }
+    session->Finish(std::move(status));
+  }
+
+  size_t free_slots() { return staging_allocator_->num_free_slots(); }
+
+  bool has_send(uint64_t uuid) {
+    absl::MutexLock lock(mu_);
+    auto session = FindSessionLocked<TransferSendSession>(uuid);
+    return session != nullptr && !session->Done();
+  }
+
+  bool has_recv(uint64_t uuid) {
+    absl::MutexLock lock(mu_);
+    auto session = FindSessionLocked<TransferReceiveSession>(uuid);
+    return session != nullptr && !session->Done();
+  }
+
+ private:
+  class LoopbackBase : public kv_cache::KVCacheManagerBase {
+   public:
+    LoopbackBase(int64_t num_slots, LoopbackManager* owner)
+        : kv_cache::KVCacheManagerBase(
+              /*num_layers=*/1, /*num_shards=*/1,
+              std::vector<size_t>(1, kLoopbackBlockBytes),
+              /*local_port=*/std::nullopt,
+              /*host_blocks_to_allocate=*/static_cast<int>(num_slots),
+              /*parallelism=*/1, nullptr),
+          owner_(owner) {}
+
+    absl::StatusOr<raiden::PjRtCopyFuture> D2hSyncDispatch(
+        const std::vector<int64_t>& src_offsets_major_dim,
+        const std::vector<int64_t>& dst_offsets_major_dim,
+        const std::vector<int64_t>& copy_sizes_major_dim,
+        std::optional<int64_t> slot_idx, std::optional<size_t> layer_idx,
+        std::optional<size_t> host_layer_idx,
+        std::optional<size_t> shard_idx) override {
+      CHECK_EQ(src_offsets_major_dim.size(), 1);
+      CHECK_EQ(dst_offsets_major_dim.size(), 1);
+      CHECK_EQ(copy_sizes_major_dim.size(), 1);
+      CHECK_EQ(copy_sizes_major_dim[0], 1);
+      return Record(Copy::Direction::kDeviceToHost,
+                    /*device_block=*/src_offsets_major_dim[0],
+                    /*host_block=*/dst_offsets_major_dim[0]);
+    }
+
+    absl::StatusOr<raiden::PjRtCopyFuture> H2dSyncDispatch(
+        const std::vector<int64_t>& src_offsets_major_dim,
+        const std::vector<int64_t>& dst_offsets_major_dim,
+        const std::vector<int64_t>& copy_sizes_major_dim,
+        std::optional<int64_t> slot_idx, std::optional<size_t> layer_idx,
+        std::optional<size_t> host_layer_idx,
+        std::optional<size_t> shard_idx) override {
+      CHECK_EQ(src_offsets_major_dim.size(), 1);
+      CHECK_EQ(dst_offsets_major_dim.size(), 1);
+      CHECK_EQ(copy_sizes_major_dim.size(), 1);
+      CHECK_EQ(copy_sizes_major_dim[0], 1);
+      return Record(Copy::Direction::kHostToDevice,
+                    /*device_block=*/dst_offsets_major_dim[0],
+                    /*host_block=*/src_offsets_major_dim[0]);
+    }
+
+   private:
+    absl::StatusOr<raiden::PjRtCopyFuture> Record(Copy::Direction direction,
+                                                  int64_t device_block,
+                                                  int64_t host_block) {
+      uint8_t* staging_ptr =
+          GetBlockHostPointer(/*layer_idx=*/0, /*shard_idx=*/0, host_block);
+      absl::MutexLock lock(owner_->copies_mu_);
+      if (owner_->shutting_down_) {
+        return absl::CancelledError("LoopbackManager shutting down");
+      }
+      auto [promise, future] = xla::MakePromise<>();
+      owner_->copies_.push_back(Copy{direction, std::move(promise),
+                                     static_cast<size_t>(device_block),
+                                     staging_ptr});
+      return raiden::PjRtCopyFuture(std::move(future), raiden::BufferHolders{});
+    }
+
+    LoopbackManager* owner_;
+  };
+};
+
+enum class Settled { kNone, kSent, kReceived, kFailed };
+
+template <typename Sink>
+void AbslStringify(Sink& sink, Settled settled) {
+  switch (settled) {
+    case Settled::kNone:
+      sink.Append("kNone");
+      return;
+    case Settled::kSent:
+      sink.Append("kSent");
+      return;
+    case Settled::kReceived:
+      sink.Append("kReceived");
+      return;
+    case Settled::kFailed:
+      sink.Append("kFailed");
+      return;
+  }
+}
+
+// Polls `manager` until `req_id` settles and reports how, or gives up after
+// `timeout`. Nothing else is expected to settle meanwhile.
+Settled AwaitSettled(KVCacheManagerWithTransfer& manager,
+                     const std::string& req_id,
+                     absl::Duration timeout = kLoopbackWait) {
+  const absl::Time deadline = absl::Now() + timeout;
+  while (absl::Now() < deadline) {
+    CompleteReadResult result = manager.CompleteReadWithDetails();
+    const size_t total =
+        result.sent.size() + result.received.size() + result.failed.size();
+    if (total == 0) {
+      absl::SleepFor(absl::Milliseconds(1));
+      continue;
+    }
+    EXPECT_EQ(total, 1);
+    EXPECT_THAT(result.sent, AnyOf(IsEmpty(), ElementsAre(req_id)));
+    EXPECT_THAT(result.received, AnyOf(IsEmpty(), ElementsAre(req_id)));
+    EXPECT_THAT(result.failed, AnyOf(IsEmpty(), ElementsAre(req_id)));
+    if (std::find(result.sent.begin(), result.sent.end(), req_id) !=
+        result.sent.end()) {
+      return Settled::kSent;
+    }
+    if (std::find(result.received.begin(), result.received.end(), req_id) !=
+        result.received.end()) {
+      return Settled::kReceived;
+    }
+    if (std::find(result.failed.begin(), result.failed.end(), req_id) !=
+        result.failed.end()) {
+      return Settled::kFailed;
+    }
+  }
+  return Settled::kNone;
 }
 
 TEST(SendDrainTest, ExpiredSendKeepsItsStagingUntilTheCopyEnds) {
@@ -2311,6 +2597,166 @@ TEST(RecvDrainTest, CancelledReceiveWhoseCopyThenFailsStaysCancelled) {
   EXPECT_THAT(completions.failed, ElementsAre("req"));
   EXPECT_EQ(completions.details["req"].code, "CANCELLED");
   EXPECT_THAT(consumer.CompleteReadWithDetails().failed, IsEmpty());
+}
+
+// MultiRequestTest: consecutive requests over loopback. A serving engine starts
+// its next request on the buffers the previous one released: the prefill
+// device block, the producer's staging slot and the consumer's staging slot
+// are reused, while the consumer's device block that received the previous
+// request's KV stays in use. In both tests a slot that is reused was the only
+// free one, so the next request could only have proceeded on the slot the
+// previous one gave back.
+
+// Request 0 is cancelled on both ends while its device-to-host copy runs; the
+// send settles once the copy lands, request 1 then runs end to end over the
+// slot each end got back, and the consumer's device block for request 0 keeps
+// its contents.
+TEST(MultiRequestTest, NextRequestRunsOnTheSlotsACancelledRequestReleased) {
+  LoopbackManager producer(/*num_slots=*/1, /*node_id=*/0,
+                           /*local_control_port=*/0);
+  LoopbackManager consumer(/*num_slots=*/1, /*node_id=*/1,
+                           /*local_control_port=*/-1);
+  producer.FillDeviceBlock(/*block_id=*/0, 0xAA);
+  consumer.FillDeviceBlock(/*block_id=*/0, 0x11);
+
+  ASSERT_EQ(producer.NotifyForRead("req_0", /*uuid=*/701, /*block_ids=*/{0}),
+            701);
+  consumer.StartRead("req_0", /*uuid=*/701, producer.control_endpoint(),
+                     /*remote_block_ids=*/{0}, /*local_block_ids=*/{0});
+  ASSERT_TRUE(producer.WaitForCopiesIssued(1, kLoopbackWait));
+  uint8_t* const producer_slot = producer.copy_staging_ptr(0);
+  EXPECT_EQ(producer.free_slots(), 0);
+  EXPECT_EQ(consumer.free_slots(), 0);
+
+  // Cancelled while the copy runs: the send keeps its slot until the copy
+  // lands, then settles failed without pushing; the receive settles once its
+  // pull handshake is answered, with no copy ever dispatched.
+  producer.CancelSend(/*uuid=*/701);
+  consumer.FailRecv(/*uuid=*/701, absl::CancelledError("recv cancelled"));
+  EXPECT_TRUE(producer.has_send(701));
+  EXPECT_EQ(producer.free_slots(), 0);
+  EXPECT_EQ(AwaitSettled(consumer, "req_0"), Settled::kFailed);
+  EXPECT_FALSE(consumer.has_recv(701));
+  EXPECT_EQ(consumer.copies_issued(), 0);
+  EXPECT_EQ(consumer.free_slots(), 1);
+
+  producer.FinishCopy(0, absl::OkStatus());
+  EXPECT_EQ(StagingBlock(producer_slot), BlockPattern(0xAA));
+  ASSERT_EQ(AwaitSettled(producer, "req_0"), Settled::kFailed);
+  EXPECT_FALSE(producer.has_send(701));
+  EXPECT_EQ(producer.free_slots(), 1);
+  EXPECT_EQ(consumer.device_block(0), BlockPattern(0x11));
+
+  // The engine reclaims the prefill block for request 1, which runs over the
+  // same producer slot and the same consumer slot.
+  producer.FillDeviceBlock(/*block_id=*/0, 0xBB);
+  ASSERT_EQ(producer.NotifyForRead("req_1", /*uuid=*/702, /*block_ids=*/{0}),
+            702);
+  consumer.StartRead("req_1", /*uuid=*/702, producer.control_endpoint(),
+                     /*remote_block_ids=*/{0}, /*local_block_ids=*/{1});
+  ASSERT_TRUE(producer.WaitForCopiesIssued(2, kLoopbackWait));
+  EXPECT_EQ(producer.copy_staging_ptr(1), producer_slot);
+  producer.FinishCopy(1, absl::OkStatus());
+  EXPECT_EQ(StagingBlock(producer_slot), BlockPattern(0xBB));
+
+  ASSERT_TRUE(consumer.WaitForCopiesIssued(1, kLoopbackWait));
+  uint8_t* const consumer_slot = consumer.copy_staging_ptr(0);
+  EXPECT_EQ(consumer_slot,
+            consumer.base()->GetBlockHostPointer(/*layer_idx=*/0,
+                                                 /*shard_idx=*/0,
+                                                 /*block_id=*/0));
+  EXPECT_EQ(StagingBlock(consumer_slot), BlockPattern(0xBB));
+  consumer.FinishCopy(0, absl::OkStatus());
+  EXPECT_EQ(AwaitSettled(producer, "req_1"), Settled::kSent);
+  EXPECT_EQ(AwaitSettled(consumer, "req_1"), Settled::kReceived);
+  EXPECT_EQ(producer.free_slots(), 1);
+  EXPECT_EQ(consumer.free_slots(), 1);
+  EXPECT_EQ(consumer.device_block(1), BlockPattern(0xBB));
+  EXPECT_EQ(consumer.device_block(0), BlockPattern(0x11));
+}
+
+// The producer's send settles when its push lands in the consumer's staging,
+// before the consumer's host-to-device copy completes. The engine then
+// recycles the prefill block and the producer's slot for request 1 while
+// request 0's copy is still pending on the consumer, and request 2 later
+// reuses the consumer slot request 0 released; neither overwrite reaches the
+// consumer's device block that holds request 0's KV.
+TEST(MultiRequestTest,
+     PrefillRecyclesWhileTheConsumerCopyOfTheEarlierRequestStillRuns) {
+  LoopbackManager producer(/*num_slots=*/1, /*node_id=*/0,
+                           /*local_control_port=*/0);
+  LoopbackManager consumer(/*num_slots=*/2, /*node_id=*/1,
+                           /*local_control_port=*/-1);
+  producer.FillDeviceBlock(/*block_id=*/0, 0xAA);
+
+  ASSERT_EQ(producer.NotifyForRead("req_0", /*uuid=*/703, /*block_ids=*/{0}),
+            703);
+  consumer.StartRead("req_0", /*uuid=*/703, producer.control_endpoint(),
+                     /*remote_block_ids=*/{0}, /*local_block_ids=*/{0});
+  ASSERT_TRUE(producer.WaitForCopiesIssued(1, kLoopbackWait));
+  uint8_t* const producer_slot = producer.copy_staging_ptr(0);
+
+  // The push lands and the send settles; the consumer has dispatched its copy
+  // and holds its slot until that copy completes.
+  producer.FinishCopy(0, absl::OkStatus());
+  ASSERT_TRUE(consumer.WaitForCopiesIssued(1, kLoopbackWait));
+  ASSERT_EQ(AwaitSettled(producer, "req_0"), Settled::kSent);
+  EXPECT_EQ(producer.free_slots(), 1);
+  EXPECT_TRUE(consumer.has_recv(703));
+  EXPECT_EQ(consumer.free_slots(), 1);
+  uint8_t* const consumer_slot_of_req_0 = consumer.copy_staging_ptr(0);
+  EXPECT_EQ(StagingBlock(consumer_slot_of_req_0), BlockPattern(0xAA));
+  EXPECT_EQ(consumer.device_block(0),
+            std::vector<uint8_t>(kLoopbackBlockBytes, 0));
+
+  // Request 1 recycles the prefill block and the producer slot while request
+  // 0's copy is pending; on the consumer it takes the other slot.
+  producer.FillDeviceBlock(/*block_id=*/0, 0xBB);
+  ASSERT_EQ(producer.NotifyForRead("req_1", /*uuid=*/704, /*block_ids=*/{0}),
+            704);
+  consumer.StartRead("req_1", /*uuid=*/704, producer.control_endpoint(),
+                     /*remote_block_ids=*/{0}, /*local_block_ids=*/{1});
+  ASSERT_TRUE(producer.WaitForCopiesIssued(2, kLoopbackWait));
+  EXPECT_EQ(producer.copy_staging_ptr(1), producer_slot);
+  producer.FinishCopy(1, absl::OkStatus());
+  EXPECT_EQ(StagingBlock(producer_slot), BlockPattern(0xBB));
+  ASSERT_TRUE(consumer.WaitForCopiesIssued(2, kLoopbackWait));
+  EXPECT_EQ(consumer.free_slots(), 0);
+  EXPECT_EQ(AwaitSettled(producer, "req_1"), Settled::kSent);
+  uint8_t* const consumer_slot_of_req_1 = consumer.copy_staging_ptr(1);
+  EXPECT_NE(consumer_slot_of_req_1, consumer_slot_of_req_0);
+  EXPECT_EQ(StagingBlock(consumer_slot_of_req_0), BlockPattern(0xAA));
+  EXPECT_EQ(StagingBlock(consumer_slot_of_req_1), BlockPattern(0xBB));
+
+  // Request 0's copy lands and the receive is reported; request 2 then reuses
+  // the slot request 0 released, while request 0's device block keeps its
+  // bytes.
+  consumer.FinishCopy(0, absl::OkStatus());
+  EXPECT_EQ(AwaitSettled(consumer, "req_0"), Settled::kReceived);
+  EXPECT_EQ(consumer.device_block(0), BlockPattern(0xAA));
+  EXPECT_EQ(consumer.free_slots(), 1);
+
+  producer.FillDeviceBlock(/*block_id=*/0, 0xCC);
+  ASSERT_EQ(producer.NotifyForRead("req_2", /*uuid=*/705, /*block_ids=*/{0}),
+            705);
+  consumer.StartRead("req_2", /*uuid=*/705, producer.control_endpoint(),
+                     /*remote_block_ids=*/{0}, /*local_block_ids=*/{2});
+  ASSERT_TRUE(producer.WaitForCopiesIssued(3, kLoopbackWait));
+  producer.FinishCopy(2, absl::OkStatus());
+  ASSERT_TRUE(consumer.WaitForCopiesIssued(3, kLoopbackWait));
+  EXPECT_EQ(AwaitSettled(producer, "req_2"), Settled::kSent);
+  EXPECT_EQ(consumer.copy_staging_ptr(2), consumer_slot_of_req_0);
+  EXPECT_EQ(StagingBlock(consumer_slot_of_req_0), BlockPattern(0xCC));
+  EXPECT_EQ(consumer.device_block(0), BlockPattern(0xAA));
+
+  consumer.FinishCopy(1, absl::OkStatus());
+  EXPECT_EQ(AwaitSettled(consumer, "req_1"), Settled::kReceived);
+  consumer.FinishCopy(2, absl::OkStatus());
+  EXPECT_EQ(AwaitSettled(consumer, "req_2"), Settled::kReceived);
+  EXPECT_EQ(consumer.free_slots(), 2);
+  EXPECT_EQ(consumer.device_block(0), BlockPattern(0xAA));
+  EXPECT_EQ(consumer.device_block(1), BlockPattern(0xBB));
+  EXPECT_EQ(consumer.device_block(2), BlockPattern(0xCC));
 }
 
 }  // namespace

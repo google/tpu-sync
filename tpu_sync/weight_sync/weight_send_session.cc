@@ -208,7 +208,8 @@ class PushSendSession final : public WeightSendSession {
                   int max_concurrency, std::vector<PushTask> tasks,
                   WeightSendSessionOptions options)
       : WeightSendSession(uuid, options.deadline,
-                          std::move(options.host_buffer_owner)),
+                          std::move(options.host_buffer_owner),
+                          std::move(options.data_ready_future_provider)),
         client_(client),
         tasks_(std::move(tasks)),
         max_concurrency_(max_concurrency),
@@ -267,6 +268,17 @@ class PushSendSession final : public WeightSendSession {
       }
 
       const PushTask& task = tasks_[task_idx];
+      absl::Status ready_status =
+          GetDataReadyFuture(static_cast<size_t>(task.request.buffer_id))
+              .Await();
+      if (!ready_status.ok()) {
+        Finish(ready_status);
+        return;
+      }
+      if (IsDraining()) {
+        return;
+      }
+
       absl::Duration timeout = absl::ZeroDuration();
       if (deadline_ != std::chrono::steady_clock::time_point::max()) {
         auto now = std::chrono::steady_clock::now();
@@ -328,7 +340,8 @@ class PullSendSession final
                   absl::flat_hash_map<WeightChunkBatchKey, ServeEntry> entries,
                   size_t total_expected_pulls, WeightSendSessionOptions options)
       : WeightSendSession(uuid, options.deadline,
-                          std::move(options.host_buffer_owner)),
+                          std::move(options.host_buffer_owner),
+                          std::move(options.data_ready_future_provider)),
         entries_(std::move(entries)),
         total_remaining_pulls_(total_expected_pulls) {}
 
@@ -369,6 +382,13 @@ class PullSendSession final
           "PullSendSession deadline exceeded on PullChunks");
       Finish(err);
       return err;
+    }
+
+    absl::Status ready_status =
+        GetDataReadyFuture(static_cast<size_t>(request.buffer_id)).Await();
+    if (!ready_status.ok()) {
+      Finish(ready_status);
+      return ready_status;
     }
 
     WeightChunkBatchKey key{request.buffer_id, request.shard_id,
@@ -426,10 +446,12 @@ class PullSendSession final
 
 WeightSendSession::WeightSendSession(
     uint64_t uuid, std::chrono::steady_clock::time_point deadline,
-    std::shared_ptr<const void> host_buffer_owner)
+    std::shared_ptr<const void> host_buffer_owner,
+    DataReadyFutureProvider data_ready_future_provider)
     : uuid_(uuid),
       deadline_(deadline),
-      host_buffer_owner_(std::move(host_buffer_owner)) {}
+      host_buffer_owner_(std::move(host_buffer_owner)),
+      data_ready_future_provider_(std::move(data_ready_future_provider)) {}
 
 absl::StatusOr<PullChunksResponse> WeightSendSession::OnPullChunks(
     const PullChunksRequest& request) {
@@ -504,6 +526,9 @@ absl::Status WeightSendSession::OnDataReceived(
 
 tsl::Future<> WeightSendSession::GetDataReadyFuture(
     size_t major_dimension_idx) {
+  if (data_ready_future_provider_) {
+    return data_ready_future_provider_(major_dimension_idx);
+  }
   return tsl::Future<>(absl::OkStatus());
 }
 

@@ -306,17 +306,27 @@ if [[ "${BUILD_MODE}" == "torch" ]]; then
   # Extra variants: rebuild the extension against each additional torch in an
   # isolated venv (a fresh TORCH_SOURCE path forces the bazel torch repo to
   # re-resolve; an in-place pip swap at the same path would be reused stale).
+  # Stage venvs under BAZEL_CACHE_DIR rather than /tmp: torch_local_repo.bzl
+  # populates @local_torch with `cp -as` symlinks into TORCH_SOURCE, and
+  # Bazel's linux-sandbox mounts a private per-action /tmp that hides /tmp
+  # symlink targets from compile actions.
+  # TODO: Copy only torch/include (and check rctx.execute return codes) in
+  # torch_local_repo.bzl so @local_torch does not rely on TORCH_SOURCE
+  # symlinks.
   for V in "${TORCH_ABIS[@]:1}"; do
-    python3 -m venv "/tmp/torch-abi-${V}"
-    "/tmp/torch-abi-${V}/bin/pip" install -q "torch==${V}" \
+    TORCH_ABI_VENV="${BAZEL_CACHE_DIR}/torch-abi-${V}"
+    rm -rf "${TORCH_ABI_VENV}"
+    python3 -m venv "${TORCH_ABI_VENV}"
+    "${TORCH_ABI_VENV}/bin/pip" install -q "torch==${V}" \
       --index-url https://download.pytorch.org/whl/cpu
-    TORCH_SOURCE="$("/tmp/torch-abi-${V}/bin/python3" -c 'import torch, pathlib; print(pathlib.Path(torch.__file__).resolve().parent.parent)')"
+    TORCH_SOURCE="$("${TORCH_ABI_VENV}/bin/python3" -c 'import torch, pathlib; print(pathlib.Path(torch.__file__).resolve().parent.parent)')"
     export TORCH_SOURCE
-    SUFFIX="$(torch_suffix "/tmp/torch-abi-${V}/bin/python3")"
+    SUFFIX="$(torch_suffix "${TORCH_ABI_VENV}/bin/python3")"
     ./build.sh torch ${EXTRA_BAZEL_FLAGS}
     cp "${REPO_ROOT}/tpu_sync/frameworks/torch/_tpu_raiden_torch.so" \
       "${EXT_DIR}/_tpu_raiden_torch_${SUFFIX}.so"
     set_glue_needed "${EXT_DIR}/_tpu_raiden_torch_${SUFFIX}.so" "${SUFFIX}"
+    rm -rf "${TORCH_ABI_VENV}"
   done
 
   rm -f "${WHL}"

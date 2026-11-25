@@ -128,7 +128,7 @@ class GrpcTransportServer::GrpcTransportServiceImpl final
         .chunk_batch_id = request->chunk_batch_id(),
     };
     absl::StatusOr<PullChunksResponse> pulled =
-        delegate_->ResolvePullChunks(pull_req);
+        delegate_->OnPullChunks(pull_req);
     if (!pulled.ok()) {
       SetStatusProto(pulled.status(), response.mutable_status());
       return new PullChunksReactor(std::move(response));
@@ -184,9 +184,9 @@ class GrpcTransportServer::GrpcTransportServiceImpl final
       ApplyChunkProto(request.chunks(i), host_buffer);
     }
 
-    return delegate_->OnPushChunksComplete(request.uuid(), request.buffer_id(),
-                                           request.shard_id(),
-                                           request.chunk_batch_id());
+    return delegate_->OnPushChunks(request.uuid(), request.buffer_id(),
+                                   request.shard_id(),
+                                   request.chunk_batch_id());
   }
 
   GrpcTransportDelegate* const delegate_;

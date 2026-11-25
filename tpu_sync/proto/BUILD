@@ -202,6 +202,7 @@ cc_proto_library(
 cc_grpc_library(
     name = "grpc_transport_service_cc_grpc",
     srcs = [":grpc_transport_service_proto"],
+    grpc_only = True,
     visibility = ["//visibility:public"],
     deps = [":grpc_transport_service_cc_proto"],
 )

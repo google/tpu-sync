@@ -40,16 +40,16 @@ class GrpcTransportDelegate {
   virtual absl::StatusOr<absl::Span<uint8_t>> GetHostBuffer(
       uint64_t buffer_id, uint32_t shard_id) = 0;
 
-  virtual absl::Status OnPushChunksComplete(uint64_t uuid, uint64_t buffer_id,
-                                            uint32_t shard_id,
-                                            uint64_t chunk_batch_id) {
+  virtual absl::Status OnPushChunks(uint64_t uuid, uint64_t buffer_id,
+                                    uint32_t shard_id,
+                                    uint64_t chunk_batch_id) {
     return absl::OkStatus();
   }
 
-  virtual absl::StatusOr<PullChunksResponse> ResolvePullChunks(
+  virtual absl::StatusOr<PullChunksResponse> OnPullChunks(
       const PullChunksRequest& request) {
     return absl::UnimplementedError(
-        "GrpcTransportDelegate::ResolvePullChunks is not implemented");
+        "GrpcTransportDelegate::OnPullChunks is not implemented");
   }
 };
 

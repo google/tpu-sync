@@ -90,9 +90,9 @@ class FakeGrpcTransportDelegate final : public GrpcTransportDelegate {
     return absl::MakeSpan(it->second);
   }
 
-  absl::Status OnPushChunksComplete(uint64_t uuid, uint64_t buffer_id,
-                                    uint32_t shard_id,
-                                    uint64_t chunk_batch_id) override {
+  absl::Status OnPushChunks(uint64_t uuid, uint64_t buffer_id,
+                            uint32_t shard_id,
+                            uint64_t chunk_batch_id) override {
     absl::MutexLock lock(mu_);
     push_records_.push_back(PushRecord{
         .uuid = uuid,
@@ -103,7 +103,7 @@ class FakeGrpcTransportDelegate final : public GrpcTransportDelegate {
     return absl::OkStatus();
   }
 
-  absl::StatusOr<PullChunksResponse> ResolvePullChunks(
+  absl::StatusOr<PullChunksResponse> OnPullChunks(
       const PullChunksRequest& request) override {
     absl::MutexLock lock(mu_);
     auto it = pull_results_.find({request.uuid, request.buffer_id,

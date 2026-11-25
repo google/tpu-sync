@@ -21,9 +21,12 @@ helper tests run there.
 
 import collections
 import dataclasses
+import importlib
+import importlib.util
 import os
 import socket
 import struct
+from unittest import mock
 from absl.testing import absltest
 from absl.testing import parameterized
 import jax
@@ -747,6 +750,75 @@ class DeviceNumaNodesTest(absltest.TestCase):
       self.assertEqual(eps.hosts[1].devices, (devices.flat[1], devices.flat[3]))
     finally:
       weight_synchronizer_ffi.init_weight_synchronizer = original_init
+
+
+class PurePythonFfiFallbackTest(absltest.TestCase):
+
+  def test_prepare_extended_info(self):
+    ws = weight_synchronizer_ffi
+    got = ws.prepare_extended_info(
+        [10, 11, 12, 13, 14, 20, 21, 22, 23, 24, 99, 99],
+        [0, 3],
+        [0, 8],
+        [8, 16],
+        [0, 4],
+        [4, 8],
+    )
+    self.assertEqual(
+        got,
+        [10, 11, 12, 13, 14, 0, 0, 8, 0, 4, 20, 21, 22, 23, 24, 3, 8, 16, 4, 8],
+    )
+    self.assertEqual(ws.prepare_extended_info([], [], [], [], [], []), [])
+    with self.assertRaisesRegex(IndexError, "expected at least 10"):
+      ws.prepare_extended_info(
+          list(range(9)), [0, 1], [0, 8], [8, 16], [0, 4], [4, 8]
+      )
+
+  def test_ffi_dispatch_when_present_or_absent(self):
+    ws = weight_synchronizer_ffi
+    with mock.patch.object(ws, "_weight_synchronizer_ffi", None):
+      self.assertIsNone(ws.destroy_weight_synchronizer())
+      self.assertFalse(ws.is_listener_active(3))
+    fake = mock.MagicMock(**{"is_listener_active.return_value": True})
+    with mock.patch.object(ws, "_weight_synchronizer_ffi", fake):
+      ws.destroy_weight_synchronizer()
+      self.assertTrue(ws.is_listener_active(2))
+      fake.destroy_weight_synchronizer.assert_called_once_with()
+      fake.is_listener_active.assert_called_once_with(2)
+
+  def test_load_weight_synchronizer_ffi(self):
+    ws = weight_synchronizer_ffi
+    ffi_mod = f"{ws.__package__}._weight_synchronizer_ffi"
+    with (
+        mock.patch.object(
+            importlib.util, "find_spec", return_value=None
+        ) as mock_find,
+        mock.patch.object(importlib, "import_module") as mock_imp,
+    ):
+      self.assertIsNone(ws._load_weight_synchronizer_ffi())
+      mock_find.assert_called_once_with(ffi_mod)
+      mock_imp.assert_not_called()
+
+    sentinel = object()
+    with (
+        mock.patch.object(importlib.util, "find_spec", return_value=object()),
+        mock.patch.object(
+            importlib, "import_module", return_value=sentinel
+        ) as mock_imp,
+    ):
+      self.assertIs(ws._load_weight_synchronizer_ffi(), sentinel)
+      mock_imp.assert_called_once_with(ffi_mod)
+
+    with (
+        mock.patch.object(importlib.util, "find_spec", return_value=object()),
+        mock.patch.object(
+            importlib,
+            "import_module",
+            side_effect=ModuleNotFoundError("nested_dep", name="nested_dep"),
+        ),
+    ):
+      with self.assertRaisesRegex(ModuleNotFoundError, "nested_dep"):
+        ws._load_weight_synchronizer_ffi()
 
 
 if __name__ == "__main__":

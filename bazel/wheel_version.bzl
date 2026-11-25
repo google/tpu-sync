@@ -19,6 +19,8 @@ Mirrors torch_tpu/bazel/wheel_version.bzl: reads the base `version` from the
 (e.g. ".dev20260613120000") so CI can stamp dated dev builds.
 """
 
+_SUPPORTED_PYTHON_VERSIONS = ("3.12", "3.13", "3.14")
+
 def _raiden_version_repo_impl(ctx):
     pyproject_path = ctx.path(ctx.attr.pyproject_toml)
     content = ctx.read(pyproject_path)
@@ -50,13 +52,32 @@ def _raiden_version_repo_impl(ctx):
     suffix = ctx.os.environ.get("WHEEL_VERSION_EXTRAS", "")
     full_version = version + suffix
 
+    py_version = ctx.os.environ.get("HERMETIC_PYTHON_VERSION", "3.12").strip() or "3.12"
+    if py_version not in _SUPPORTED_PYTHON_VERSIONS:
+        fail("HERMETIC_PYTHON_VERSION must be one of {}, got '{}'".format(
+            _SUPPORTED_PYTHON_VERSIONS,
+            py_version,
+        ))
+    py_parts = py_version.split(".")
+    py_tag = "cp{}{}".format(py_parts[0], py_parts[1])
+
     ctx.file("BUILD.bazel", "")
-    ctx.file("version.bzl", "WHEEL_VERSION = '{}'\n".format(full_version))
+    ctx.file(
+        "version.bzl",
+        "\n".join([
+            "WHEEL_VERSION = '{}'".format(full_version),
+            "WHEEL_PYTHON_VERSION = '{}'".format(py_version),
+            "WHEEL_PYTHON_TAG = '{}'".format(py_tag),
+            "WHEEL_ABI_TAG = '{}'".format(py_tag),
+            "SUPPORTED_PYTHON_VERSIONS = {}".format(repr(_SUPPORTED_PYTHON_VERSIONS)),
+            "",
+        ]),
+    )
 
 raiden_version_repo = repository_rule(
     implementation = _raiden_version_repo_impl,
     attrs = {
         "pyproject_toml": attr.label(mandatory = True, allow_single_file = True),
     },
-    environ = ["WHEEL_VERSION_EXTRAS"],
+    environ = ["WHEEL_VERSION_EXTRAS", "HERMETIC_PYTHON_VERSION"],
 )

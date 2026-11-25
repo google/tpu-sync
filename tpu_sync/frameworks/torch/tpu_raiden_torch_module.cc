@@ -203,9 +203,10 @@ using ::tpu_raiden::kv_cache::ToStdStringVector;
 
 // Mooncake dlopen()s this extension to serve the handles that its
 // mooncake_provider submodule exports, so the entry point is defined here, in
-// the extension's own sources; see
-// tpu_sync/solutions/mooncake/mooncake_provider.h.
-extern "C" int mc_tpu_buffer_provider_get(
+// the extension's own sources; marked weak so binaries statically linking both
+// _tpu_raiden_jax and _tpu_raiden_torch merge the identical definitions
+// cleanly. See tpu_sync/solutions/mooncake/mooncake_provider.h.
+extern "C" __attribute__((weak)) int mc_tpu_buffer_provider_get(
     raiden::mooncake::ProviderTable* out) {
   return raiden::mooncake::GetProviderTable(out);
 }

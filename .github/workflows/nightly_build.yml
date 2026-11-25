@@ -39,8 +39,8 @@ on:
     - cron: "0 8 * * *"  # 08:00 UTC daily
   workflow_dispatch:
     inputs:
-      jax_version:
-        description: "JAX version the jax wheel builds against (empty = DEFAULT_VERSION in third_party/jax/versions.bzl)"
+      jax_abis:
+        description: "JAX releases bundled in each jax wheel, space-separated (empty = WHEEL_ABIS in third_party/jax/versions.bzl)"
         required: false
         default: ""
         type: string
@@ -115,12 +115,13 @@ jobs:
           if-no-files-found: error
 
   build:
-    name: "Build ${{ matrix.framework }} wheel"
+    name: "Build ${{ matrix.framework }} (py${{ matrix.python_version }}) wheel"
     needs: version
     strategy:
       fail-fast: false
       matrix:
         framework: [jax, torch]
+        python_version: ["3.12", "3.13", "3.14"]
     runs-on: linux-x86-n4-32
     container:
       image: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:9644db6e0e969079b138547dd99818c02e6ab51d892c4675cf2f4edf02a1e71a
@@ -141,7 +142,8 @@ jobs:
         working-directory: tpu-sync
         env:
           BUILD_MODE: ${{ matrix.framework }}
-          RAIDEN_JAX_VERSION: ${{ matrix.framework == 'jax' && inputs.jax_version || '' }}
+          HERMETIC_PYTHON_VERSION: ${{ matrix.python_version }}
+          RAIDEN_JAX_ABIS: ${{ matrix.framework == 'jax' && inputs.jax_abis || '' }}
           WHEEL_VERSION_EXTRAS: ${{ needs.version.outputs.wheel_version_extras }}
           EXTRA_BAZEL_FLAGS: ${{ (inputs.use_remote_cache || 'yes') == 'yes' && '--config=ci' || '' }}
         run: |
@@ -156,7 +158,7 @@ jobs:
       # wheel's own Requires-Dist pins; extract them so each build records the
       # stack it must run with.
       - name: Record JAX stack pins
-        if: matrix.framework == 'jax'
+        if: matrix.framework == 'jax' && matrix.python_version == '3.12'
         working-directory: tpu-sync
         run: |
           python3 - <<'PY'
@@ -166,7 +168,7 @@ jobs:
               meta = next(n for n in z.namelist() if n.endswith('.dist-info/METADATA'))
               text = z.read(meta).decode()
           pins = [l.removeprefix('Requires-Dist: ') for l in text.splitlines()
-                  if re.match(r'Requires-Dist: (jax|jaxlib|libtpu)\b', l)]
+                  if re.match(r'Requires-Dist: (jax|jaxlib|libtpu)(?=[\s;=<>!~\[(]|$)', l)]
           assert pins, f'no jax/jaxlib/libtpu pins found in {whl} METADATA'
           open('dist/jax_pins.txt', 'w').write('\n'.join(pins) + '\n')
           print('\n'.join(pins))
@@ -176,7 +178,7 @@ jobs:
       - name: Upload wheel artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
-          name: nightly-wheel-${{ matrix.framework }}
+          name: nightly-wheel-${{ matrix.framework }}-py${{ matrix.python_version }}
           path: |
             tpu-sync/dist/*${{ needs.version.outputs.wheel_version_extras }}-*.whl
             tpu-sync/dist/jax_pins.txt

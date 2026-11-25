@@ -12,11 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The JAX half of the Mooncake TPU buffer provider, the _mooncake_provider
-// extension. Mooncake dlopen()s this extension (the path library_path() in
-// tpu_sync/solutions/mooncake/jax/mooncake_provider.py returns) and calls the
-// mc_tpu_buffer_provider_get defined here, which serves the table of the same
-// provider core that exports the handles below.
+#include "tpu_sync/solutions/mooncake/jax/mooncake_provider_bindings.h"
 
 #include <Python.h>
 
@@ -61,26 +57,20 @@ std::vector<uint64_t> ExportShardBuffers(
 }
 
 }  // namespace
-}  // namespace raiden::mooncake
 
-// Defined here, in the extension's own sources; see mooncake_provider.h.
-extern "C" int mc_tpu_buffer_provider_get(
-    raiden::mooncake::ProviderTable* out) {
-  return raiden::mooncake::GetProviderTable(out);
-}
-
-NB_MODULE(_mooncake_provider, m) {
-  m.def("export_buffers", &raiden::mooncake::ExportShardBuffers,
-        nb::arg("shards"),
+void BindJaxMooncakeProvider(nb::module_& m) {
+  m.def("export_buffers", &ExportShardBuffers, nb::arg("shards"),
         "Exports one Mooncake provider handle per (shard.data, device_index) "
         "pair, in order. All-or-nothing. The caller owns the handles.");
-  m.def("live_buffer_count", &raiden::mooncake::LiveBufferCount,
+  m.def("live_buffer_count", &LiveBufferCount,
         "Number of exported handles not yet released.");
-  m.def("live_dma_mapping_count", &raiden::mooncake::LiveDmaMappingCount,
+  m.def("live_dma_mapping_count", &LiveDmaMappingCount,
         "Number of host ranges mapped by the table's dma_map and not yet "
         "unmapped.");
-  m.def("mark_process_exiting", &raiden::mooncake::MarkProcessExiting,
+  m.def("mark_process_exiting", &MarkProcessExiting,
         "Declares that interpreter exit has begun: from now on dma_map fails "
         "and dma_unmap skips PJRT, whose client JAX's atexit handler may "
         "destroy. mooncake_provider registers it with atexit.");
 }
+
+}  // namespace raiden::mooncake

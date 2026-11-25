@@ -16,6 +16,8 @@
 
 import collections
 import dataclasses
+import importlib
+import importlib.util
 import os
 import socket
 import struct
@@ -29,7 +31,15 @@ from jax.experimental import xla_metadata
 import jax.numpy as jnp
 import numpy as np
 
-from tpu_sync.frameworks.jax import _weight_synchronizer_ffi
+
+def _load_weight_synchronizer_ffi() -> Any:
+  ffi_mod = f"{__package__}._weight_synchronizer_ffi"
+  if importlib.util.find_spec(ffi_mod) is None:
+    return None
+  return importlib.import_module(ffi_mod)
+
+
+_weight_synchronizer_ffi = _load_weight_synchronizer_ffi()
 
 ENDPOINTS_API_VERSION: int = 1
 
@@ -723,18 +733,32 @@ def prepare_extended_info(
     gathered_info, device_ids, r_starts, r_ends, c_starts, c_ends
 ):
   """Packs metadata for coordination."""
-  return _weight_synchronizer_ffi.prepare_extended_info(
-      gathered_info, device_ids, r_starts, r_ends, c_starts, c_ends
-  )
+  expected_len = 5 * len(device_ids)
+  if len(gathered_info) < expected_len:
+    raise IndexError(
+        f"gathered_info has {len(gathered_info)} elements, expected at least"
+        f" {expected_len} for {len(device_ids)} devices."
+    )
+  extended_info = []
+  for i, dev_id in enumerate(device_ids):
+    base = i * 5
+    extended_info.extend(gathered_info[base : base + 5])
+    extended_info.extend(
+        (dev_id, r_starts[i], r_ends[i], c_starts[i], c_ends[i])
+    )
+  return extended_info
 
 
 def destroy_weight_synchronizer():
   """Cleans up WeightSynchronizer instances."""
-  _weight_synchronizer_ffi.destroy_weight_synchronizer()
+  if _weight_synchronizer_ffi is not None:
+    _weight_synchronizer_ffi.destroy_weight_synchronizer()
 
 
 def is_listener_active(shard_idx: int = 0) -> bool:
   """Returns whether the native C++ listener for the shard is active."""
+  if _weight_synchronizer_ffi is None:
+    return False
   return _weight_synchronizer_ffi.is_listener_active(shard_idx)
 
 

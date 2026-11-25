@@ -33,10 +33,10 @@ RAIDEN_SERVER_BAZEL_TARGETS=(
   "//tpu_sync/store_node:kv_cache_host_store_node_main"
 )
 
+# mooncake_provider is mounted as a submodule inside _tpu_raiden_jax, and
+# standalone FFI C++ extensions are omitted under --define raiden_wheel_build=true.
 RAIDEN_JAX_EXTENSION_BAZEL_TARGETS=(
   "//tpu_sync/frameworks/jax:_tpu_raiden_jax"
-  "//tpu_sync/frameworks/jax:_weight_synchronizer_ffi"
-  "//tpu_sync/solutions/mooncake/jax:_mooncake_provider"
 )
 
 RAIDEN_JAX_E2E_BAZEL_TARGETS=(
@@ -81,9 +81,15 @@ raiden_stage_server_binaries() {
 raiden_stage_jax_artifacts() {
   local workspace_dir="$1"
   echo "Copying JAX artifacts..."
+  # Remove stale standalone .so files from earlier builds so existing checkouts
+  # do not pick up outdated extensions.
+  rm -f \
+    "${workspace_dir}/tpu_sync/frameworks/jax/_weight_synchronizer_ffi.so" \
+    "${workspace_dir}/tpu_sync/frameworks/jax/_kv_cache_manager_ffi.so" \
+    "${workspace_dir}/tpu_sync/solutions/mooncake/jax/_mooncake_provider.so"
   cp -f "${workspace_dir}/bazel-bin/tpu_sync/frameworks/jax/_tpu_raiden_jax.so" "${workspace_dir}/tpu_sync/frameworks/jax/"
-  cp -f "${workspace_dir}/bazel-bin/tpu_sync/frameworks/jax/_weight_synchronizer_ffi.so" "${workspace_dir}/tpu_sync/frameworks/jax/"
-  cp -f "${workspace_dir}/bazel-bin/tpu_sync/solutions/mooncake/jax/_mooncake_provider.so" "${workspace_dir}/tpu_sync/solutions/mooncake/jax/"
+  # bazel-bin outputs are 0555 read-only; make writable so subsequent builds can overwrite.
+  chmod u+w "${workspace_dir}/tpu_sync/frameworks/jax/_tpu_raiden_jax.so"
 }
 
 # Stages all artifacts produced by a full JAX build (protos, server binaries,

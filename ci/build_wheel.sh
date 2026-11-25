@@ -35,10 +35,11 @@
 # value builds a wheel with the bare pyproject.toml version (a release).
 # RAIDEN_TORCH_ABIS lists the torch releases the torch wheel ships an
 # extension variant for (see ci/build_wheel_impl.sh).
-# RAIDEN_JAX_VERSION selects the JAX version the jax wheel builds against
-# (see third_party/jax/versions.bzl); unset means the default version. The jax
-# wheel's build tag is that JAX version without dots, e.g.
-# tpu_sync_jax-0.0.1.dev<ts>-0112-cp312-...whl for 0.11.2.
+# RAIDEN_JAX_ABIS lists the JAX releases the jax wheel ships an extension
+# variant for (default: WHEEL_ABIS in third_party/jax/versions.bzl);
+# RAIDEN_JAX_VERSION selects a single JAX version when RAIDEN_JAX_ABIS is unset.
+# HERMETIC_PYTHON_VERSION selects the Python minor version for the wheel
+# (default "3.12"; "3.13" or "3.14" builds cp313/cp314).
 
 set -exu -o pipefail
 
@@ -62,6 +63,7 @@ if [[ "${BUILD_MODE}" != "torch" && "${BUILD_MODE}" != "jax" ]]; then
 fi
 
 RAIDEN_TORCH_ABIS="${RAIDEN_TORCH_ABIS:-2.11.0 2.12.0 2.13.0}"
+HERMETIC_PYTHON_VERSION="${HERMETIC_PYTHON_VERSION:-3.12}"
 TORCH_TPU_SRC="${TORCH_TPU_SRC:-}"
 WHEEL_DIR="${KOKORO_ARTIFACTS_DIR:-${HOME}/raiden_artifacts}/dist"
 CACHE_DIR="${RAIDEN_CONTAINER_CACHE:-${HOME}/.bazel_cache_container}"
@@ -94,22 +96,27 @@ docker run --rm \
   -e BUILD_MODE="${BUILD_MODE}" \
   -e WHEEL_VERSION_EXTRAS="${WHEEL_VERSION_EXTRAS}" \
   -e RAIDEN_TORCH_ABIS="${RAIDEN_TORCH_ABIS}" \
+  -e RAIDEN_JAX_ABIS="${RAIDEN_JAX_ABIS:-}" \
   -e RAIDEN_JAX_VERSION="${RAIDEN_JAX_VERSION:-}" \
+  -e HERMETIC_PYTHON_VERSION="${HERMETIC_PYTHON_VERSION}" \
   -e BAZEL_CACHE_DIR=/cache \
   ${DOCKER_ENV[@]+"${DOCKER_ENV[@]}"} \
   "${CONTAINER_IMAGE}" \
   bash ci/build_wheel_impl.sh
 
-# Scope to THIS build's wheel(s) (.dev<timestamp>); REPO_ROOT/dist and WHEEL_DIR
-# are persistent and may hold wheels from earlier runs.
-if [[ -n "$(ls -A "${REPO_ROOT}"/dist/*"${WHEEL_VERSION_EXTRAS}"-*.whl 2>/dev/null)" ]]; then
-  cp "${REPO_ROOT}"/dist/*"${WHEEL_VERSION_EXTRAS}"-*.whl "${WHEEL_DIR}/"
-  echo "===> Wheel(s) built:"; ls -lh "${WHEEL_DIR}"/*"${WHEEL_VERSION_EXTRAS}"-*.whl
+PY_TAG="cp${HERMETIC_PYTHON_VERSION//./}"
+BASE_VERSION="$(sed -n -E 's/^version = "(.*)"/\1/p' "${REPO_ROOT}/pyproject.toml" | head -1)"
+WHEEL_GLOB="tpu_sync_${BUILD_MODE}-${BASE_VERSION}${WHEEL_VERSION_EXTRAS}-*${PY_TAG}-*.whl"
+# Scope to THIS build's wheel(s); REPO_ROOT/dist and WHEEL_DIR are persistent
+# and may hold wheels from earlier runs or other Python tags.
+if [[ -n "$(ls -A "${REPO_ROOT}"/dist/${WHEEL_GLOB} 2>/dev/null)" ]]; then
+  cp "${REPO_ROOT}"/dist/${WHEEL_GLOB} "${WHEEL_DIR}/"
+  echo "===> Wheel(s) built:"; ls -lh "${WHEEL_DIR}"/${WHEEL_GLOB}
 else
-  echo "ERROR: wheel build produced no .whl for ${WHEEL_VERSION_EXTRAS} in dist/" >&2; exit 1
+  echo "ERROR: wheel build produced no .whl matching ${WHEEL_GLOB} in dist/" >&2; exit 1
 fi
 
 echo "===> twine check..."
 docker run --rm -v "${WHEEL_DIR}:/dist" "${CONTAINER_IMAGE}" \
-  bash -c "uv run --isolated --with twine twine check /dist/*${WHEEL_VERSION_EXTRAS}-*.whl"
+  bash -c "uv run --isolated --with twine twine check /dist/${WHEEL_GLOB}"
 echo "===> raiden wheel build successful!"

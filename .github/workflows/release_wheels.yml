@@ -46,8 +46,8 @@ on:
         required: false
         default: "jax torch"
         type: string
-      jax_version:
-        description: "JAX version the jax wheel builds against (empty = DEFAULT_VERSION in third_party/jax/versions.bzl)"
+      jax_abis:
+        description: "JAX releases bundled in each jax wheel, space-separated (empty = WHEEL_ABIS in third_party/jax/versions.bzl)"
         required: false
         default: ""
         type: string
@@ -126,12 +126,13 @@ jobs:
           PY
 
   build:
-    name: "Build ${{ matrix.framework }} wheel"
+    name: "Build ${{ matrix.framework }} (py${{ matrix.python_version }}) wheel"
     needs: verify
     strategy:
       fail-fast: false
       matrix:
         framework: ${{ fromJSON(needs.verify.outputs.frameworks) }}
+        python_version: ["3.12", "3.13", "3.14"]
     runs-on: linux-x86-n4-32
     container:
       image: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest@sha256:9644db6e0e969079b138547dd99818c02e6ab51d892c4675cf2f4edf02a1e71a
@@ -152,17 +153,18 @@ jobs:
         working-directory: tpu-sync
         env:
           BUILD_MODE: ${{ matrix.framework }}
+          HERMETIC_PYTHON_VERSION: ${{ matrix.python_version }}
           WHEEL_VERSION_EXTRAS: ${{ needs.verify.outputs.wheel_version_extras }}
-          INPUT_JAX_VERSION: ${{ inputs.jax_version }}
+          INPUT_JAX_ABIS: ${{ inputs.jax_abis }}
           INPUT_TORCH_ABIS: ${{ inputs.torch_abis }}
           EXTRA_BAZEL_FLAGS: ${{ (inputs.use_remote_cache || 'yes') == 'yes' && '--config=ci' || '' }}
         run: |
           export BAZEL_CACHE_DIR="${RUNNER_TEMP}/bazel_cache"
-          # Tag builds take the script's default JAX version and torch release
+          # Tag builds take the script's default JAX ABIs and torch release
           # list; a dispatch may override them.
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            if [[ "${BUILD_MODE}" == "jax" && -n "${INPUT_JAX_VERSION}" ]]; then
-              export RAIDEN_JAX_VERSION="${INPUT_JAX_VERSION}"
+            if [[ "${BUILD_MODE}" == "jax" && -n "${INPUT_JAX_ABIS}" ]]; then
+              export RAIDEN_JAX_ABIS="${INPUT_JAX_ABIS}"
             fi
             export RAIDEN_TORCH_ABIS="${INPUT_TORCH_ABIS}"
           fi
@@ -170,7 +172,7 @@ jobs:
       # The torch wheel pairs with a torch_tpu wheel; record the version the
       # release was validated with so the release notes carry it.
       - name: Record torch_tpu pairing
-        if: matrix.framework == 'torch'
+        if: matrix.framework == 'torch' && matrix.python_version == '3.12'
         working-directory: tpu-sync
         run: |
           tr -d '\r\n ' < torch_tpu.version > dist/torch_tpu_version.txt
@@ -184,7 +186,7 @@ jobs:
       # wheel's own Requires-Dist pins; extract them so the release records the
       # stack it must run with, mirroring torch_tpu_version.txt on the torch side.
       - name: Record JAX stack pins
-        if: matrix.framework == 'jax'
+        if: matrix.framework == 'jax' && matrix.python_version == '3.12'
         working-directory: tpu-sync
         run: |
           python3 - <<'PY'
@@ -194,7 +196,7 @@ jobs:
               meta = next(n for n in z.namelist() if n.endswith('.dist-info/METADATA'))
               text = z.read(meta).decode()
           pins = [l.removeprefix('Requires-Dist: ') for l in text.splitlines()
-                  if re.match(r'Requires-Dist: (jax|jaxlib|libtpu)\b', l)]
+                  if re.match(r'Requires-Dist: (jax|jaxlib|libtpu)(?=[\s;=<>!~\[(]|$)', l)]
           assert pins, f'no jax/jaxlib/libtpu pins found in {whl} METADATA'
           open('dist/jax_pins.txt', 'w').write('\n'.join(pins) + '\n')
           print('\n'.join(pins))
@@ -204,7 +206,7 @@ jobs:
       - name: Upload wheel artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
-          name: release-wheel-${{ matrix.framework }}
+          name: release-wheel-${{ matrix.framework }}-py${{ matrix.python_version }}
           path: |
             tpu-sync/dist/*${{ needs.verify.outputs.wheel_version_extras }}-*.whl
             tpu-sync/dist/torch_tpu_version.txt

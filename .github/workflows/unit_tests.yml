@@ -64,11 +64,13 @@ jobs:
       # inside this ephemeral container.
       - name: Fix Git Workspace Ownership
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE/tpu-sync"
-      # The golden-commit tooling runs on a stock python3 outside Bazel (see
-      # golden_commit.yml), so its tests run the same way, before the build.
-      - name: Test the golden-commit tooling
+      # The golden-commit and wheel-packing tools run on stock python3 outside
+      # Bazel, so their tests run the same way, before the build.
+      - name: Test the golden-commit and wheel-packing tooling
         working-directory: tpu-sync
-        run: python3 -m unittest ci/golden/golden_commit_test.py
+        run: |
+          python3 -m unittest ci/golden/golden_commit_test.py
+          python3 -m unittest ci/pack_jax_wheel_test.py
       - name: Run CPU unit tests, E2E JAX build, and binding verification
         working-directory: tpu-sync
         run: |

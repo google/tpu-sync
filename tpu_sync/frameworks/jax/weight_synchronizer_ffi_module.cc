@@ -13,35 +13,10 @@
 // limitations under the License.
 
 #include <nanobind/nanobind.h>
-#include <nanobind/ndarray.h>
-#include "tpu_sync/frameworks/jax/weight_synchronizer.h"
-#include "tpu_sync/frameworks/jax/weight_synchronizer_ffi.h"
 #include "tpu_sync/frameworks/jax/weight_synchronizer_ffi_internal.h"
+#include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
 namespace nb = nanobind;
-
-namespace {
-
-nb::list prepare_extended_info(nb::list gathered_info_list, nb::list device_ids,
-                               nb::list r_starts, nb::list r_ends,
-                               nb::list c_starts, nb::list c_ends) {
-  size_t n = nb::len(device_ids);
-  nb::list extended_info;
-
-  for (size_t i = 0; i < n; ++i) {
-    for (size_t j = 0; j < 5; ++j) {
-      extended_info.append(gathered_info_list[i * 5 + j]);
-    }
-    extended_info.append(device_ids[i]);
-    extended_info.append(r_starts[i]);
-    extended_info.append(r_ends[i]);
-    extended_info.append(c_starts[i]);
-    extended_info.append(c_ends[i]);
-  }
-  return extended_info;
-}
-
-}  // namespace
 
 NB_MODULE(_weight_synchronizer_ffi, m) {
   m.def("destroy_weight_synchronizer", []() {
@@ -63,6 +38,4 @@ NB_MODULE(_weight_synchronizer_ffi, m) {
             .HasActiveListener();
       },
       nb::arg("shard_idx") = 0);
-
-  m.def("prepare_extended_info", &prepare_extended_info);
 }

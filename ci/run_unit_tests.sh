@@ -29,9 +29,9 @@
 #   Phase 1: Every cc_test and py_test under the package patterns in
 #            RAIDEN_TEST_SCOPE that carries none of the exclusion tags (no_oss,
 #            notap, manual, or any requires-<resource> tag), plus the E2E JAX
-#            build targets (_tpu_raiden_jax.so, _weight_synchronizer_ffi.so,
-#            C++ control-plane service binaries, and Python protobuf modules)
-#            in a single Bazel invocation.
+#            build targets (_tpu_raiden_jax.so with its mooncake_provider
+#            submodule, C++ control-plane service binaries, and Python protobuf
+#            modules) in a single Bazel invocation.
 #   Phase 2: Materialize and verify the built E2E JAX and control-plane
 #            artifacts in the source tree.
 #   Phase 3: Python 3.12 dynamic module binding linkage check (`import
@@ -232,7 +232,8 @@ if [[ "${RAIDEN_RUN_E2E_BUILD}" == "true" ]]; then
 
   echo "=== Phase 3: Verifying Dynamic Module Binding Linkage ==="
   export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/bazel-bin:${REPO_ROOT}/tpu_sync/api/jax:${REPO_ROOT}/tpu_sync/frameworks/jax:${PYTHONPATH:-}"
-  HERMETIC_PYTHON_BIN="$(find "${BAZEL_OUTPUT_BASE}/external" -path "*/bin/python3" -executable 2>/dev/null | grep -E "python_3_12|rules_python" | head -n 1 || true)"
+  PY_VER_UNDERSCORE="${HERMETIC_PYTHON_VERSION//./_}"
+  HERMETIC_PYTHON_BIN="$(find "${BAZEL_OUTPUT_BASE}/external" -path "*/bin/python3" -executable 2>/dev/null | grep -E "python_${PY_VER_UNDERSCORE}(_|$|/)" | head -n 1 || true)"
   if [[ -z "${HERMETIC_PYTHON_BIN}" ]] || ! "${HERMETIC_PYTHON_BIN}" --version &>/dev/null; then
     HERMETIC_PYTHON_BIN="python3"
   fi
@@ -241,13 +242,21 @@ if [[ "${RAIDEN_RUN_E2E_BUILD}" == "true" ]]; then
   "${HERMETIC_PYTHON_BIN}" -c "
 import sys
 from unittest.mock import MagicMock
-sys.modules['jax'] = MagicMock()
-sys.modules['jax.core'] = MagicMock()
-sys.modules['jax.extend'] = MagicMock()
-sys.modules['jax.extend.ffi'] = MagicMock()
+for _m in ('jax', 'jax.core', 'jax.experimental', 'jax.extend', 'jax.extend.ffi', 'jax.numpy'):
+  sys.modules[_m] = MagicMock()
+for _m in ('absl', 'numpy'):
+  sys.modules.setdefault(_m, MagicMock())
+
+from tpu_sync.frameworks.jax import _tpu_raiden_jax
+assert hasattr(_tpu_raiden_jax, 'mooncake_provider'), 'missing submodule mooncake_provider'
+
+from tpu_sync.frameworks.jax import weight_synchronizer_ffi
+assert weight_synchronizer_ffi.prepare_extended_info(
+    [1, 2, 3, 4, 5], [0], [10], [20], [30], [40]
+) == [1, 2, 3, 4, 5, 0, 10, 20, 30, 40]
 
 import kv_cache_manager
-print('Dynamic linkage verified: kv_cache_manager (_tpu_raiden_jax.so) imported successfully!')
+print('Dynamic linkage verified: kv_cache_manager (_tpu_raiden_jax.so + mooncake_provider) and weight_synchronizer_ffi imported successfully!')
 "
 fi
 

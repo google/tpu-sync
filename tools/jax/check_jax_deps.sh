@@ -56,6 +56,15 @@ done
 printf '%s\n' "${SUPPORTED[@]}" | grep -qxF "${DEFAULT_VERSION}" ||
   fail "versions.bzl sets DEFAULT_VERSION to ${DEFAULT_VERSION}, which its own SUPPORTED_VERSIONS does not list"
 
+mapfile -t WHEEL_ABIS < <(raiden_jax_wheel_abis "${WORKSPACE_DIR}")
+if [[ ${#WHEEL_ABIS[@]} -eq 0 ]]; then
+  fail "versions.bzl defines an empty WHEEL_ABIS list"
+fi
+for version in "${WHEEL_ABIS[@]}"; do
+  printf '%s\n' "${SUPPORTED[@]}" | grep -qxF "${version}" ||
+    fail "versions.bzl sets WHEEL_ABIS entry ${version}, which its own SUPPORTED_VERSIONS does not list"
+done
+
 # --- Validate self-consistency for each version -------------------------------
 
 for version in "${VERSIONS[@]}"; do

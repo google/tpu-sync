@@ -42,11 +42,14 @@
 #                            against (default "2.11.0 2.12.0 2.13.0", the
 #                            releases torch_tpu ships glue for; "2.11.0" alone
 #                            builds a single-ABI wheel)
-#   RAIDEN_JAX_VERSION       JAX version the jax wheel builds against, read by
-#                            build.sh (default: DEFAULT_VERSION in
-#                            third_party/jax/versions.bzl); the jax wheel's
-#                            build tag is that JAX version without dots
-#                            (e.g. 0112)
+#   RAIDEN_JAX_ABIS          JAX releases the jax wheel ships an extension
+#                            variant for, space-separated, the first one being
+#                            the release the base wheel builds against (default:
+#                            WHEEL_ABIS in third_party/jax/versions.bzl)
+#   RAIDEN_JAX_VERSION       single-version override when RAIDEN_JAX_ABIS is
+#                            unset
+#   HERMETIC_PYTHON_VERSION  Python minor version for the wheel (default "3.12";
+#                            "3.13"/"3.14" builds cp313/cp314)
 #   TORCH_TPU_INDEX_URL      pip index the torch_tpu wheel named by
 #                            torch_tpu.version is installed from (default:
 #                            the torch_tpu virtual registry)
@@ -71,15 +74,28 @@ fi
 # wheel with the bare pyproject version.
 WHEEL_VERSION_EXTRAS="${WHEEL_VERSION_EXTRAS-.dev$(date -u +%Y%m%d%H%M%S)}"
 export WHEEL_VERSION_EXTRAS
-# The jax wheel carries the JAX version it was built against as its wheel build
-# tag, dots removed (0.11.2 -> tpu_sync_jax-<version>-0112-cp312-...whl). The
-# version itself is unchanged. Unset RAIDEN_JAX_VERSION means DEFAULT_VERSION in
-# third_party/jax/versions.bzl.
+export HERMETIC_PYTHON_VERSION="${HERMETIC_PYTHON_VERSION:-3.12}"
+PY_TAG="cp${HERMETIC_PYTHON_VERSION//./}"
+BASE_VERSION="$(sed -n -E 's/^version = "(.*)"/\1/p' "${REPO_ROOT}/pyproject.toml" | head -1)"
+WHEEL_FULL_VERSION="${BASE_VERSION}${WHEEL_VERSION_EXTRAS}"
 if [[ "${BUILD_MODE}" == "jax" ]]; then
   # shellcheck source=tools/jax/jax_deps.sh
   source "${REPO_ROOT}/tools/jax/jax_deps.sh"
-  WHEEL_JAX_VERSION="${RAIDEN_JAX_VERSION:-$(raiden_jax_default_version "${REPO_ROOT}")}"
-  WHEEL_BUILD_TAG="${WHEEL_JAX_VERSION//./}"
+  if [[ -n "${RAIDEN_JAX_ABIS:-}" ]]; then
+    read -r -a JAX_ABIS <<< "${RAIDEN_JAX_ABIS}"
+  elif [[ -n "${RAIDEN_JAX_VERSION:-}" ]]; then
+    JAX_ABIS=("${RAIDEN_JAX_VERSION}")
+  else
+    WHEEL_ABIS_RAW="$(raiden_jax_wheel_abis "${REPO_ROOT}")"
+    mapfile -t JAX_ABIS <<< "${WHEEL_ABIS_RAW}"
+  fi
+  if [[ ${#JAX_ABIS[@]} -eq 0 ]]; then
+    echo "ERROR: JAX_ABIS must name at least one JAX release" >&2
+    exit 1
+  fi
+  for V in "${JAX_ABIS[@]}"; do
+    raiden_jax_validate_version "${REPO_ROOT}" "${V}"
+  done
 fi
 read -r -a TORCH_ABIS <<< "${RAIDEN_TORCH_ABIS:-2.11.0 2.12.0 2.13.0}"
 export BAZEL_CACHE_DIR="${BAZEL_CACHE_DIR:-/cache}"
@@ -199,14 +215,51 @@ fi
 # also match those stale wheels and hand multiple paths to the single-wheel
 # patchelf step below (which then fails). WHEEL_VERSION_EXTRAS (.dev<timestamp>)
 # is unique per build and appears verbatim in the filename, so scope to it.
-WHEEL_GLOB="${WHEEL_DIST}-*${WHEEL_VERSION_EXTRAS}-*.whl"
+WHEEL_GLOB="${WHEEL_DIST}-${WHEEL_FULL_VERSION}-*${PY_TAG}-*.whl"
 
-# Every extension carries a static copy of the runtime (the jax wheel ships
-# three, the torch wheel one per torch release); with default symbol
-# visibility their export tables alone put a wheel over PyPI's 100 MB file
-# limit. Hidden visibility keeps only the module entry points exported and
-# shrinks each extension to about a third.
+# Every extension carries a static copy of the runtime (one variant per JAX or
+# torch release); with default symbol visibility their export tables alone put
+# a wheel over PyPI's 100 MB file limit. Hidden visibility keeps only the
+# module entry points exported and shrinks each extension to about a third.
 EXTRA_BAZEL_FLAGS+=" --copt=-fvisibility=hidden --cxxopt=-fvisibility-inlines-hidden"
+if [[ "${BUILD_MODE}" == "jax" ]]; then
+  JAX_BUILD_FLAGS=(
+    --skip-pip-install
+    --skip-server-binaries
+    --repo_env=WHEEL_VERSION_EXTRAS="${WHEEL_VERSION_EXTRAS}"
+  )
+  BAZEL_OUTPUT_BASE="${BAZEL_OUTPUT_BASE}_jax_${JAX_ABIS[0]}" \
+    RAIDEN_JAX_VERSION="${JAX_ABIS[0]}" \
+    ./build.sh jax "${JAX_BUILD_FLAGS[@]}" "${WHEEL_TARGET}" ${EXTRA_BAZEL_FLAGS}
+
+  mkdir -p "${REPO_ROOT}/dist"
+  cp "${REPO_ROOT}"/bazel-bin/ci/wheel/${WHEEL_GLOB} "${REPO_ROOT}/dist/"
+  pip install -q wheel
+  WHL="$(ls "${REPO_ROOT}"/dist/${WHEEL_GLOB} | head -1)"
+  UNPACK_DIR="$(mktemp -d)"
+  trap 'rm -rf "${UNPACK_DIR}"' EXIT
+  wheel unpack "${WHL}" -d "${UNPACK_DIR}"
+  PKG_DIR="$(ls -d "${UNPACK_DIR}"/*/)"
+  EXT_DIR="${PKG_DIR}tpu_sync/frameworks/jax"
+  cp -f "${EXT_DIR}/_tpu_raiden_jax.so" \
+    "${EXT_DIR}/_tpu_raiden_jax_${JAX_ABIS[0]//./_}.so"
+
+  for V in "${JAX_ABIS[@]:1}"; do
+    BAZEL_OUTPUT_BASE="${BAZEL_OUTPUT_BASE}_jax_${V}" \
+      RAIDEN_JAX_VERSION="${V}" \
+      ./build.sh jax "${JAX_BUILD_FLAGS[@]}" ${EXTRA_BAZEL_FLAGS}
+    cp -f "${REPO_ROOT}/tpu_sync/frameworks/jax/_tpu_raiden_jax.so" \
+      "${EXT_DIR}/_tpu_raiden_jax_${V//./_}.so"
+  done
+
+  python3 "${REPO_ROOT}/ci/pack_jax_wheel.py" "${PKG_DIR}" "${JAX_ABIS[@]}"
+  rm -f "${WHL}"
+  wheel pack "${PKG_DIR}" -d "${REPO_ROOT}/dist"
+  echo "===> Wheel(s) built:"
+  ls -lh "${REPO_ROOT}"/dist/${WHEEL_GLOB}
+  exit 0
+fi
+
 ./build.sh "${BUILD_MODE}" "${WHEEL_TARGET}" \
   --repo_env=WHEEL_VERSION_EXTRAS="${WHEEL_VERSION_EXTRAS}" \
   ${EXTRA_BAZEL_FLAGS}
@@ -215,12 +268,6 @@ mkdir -p "${REPO_ROOT}/dist"
 # bazel-bin is the convenience symlink build.sh leaves in the workspace; it
 # points at the output directory of whatever configuration the build used.
 cp "${REPO_ROOT}"/bazel-bin/ci/wheel/${WHEEL_GLOB} "${REPO_ROOT}/dist/"
-# py_wheel cannot set a build tag, so retag the jax wheel here. `wheel tags`
-# rewrites the file name and the WHEEL metadata's Build field together.
-if [[ "${BUILD_MODE}" == "jax" ]]; then
-  pip install -q wheel
-  wheel tags --remove --build "${WHEEL_BUILD_TAG}" "${REPO_ROOT}"/dist/${WHEEL_GLOB}
-fi
 
 # The bazel-built _tpu_raiden_torch.so does not link libpywrap; the torch
 # extension loader (tpu_sync/api/torch/torch_abi.py) requires a NEEDED on

@@ -73,20 +73,20 @@ COMMON_DEPS = [
     "//tpu_sync/rpc:raiden_controller",
 ]
 
-# JAX native extensions + wrappers + public API. (TransferEngine was merged into
-# KVCacheManager upstream, so there is no _transfer_engine target.)
+# JAX native extension + wrappers + public API. _tpu_raiden_jax includes the
+# mooncake_provider submodule, and standalone FFI C++ extensions are omitted
+# under raiden_wheel_build=true so multi-ABI wheels ship a single .so per JAX
+# release.
 JAX_DEPS = [
     "//tpu_sync/frameworks/jax:_tpu_raiden_jax",
-    "//tpu_sync/frameworks/jax:_kv_cache_manager_ffi",
-    "//tpu_sync/frameworks/jax:_weight_synchronizer_ffi",
     "//tpu_sync/frameworks/jax:weight_synchronizer_ffi_py",
     "//tpu_sync/frameworks/jax:resharding_planner",
     "//tpu_sync/frameworks/jax:jax_test_utils",
     "//tpu_sync/api/jax:kv_cache_manager_jax_py",
     "//tpu_sync/api/jax:weight_synchronizer_jax_py",
     # TPU buffer provider that Mooncake imports as
-    # tpu_sync.solutions.mooncake.jax.mooncake_provider; brings
-    # _mooncake_provider.so.
+    # tpu_sync.solutions.mooncake.jax.mooncake_provider; submodule of
+    # _tpu_raiden_jax (no extra .so).
     "//tpu_sync/solutions/mooncake/jax:mooncake_provider",
 ]
 # Excluded (non-OSS internal grpc / global registry):

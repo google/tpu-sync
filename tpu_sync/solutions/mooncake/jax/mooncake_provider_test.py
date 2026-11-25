@@ -31,9 +31,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from tpu_sync.frameworks.jax import _tpu_raiden_jax
 from tpu_sync.solutions.mooncake import mooncake_provider_test_util as test_util
-from tpu_sync.solutions.mooncake.jax import _mooncake_provider
 from tpu_sync.solutions.mooncake.jax import mooncake_provider
+
+_mooncake_provider = _tpu_raiden_jax.mooncake_provider
 
 # Not in the mmap module.
 _PROT_NONE = 0

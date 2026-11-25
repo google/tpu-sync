@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Shared py_wheel template for the per-framework tpu_sync wheels, so the
-# tpu_sync_jax and tpu_sync_torch wheels stay identical except for their
-# distribution name, requires list, and package contents.
+"""Shared py_wheel template for the per-framework tpu_sync wheels.
 
+Keeps the tpu_sync_jax and tpu_sync_torch wheels identical except for their
+distribution name, requires list, and package contents.
+"""
+
+load("@raiden_version//:version.bzl", "SUPPORTED_PYTHON_VERSIONS", "WHEEL_ABI_TAG", "WHEEL_PYTHON_TAG")
 load("@rules_python//python:packaging.bzl", "py_wheel")
 
 def raiden_framework_wheel(
@@ -39,12 +42,15 @@ def raiden_framework_wheel(
     py_wheel(
         entry_points = entry_points,
         name = name,
-        abi = "cp312",
+        abi = WHEEL_ABI_TAG,
         author = "TPU Raiden team",
         classifiers = [
             "Development Status :: 3 - Alpha",
             "License :: OSI Approved :: Apache Software License",
-            "Programming Language :: Python :: 3.12",
+        ] + [
+            "Programming Language :: Python :: {}".format(v)
+            for v in SUPPORTED_PYTHON_VERSIONS
+        ] + [
             "Topic :: Scientific/Engineering :: Artificial Intelligence",
         ],
         description_file = "//:README.md",
@@ -53,7 +59,7 @@ def raiden_framework_wheel(
         license = "Apache 2.0",
         platform = "manylinux_2_31_x86_64",
         python_requires = ">=3.12",
-        python_tag = "cp312",
+        python_tag = WHEEL_PYTHON_TAG,
         requires = requires,
         summary = "High-bandwidth PJRT raw-transfer / KV-cache DMA engine for TPU.",
         tags = ["manual"],

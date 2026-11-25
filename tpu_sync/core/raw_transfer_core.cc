@@ -14,11 +14,29 @@
 
 #include "tpu_sync/core/raw_transfer_core.h"
 
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <optional>
 #include <vector>
 
+#include "absl/log/log.h"
+#include "absl/status/status.h"
+#include "absl/strings/string_view.h"
+#include "absl/synchronization/notification.h"
+#include "xla/pjrt/c/pjrt_c_api.h"
+#include "xla/pjrt/c/pjrt_c_api_device_event.h"
+#include "xla/pjrt/c/pjrt_c_api_raw_buffer_extension.h"
 #include "tpu_sync/core/tpu_utils.h"
+#include "tpu_sync/transport/block_transport_delegate.h"
 
 namespace raiden {
+
+std::optional<ExternalDmaInfo> RaidenBufferHandle::AcquireExternalDmaAccess()
+    const {
+  std::optional<ExternalDmaInfo> result;
+  return result;
+}
 
 std::vector<int> DetectNumaNodes(
     const std::vector<std::vector<RaidenBufferHandle>>& layer_buffers) {

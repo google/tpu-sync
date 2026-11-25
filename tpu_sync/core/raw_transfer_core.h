@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -159,6 +160,26 @@ inline int64_t GetMajorSliceByteSize(const xla::Shape& shape,
   }
   return physical_size / major;
 }
+
+// Physical PCIe BAR2 `dma-buf` location of an on-device PJRT buffer in TPU HBM.
+//
+// On TPU hosts with peer-to-peer DMA enabled, the kernel driver (`vfio-pci` /
+// `libtpu`) exports the chip's physical HBM PCIe BAR2 aperture as a Linux
+// `dma-buf` file descriptor (`dma_buf_fd`). Each on-device tensor occupies a
+// contiguous byte slice `[offset, offset + size)` inside that file descriptor,
+// allowing external I/O engines (RDMA NICs, kernel VFS, or `libtdsul`) to DMA
+// directly between storage and TPU HBM over PCIe without copying through Host
+// DRAM.
+//
+// `pin` holds a type-erased RAII handle to PJRT's `PJRT_ExternalDmaAccess`: as
+// long as any copy of `pin` is alive, XLA's HBM allocator/compactor is
+// prevented from relocating or freeing the underlying HBM range.
+struct ExternalDmaInfo {
+  int dma_buf_fd = -1;
+  size_t offset = 0;
+  size_t size = 0;
+  std::shared_ptr<void> pin;
+};
 
 struct RaidenBufferHandle {
   xla::PjRtBuffer* buffer =
@@ -317,6 +338,15 @@ struct RaidenBufferHandle {
     if (err) return PjrtErrorToStatusLocal(c_hold->c_api, err);
     return args.event;
   }
+
+  // Queries PJRT's RawBuffer C-API for this tensor's PCIe BAR2 `dma-buf` file
+  // descriptor and byte range (`{dma_buf_fd, offset, size}`), waits for the
+  // buffer's allocation-ready device event so its physical HBM address is
+  // materialized, and pins the HBM slice until the returned `ExternalDmaInfo`
+  // is destroyed. Returns `std::nullopt` if the PJRT plugin does not support
+  // external DMA export (e.g. XLA CPU or older `libtpu` builds) or export
+  // fails.
+  std::optional<ExternalDmaInfo> AcquireExternalDmaAccess() const;
 };
 
 using BufferHoldAndAlias = RaidenBufferHandle;

@@ -19,6 +19,7 @@
 #include <netinet/in.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -28,6 +29,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <random>
@@ -127,10 +129,15 @@ void RandomNonZero(absl::Span<uint8_t> data) {
   }
 }
 
+using ::absl_testing::IsOkAndHolds;
+using ::absl_testing::StatusIs;
+using ::testing::_;
 using ::testing::Each;
 using ::testing::ElementsAre;
 using ::testing::Eq;
+using ::testing::HasSubstr;
 using ::testing::Ne;
+using ::testing::Not;
 using ::testing::Pointwise;
 using ::testing::UnorderedElementsAre;
 using ::testing::UnorderedElementsAreArray;
@@ -2068,6 +2075,577 @@ TEST(RawBufferTransportSourceBindTest,
   EXPECT_THAT(server.peer_ips(), ::testing::UnorderedElementsAre(
                                      ::testing::HasSubstr("127.0.0.5"),
                                      ::testing::HasSubstr("127.0.0.6")));
+}
+
+// Destination delegate whose only host buffer is a `span_size`-byte window in
+// the middle of a larger allocation. The window and the guard bands on both
+// sides of it start filled with 0xAB, so a test can tell whether a push wrote
+// outside the window it was given.
+class GuardedSpanDelegate : public RawBufferTransportDelegate {
+ public:
+  explicit GuardedSpanDelegate(size_t span_size)
+      : span_size_(span_size), backing_(span_size + 2 * kGuardSize, 0xAB) {}
+
+  using RawBufferTransportDelegate::GetHostBuffer;
+
+  absl::StatusOr<absl::Span<const uint8_t>> GetHostBuffer(
+      size_t /*buffer_id*/, size_t /*shard_idx*/) const override {
+    return absl::Span<const uint8_t>(backing_.data() + kGuardSize, span_size_);
+  }
+
+  absl::Span<const uint8_t> AllBytes() const { return backing_; }
+
+  absl::Span<const uint8_t> PrefixGuard() const {
+    return absl::MakeConstSpan(backing_.data(), kGuardSize);
+  }
+
+  absl::Span<const uint8_t> SpanData() const {
+    return absl::MakeConstSpan(backing_.data() + kGuardSize, span_size_);
+  }
+
+  absl::Span<const uint8_t> SuffixGuard() const {
+    return absl::MakeConstSpan(backing_.data() + kGuardSize + span_size_,
+                               kGuardSize);
+  }
+
+ private:
+  // Each guard band is as large as the largest out-of-bounds write the tests
+  // below can provoke (one extra 64-byte slice past the end), so a bounds
+  // regression fails the guard checks instead of corrupting the heap.
+  static constexpr size_t kGuardSize = 64;
+
+  const size_t span_size_;
+  std::vector<uint8_t> backing_;
+};
+
+// Minimal delegate that advertises a synthetic large span length backed by a
+// single byte, for testing upfront total_bytes overflow rejection without
+// allocating gigabytes (the advertised length is never dereferenced).
+class SyntheticLargeSpanDelegate : public RawBufferTransportDelegate {
+ public:
+  explicit SyntheticLargeSpanDelegate(size_t advertised_size)
+      : advertised_size_(advertised_size) {}
+
+  using RawBufferTransportDelegate::GetHostBuffer;
+
+  absl::StatusOr<absl::Span<const uint8_t>> GetHostBuffer(
+      size_t /*buffer_id*/, size_t /*shard_idx*/) const override {
+    return absl::Span<const uint8_t>(&backing_, advertised_size_);
+  }
+
+  uint8_t byte() const { return backing_; }
+
+ private:
+  uint8_t backing_ = 0xAB;
+  const size_t advertised_size_;
+};
+
+::testing::Matcher<const std::string&> PeerInvalidArg(
+    absl::string_view detail) {
+  return HasSubstr(
+      absl::StrCat("ProcessPeerRequest failed: INVALID_ARGUMENT: ", detail));
+}
+
+::testing::Matcher<const std::string&> PeerOob(absl::string_view kind,
+                                               absl::string_view detail,
+                                               int item = 0) {
+  return PeerInvalidArg(absl::StrCat("Destination out of bounds in ", kind,
+                                     " push: item ", item,
+                                     " (layer 0, shard 0) ", detail));
+}
+
+auto PeerClosed() {
+  return StatusIs(absl::StatusCode::kInternal, Not(HasSubstr("timeout")));
+}
+
+auto PeerEof() {
+  return StatusIs(absl::StatusCode::kInternal, HasSubstr("eof"));
+}
+
+absl::Status PushOne(RawBufferTransport& src, BufferPushTask task) {
+  return src.PushBuffers({std::move(task)}, /*parallelism=*/1, /*uuid=*/0);
+}
+
+// Serializes the header and V2 metadata items of an op-7
+// (kOpBufferPushBatched) request, without payload, as a peer sends them.
+std::vector<char> SerializeOp7V2Request(uint64_t uuid,
+                                        absl::Span<const ChunkMetadata> items) {
+  ChunkHeader header = {};
+  header.version = 2;
+  header.op = kOpBufferPushBatched;
+  header.metadata_size = kMetadataV2Size;
+  header.count_or_size = static_cast<uint32_t>(items.size());
+  header.uuid = uuid;
+  const auto s_header = SerializeChunkHeader(header);
+  std::vector<char> req(s_header.begin(), s_header.end());
+  for (const ChunkMetadata& item : items) {
+    const auto s_meta = SerializeChunkMetadata(item, /*ver=*/2);
+    req.insert(req.end(), s_meta.begin(), s_meta.end());
+  }
+  return req;
+}
+
+absl::StatusOr<uint8_t> SendRawOp7V2AndReadAck(
+    absl::string_view dst_addr, absl::Span<const ChunkMetadata> items,
+    absl::Span<const uint8_t> payload = {}) {
+  ABSL_ASSIGN_OR_RETURN(const int fd, ConnectToPeer(dst_addr));
+  const absl::Cleanup close_fd = [fd] { close(fd); };
+  const std::vector<char> req = SerializeOp7V2Request(/*uuid=*/0, items);
+  ABSL_RETURN_IF_ERROR(WriteExact(fd, req.data(), req.size()));
+  if (!payload.empty()) {
+    ABSL_RETURN_IF_ERROR(WriteExact(fd, payload.data(), payload.size()));
+  }
+  uint8_t ack = 0;
+  ABSL_RETURN_IF_ERROR(ReadExact(fd, &ack, 1, /*timeout_ms=*/5000));
+  return ack;
+}
+
+TEST(RawBufferTransportBatchedPushBoundsTest,
+     RejectsContiguousOutOfBoundsWithoutOverwritingGuardBand) {
+  constexpr uint64_t kWrapSliceBytes =
+      (std::numeric_limits<uint64_t>::max() / 2) + 1;
+  absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);
+  EXPECT_CALL(log, Log(absl::LogSeverity::kError, _,
+                       PeerOob("batched",
+                               "count 2 * size_bytes 64 exceeds host buffer "
+                               "size 64")));
+  EXPECT_CALL(log,
+              Log(absl::LogSeverity::kError, _,
+                  PeerOob("batched",
+                          absl::StrCat("count 2 * size_bytes ", kWrapSliceBytes,
+                                       " exceeds host buffer size 64"))));
+  log.StartCapturingLogs();
+
+  GuardedSpanDelegate dst(/*span_size=*/64);
+  RawBufferTransport dst_transport(&dst, kLocalPort);
+  RawMockDelegate src_delegate(1);
+  RawBufferTransport src_transport(&src_delegate, kLocalPort);
+  const std::string dst_addr = GetIpPort(dst_transport);
+
+  std::vector<uint8_t> payload(128, 0xCD);
+  EXPECT_THAT(PushOne(src_transport, {.peer = dst_addr,
+                                      .data_ptr = payload.data(),
+                                      .size_bytes = 64,
+                                      .dst_stride_bytes = 64,
+                                      .count = 2,
+                                      .src_stride_bytes = 64}),
+              PeerClosed());
+  // count=2 * ((UINT64_MAX / 2) + 1) wraps modulo 2^64 to 0 if unchecked.
+  EXPECT_THAT(
+      SendRawOp7V2AndReadAck(
+          dst_addr, {ChunkMetadata{.size_bytes = kWrapSliceBytes, .count = 2}}),
+      PeerEof());
+  EXPECT_THAT(dst.AllBytes(), Each(Eq(0xAB)));
+
+  // Positive pair: count=1 fits exactly inside the 64-byte host span.
+  ABSL_EXPECT_OK(PushOne(src_transport, {.peer = dst_addr,
+                                         .data_ptr = payload.data(),
+                                         .size_bytes = 64,
+                                         .dst_stride_bytes = 64,
+                                         .count = 1,
+                                         .src_stride_bytes = 64}));
+  EXPECT_THAT(dst.PrefixGuard(), Each(Eq(0xAB)));
+  EXPECT_THAT(dst.SpanData(), Each(Eq(0xCD)));
+  EXPECT_THAT(dst.SuffixGuard(), Each(Eq(0xAB)));
+}
+
+TEST(RawBufferTransportBatchedPushBoundsTest,
+     RejectsStridedWrapUnderflowWithoutOverwritingPrefixGuard) {
+  absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);
+  EXPECT_CALL(
+      log,
+      Log(absl::LogSeverity::kError, _,
+          PeerOob("strided",
+                  absl::StrCat("count 2 with stride ", SIZE_MAX - 7,
+                               " and size_bytes 8 exceeds host buffer size "
+                               "64"))));
+  EXPECT_CALL(log, Log(absl::LogSeverity::kError, _,
+                       PeerOob("strided",
+                               "count 2 with stride 64 and size_bytes 8 "
+                               "exceeds host buffer size 64")));
+  EXPECT_CALL(log, Log(absl::LogSeverity::kError, _,
+                       PeerOob("strided",
+                               "size_bytes 65 exceeds host buffer size 64")));
+  log.StartCapturingLogs();
+
+  GuardedSpanDelegate dst(/*span_size=*/64);
+  RawBufferTransport dst_transport(&dst, kLocalPort);
+  RawMockDelegate src_delegate(1);
+  RawBufferTransport src_transport(&src_delegate, kLocalPort);
+  const std::string dst_addr = GetIpPort(dst_transport);
+
+  std::vector<uint8_t> payload(16, 0xCD);
+  // dst_stride = SIZE_MAX - 7 wraps (count - 1) * dst_stride + size_bytes to 0,
+  // writing segment 1 at base - 8 if unchecked.
+  EXPECT_THAT(PushOne(src_transport, {.peer = dst_addr,
+                                      .data_ptr = payload.data(),
+                                      .size_bytes = 8,
+                                      .dst_stride_bytes = SIZE_MAX - 7,
+                                      .count = 2,
+                                      .src_stride_bytes = 8}),
+              PeerClosed());
+  // Non-wrapping strided span that exceeds host_size (64 + 8 = 72 > 64).
+  EXPECT_THAT(PushOne(src_transport, {.peer = dst_addr,
+                                      .data_ptr = payload.data(),
+                                      .size_bytes = 8,
+                                      .dst_stride_bytes = 64,
+                                      .count = 2,
+                                      .src_stride_bytes = 8}),
+              PeerClosed());
+  // Single strided slice larger than host_size (size_bytes=65 > 64).
+  std::vector<uint8_t> oversized_payload(130, 0xCD);
+  EXPECT_THAT(PushOne(src_transport, {.peer = dst_addr,
+                                      .data_ptr = oversized_payload.data(),
+                                      .size_bytes = 65,
+                                      .dst_stride_bytes = 128,
+                                      .count = 2,
+                                      .src_stride_bytes = 65}),
+              PeerClosed());
+  EXPECT_THAT(dst.AllBytes(), Each(Eq(0xAB)));
+
+  // Positive pair: valid strided push writes [0, 8) and [16, 24) only.
+  ABSL_EXPECT_OK(PushOne(src_transport, {.peer = dst_addr,
+                                         .data_ptr = payload.data(),
+                                         .size_bytes = 8,
+                                         .dst_stride_bytes = 16,
+                                         .count = 2,
+                                         .src_stride_bytes = 8}));
+  EXPECT_THAT(dst.PrefixGuard(), Each(Eq(0xAB)));
+  EXPECT_THAT(dst.SuffixGuard(), Each(Eq(0xAB)));
+  const absl::Span<const uint8_t> span = dst.SpanData();
+  EXPECT_THAT(span.subspan(0, 8), Each(Eq(0xCD)));
+  EXPECT_THAT(span.subspan(8, 8), Each(Eq(0xAB)));
+  EXPECT_THAT(span.subspan(16, 8), Each(Eq(0xCD)));
+  EXPECT_THAT(span.subspan(24), Each(Eq(0xAB)));
+}
+
+TEST(RawBufferTransportBatchedPushBoundsTest,
+     RejectsNonZeroOffsetBoundsAndWraparound) {
+  constexpr uint64_t kContigWrapOffset =
+      std::numeric_limits<uint64_t>::max() - 7;
+  constexpr uint64_t kStridedWrapOffset =
+      std::numeric_limits<uint64_t>::max() - 15;
+  absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);
+  EXPECT_CALL(log, Log(absl::LogSeverity::kError, _,
+                       PeerOob("batched",
+                               "offset 32 + bytes 40 exceeds host buffer size "
+                               "64")));
+  EXPECT_CALL(
+      log,
+      Log(absl::LogSeverity::kError, _,
+          PeerOob("batched",
+                  absl::StrCat("offset ", kContigWrapOffset,
+                               " + bytes 16 exceeds host buffer size 64"))));
+  EXPECT_CALL(log, Log(absl::LogSeverity::kError, _,
+                       PeerOob("strided",
+                               "offset 48 + span 24 exceeds host buffer size "
+                               "64")));
+  EXPECT_CALL(
+      log,
+      Log(absl::LogSeverity::kError, _,
+          PeerOob("strided",
+                  absl::StrCat("offset ", kStridedWrapOffset,
+                               " + span 24 exceeds host buffer size 64"))));
+  log.StartCapturingLogs();
+
+  GuardedSpanDelegate dst(/*span_size=*/64);
+  RawBufferTransport dst_transport(&dst, kLocalPort);
+  RawMockDelegate src_delegate(1);
+  RawBufferTransport src_transport(&src_delegate, kLocalPort);
+  const std::string dst_addr = GetIpPort(dst_transport);
+
+  std::vector<uint8_t> payload_cd(40, 0xCD);
+  std::vector<uint8_t> payload_ce(16, 0xCE);
+  // Contiguous OOB (32 + 40 > 64) and uint64 wraparound ((UINT64_MAX-7)+16).
+  EXPECT_THAT(PushOne(src_transport, {.peer = dst_addr,
+                                      .dst_offset_bytes = 32,
+                                      .data_ptr = payload_cd.data(),
+                                      .size_bytes = 40}),
+              PeerClosed());
+  EXPECT_THAT(PushOne(src_transport, {.peer = dst_addr,
+                                      .dst_offset_bytes = kContigWrapOffset,
+                                      .data_ptr = payload_cd.data(),
+                                      .size_bytes = 16}),
+              PeerClosed());
+  // Strided OOB (48 + 24 > 64) and uint64 wraparound ((UINT64_MAX-15)+24).
+  EXPECT_THAT(PushOne(src_transport, {.peer = dst_addr,
+                                      .dst_offset_bytes = 48,
+                                      .data_ptr = payload_ce.data(),
+                                      .size_bytes = 8,
+                                      .dst_stride_bytes = 16,
+                                      .count = 2,
+                                      .src_stride_bytes = 8}),
+              PeerClosed());
+  EXPECT_THAT(PushOne(src_transport, {.peer = dst_addr,
+                                      .dst_offset_bytes = kStridedWrapOffset,
+                                      .data_ptr = payload_ce.data(),
+                                      .size_bytes = 8,
+                                      .dst_stride_bytes = 16,
+                                      .count = 2,
+                                      .src_stride_bytes = 8}),
+              PeerClosed());
+  EXPECT_THAT(dst.AllBytes(), Each(Eq(0xAB)));
+
+  // Positive pair: valid non-zero-offset contiguous and strided pushes.
+  ABSL_EXPECT_OK(
+      src_transport.PushBuffers({BufferPushTask{.peer = dst_addr,
+                                                .dst_offset_bytes = 8,
+                                                .data_ptr = payload_cd.data(),
+                                                .size_bytes = 16},
+                                 BufferPushTask{.peer = dst_addr,
+                                                .dst_offset_bytes = 32,
+                                                .data_ptr = payload_ce.data(),
+                                                .size_bytes = 8,
+                                                .dst_stride_bytes = 16,
+                                                .count = 2,
+                                                .src_stride_bytes = 8}},
+                                /*parallelism=*/1, /*uuid=*/0));
+  EXPECT_THAT(dst.PrefixGuard(), Each(Eq(0xAB)));
+  EXPECT_THAT(dst.SuffixGuard(), Each(Eq(0xAB)));
+  const absl::Span<const uint8_t> span = dst.SpanData();
+  EXPECT_THAT(span.subspan(0, 8), Each(Eq(0xAB)));
+  EXPECT_THAT(span.subspan(8, 16), Each(Eq(0xCD)));
+  EXPECT_THAT(span.subspan(24, 8), Each(Eq(0xAB)));
+  EXPECT_THAT(span.subspan(32, 8), Each(Eq(0xCE)));
+  EXPECT_THAT(span.subspan(40, 8), Each(Eq(0xAB)));
+  EXPECT_THAT(span.subspan(48, 8), Each(Eq(0xCE)));
+  EXPECT_THAT(span.subspan(56), Each(Eq(0xAB)));
+}
+
+TEST(RawBufferTransportBatchedPushBoundsTest,
+     RejectsMultiItemBatchAtomicallyBeforeWritingEarlierItems) {
+  absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);
+  EXPECT_CALL(log, Log(absl::LogSeverity::kError, _,
+                       PeerOob("batched",
+                               "offset 56 + bytes 16 exceeds host buffer size "
+                               "64",
+                               /*item=*/1)));
+  log.StartCapturingLogs();
+
+  GuardedSpanDelegate dst(/*span_size=*/64);
+  RawBufferTransport dst_transport(&dst, kLocalPort);
+  RawMockDelegate src_delegate(1);
+  RawBufferTransport src_transport(&src_delegate, kLocalPort);
+  const std::string dst_addr = GetIpPort(dst_transport);
+
+  std::vector<uint8_t> payload_cd(16, 0xCD);
+  std::vector<uint8_t> payload_ce(16, 0xCE);
+  // Item 0 is in-bounds, item 1 is OOB; upfront validation rejects before I/O.
+  EXPECT_THAT(
+      src_transport.PushBuffers({BufferPushTask{.peer = dst_addr,
+                                                .dst_offset_bytes = 0,
+                                                .data_ptr = payload_cd.data(),
+                                                .size_bytes = 16},
+                                 BufferPushTask{.peer = dst_addr,
+                                                .dst_offset_bytes = 56,
+                                                .data_ptr = payload_ce.data(),
+                                                .size_bytes = 16}},
+                                /*parallelism=*/1, /*uuid=*/0),
+      PeerClosed());
+  EXPECT_THAT(dst.AllBytes(), Each(Eq(0xAB)));
+
+  // Positive pair: both items in-bounds write cleanly.
+  ABSL_EXPECT_OK(
+      src_transport.PushBuffers({BufferPushTask{.peer = dst_addr,
+                                                .dst_offset_bytes = 0,
+                                                .data_ptr = payload_cd.data(),
+                                                .size_bytes = 16},
+                                 BufferPushTask{.peer = dst_addr,
+                                                .dst_offset_bytes = 48,
+                                                .data_ptr = payload_ce.data(),
+                                                .size_bytes = 16}},
+                                /*parallelism=*/1, /*uuid=*/0));
+  EXPECT_THAT(dst.PrefixGuard(), Each(Eq(0xAB)));
+  EXPECT_THAT(dst.SuffixGuard(), Each(Eq(0xAB)));
+  const absl::Span<const uint8_t> span = dst.SpanData();
+  EXPECT_THAT(span.subspan(0, 16), Each(Eq(0xCD)));
+  EXPECT_THAT(span.subspan(16, 32), Each(Eq(0xAB)));
+  EXPECT_THAT(span.subspan(48, 16), Each(Eq(0xCE)));
+}
+
+TEST(RawBufferTransportBatchedPushBoundsTest,
+     RejectsHugeStridedCountWithoutOomAndSkipsZeroByteSegments) {
+  absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);
+  EXPECT_CALL(
+      log,
+      Log(absl::LogSeverity::kError, _,
+          PeerOob("strided",
+                  absl::StrCat("count ", UINT32_MAX,
+                               " with stride 2 and size_bytes 1 exceeds host "
+                               "buffer size 64"))));
+  EXPECT_CALL(
+      log,
+      Log(absl::LogSeverity::kError, _,
+          PeerOob("strided",
+                  absl::StrCat("count ", UINT32_MAX,
+                               " with stride 2 and size_bytes 0 exceeds host "
+                               "buffer size 64"))));
+  log.StartCapturingLogs();
+
+  GuardedSpanDelegate dst(/*span_size=*/64);
+  RawBufferTransport dst_transport(&dst, kLocalPort);
+  const std::string dst_addr = GetIpPort(dst_transport);
+
+  // Non-zero and zero-byte slices with huge strided counts must be refused
+  // cleanly without reserving gigabytes of iovecs or looping UINT32_MAX times.
+  EXPECT_THAT(
+      SendRawOp7V2AndReadAck(dst_addr, {ChunkMetadata{.size_bytes = 1,
+                                                      .dst_stride_bytes = 2,
+                                                      .count = UINT32_MAX}}),
+      PeerEof());
+  EXPECT_THAT(
+      SendRawOp7V2AndReadAck(dst_addr, {ChunkMetadata{.size_bytes = 0,
+                                                      .dst_stride_bytes = 2,
+                                                      .count = UINT32_MAX}}),
+      PeerEof());
+
+  // Valid zero-byte contiguous and in-bounds strided items succeed immediately
+  // without touching the buffer.
+  EXPECT_THAT(
+      SendRawOp7V2AndReadAck(dst_addr, {ChunkMetadata{.size_bytes = 0,
+                                                      .dst_stride_bytes = 0,
+                                                      .count = UINT32_MAX}}),
+      IsOkAndHolds(uint8_t{1}));
+  EXPECT_THAT(
+      SendRawOp7V2AndReadAck(
+          dst_addr,
+          {ChunkMetadata{.size_bytes = 0, .dst_stride_bytes = 1, .count = 65}}),
+      IsOkAndHolds(uint8_t{1}));
+  EXPECT_THAT(dst.AllBytes(), Each(Eq(0xAB)));
+
+  // Mixed batch with total_bytes > 0 exercises the streaming loop's
+  // `meta.size_bytes == 0` skip alongside a live payload item.
+  const std::vector<uint8_t> payload(16, 0xCD);
+  EXPECT_THAT(
+      SendRawOp7V2AndReadAck(
+          dst_addr,
+          {ChunkMetadata{.size_bytes = 0, .dst_stride_bytes = 1, .count = 65},
+           ChunkMetadata{.dst_offset_bytes = 8, .size_bytes = 16, .count = 1}},
+          payload),
+      IsOkAndHolds(uint8_t{1}));
+  EXPECT_THAT(dst.PrefixGuard(), Each(Eq(0xAB)));
+  EXPECT_THAT(dst.SuffixGuard(), Each(Eq(0xAB)));
+  const absl::Span<const uint8_t> span = dst.SpanData();
+  EXPECT_THAT(span.subspan(0, 8), Each(Eq(0xAB)));
+  EXPECT_THAT(span.subspan(8, 16), Each(Eq(0xCD)));
+  EXPECT_THAT(span.subspan(24), Each(Eq(0xAB)));
+}
+
+TEST(RawBufferTransportBatchedPushBoundsTest, HandlesEmptyHostSpanBounds) {
+  absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);
+  EXPECT_CALL(log, Log(absl::LogSeverity::kError, _,
+                       PeerOob("batched",
+                               "count 1 * size_bytes 1 exceeds host buffer "
+                               "size 0")));
+  EXPECT_CALL(
+      log,
+      Log(absl::LogSeverity::kError, _,
+          PeerOob("batched", "offset 1 + bytes 0 exceeds host buffer size 0")));
+  EXPECT_CALL(log, Log(absl::LogSeverity::kError, _,
+                       PeerOob("strided",
+                               "count 2 with stride 1 and size_bytes 0 exceeds "
+                               "host buffer size 0")));
+  log.StartCapturingLogs();
+
+  GuardedSpanDelegate dst(/*span_size=*/0);
+  RawBufferTransport dst_transport(&dst, kLocalPort);
+  const std::string dst_addr = GetIpPort(dst_transport);
+
+  EXPECT_THAT(SendRawOp7V2AndReadAck(
+                  dst_addr, {ChunkMetadata{.size_bytes = 1, .count = 1}}),
+              PeerEof());
+  EXPECT_THAT(
+      SendRawOp7V2AndReadAck(
+          dst_addr,
+          {ChunkMetadata{.dst_offset_bytes = 1, .size_bytes = 0, .count = 1}}),
+      PeerEof());
+  EXPECT_THAT(
+      SendRawOp7V2AndReadAck(
+          dst_addr,
+          {ChunkMetadata{.size_bytes = 0, .dst_stride_bytes = 1, .count = 2}}),
+      PeerEof());
+
+  // Positive pair: zero-byte write at offset 0 succeeds on an empty host span.
+  EXPECT_THAT(
+      SendRawOp7V2AndReadAck(
+          dst_addr,
+          {ChunkMetadata{.dst_offset_bytes = 0, .size_bytes = 0, .count = 1}}),
+      IsOkAndHolds(uint8_t{1}));
+  EXPECT_THAT(dst.AllBytes(), Each(Eq(0xAB)));
+  EXPECT_TRUE(dst.SpanData().empty());
+}
+
+TEST(RawBufferTransportBatchedPushBoundsTest,
+     RejectsTotalBytesOverflowPastSsizeMax) {
+  constexpr uint64_t kMaxTotalBytes =
+      static_cast<uint64_t>(std::numeric_limits<ssize_t>::max());
+  constexpr uint64_t kItemBytes = (kMaxTotalBytes / 2) + 1;
+
+  absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);
+  EXPECT_CALL(
+      log, Log(absl::LogSeverity::kError, _,
+               PeerInvalidArg(absl::StrCat(
+                   "Total batched push bytes overflow at item 1 (layer 0, "
+                   "shard 0): total_bytes ",
+                   kItemBytes, " + item_bytes ", kItemBytes, " exceeds limit ",
+                   kMaxTotalBytes))));
+  log.StartCapturingLogs();
+
+  SyntheticLargeSpanDelegate dst(static_cast<size_t>(kItemBytes));
+  RawBufferTransport dst_transport(&dst, kLocalPort);
+  const std::string dst_addr = GetIpPort(dst_transport);
+
+  const ChunkMetadata half_plus_one = {.size_bytes = kItemBytes, .count = 1};
+  EXPECT_THAT(SendRawOp7V2AndReadAck(dst_addr, {half_plus_one, half_plus_one}),
+              PeerEof());
+  EXPECT_EQ(dst.byte(), 0xAB);
+
+  // Positive pair: a 1-byte write into the real backing byte succeeds.
+  const std::vector<uint8_t> one_byte = {0xCD};
+  EXPECT_THAT(
+      SendRawOp7V2AndReadAck(
+          dst_addr, {ChunkMetadata{.size_bytes = 1, .count = 1}}, one_byte),
+      IsOkAndHolds(uint8_t{1}));
+  EXPECT_EQ(dst.byte(), 0xCD);
+}
+
+TEST(RawBufferTransportBatchedPushBoundsTest,
+     StreamsLargeStridedBatchPast65536Segments) {
+  constexpr uint32_t kCount = 70000;
+  constexpr size_t kSliceBytes = 2;
+  constexpr size_t kDstStride = 4;
+  constexpr size_t kHostSpan = kCount * kDstStride;
+
+  GuardedSpanDelegate dst(kHostSpan);
+  RawBufferTransport dst_transport(&dst, kLocalPort);
+  RawMockDelegate src_delegate(1);
+  RawBufferTransport src_transport(&src_delegate, kLocalPort);
+  const std::string dst_addr = GetIpPort(dst_transport);
+
+  std::vector<uint8_t> payload(kCount * kSliceBytes);
+  for (size_t i = 0; i < payload.size(); ++i) {
+    payload[i] = static_cast<uint8_t>((i * 11 + 5) & 0xFF);
+  }
+  ABSL_ASSERT_OK(PushOne(src_transport, {.peer = dst_addr,
+                                         .data_ptr = payload.data(),
+                                         .size_bytes = kSliceBytes,
+                                         .dst_stride_bytes = kDstStride,
+                                         .count = kCount,
+                                         .src_stride_bytes = kSliceBytes}));
+
+  EXPECT_THAT(dst.PrefixGuard(), Each(Eq(0xAB)));
+  EXPECT_THAT(dst.SuffixGuard(), Each(Eq(0xAB)));
+  const absl::Span<const uint8_t> span = dst.SpanData();
+  for (size_t c = 0; c < kCount; ++c) {
+    ASSERT_EQ(span[c * kDstStride], payload[c * kSliceBytes])
+        << "mismatch at segment " << c << " byte 0";
+    ASSERT_EQ(span[c * kDstStride + 1], payload[c * kSliceBytes + 1])
+        << "mismatch at segment " << c << " byte 1";
+    ASSERT_EQ(span[c * kDstStride + 2], 0xAB)
+        << "gap clobbered at segment " << c << " byte 2";
+    ASSERT_EQ(span[c * kDstStride + 3], 0xAB)
+        << "gap clobbered at segment " << c << " byte 3";
+  }
 }
 
 }  // namespace

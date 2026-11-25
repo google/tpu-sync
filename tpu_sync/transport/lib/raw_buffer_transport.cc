@@ -20,6 +20,7 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
@@ -517,79 +518,144 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
           metadata[i], DeserializeChunkMetadata(item_bytes, header.version));
     }
 
-    size_t total_iovs = 0;
-    for (uint32_t i = 0; i < batch_size; ++i) {
-      const auto& meta = metadata[i];
-      const uint32_t count = meta.count > 0 ? meta.count : 1;
-      const size_t dst_stride =
-          meta.dst_stride_bytes > 0 ? meta.dst_stride_bytes : meta.size_bytes;
-      total_iovs += (count == 1 || dst_stride == meta.size_bytes) ? 1 : count;
-    }
-
-    std::vector<struct iovec> iovs;
-    iovs.reserve(total_iovs);
-    size_t total_bytes = 0;
+    // Validate every item upfront with overflow-checked uint64_t arithmetic and
+    // zero iovec allocation; payload iovecs are streamed in fixed IOV_MAX
+    // windows below.
+    constexpr uint64_t kMaxTotalBytes =
+        static_cast<uint64_t>(std::numeric_limits<ssize_t>::max());
+    constexpr uint64_t kMaxIovs = static_cast<uint64_t>(IOV_MAX);
+    std::vector<uint8_t*> base_ptrs(batch_size, nullptr);
+    uint64_t total_bytes = 0;
+    uint64_t iov_hint = 0;
 
     for (uint32_t i = 0; i < batch_size; ++i) {
-      const auto& meta = metadata[i];
+      const ChunkMetadata& meta = metadata[i];
       ABSL_ASSIGN_OR_RETURN(
           const absl::Span<uint8_t> host_buffer,
           raw_delegate_->GetHostBuffer(meta.layer_idx, meta.dst_shard_idx),
           _.SetCode(absl::StatusCode::kInvalidArgument).SetPrepend()
               << "Destination host pointer is null in batched push: ");
-      uint8_t* const base_host_ptr = host_buffer.data();
-      const size_t host_size = host_buffer.size();
-      const uint32_t count = meta.count > 0 ? meta.count : 1;
-      const size_t dst_stride =
+      base_ptrs[i] = host_buffer.data();
+      const uint64_t host_size = host_buffer.size();
+      const uint64_t count =
+          meta.count > 0 ? static_cast<uint64_t>(meta.count) : uint64_t{1};
+      const uint64_t dst_stride =
           meta.dst_stride_bytes > 0 ? meta.dst_stride_bytes : meta.size_bytes;
+      const bool is_contiguous = count == 1 || dst_stride == meta.size_bytes;
 
-      if (count == 1 || dst_stride == meta.size_bytes) {
-        const size_t task_bytes = count * meta.size_bytes;
-        if (meta.size_bytes > host_size ||
-            meta.dst_offset_bytes > host_size - task_bytes) {
-          return absl::InvalidArgumentError(
-              "Destination out of bounds in batched push");
+      uint64_t item_bytes = 0;
+      if (is_contiguous) {
+        if (meta.size_bytes > 0 && count > host_size / meta.size_bytes) {
+          return absl::InvalidArgumentError(absl::StrCat(
+              "Destination out of bounds in batched push: item ", i, " (layer ",
+              meta.layer_idx, ", shard ", meta.dst_shard_idx, ") count ", count,
+              " * size_bytes ", meta.size_bytes, " exceeds host buffer size ",
+              host_size));
         }
-        if (task_bytes > 0) {
-          AppendOrMergeIov(iovs, base_host_ptr + meta.dst_offset_bytes,
-                           task_bytes);
-          total_bytes += task_bytes;
+        item_bytes = count * meta.size_bytes;
+        if (meta.dst_offset_bytes > host_size - item_bytes) {
+          return absl::InvalidArgumentError(absl::StrCat(
+              "Destination out of bounds in batched push: item ", i, " (layer ",
+              meta.layer_idx, ", shard ", meta.dst_shard_idx, ") offset ",
+              meta.dst_offset_bytes, " + bytes ", item_bytes,
+              " exceeds host buffer size ", host_size));
         }
       } else {
         if (dst_stride < meta.size_bytes) {
-          return absl::InvalidArgumentError(
-              absl::StrCat("Destination stride (", dst_stride,
-                           ") cannot be smaller than slice size (",
-                           meta.size_bytes, ") in strided push"));
+          return absl::InvalidArgumentError(absl::StrCat(
+              "Destination stride (", dst_stride,
+              ") cannot be smaller than slice size (", meta.size_bytes,
+              ") in strided push for item ", i, " (layer ", meta.layer_idx,
+              ", shard ", meta.dst_shard_idx, ")"));
         }
-        const size_t max_span =
-            meta.dst_offset_bytes + (count - 1) * dst_stride + meta.size_bytes;
-        if (max_span > host_size) {
-          return absl::InvalidArgumentError(
-              "Destination out of bounds in strided push");
+        if (meta.size_bytes > host_size) {
+          return absl::InvalidArgumentError(absl::StrCat(
+              "Destination out of bounds in strided push: item ", i, " (layer ",
+              meta.layer_idx, ", shard ", meta.dst_shard_idx, ") size_bytes ",
+              meta.size_bytes, " exceeds host buffer size ", host_size));
         }
-        for (uint32_t c = 0; c < count; ++c) {
-          AppendOrMergeIov(
-              iovs, base_host_ptr + meta.dst_offset_bytes + c * dst_stride,
-              meta.size_bytes);
+        if (count - 1 > (host_size - meta.size_bytes) / dst_stride) {
+          return absl::InvalidArgumentError(absl::StrCat(
+              "Destination out of bounds in strided push: item ", i, " (layer ",
+              meta.layer_idx, ", shard ", meta.dst_shard_idx, ") count ", count,
+              " with stride ", dst_stride, " and size_bytes ", meta.size_bytes,
+              " exceeds host buffer size ", host_size));
         }
-        total_bytes += count * meta.size_bytes;
+        const uint64_t span = (count - 1) * dst_stride + meta.size_bytes;
+        if (meta.dst_offset_bytes > host_size - span) {
+          return absl::InvalidArgumentError(absl::StrCat(
+              "Destination out of bounds in strided push: item ", i, " (layer ",
+              meta.layer_idx, ", shard ", meta.dst_shard_idx, ") offset ",
+              meta.dst_offset_bytes, " + span ", span,
+              " exceeds host buffer size ", host_size));
+        }
+        item_bytes = count * meta.size_bytes;
+      }
+
+      if (item_bytes > kMaxTotalBytes - total_bytes) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "Total batched push bytes overflow at item ", i, " (layer ",
+            meta.layer_idx, ", shard ", meta.dst_shard_idx, "): total_bytes ",
+            total_bytes, " + item_bytes ", item_bytes, " exceeds limit ",
+            kMaxTotalBytes));
+      }
+      total_bytes += item_bytes;
+      if (meta.size_bytes > 0) {
+        iov_hint +=
+            std::min(is_contiguous ? uint64_t{1} : count, kMaxIovs - iov_hint);
       }
     }
 
     if (total_bytes > 0) {
-      absl::Span<const struct iovec> remaining_iovs = iovs;
-      while (!remaining_iovs.empty()) {
-        size_t chunk =
-            std::min(remaining_iovs.size(), static_cast<size_t>(IOV_MAX));
-        ABSL_RETURN_IF_ERROR(
-            ReadVExact(client_fd, remaining_iovs.subspan(0, chunk)));
-        remaining_iovs = remaining_iovs.subspan(chunk);
+      std::vector<struct iovec> iovs;
+      iovs.reserve(static_cast<size_t>(iov_hint));
+      auto flush_iovs = [&]() -> absl::Status {
+        if (iovs.empty()) return absl::OkStatus();
+        ABSL_RETURN_IF_ERROR(ReadVExact(client_fd, iovs));
+        iovs.clear();
+        return absl::OkStatus();
+      };
+      auto push_iov = [&](uint8_t* ptr, size_t len) -> absl::Status {
+        if (len == 0) return absl::OkStatus();
+        if (!iovs.empty() &&
+            static_cast<uint8_t*>(iovs.back().iov_base) + iovs.back().iov_len ==
+                ptr) {
+          iovs.back().iov_len += len;
+          return absl::OkStatus();
+        }
+        if (iovs.size() == IOV_MAX) {
+          ABSL_RETURN_IF_ERROR(flush_iovs());
+        }
+        iovs.push_back({.iov_base = ptr, .iov_len = len});
+        return absl::OkStatus();
+      };
+
+      for (uint32_t i = 0; i < batch_size; ++i) {
+        const ChunkMetadata& meta = metadata[i];
+        if (meta.size_bytes == 0) continue;
+        uint8_t* const base_host_ptr = base_ptrs[i];
+        const uint64_t count =
+            meta.count > 0 ? static_cast<uint64_t>(meta.count) : uint64_t{1};
+        const uint64_t dst_stride =
+            meta.dst_stride_bytes > 0 ? meta.dst_stride_bytes : meta.size_bytes;
+        if (count == 1 || dst_stride == meta.size_bytes) {
+          const size_t task_bytes =
+              static_cast<size_t>(count * meta.size_bytes);
+          ABSL_RETURN_IF_ERROR(
+              push_iov(base_host_ptr + meta.dst_offset_bytes, task_bytes));
+        } else {
+          for (uint64_t c = 0; c < count; ++c) {
+            ABSL_RETURN_IF_ERROR(
+                push_iov(base_host_ptr + meta.dst_offset_bytes + c * dst_stride,
+                         static_cast<size_t>(meta.size_bytes)));
+          }
+        }
       }
-      if (store_ != nullptr) {
-        store_->IncrementCounter(metric_names::kWeightSyncReceivedBytesTotal,
-                                 {}, total_bytes);
-      }
+      ABSL_RETURN_IF_ERROR(flush_iovs());
+    }
+    if (total_bytes > 0 && store_ != nullptr) {
+      store_->IncrementCounter(metric_names::kWeightSyncReceivedBytesTotal, {},
+                               total_bytes);
     }
 
     TestOnlyRateLimiter* const limiter =

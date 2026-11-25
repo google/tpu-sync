@@ -529,6 +529,7 @@ cc_test(
         "@com_google_absl//absl/types:optional",
         "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest_main",
+        "@xla//xla/tsl/concurrency:future",
     ],
 )
 

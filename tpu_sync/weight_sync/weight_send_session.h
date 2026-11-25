@@ -40,6 +40,11 @@ struct WeightSendSessionOptions {
       std::chrono::steady_clock::time_point::max();
   // Optional owner keeping source host buffers alive until transfer completion.
   std::shared_ptr<const void> host_buffer_owner = nullptr;
+  // Optional provider returning a future that resolves once host memory for
+  // |major_dimension_idx| (layer_idx) is ready to read (e.g. D2H complete).
+  // When unset, all layers are treated as immediately ready.
+  std::function<tsl::Future<>(size_t major_dimension_idx)>
+      data_ready_future_provider = nullptr;
 };
 
 // Base class for whole-model weight send sessions implementing TransferSession
@@ -96,9 +101,13 @@ class WeightSendSession : public ::tpu_raiden::TransferSession {
   std::chrono::steady_clock::time_point deadline() const override;
 
  protected:
-  WeightSendSession(uint64_t uuid,
-                    std::chrono::steady_clock::time_point deadline,
-                    std::shared_ptr<const void> host_buffer_owner = nullptr);
+  using DataReadyFutureProvider =
+      std::function<tsl::Future<>(size_t major_dimension_idx)>;
+
+  WeightSendSession(
+      uint64_t uuid, std::chrono::steady_clock::time_point deadline,
+      std::shared_ptr<const void> host_buffer_owner = nullptr,
+      DataReadyFutureProvider data_ready_future_provider = nullptr);
 
   absl::Status MarkStarted(bool allow_already_succeeded = false);
   bool TryBeginInternalOp();
@@ -107,6 +116,7 @@ class WeightSendSession : public ::tpu_raiden::TransferSession {
   const uint64_t uuid_;
   const std::chrono::steady_clock::time_point deadline_;
   std::shared_ptr<const void> host_buffer_owner_;
+  DataReadyFutureProvider data_ready_future_provider_;
 
   mutable absl::Mutex mu_;
   bool started_ ABSL_GUARDED_BY(mu_) = false;

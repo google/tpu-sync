@@ -35,6 +35,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/types/optional.h"
 #include "absl/types/span.h"
+#include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/transport/transfer_session.h"
 #include "tpu_sync/weight_sync/lib/grpc_transport_client.h"
@@ -590,6 +591,196 @@ TEST(WeightSendSessionTest, TransferSessionInterfaceContracts) {
   EXPECT_THAT(send_iface->OnDataReceived(0, {}, {}),
               StatusIs(absl::StatusCode::kFailedPrecondition));
   EXPECT_THAT(send_iface->GetDataReadyFuture(0).Await(), IsOk());
+}
+
+TEST(WeightSendSessionTest, PushSendWaitsForDataReadyFutureBeforeSending) {
+  TestSendTransportRouter router;
+  router.AddHostBuffer(/*buffer_id=*/0, /*shard_id=*/0, /*size_bytes=*/4, 0);
+
+  GrpcTransportServer server(&router);
+  ASSERT_THAT(server.Start(0), IsOkAndHolds(Gt(0)));
+  GrpcTransportClient client;
+
+  ::tpu_sync::rpc::StartTransferRequest recv_spec;
+  recv_spec.set_uuid(8001);
+  (*recv_spec.mutable_expected_layer_chunk_counts())[0] = 1;
+  absl::StatusOr<std::shared_ptr<::tpu_raiden::TransferSession>> recv_or =
+      WeightReceiveSession::CreatePushReceiveSession(recv_spec);
+  ASSERT_THAT(recv_or, IsOk());
+  std::shared_ptr<::tpu_raiden::TransferSession> recv_session =
+      *std::move(recv_or);
+  router.RegisterSession(8001, recv_session);
+  ASSERT_THAT(recv_session->Start(), IsOk());
+
+  std::vector<uint8_t> src(4, 0);
+  auto [promise, future] = tsl::MakePromise<>();
+
+  ::tpu_sync::rpc::StartTransferRequest send_spec;
+  send_spec.set_uuid(8001);
+  send_spec.set_is_sender(true);
+  {
+    auto* entry = (*send_spec.mutable_shard_push_schedules())[0].add_entries();
+    entry->add_dst_peers(server.address());
+    entry->set_layer_idx(0);
+    entry->set_dst_shard_idx(0);
+    entry->set_src_offset_bytes(0);
+    entry->set_dst_offset_bytes(0);
+    entry->set_size_bytes(4);
+  }
+
+  WeightSendSessionOptions options;
+  options.data_ready_future_provider = [f = future](size_t) { return f; };
+
+  absl::StatusOr<std::shared_ptr<::tpu_raiden::TransferSession>> send_or =
+      WeightSendSession::CreatePushSendSession(
+          &client, send_spec,
+          [&](uint64_t, uint32_t) { return absl::MakeConstSpan(src); },
+          std::move(options));
+  ASSERT_THAT(send_or, IsOk());
+  std::shared_ptr<::tpu_raiden::TransferSession> send_session =
+      *std::move(send_or);
+
+  EXPECT_FALSE(send_session->GetDataReadyFuture(0).IsReady());
+  ASSERT_THAT(send_session->Start(), IsOk());
+  EXPECT_FALSE(send_session->Done());
+
+  // Populate host memory (simulating async D2H) and resolve the ready future.
+  src = {9, 8, 7, 6};
+  promise.Set(absl::OkStatus());
+
+  EXPECT_THAT(send_session->AwaitForDone(), IsOk());
+  EXPECT_THAT(recv_session->AwaitForDone(), IsOk());
+  EXPECT_THAT(router.ReadHostBuffer(0, 0), ElementsAre(9, 8, 7, 6));
+  server.Stop();
+}
+
+TEST(WeightSendSessionTest, PushSendFailsOnDataReadyError) {
+  GrpcTransportClient client;
+  const std::vector<uint8_t> src(4, 1);
+  ::tpu_sync::rpc::StartTransferRequest spec;
+  spec.set_uuid(8002);
+  {
+    auto* entry = (*spec.mutable_shard_push_schedules())[0].add_entries();
+    entry->add_dst_peers("127.0.0.1:1");
+    entry->set_layer_idx(0);
+    entry->set_dst_shard_idx(0);
+    entry->set_src_offset_bytes(0);
+    entry->set_dst_offset_bytes(0);
+    entry->set_size_bytes(4);
+  }
+
+  auto [promise, future] = tsl::MakePromise<>();
+  WeightSendSessionOptions options;
+  options.data_ready_future_provider = [f = future](size_t) { return f; };
+  absl::StatusOr<std::shared_ptr<::tpu_raiden::TransferSession>> send_or =
+      WeightSendSession::CreatePushSendSession(
+          &client, spec,
+          [&](uint64_t, uint32_t) { return absl::MakeConstSpan(src); },
+          std::move(options));
+  ASSERT_THAT(send_or, IsOk());
+  ASSERT_THAT((*send_or)->Start(), IsOk());
+  promise.Set(absl::InternalError("d2h failed"));
+  EXPECT_THAT((*send_or)->AwaitForDone(),
+              StatusIs(absl::StatusCode::kInternal));
+}
+
+TEST(WeightSendSessionTest, PullSendWaitsForDataReadyFutureBeforeServing) {
+  TestSendTransportRouter router;
+  auto src = std::make_shared<std::vector<uint8_t>>(4, 0);
+  auto [promise, future] = tsl::MakePromise<>();
+
+  ::tpu_sync::rpc::StartTransferRequest send_spec;
+  send_spec.set_uuid(8003);
+  send_spec.set_is_sender(true);
+  {
+    auto* entry = (*send_spec.mutable_shard_push_schedules())[0].add_entries();
+    entry->set_layer_idx(0);
+    entry->set_dst_shard_idx(0);
+    entry->set_src_offset_bytes(0);
+    entry->set_dst_offset_bytes(0);
+    entry->set_size_bytes(4);
+  }
+
+  WeightSendSessionOptions options;
+  options.host_buffer_owner = src;
+  options.data_ready_future_provider = [f = future](size_t) { return f; };
+
+  absl::StatusOr<std::shared_ptr<::tpu_raiden::TransferSession>> send_or =
+      WeightSendSession::CreatePullSendSession(
+          send_spec,
+          [&](uint64_t, uint32_t) { return absl::MakeConstSpan(*src); },
+          std::move(options));
+  ASSERT_THAT(send_or, IsOk());
+  std::shared_ptr<::tpu_raiden::TransferSession> send_session =
+      *std::move(send_or);
+  router.RegisterSession(8003, send_session);
+
+  GrpcTransportServer server(&router);
+  ASSERT_THAT(server.Start(0), IsOkAndHolds(Gt(0)));
+  GrpcTransportClient client;
+  ASSERT_THAT(send_session->Start(), IsOk());
+
+  std::vector<uint8_t> dst(4, 0);
+  ::tpu_sync::rpc::StartTransferRequest recv_spec = send_spec;
+  recv_spec.set_is_sender(false);
+  (*recv_spec.mutable_shard_push_schedules())[0]
+      .mutable_entries(0)
+      ->add_dst_peers(server.address());
+
+  absl::StatusOr<std::shared_ptr<::tpu_raiden::TransferSession>> recv_or =
+      WeightReceiveSession::CreatePullReceiveSession(
+          &client, recv_spec,
+          [&](uint64_t, uint32_t) { return absl::MakeSpan(dst); });
+  ASSERT_THAT(recv_or, IsOk());
+  std::shared_ptr<::tpu_raiden::TransferSession> recv_session =
+      *std::move(recv_or);
+
+  ASSERT_THAT(recv_session->Start(), IsOk());
+  EXPECT_FALSE(recv_session->Done());
+
+  // Populate host memory and resolve D2H future; pull completes with new bytes.
+  *src = {12, 34, 56, 78};
+  promise.Set(absl::OkStatus());
+
+  EXPECT_THAT(recv_session->AwaitForDone(), IsOk());
+  EXPECT_THAT(send_session->AwaitForDone(), IsOk());
+  EXPECT_THAT(dst, ElementsAre(12, 34, 56, 78));
+  server.Stop();
+}
+
+TEST(WeightSendSessionTest, PullSendFailsOnDataReadyError) {
+  TestSendTransportRouter router;
+  auto src = std::make_shared<std::vector<uint8_t>>(4, 1);
+
+  ::tpu_sync::rpc::StartTransferRequest spec;
+  spec.set_uuid(8004);
+  {
+    auto* entry = (*spec.mutable_shard_push_schedules())[0].add_entries();
+    entry->set_layer_idx(0);
+    entry->set_dst_shard_idx(0);
+    entry->set_src_offset_bytes(0);
+    entry->set_dst_offset_bytes(0);
+    entry->set_size_bytes(4);
+  }
+
+  auto [promise, future] = tsl::MakePromise<>();
+  WeightSendSessionOptions options;
+  options.host_buffer_owner = src;
+  options.data_ready_future_provider = [f = future](size_t) { return f; };
+  absl::StatusOr<std::shared_ptr<::tpu_raiden::TransferSession>> send_or =
+      WeightSendSession::CreatePullSendSession(
+          spec, [&](uint64_t, uint32_t) { return absl::MakeConstSpan(*src); },
+          std::move(options));
+  ASSERT_THAT(send_or, IsOk());
+  router.RegisterSession(8004, *send_or);
+  ASSERT_THAT((*send_or)->Start(), IsOk());
+
+  promise.Set(absl::InternalError("d2h failed"));
+  PullChunksRequest req{
+      .uuid = 8004, .buffer_id = 0, .shard_id = 0, .chunk_batch_id = 0};
+  EXPECT_THAT(router.OnPullChunks(req), StatusIs(absl::StatusCode::kInternal));
+  EXPECT_THAT((*send_or)->AwaitForDone(),
+              StatusIs(absl::StatusCode::kInternal));
 }
 
 }  // namespace

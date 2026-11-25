@@ -1346,6 +1346,99 @@ class KVCacheStoreHostResidentOnlyLookupTest(absltest.TestCase):
           host_resident_only=True,
       )
 
+  def test_subset_mode_matches_past_misses_and_respects_host_resident_only(
+      self,
+  ):
+    store = self._make_store()
+    rid = store.raiden_id
+    self.assertTrue(
+        store.insert(
+            [b"host_blk", b"host_hbm_blk", b"hbm_only_blk"],
+            [
+                kv_cache_store.RaidenBlockId(
+                    rid, 0, kv_cache_store.BlockStatus.HOST
+                ),
+                kv_cache_store.RaidenBlockId(
+                    rid, 1, kv_cache_store.BlockStatus.HOST_AND_HBM, 1
+                ),
+                kv_cache_store.RaidenBlockId(
+                    rid, -1, kv_cache_store.BlockStatus.HBM, 2
+                ),
+            ],
+            on_host=False,
+        )
+    )
+
+    query = [
+        b"miss_0",
+        b"host_hbm_blk",
+        b"miss_1",
+        b"hbm_only_blk",
+        b"host_blk",
+    ]
+
+    # Default PREFIX mode stops at the leading miss.
+    self.assertEmpty(
+        store.lookup(
+            query,
+            enable_global=False,
+            pin_found=False,
+            mode=kv_cache_store.LookupMatchMode.PREFIX,
+        )
+    )
+
+    # SUBSET mode skips misses and returns all matches in input order.
+    subset_res = store.lookup(
+        query,
+        enable_global=False,
+        pin_found=False,
+        mode=kv_cache_store.LookupMatchMode.SUBSET,
+    )
+    self.assertEqual(
+        [h for h, _ in subset_res],
+        [b"host_hbm_blk", b"hbm_only_blk", b"host_blk"],
+    )
+
+    # SUBSET + host_resident_only=True skips misses and excludes HBM-only.
+    host_subset_res = store.lookup(
+        query,
+        enable_global=False,
+        pin_found=False,
+        host_resident_only=True,
+        mode=kv_cache_store.LookupMatchMode.SUBSET,
+    )
+    self.assertEqual(
+        [h for h, _ in host_subset_res], [b"host_hbm_blk", b"host_blk"]
+    )
+    self.assertEqual(
+        host_subset_res[0][1].status, kv_cache_store.BlockStatus.HOST_AND_HBM
+    )
+    self.assertEqual(
+        host_subset_res[1][1].status, kv_cache_store.BlockStatus.HOST
+    )
+
+    # Empty block_hashes in SUBSET mode snapshots matching host entries.
+    snapshot_res = store.lookup(
+        [],
+        enable_global=False,
+        pin_found=False,
+        host_resident_only=True,
+        mode=kv_cache_store.LookupMatchMode.SUBSET,
+    )
+    self.assertCountEqual(
+        [h for h, _ in snapshot_res], [b"host_blk", b"host_hbm_blk"]
+    )
+
+  def test_subset_mode_rejects_enable_global(self):
+    store = self._make_store()
+    with self.assertRaisesRegex(RuntimeError, "kSubset"):
+      store.lookup(
+          [b"any_blk"],
+          enable_global=True,
+          pin_found=False,
+          mode=kv_cache_store.LookupMatchMode.SUBSET,
+      )
+
 
 if __name__ == "__main__":
   absltest.main()

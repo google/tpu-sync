@@ -1002,6 +1002,10 @@ NB_MODULE(_tpu_raiden_torch, m) {
       .value("SHARED_STORAGE",
              tpu_raiden::kv_cache::BlockStatus::SHARED_STORAGE);
 
+  nb::enum_<tpu_raiden::kv_cache::LookupMatchMode>(m, "LookupMatchMode")
+      .value("PREFIX", tpu_raiden::kv_cache::LookupMatchMode::kPrefix)
+      .value("SUBSET", tpu_raiden::kv_cache::LookupMatchMode::kSubset);
+
   nb::class_<tpu_raiden::kv_cache::RaidenBlockId>(m, "RaidenBlockId")
       .def(nb::init<tpu_raiden::kv_cache::RaidenId, int,
                     tpu_raiden::kv_cache::BlockStatus>(),
@@ -1080,12 +1084,14 @@ NB_MODULE(_tpu_raiden_torch, m) {
           "lookup",
           [](tpu_raiden::kv_cache::KVCacheStoreWrapper& self,
              const std::vector<nb::bytes>& block_hashes, bool enable_global,
-             bool pin_found, bool host_resident_only) {
+             bool pin_found, bool host_resident_only,
+             tpu_raiden::kv_cache::LookupMatchMode mode) {
             auto hashes = ToStdStringVector(block_hashes);
             tpu_raiden::kv_cache::LookupOptions options;
             options.enable_global = enable_global;
             options.pin_found = pin_found;
             options.host_resident_only = host_resident_only;
+            options.match_mode = mode;
             auto res = self->Lookup(hashes, options);
             if (!res.ok()) {
               throw std::runtime_error(absl::StrCat(
@@ -1104,12 +1110,18 @@ NB_MODULE(_tpu_raiden_torch, m) {
           },
           nb::arg("block_hashes"), nb::arg("enable_global") = false,
           nb::arg("pin_found") = true, nb::arg("host_resident_only") = false,
-          "Checks the LRU directory for cached block hashes. Returns a list of "
-          "all matched replica pairs prior to the first miss. Pins every local "
-          "hit unless pin_found is false. When host_resident_only is true, "
-          "targets only local host DRAM (HOST / HOST_AND_HBM), skipping "
-          "HBM-only entries and secondary storage tiers (cannot be combined "
-          "with enable_global=true).")
+          nb::arg("mode") = tpu_raiden::kv_cache::LookupMatchMode::kPrefix,
+          "Checks the LRU directory and secondary storage tiers for cached "
+          "block hashes. In LookupMatchMode.PREFIX (default), returns matched "
+          "replica pairs prior to the first miss. In LookupMatchMode.SUBSET, "
+          "checks every hash independently across host RAM and storage tiers, "
+          "skipping misses and returning all matches in input order (or "
+          "snapshotting host RAM when block_hashes is empty); cannot be "
+          "combined with enable_global=true. Pins every local hit unless "
+          "pin_found is false. When host_resident_only is true, targets only "
+          "local host DRAM (HOST / HOST_AND_HBM), skipping HBM-only entries "
+          "and secondary storage tiers (cannot be combined with "
+          "enable_global=true).")
       .def(
           "insert",
           [](tpu_raiden::kv_cache::KVCacheStoreWrapper& self,

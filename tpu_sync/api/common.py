@@ -60,6 +60,16 @@ class BlockStatus(enum.Enum):
   SHARED_STORAGE = 5  # Resident in shared persistent secondary storage.
 
 
+class LookupMatchMode(enum.Enum):
+  """Controls how KVCacheStore.lookup() matches requested block hashes."""
+
+  # Longest contiguous prefix from index 0; stops at the first cache miss.
+  PREFIX = 0
+  # All matching blocks in block_hashes, skipping misses and preserving input
+  # order. When block_hashes is empty, snapshots matching host RAM blocks.
+  SUBSET = 1
+
+
 class TelemetryCallbacks(NamedTuple):
   """Container for registered telemetry hooks."""
 

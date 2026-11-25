@@ -33,6 +33,7 @@ _impl = torch_abi.load_extension(
 from tpu_sync.api import common
 
 BlockStatus = common.BlockStatus
+LookupMatchMode = common.LookupMatchMode
 RaidenId = getattr(_impl, "RaidenId", common.RaidenId)
 
 # Mirrors the extension's capability marker, which out-of-tree connectors
@@ -251,11 +252,12 @@ class KVCacheStore:
       enable_global: bool = False,
       pin_found: bool = True,
       host_resident_only: bool = False,
+      mode: LookupMatchMode = LookupMatchMode.PREFIX,
   ) -> list[tuple[bytes, RaidenBlockId]]:
-    """Checks the LRU directory for cached block hashes.
+    """Checks the LRU directory and secondary storage tiers for cached blocks.
 
-    PINS every hash it returns by default (pin_found=True), one pin each, so
-    the answer cannot be evicted between being given and being used. The
+    PINS every local hash it returns by default (pin_found=True), one pin each,
+    so the answer cannot be evicted between being given and being used. The
     operation the caller goes on to perform consumes that pin: load() drops it
     on a successful local load, and save() drops it on success.
 
@@ -265,13 +267,14 @@ class KVCacheStore:
     and back, which reorders the LRU.
 
     Locally cached hits are pinned. Hashes resolved only through the global
-    registry are not: they name a block on another node, and there is nothing
-    here to hold.
+    registry or secondary storage are not: there is no local host block here to
+    hold.
 
     ONE ANSWER CAN MIX SOURCES: local host (HOST / HOST_AND_HBM), then peers
     (REMOTE -- only with enable_global, possibly several peers), then secondary
-    storage (SHARED_STORAGE, probed for the remaining tail whatever
-    enable_global is). Only local hits are pinned. Route by status:
+    storage (SHARED_STORAGE, probed for unresolved hashes whatever enable_global
+    is, unless host_resident_only=True). Only local hits are pinned. Route by
+    status:
       HOST / HOST_AND_HBM     -> load()         consumes the lookup pin
       REMOTE, SHARED_STORAGE  -> read_remote()  no pin; one call per peer, and
                                                 the storage hits may join any
@@ -287,19 +290,34 @@ class KVCacheStore:
         local host DRAM (HOST / HOST_AND_HBM), excluding HBM-only entries and
         skipping secondary storage tiers. Cannot be combined with
         enable_global=True. Defaults to False.
+      mode: Controls how `block_hashes` are matched. `LookupMatchMode.PREFIX`
+        (default) returns the longest contiguous prefix of hits starting at
+        index 0, halting at the first miss. `LookupMatchMode.SUBSET` checks
+        every hash independently across host RAM and secondary storage tiers,
+        skipping misses and returning all matches in input order (or
+        snapshotting host RAM when `block_hashes` is empty).
+        `LookupMatchMode.SUBSET` cannot be combined with `enable_global=True`.
 
     Returns:
       A list of tuples containing the block hash and the matching
-      RaidenBlockId replica, halting immediately upon the first cache miss.
+      RaidenBlockId replica (contiguous prefix in `LookupMatchMode.PREFIX`, or
+      all matching entries in input order in `LookupMatchMode.SUBSET`).
 
     Raises:
       RuntimeError: if the underlying lookup failed outright (a backend
         error, or an invalid option combination such as
-        host_resident_only=True with enable_global=True).
+        host_resident_only=True or mode=LookupMatchMode.SUBSET with
+        enable_global=True).
     """
-    raw_res = self._impl.lookup(
-        block_hashes, enable_global, pin_found, host_resident_only
-    )
+    if mode == LookupMatchMode.PREFIX:
+      raw_res = self._impl.lookup(
+          block_hashes, enable_global, pin_found, host_resident_only
+      )
+    else:
+      mode_val = getattr(_impl.LookupMatchMode, mode.name)
+      raw_res = self._impl.lookup(
+          block_hashes, enable_global, pin_found, host_resident_only, mode_val
+      )
     final_res = []
     for hash_val, raw_slice in raw_res:
       final_res.append((hash_val, RaidenBlockId(impl=raw_slice)))

@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
@@ -205,6 +206,28 @@ NB_MODULE(_tpu_raiden_jax, m) {
           nb::arg("dst_offsets_major_dim") = nb::list(),
           nb::arg("copy_sizes_major_dim") = nb::list())
 
+      // Transfers `host_block_ids.size()` blocks across all layers between a
+      // pre-packed HBM `jax.Array` (`[bucket_blocks, num_layers, ...]`) and
+      // Host DRAM slots in a single bulk PJRT DMA per TPU shard. Used by the
+      // Python HBM-staging path (`api/jax/kv_cache_manager.py`) to avoid
+      // `num_blocks * num_layers` fragmented PCIe DMAs.
+      .def(
+          "copy_packed",
+          [](tpu_raiden::kv_cache::jax::KVCacheManager& self,
+             const nb::object& packed_array,
+             const std::vector<int64_t>& host_block_ids, bool device_to_host,
+             bool unsafe_skip_buffer_lock)
+              -> absl::StatusOr<tpu_raiden::RaidenFuture> {
+            ABSL_ASSIGN_OR_RETURN(
+                raiden::PjRtCopyFuture cf,
+                self.CopyPacked(packed_array, host_block_ids, device_to_host,
+                                unsafe_skip_buffer_lock));
+            return tpu_raiden::RaidenFuture{std::move(cf)};
+          },
+          nb::arg("packed_array"), nb::arg("host_block_ids"),
+          nb::arg("device_to_host"),
+          nb::arg("unsafe_skip_buffer_lock") = false)
+
       .def(
           "d2h_auto_allocate",
           xla::ValueOrThrowWrapper(
@@ -349,6 +372,13 @@ NB_MODULE(_tpu_raiden_jax, m) {
       .def("unlock_blocks",
            &tpu_raiden::kv_cache::jax::KVCacheManager::UnlockBlocks,
            nb::arg("block_ids"))
+      // Reserves and locks `num_blocks` Host DRAM staging slots across all NUMA
+      // sub-managers without launching a per-layer DMA, so Python's HBM-staged
+      // `d2h_auto_allocate` can gather blocks in HBM first and transfer them
+      // via `copy_packed`.
+      .def("allocate_blocks",
+           &tpu_raiden::kv_cache::jax::KVCacheManager::AllocateBlocks,
+           nb::arg("num_blocks"))
       .def("dump_metrics_to_string",
            &tpu_raiden::kv_cache::jax::KVCacheManager::DumpMetricsToString)
       .def(

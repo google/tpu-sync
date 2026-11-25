@@ -690,6 +690,31 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
       std::optional<size_t> host_layer_idx = std::nullopt,
       std::optional<size_t> shard_idx = std::nullopt);
 
+  // Transfers `host_block_ids.size()` KV blocks across all `num_layers_` in a
+  // single bulk PJRT DMA per local TPU shard, avoiding `num_blocks` x
+  // `num_layers` fragmented PCIe DMA slices when offloading or recalling
+  // scattered blocks.
+  //
+  // `packed_shards` supplies one device buffer handle per local shard
+  // (`num_shards_`), laid out contiguously in block-major order
+  // `[bucket_blocks, num_layers_, layer_block_bytes]`. Axis 0 (`bucket_blocks`)
+  // may exceed `host_block_ids.size()` when XLA static power-of-two bucketing
+  // pads the staging tensor; only the prefix `[0, host_block_ids.size())` is
+  // read or written.
+  //
+  //   * `device_to_host == true` (D2H): Issues one bulk PJRT D2H DMA per shard
+  //     into a pooled Host DRAM bounce buffer and scatters each
+  //     `[block, layer]` slice into `layers_[layer].shards[shard]` at
+  //     `host_block_ids` inside an `OnReady` callback; the returned future
+  //     completes after the host scatter finishes.
+  //   * `device_to_host == false` (H2D): Packs `host_block_ids` across all
+  //     layers from `layers_` into a pooled Host DRAM bounce buffer and issues
+  //     one bulk PJRT H2D DMA per shard into `packed_shards`, keeping the
+  //     bounce buffer alive until PJRT completes the transfer.
+  absl::StatusOr<raiden::PjRtCopyFuture> CopyPackedDeviceBuffer(
+      absl::Span<const raiden::RaidenBufferHandle> packed_shards,
+      absl::Span<const int64_t> host_block_ids, bool device_to_host);
+
   // Per-layer device buffer holds bundled with the layer's on-device size.
   // For uniform models every layer has the same physical_size; for hybrid
   // (HMA) models sizes may differ (e.g. mamba conv_state bf16 vs ssm f32).
@@ -922,7 +947,12 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   std::shared_ptr<const PoolStagingLease> PoolStagingLeaseSnapshot(
       size_t storage_idx, uint64_t uuid) const;
 
+  // Single reusable DMA-capable Host DRAM bounce buffer per TPU shard (grown
+  // on demand) so steady-state `CopyPackedDeviceBuffer` calls avoid repeated
+  // host page allocation and IOMMU pinning.
+  struct ShardBounceCache;
   HostBufferAllocator host_allocator_ = nullptr;
+  std::shared_ptr<ShardBounceCache> bounce_cache_;
 
   absl::StatusOr<std::shared_ptr<const TransferPlan>> GetTransferPlan(
       uint64_t uuid) const;

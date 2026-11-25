@@ -820,6 +820,98 @@ class KVCacheManagerTest(parameterized.TestCase):
     # Out of range: GetHostBuffer fails and read_host_memory returns [].
     self.assertEqual(manager.read_host_memory(n_layers, 0, num_floats), [])
 
+  def test_fragmented_hbm_staging_and_host_bounce_roundtrip(self):
+    """Verifies multi-window HBM staging, donated caches, and bounds checks."""
+    # Exercises the full Python HBM gather/scatter + C++ ShardBounceCache stack:
+    #   1. Window chunking (`max_staging_blocks=4` splits a 5-block transfer
+    #      into a 4-block window + a 1-block window) and power-of-two bucket
+    #      decomposition.
+    #   2. Step-by-step `donate_argnums` KV-cache invalidation (`x + 1.0`)
+    #      before D2H and between consecutive H2D recalls.
+    #   3. Explicit `ValueError` bounds checking on out-of-range block indices
+    #      (which raw XLA `jnp.take` / `.at[].set()` would silently clamp/drop).
+    from tpu_sync.api.jax import kv_cache_manager as py_mgr  # pylint: disable=g-import-not-at-top
+
+    tpu_sharding = self.setup_shardings()
+    n_layers = 3
+    test_shape = (8, 16, 8, 4, 32)
+    key = jax.random.key(909)
+
+    src_refs = []
+    init_arrs = []
+    for i in range(n_layers):
+      sub_key = jax.random.fold_in(key, i)
+      base = jax.random.uniform(sub_key, test_shape, dtype=jnp.float32)
+      src_refs.append(np.asarray(base))
+      init_arrs.append(jax.device_put(base, tpu_sharding))
+    jax.block_until_ready(init_arrs)
+
+    # Set max_staging_blocks=4 so a 5-block transfer exercises both multi-window
+    # chunking (4 + 1) and non-power-of-two bucket decomposition.
+    manager = py_mgr.KVCacheManager(
+        kv_caches=init_arrs,
+        local_control_port=0,
+        host_blocks_to_allocate=8,
+        unsafe_skip_buffer_lock=self.skip_lock,
+        enable_hbm_staging=True,
+        max_staging_blocks=4,
+    )
+
+    # Simulate engine forward step donating and invalidating the initial arrays
+    # (matching TPUModelRunner replacing `runner.kv_caches` each step).
+    donate_step = jax.jit(
+        lambda xs: [x + jnp.float32(1.0) for x in xs], donate_argnums=(0,)
+    )
+    live_caches = donate_step(init_arrs)
+    jax.block_until_ready(live_caches)
+    expected_refs = [ref + 1.0 for ref in src_refs]
+
+    # Save 5 non-contiguous HBM blocks via d2h_auto_allocate with live_caches.
+    src_blocks = [6, 1, 4, 2, 7]
+    allocated_chunks, save_fut = manager.d2h_auto_allocate(
+        src_blocks, kv_caches=live_caches
+    )
+    save_fut.Await()
+    self.assertLen(allocated_chunks, 5)
+
+    # Replace live_caches with fresh zeroed donated arrays, then scatter back
+    # into 5 non-contiguous destination HBM blocks [7, 0, 5, 3, 1].
+    zero_caches = [
+        jax.device_put(jnp.zeros(test_shape, dtype=jnp.float32), tpu_sharding)
+        for _ in range(n_layers)
+    ]
+    jax.block_until_ready(zero_caches)
+    dst_blocks = [7, 0, 5, 3, 1]
+    manager.h2d(
+        allocated_chunks, dst_blocks, [1] * 5, kv_caches=zero_caches
+    ).Await()
+    # Donate `manager.kv_caches` in a simulated step and run a second H2D to
+    # ensure no deleted/donated reference from the prior H2D is retained.
+    step2_caches = donate_step(manager.kv_caches)
+    jax.block_until_ready(step2_caches)
+    manager.h2d(
+        allocated_chunks, dst_blocks, [1] * 5, kv_caches=step2_caches
+    ).Await()
+    updated_caches = manager.kv_caches
+
+    untouched_blocks = sorted(set(range(8)) - set(dst_blocks))
+    for layer_idx in range(n_layers):
+      actual = np.asarray(updated_caches[layer_idx])
+      for dst_blk, orig_blk in zip(dst_blocks, src_blocks):
+        np.testing.assert_array_equal(
+            actual[dst_blk], expected_refs[layer_idx][orig_blk]
+        )
+      for untouched in untouched_blocks:
+        np.testing.assert_array_equal(actual[untouched], 1.0)
+
+    manager.unlock_blocks(allocated_chunks)
+
+    # Out-of-bounds block offset must raise ValueError loudly on both paths.
+    with self.assertRaisesRegex(ValueError, "out of bounds"):
+      manager.d2h([8], [0], [1], kv_caches=updated_caches)
+    with self.assertRaisesRegex(ValueError, "out of bounds"):
+      manager.h2d([0], [8], [1], kv_caches=updated_caches)
+
 
 if __name__ == "__main__":
   absltest.main()

@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <thread>  // NOLINT
 #include <tuple>
 #include <utility>
@@ -30,6 +32,8 @@
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
+#include "xla/tsl/concurrency/future.h"
+#include "tpu_sync/transport/transfer_session.h"
 #include "tpu_sync/weight_sync/lib/grpc_transport_client.h"
 #include "tpu_sync/weight_sync/lib/grpc_transport_service.h"
 #include "tpu_sync/weight_sync/lib/grpc_transport_types.h"
@@ -49,8 +53,92 @@ struct PushRecord {
   uint64_t chunk_batch_id = 0;
 };
 
+class StubTransferSession final : public ::tpu_raiden::TransferSession {
+ public:
+  absl::Status Start() override { return absl::OkStatus(); }
+  bool Done() const override {
+    absl::MutexLock lock(mu_);
+    return done_;
+  }
+  void Finish(const absl::Status& status = absl::OkStatus()) override {
+    absl::MutexLock lock(mu_);
+    if (!status.ok() && status_.ok()) {
+      status_ = status;
+    }
+    draining_ = true;
+    if (in_flight_ == 0) {
+      done_ = true;
+    }
+  }
+  bool TryBeginOp() override {
+    absl::MutexLock lock(mu_);
+    if (draining_ || done_) {
+      return false;
+    }
+    ++in_flight_;
+    return true;
+  }
+  void EndOp() override {
+    absl::MutexLock lock(mu_);
+    if (in_flight_ > 0) {
+      --in_flight_;
+    }
+    if (draining_ && in_flight_ == 0) {
+      done_ = true;
+    }
+  }
+  absl::Status GetStatus() const override {
+    absl::MutexLock lock(mu_);
+    return status_;
+  }
+  absl::Status AwaitForDone() override {
+    absl::MutexLock lock(mu_);
+    mu_.Await(absl::Condition(&done_));
+    return status_;
+  }
+  bool IsDraining() const override {
+    absl::MutexLock lock(mu_);
+    return draining_;
+  }
+  absl::StatusOr<size_t> ResolveStagingSlot(size_t) override {
+    return absl::NotFoundError("unused");
+  }
+  absl::Status OnDataReceived(size_t, absl::Span<const int>,
+                              absl::Span<const int>) override {
+    return absl::OkStatus();
+  }
+  tsl::Future<> GetDataReadyFuture(size_t) override {
+    return tsl::Future<>(absl::OkStatus());
+  }
+  std::optional<std::shared_ptr<const ::tpu_raiden::TransferPlan>> plan()
+      const override {
+    return std::nullopt;
+  }
+  std::chrono::steady_clock::time_point deadline() const override {
+    return std::chrono::steady_clock::time_point::max();
+  }
+
+ private:
+  mutable absl::Mutex mu_;
+  int in_flight_ ABSL_GUARDED_BY(mu_) = 0;
+  bool draining_ ABSL_GUARDED_BY(mu_) = false;
+  bool done_ ABSL_GUARDED_BY(mu_) = false;
+  absl::Status status_ ABSL_GUARDED_BY(mu_);
+};
+
 class FakeGrpcTransportDelegate final : public GrpcTransportDelegate {
  public:
+  void SetSession(uint64_t uuid,
+                  std::shared_ptr<::tpu_raiden::TransferSession> session) {
+    absl::MutexLock lock(mu_);
+    sessions_[uuid] = std::move(session);
+  }
+
+  void SetRequireRegisteredSession(bool require) {
+    absl::MutexLock lock(mu_);
+    require_registered_session_ = require;
+  }
+
   void AddBuffer(uint64_t buffer_id, uint32_t shard_id, size_t size_bytes,
                  uint8_t fill = 0) {
     absl::MutexLock lock(mu_);
@@ -90,6 +178,19 @@ class FakeGrpcTransportDelegate final : public GrpcTransportDelegate {
     return absl::MakeSpan(it->second);
   }
 
+  absl::StatusOr<std::shared_ptr<::tpu_raiden::TransferSession>> GetSession(
+      uint64_t uuid) const override {
+    absl::MutexLock lock(mu_);
+    auto it = sessions_.find(uuid);
+    if (it != sessions_.end()) {
+      return it->second;
+    }
+    if (require_registered_session_) {
+      return absl::NotFoundError(absl::StrCat("Session ", uuid, " not found"));
+    }
+    return default_session_;
+  }
+
   absl::Status OnPushChunks(uint64_t uuid, uint64_t buffer_id,
                             uint32_t shard_id,
                             uint64_t chunk_batch_id) override {
@@ -122,6 +223,11 @@ class FakeGrpcTransportDelegate final : public GrpcTransportDelegate {
                       absl::StatusOr<PullChunksResponse>>
       pull_results_ ABSL_GUARDED_BY(mu_);
   std::vector<PushRecord> push_records_ ABSL_GUARDED_BY(mu_);
+  absl::flat_hash_map<uint64_t, std::shared_ptr<::tpu_raiden::TransferSession>>
+      sessions_ ABSL_GUARDED_BY(mu_);
+  bool require_registered_session_ ABSL_GUARDED_BY(mu_) = false;
+  std::shared_ptr<::tpu_raiden::TransferSession> default_session_ =
+      std::make_shared<StubTransferSession>();
 };
 
 TEST(GrpcTransportTest, PushContiguousScatterChunkSucceeds) {
@@ -435,6 +541,48 @@ TEST(GrpcTransportTest, EnforcesMaxMessageSizeBound) {
       &delegate, GrpcTransportServerConfig{.max_message_size_bytes = -1});
   EXPECT_THAT(invalid_server.Start(),
               StatusIs(absl::StatusCode::kInvalidArgument));
+}
+
+TEST(GrpcTransportTest, PushGatesOnSessionBeforeWritingHostBuffer) {
+  FakeGrpcTransportDelegate delegate;
+  delegate.SetRequireRegisteredSession(true);
+  delegate.AddBuffer(/*buffer_id=*/1, /*shard_id=*/0, /*size_bytes=*/4,
+                     /*fill=*/0xCC);
+
+  GrpcTransportServer server(&delegate);
+  ABSL_ASSERT_OK(server.Start());
+
+  GrpcTransportClient client;
+  const std::vector<uint8_t> data = {1, 2, 3, 4};
+
+  // Unknown uuid is rejected before touching host memory.
+  EXPECT_THAT(
+      client.PushChunks(
+          server.address(),
+          PushChunksRequest{
+              .uuid = 999,
+              .buffer_id = 1,
+              .shard_id = 0,
+              .chunks = {ScatterChunkSpec{.payload = data, .byte_offset = 0}},
+          }),
+      StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_THAT(delegate.CopyBuffer(1, 0), ElementsAre(0xCC, 0xCC, 0xCC, 0xCC));
+
+  // Draining/cancelled session rejects before touching host memory.
+  auto cancelled_session = std::make_shared<StubTransferSession>();
+  cancelled_session->Finish(absl::CancelledError("aborted"));
+  delegate.SetSession(500, cancelled_session);
+  EXPECT_THAT(
+      client.PushChunks(
+          server.address(),
+          PushChunksRequest{
+              .uuid = 500,
+              .buffer_id = 1,
+              .shard_id = 0,
+              .chunks = {ScatterChunkSpec{.payload = data, .byte_offset = 0}},
+          }),
+      StatusIs(absl::StatusCode::kCancelled));
+  EXPECT_THAT(delegate.CopyBuffer(1, 0), ElementsAre(0xCC, 0xCC, 0xCC, 0xCC));
 }
 
 }  // namespace

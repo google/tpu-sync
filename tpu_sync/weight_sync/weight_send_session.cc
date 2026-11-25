@@ -350,8 +350,8 @@ class PullSendSession final
     return absl::OkStatus();
   }
 
-  absl::StatusOr<PullChunksResponse> HandlePullChunks(
-      const PullChunksRequest& request) {
+  absl::StatusOr<PullChunksResponse> OnPullChunks(
+      const PullChunksRequest& request) override {
     if (request.uuid != uuid_) {
       return absl::InvalidArgumentError(
           absl::StrCat("PullSendSession uuid mismatch: expected ", uuid_,
@@ -430,6 +430,12 @@ WeightSendSession::WeightSendSession(
     : uuid_(uuid),
       deadline_(deadline),
       host_buffer_owner_(std::move(host_buffer_owner)) {}
+
+absl::StatusOr<PullChunksResponse> WeightSendSession::OnPullChunks(
+    const PullChunksRequest& request) {
+  return absl::FailedPreconditionError(
+      "WeightSendSession does not serve pull requests");
+}
 
 bool WeightSendSession::Done() const {
   absl::MutexLock lock(mu_);
@@ -629,7 +635,8 @@ WeightSendSession::CreatePushSendSession(
       client, uuid, max_concurrency, std::move(tasks), std::move(options));
 }
 
-absl::StatusOr<PullSendSessionHandle> WeightSendSession::CreatePullSendSession(
+absl::StatusOr<std::shared_ptr<::tpu_raiden::TransferSession>>
+WeightSendSession::CreatePullSendSession(
     const ::tpu_sync::rpc::StartTransferRequest& spec,
     ConstHostBufferProvider host_buffer_provider,
     WeightSendSessionOptions options) {
@@ -701,21 +708,8 @@ absl::StatusOr<PullSendSessionHandle> WeightSendSession::CreatePullSendSession(
     total_expected += serve_entry.expected_pulls;
   }
 
-  auto session = std::make_shared<PullSendSession>(
-      uuid, std::move(entries), total_expected, std::move(options));
-  std::weak_ptr<PullSendSession> weak_session = session;
-  PullChunksHandler on_pull =
-      [weak_session = std::move(weak_session)](const PullChunksRequest& request)
-      -> absl::StatusOr<PullChunksResponse> {
-    std::shared_ptr<PullSendSession> live = weak_session.lock();
-    if (live == nullptr) {
-      return absl::FailedPreconditionError(
-          "PullSendSession has been destroyed");
-    }
-    return live->HandlePullChunks(request);
-  };
-  return PullSendSessionHandle{.session = std::move(session),
-                               .on_pull = std::move(on_pull)};
+  return std::make_shared<PullSendSession>(uuid, std::move(entries),
+                                           total_expected, std::move(options));
 }
 
 }  // namespace tpu_raiden::weight_sync

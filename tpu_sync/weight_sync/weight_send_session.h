@@ -42,17 +42,6 @@ struct WeightSendSessionOptions {
   std::shared_ptr<const void> host_buffer_owner = nullptr;
 };
 
-using PullChunksHandler =
-    std::function<absl::StatusOr<PullChunksResponse>(const PullChunksRequest&)>;
-
-// Returned by WeightSendSession::CreatePullSendSession(): pairs the
-// TransferSession lifecycle handle with a thread-safe pull callback to wire
-// into GrpcTransportDelegate::OnPullChunks().
-struct PullSendSessionHandle {
-  std::shared_ptr<::tpu_raiden::TransferSession> session;
-  PullChunksHandler on_pull;
-};
-
 // Base class for whole-model weight send sessions implementing TransferSession
 // from a StartTransferRequest spec (host-buffer transfer only; D2H is handled
 // externally). Thread-safe.
@@ -74,14 +63,19 @@ class WeightSendSession : public ::tpu_raiden::TransferSession {
   // Creates a passive pull-based send session from |spec| using
   // |host_buffer_provider| to resolve source host buffers for each (layer_idx,
   // src_shard_idx).
-  static absl::StatusOr<PullSendSessionHandle> CreatePullSendSession(
-      const ::tpu_sync::rpc::StartTransferRequest& spec,
-      ConstHostBufferProvider host_buffer_provider,
-      WeightSendSessionOptions options = {});
+  static absl::StatusOr<std::shared_ptr<::tpu_raiden::TransferSession>>
+  CreatePullSendSession(const ::tpu_sync::rpc::StartTransferRequest& spec,
+                        ConstHostBufferProvider host_buffer_provider,
+                        WeightSendSessionOptions options = {});
 
   ~WeightSendSession() override = default;
 
   uint64_t uuid() const { return uuid_; }
+
+  // Serves an incoming PullChunks RPC for passive pull-based send sessions.
+  // Push send sessions return FailedPreconditionError. Thread-safe.
+  virtual absl::StatusOr<PullChunksResponse> OnPullChunks(
+      const PullChunksRequest& request);
 
   bool Done() const override;
   void Finish(const absl::Status& status = absl::OkStatus()) override;

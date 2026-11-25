@@ -26,12 +26,14 @@
 #include "absl/types/span.h"
 #include "grpcpp/server.h"
 #include "tpu_sync/platform/grpc_credential_factory.h"
+#include "tpu_sync/transport/transfer_session.h"
 #include "tpu_sync/weight_sync/lib/grpc_transport_types.h"
 
 namespace tpu_raiden::weight_sync {
 
 // Delegate used by GrpcTransportServer to resolve destination host buffers,
-// receive push completion notifications, and serve pull requests.
+// look up active transfer sessions, receive push completion notifications, and
+// serve pull requests.
 // Implementations must be thread-safe for concurrent RPC handlers.
 class GrpcTransportDelegate {
  public:
@@ -39,6 +41,11 @@ class GrpcTransportDelegate {
 
   virtual absl::StatusOr<absl::Span<uint8_t>> GetHostBuffer(
       uint64_t buffer_id, uint32_t shard_id) = 0;
+
+  // Returns the active transfer session registered under |uuid|, or kNotFound
+  // when no session holds it.
+  virtual absl::StatusOr<std::shared_ptr<::tpu_raiden::TransferSession>>
+  GetSession(uint64_t uuid) const = 0;
 
   virtual absl::Status OnPushChunks(uint64_t uuid, uint64_t buffer_id,
                                     uint32_t shard_id,

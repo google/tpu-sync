@@ -39,6 +39,7 @@
 #include "tpu_sync/proto/grpc_transport_service.grpc.pb.h"
 #include "tpu_sync/proto/grpc_transport_service.pb.h"
 #include "tpu_sync/rpc/weight_transfer_common.pb.h"
+#include "tpu_sync/transport/transfer_session.h"
 #include "tpu_sync/weight_sync/lib/grpc_transport_types.h"
 
 namespace tpu_raiden::weight_sync {
@@ -90,6 +91,40 @@ class PullChunksReactor final
   std::shared_ptr<const void> owner_;
   ::tpu_sync::proto::GrpcPullResponse response_;
 };
+
+absl::StatusOr<std::shared_ptr<::tpu_raiden::TransferSession>>
+BeginIncomingPush(GrpcTransportDelegate* delegate, uint64_t uuid) {
+  if (uuid == 0) {
+    return nullptr;
+  }
+  ABSL_ASSIGN_OR_RETURN(std::shared_ptr<::tpu_raiden::TransferSession> session,
+                        delegate->GetSession(uuid));
+  if (session == nullptr) {
+    return absl::NotFoundError(absl::StrCat("Session ", uuid, " not found"));
+  }
+  if (!session->TryBeginOp()) {
+    return absl::CancelledError(
+        absl::StrCat("Session for uuid=", uuid,
+                     " is not accepting pushes (draining or a send session)"));
+  }
+  return session;
+}
+
+absl::Status EndIncomingPush(
+    const std::shared_ptr<::tpu_raiden::TransferSession>& session,
+    const absl::Status& status) {
+  if (session == nullptr) {
+    return status;
+  }
+  if (!status.ok()) {
+    session->Finish(status);
+  }
+  session->EndOp();
+  if (!status.ok() || session->GetStatus().ok()) {
+    return status;
+  }
+  return absl::CancelledError(session->GetStatus().message());
+}
 
 }  // namespace
 
@@ -170,23 +205,31 @@ class GrpcTransportServer::GrpcTransportServiceImpl final
     }
 
     ABSL_ASSIGN_OR_RETURN(
-        absl::Span<uint8_t> host_buffer,
-        delegate_->GetHostBuffer(request.buffer_id(), request.shard_id()));
+        std::shared_ptr<::tpu_raiden::TransferSession> session,
+        BeginIncomingPush(delegate_, request.uuid()));
 
-    // Pass 1: validate every chunk upfront so rejected batches are atomic.
-    for (int i = 0; i < request.chunks_size(); ++i) {
-      ABSL_RETURN_IF_ERROR(
-          ValidateChunkProto(request.chunks(i), host_buffer.size(), i));
-    }
+    absl::Status status = [&]() -> absl::Status {
+      ABSL_ASSIGN_OR_RETURN(
+          absl::Span<uint8_t> host_buffer,
+          delegate_->GetHostBuffer(request.buffer_id(), request.shard_id()));
 
-    // Pass 2: apply all validated chunks into the host buffer.
-    for (int i = 0; i < request.chunks_size(); ++i) {
-      ApplyChunkProto(request.chunks(i), host_buffer);
-    }
+      // Pass 1: validate every chunk upfront so rejected batches are atomic.
+      for (int i = 0; i < request.chunks_size(); ++i) {
+        ABSL_RETURN_IF_ERROR(
+            ValidateChunkProto(request.chunks(i), host_buffer.size(), i));
+      }
 
-    return delegate_->OnPushChunks(request.uuid(), request.buffer_id(),
-                                   request.shard_id(),
-                                   request.chunk_batch_id());
+      // Pass 2: apply all validated chunks into the host buffer.
+      for (int i = 0; i < request.chunks_size(); ++i) {
+        ApplyChunkProto(request.chunks(i), host_buffer);
+      }
+
+      return delegate_->OnPushChunks(request.uuid(), request.buffer_id(),
+                                     request.shard_id(),
+                                     request.chunk_batch_id());
+    }();
+
+    return EndIncomingPush(session, status);
   }
 
   GrpcTransportDelegate* const delegate_;

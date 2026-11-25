@@ -28,6 +28,7 @@
 #include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
@@ -72,15 +73,15 @@ class TestSendTransportRouter final : public GrpcTransportDelegate {
     return it->second;
   }
 
-  void RegisterPushReceiveSession(
-      uint64_t uuid, std::shared_ptr<::tpu_raiden::TransferSession> session) {
+  void RegisterSession(uint64_t uuid,
+                       std::shared_ptr<::tpu_raiden::TransferSession> session) {
     absl::MutexLock lock(mu_);
-    push_receive_sessions_[uuid] = std::move(session);
+    sessions_[uuid] = std::move(session);
   }
 
-  void RegisterPullHandler(uint64_t uuid, PullChunksHandler handler) {
-    absl::MutexLock lock(mu_);
-    pull_handlers_[uuid] = std::move(handler);
+  void RegisterPushReceiveSession(
+      uint64_t uuid, std::shared_ptr<::tpu_raiden::TransferSession> session) {
+    RegisterSession(uuid, std::move(session));
   }
 
   absl::StatusOr<absl::Span<uint8_t>> GetHostBuffer(
@@ -94,23 +95,22 @@ class TestSendTransportRouter final : public GrpcTransportDelegate {
     return absl::MakeSpan(it->second);
   }
 
+  absl::StatusOr<std::shared_ptr<::tpu_raiden::TransferSession>> GetSession(
+      uint64_t uuid) const override {
+    absl::MutexLock lock(mu_);
+    auto it = sessions_.find(uuid);
+    if (it == sessions_.end()) {
+      return absl::NotFoundError(absl::StrCat("No session for uuid=", uuid));
+    }
+    return it->second;
+  }
+
   absl::Status OnPushChunks(uint64_t uuid, uint64_t buffer_id,
                             uint32_t shard_id,
                             uint64_t chunk_batch_id) override {
-    std::shared_ptr<::tpu_raiden::TransferSession> session;
-    {
-      absl::MutexLock lock(mu_);
-      auto it = push_receive_sessions_.find(uuid);
-      if (it == push_receive_sessions_.end()) {
-        return absl::NotFoundError(
-            absl::StrCat("No PushReceiveSession for uuid=", uuid));
-      }
-      session = it->second;
-    }
-    if (!session->TryBeginOp()) {
-      return absl::FailedPreconditionError("Session is draining or done");
-    }
-    absl::Cleanup end_op = [&]() { session->EndOp(); };
+    ABSL_ASSIGN_OR_RETURN(
+        std::shared_ptr<::tpu_raiden::TransferSession> session,
+        GetSession(uuid));
     const int shard = static_cast<int>(shard_id);
     return session->OnDataReceived(static_cast<size_t>(buffer_id), {},
                                    absl::MakeConstSpan(&shard, 1));
@@ -118,17 +118,15 @@ class TestSendTransportRouter final : public GrpcTransportDelegate {
 
   absl::StatusOr<PullChunksResponse> OnPullChunks(
       const PullChunksRequest& request) override {
-    PullChunksHandler handler;
-    {
-      absl::MutexLock lock(mu_);
-      auto it = pull_handlers_.find(request.uuid);
-      if (it == pull_handlers_.end()) {
-        return absl::NotFoundError(
-            absl::StrCat("No pull handler for uuid=", request.uuid));
-      }
-      handler = it->second;
+    ABSL_ASSIGN_OR_RETURN(
+        std::shared_ptr<::tpu_raiden::TransferSession> session,
+        GetSession(request.uuid));
+    auto send_session = std::dynamic_pointer_cast<WeightSendSession>(session);
+    if (send_session == nullptr) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          "Session for uuid=", request.uuid, " is not a WeightSendSession"));
     }
-    return handler(request);
+    return send_session->OnPullChunks(request);
   }
 
  private:
@@ -136,9 +134,7 @@ class TestSendTransportRouter final : public GrpcTransportDelegate {
   absl::flat_hash_map<BufferShardKey, std::vector<uint8_t>> buffers_
       ABSL_GUARDED_BY(mu_);
   absl::flat_hash_map<uint64_t, std::shared_ptr<::tpu_raiden::TransferSession>>
-      push_receive_sessions_ ABSL_GUARDED_BY(mu_);
-  absl::flat_hash_map<uint64_t, PullChunksHandler> pull_handlers_
-      ABSL_GUARDED_BY(mu_);
+      sessions_ ABSL_GUARDED_BY(mu_);
 };
 
 TEST(WeightSendSessionTest, PushSendAndPushReceiveWholeModelEndToEnd) {
@@ -312,12 +308,13 @@ TEST(WeightSendSessionTest, PullSendAndPullReceiveWholeModelEndToEnd) {
     return absl::NotFoundError("Unknown source buffer");
   };
 
-  absl::StatusOr<PullSendSessionHandle> send_handle_or =
-      WeightSendSession::CreatePullSendSession(send_spec, src_provider);
-  ASSERT_THAT(send_handle_or, IsOk());
+  absl::StatusOr<std::shared_ptr<::tpu_raiden::TransferSession>>
+      send_session_or =
+          WeightSendSession::CreatePullSendSession(send_spec, src_provider);
+  ASSERT_THAT(send_session_or, IsOk());
   std::shared_ptr<::tpu_raiden::TransferSession> send_session =
-      std::move(send_handle_or->session);
-  router.RegisterPullHandler(/*uuid=*/2002, std::move(send_handle_or->on_pull));
+      *std::move(send_session_or);
+  router.RegisterSession(/*uuid=*/2002, send_session);
 
   GrpcTransportServer server(&router);
   ASSERT_THAT(server.Start(0), IsOkAndHolds(Gt(0)));
@@ -385,15 +382,15 @@ TEST(WeightSendSessionTest, PullSendFanoutServesMultipleReceivers) {
     entry->set_size_bytes(4);
   }
 
-  absl::StatusOr<PullSendSessionHandle> send_handle_or =
-      WeightSendSession::CreatePullSendSession(
+  absl::StatusOr<std::shared_ptr<::tpu_raiden::TransferSession>>
+      send_session_or = WeightSendSession::CreatePullSendSession(
           send_spec,
           [&](uint64_t, uint32_t) { return absl::MakeConstSpan(*src); },
           WeightSendSessionOptions{.host_buffer_owner = src});
-  ASSERT_THAT(send_handle_or, IsOk());
+  ASSERT_THAT(send_session_or, IsOk());
   std::shared_ptr<::tpu_raiden::TransferSession> send_session =
-      std::move(send_handle_or->session);
-  router.RegisterPullHandler(/*uuid=*/3003, std::move(send_handle_or->on_pull));
+      *std::move(send_session_or);
+  router.RegisterSession(/*uuid=*/3003, send_session);
 
   GrpcTransportServer server(&router);
   ASSERT_THAT(server.Start(0), IsOkAndHolds(Gt(0)));
@@ -448,14 +445,14 @@ TEST(WeightSendSessionTest, PullSendWaitsForResponseOwnerReleaseToDrain) {
   entry->set_dst_offset_bytes(0);
   entry->set_size_bytes(4);
 
-  absl::StatusOr<PullSendSessionHandle> send_or =
+  absl::StatusOr<std::shared_ptr<::tpu_raiden::TransferSession>> send_or =
       WeightSendSession::CreatePullSendSession(
           spec, [&](uint64_t, uint32_t) { return absl::MakeConstSpan(*src); },
           WeightSendSessionOptions{.host_buffer_owner = src});
   ASSERT_THAT(send_or, IsOk());
   std::shared_ptr<::tpu_raiden::TransferSession> send_session =
-      std::move(send_or->session);
-  router.RegisterPullHandler(/*uuid=*/6006, std::move(send_or->on_pull));
+      *std::move(send_or);
+  router.RegisterSession(/*uuid=*/6006, send_session);
   ASSERT_THAT(send_session->Start(), IsOk());
 
   PullChunksRequest req{
@@ -487,14 +484,14 @@ TEST(WeightSendSessionTest, PullSendStartSucceedsAfterEarlyPullCompletion) {
   entry->set_dst_offset_bytes(0);
   entry->set_size_bytes(4);
 
-  absl::StatusOr<PullSendSessionHandle> send_or =
+  absl::StatusOr<std::shared_ptr<::tpu_raiden::TransferSession>> send_or =
       WeightSendSession::CreatePullSendSession(
           spec, [&](uint64_t, uint32_t) { return absl::MakeConstSpan(*src); },
           WeightSendSessionOptions{.host_buffer_owner = src});
   ASSERT_THAT(send_or, IsOk());
   std::shared_ptr<::tpu_raiden::TransferSession> send_session =
-      std::move(send_or->session);
-  router.RegisterPullHandler(/*uuid=*/6007, std::move(send_or->on_pull));
+      *std::move(send_or);
+  router.RegisterSession(/*uuid=*/6007, send_session);
 
   // Pull arrives and completes before Start() is called.
   PullChunksRequest req{
@@ -562,12 +559,12 @@ TEST(WeightSendSessionTest, EmptySpecsCompleteImmediatelyOnStart) {
   EXPECT_THAT((*push_send_or)->AwaitForDone(), IsOk());
 
   spec.set_uuid(4);
-  absl::StatusOr<PullSendSessionHandle> pull_send_or =
+  absl::StatusOr<std::shared_ptr<::tpu_raiden::TransferSession>> pull_send_or =
       WeightSendSession::CreatePullSendSession(spec, unused_provider);
   ASSERT_THAT(pull_send_or, IsOk());
-  ASSERT_THAT(pull_send_or->session->Start(), IsOk());
-  EXPECT_TRUE(pull_send_or->session->Done());
-  EXPECT_THAT(pull_send_or->session->AwaitForDone(), IsOk());
+  ASSERT_THAT((*pull_send_or)->Start(), IsOk());
+  EXPECT_TRUE((*pull_send_or)->Done());
+  EXPECT_THAT((*pull_send_or)->AwaitForDone(), IsOk());
 }
 
 TEST(WeightSendSessionTest, TransferSessionInterfaceContracts) {

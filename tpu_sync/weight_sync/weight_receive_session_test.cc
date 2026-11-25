@@ -30,6 +30,7 @@
 #include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
@@ -99,23 +100,23 @@ class FakeReceiveTransportDelegate final : public GrpcTransportDelegate {
     return absl::MakeSpan(it->second);
   }
 
+  absl::StatusOr<std::shared_ptr<::tpu_raiden::TransferSession>> GetSession(
+      uint64_t uuid) const override {
+    absl::MutexLock lock(mu_);
+    auto it = push_receive_sessions_.find(uuid);
+    if (it == push_receive_sessions_.end()) {
+      return absl::NotFoundError(
+          absl::StrCat("No PushReceiveSession for uuid=", uuid));
+    }
+    return it->second;
+  }
+
   absl::Status OnPushChunks(uint64_t uuid, uint64_t buffer_id,
                             uint32_t shard_id,
                             uint64_t chunk_batch_id) override {
-    std::shared_ptr<::tpu_raiden::TransferSession> session;
-    {
-      absl::MutexLock lock(mu_);
-      auto it = push_receive_sessions_.find(uuid);
-      if (it == push_receive_sessions_.end()) {
-        return absl::NotFoundError(
-            absl::StrCat("No PushReceiveSession for uuid=", uuid));
-      }
-      session = it->second;
-    }
-    if (!session->TryBeginOp()) {
-      return absl::FailedPreconditionError("Session is draining or done");
-    }
-    absl::Cleanup end_op = [&]() { session->EndOp(); };
+    ABSL_ASSIGN_OR_RETURN(
+        std::shared_ptr<::tpu_raiden::TransferSession> session,
+        GetSession(uuid));
     const int shard = static_cast<int>(shard_id);
     return session->OnDataReceived(static_cast<size_t>(buffer_id), {},
                                    absl::MakeConstSpan(&shard, 1));

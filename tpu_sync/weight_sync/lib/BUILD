@@ -42,6 +42,7 @@ cc_library(
         "//tpu_sync/proto:grpc_transport_service_cc_grpc",
         "//tpu_sync/proto:grpc_transport_service_cc_proto",
         "//tpu_sync/rpc:weight_transfer_common_cc_proto",
+        "//tpu_sync/transport:transfer_session",
         "@com_github_grpc_grpc//:grpc++",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/status",
@@ -88,6 +89,7 @@ cc_test(
         ":grpc_transport_client",
         ":grpc_transport_service",
         ":grpc_transport_types",
+        "//tpu_sync/transport:transfer_session",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/status",
@@ -97,5 +99,6 @@ cc_test(
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest_main",
+        "@xla//xla/tsl/concurrency:future",
     ],
 )

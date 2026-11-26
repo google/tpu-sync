@@ -153,6 +153,14 @@ class RecvRecorder {
     };
   }
 
+  bool WaitForResolves(size_t count, absl::Duration timeout) {
+    absl::MutexLock lock(mu_);
+    const auto reached = [this, count]() {
+      mu_.AssertReaderHeld();
+      return resolves_.size() >= count;
+    };
+    return mu_.AwaitWithTimeout(absl::Condition(&reached), timeout);
+  }
   bool WaitForCompletions(size_t count, absl::Duration timeout) {
     absl::MutexLock lock(mu_);
     const auto reached = [this, count]() {
@@ -555,6 +563,37 @@ TEST(PeregrineTransportAdapterTest, MultiLayerPushWithoutCallbackIsRejected) {
                                /*on_complete=*/nullptr),
               StatusIs(absl::StatusCode::kInvalidArgument,
                        HasSubstr("requires a completion callback")));
+}
+
+TEST(PeregrineTransportAdapterTest,
+     RejectsExplicitPushExceedingTargetBlockBufferSize) {
+  std::vector<uint8_t> block0(8, 0);
+  std::vector<uint8_t> src(16, 0xAB);
+  RecvRecorder recorder({&block0});
+  absl::StatusOr<std::unique_ptr<PeregrineTransportAdapter>> local =
+      CreateAdapter(/*num_conns_per_peer=*/1);
+  ABSL_ASSERT_OK(local);
+  absl::StatusOr<std::unique_ptr<PeregrineTransportAdapter>> remote =
+      CreateAdapter(/*num_conns_per_peer=*/1, recorder.hooks());
+  ABSL_ASSERT_OK(remote);
+  const std::string remote_endpoint =
+      absl::StrCat("127.0.0.1:", (*remote)->local_port());
+
+  // Request 16 bytes into a receiver block of only 8 bytes; Peregrine rejects
+  // it centrally via `ResolveAddrCallback`'s returned span bounds.
+  Request req = ExplicitPushRequest(src.data(), src.size(), /*dst_block_id=*/0);
+  ABSL_ASSERT_OK((*local)->Post(/*peers=*/{remote_endpoint},
+                                absl::MakeConstSpan(&req, 1),
+                                /*src_block_ids=*/{}, /*dst_block_ids=*/{},
+                                /*on_complete=*/nullptr));
+
+  ASSERT_TRUE(recorder.WaitForResolves(1, kTransferTimeout));
+  ASSERT_TRUE(recorder.WaitForCompletions(1, kTransferTimeout));
+  const std::vector<RecvRecorder::Completion> completions =
+      recorder.completions();
+  ASSERT_EQ(completions.size(), 1);
+  EXPECT_THAT(completions[0].status, StatusIs(absl::StatusCode::kInternal));
+  EXPECT_EQ(block0, std::vector<uint8_t>(8, 0));
 }
 
 }  // namespace

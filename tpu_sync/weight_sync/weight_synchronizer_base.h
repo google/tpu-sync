@@ -18,6 +18,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <future>
 #include <memory>
 #include <optional>
@@ -50,6 +51,9 @@
 #include "tpu_sync/core/tpu_utils.h"
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
+#include "tpu_sync/transport/transfer_session.h"
+#include "tpu_sync/weight_sync/staging_buffer_guard.h"
+#include "tpu_sync/weight_sync/weight_version.h"
 
 namespace tpu_sync {
 namespace rpc {
@@ -108,7 +112,28 @@ struct WeightSyncMetrics {
   uint64_t push_resharded_call_count = 0;
 };
 
+class WeightGrpcTransportDelegate;
 class WeightSynchronizerListener;
+
+// Settings for one versioned weight receive. Repeated prepares for the same
+// transfer ID must agree on these fields.
+struct VersionedReceiveSpec {
+  WeightVersion version;
+  tpu_sync::rpc::HostTilingMode host_tiling_mode =
+      tpu_sync::rpc::HOST_TILING_MODE_DEFERRED;
+  std::vector<bool> skip_tiling;
+  std::vector<size_t> expected_layer_chunks;
+
+  bool operator==(const VersionedReceiveSpec&) const = default;
+};
+
+struct VersionedReceiveOptions {
+  WeightVersion version;
+  // Max transfer duration (0 or infinite means no limit; negative fails).
+  absl::Duration receive_timeout = absl::ZeroDuration();
+  // Max wait for earlier writes, reads, and receive sessions to finish.
+  absl::Duration drain_timeout = absl::Seconds(30);
+};
 
 class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
  public:
@@ -424,6 +449,53 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
       ABSL_LOCKS_EXCLUDED(device_buffer_resolver_mu_);
 
   void ForgetPushProgress(uint64_t uuid) override;
+
+  // Attaches (or clears with nullptr) the gRPC delegate for ready sessions.
+  // Attach before starting receives; stop its server or clear before teardown.
+  void SetGrpcTransportDelegate(
+      WeightGrpcTransportDelegate* absl_nullable delegate)
+      ABSL_LOCKS_EXCLUDED(receive_state_mu_);
+
+  // Sets up a receive for `request.uuid()`, or joins it if active with the same
+  // settings. Claims staging, waits for earlier work, and registers once. For a
+  // new transfer, if the ready receive's session is done with OK, it is
+  // committed first; otherwise the active receive is cancelled. A prepare (or a
+  // waiting joiner) for a receive that already committed gets
+  // FailedPrecondition. HOST_TILING_MODE_ON_ARRIVAL gets Unimplemented.
+  absl::Status PrepareVersionedReceive(
+      const tpu_sync::rpc::StartTransferRequest& request,
+      const VersionedReceiveOptions& options)
+      ABSL_LOCKS_EXCLUDED(receive_state_mu_);
+
+  // Fails the active receive for `uuid` with non-OK `status` and cleans up
+  // unlocked. First settles the active receive if it is ready (commits it if
+  // its session is done with OK, fails it if its session failed or is past its
+  // deadline). Then fails `uuid` if it is still active; otherwise does nothing
+  // more.
+  void FailVersionedReceive(uint64_t uuid, absl::Status status)
+      ABSL_LOCKS_EXCLUDED(receive_state_mu_);
+
+  // Waits up to `timeout` for the receive of transfer `uuid` to commit
+  // `version`, which means all of it reached the host staging buffer (it is
+  // not copied to the device yet, and a newer receive may overwrite it later).
+  // Returns true once it committed, false if it was still running when the
+  // wait ended, or the error that ended it with its own code (for example
+  // Aborted if a newer receive replaced it, or DeadlineExceeded if it timed
+  // out). A zero `timeout` checks once. Returns NotFound for an unknown or
+  // forgotten transfer (at least the last kMaxFinishedReceives finished
+  // receives are kept) and InvalidArgument for another version or a negative
+  // `timeout`. Because a failed receive's error keeps its own code, NotFound or
+  // InvalidArgument can also come from the receive itself. The wait ending does
+  // not fail the receive. Each call also checks the ready receive (commits it,
+  // fails it, or times it out); nothing does this in the background.
+  absl::StatusOr<bool> AwaitVersionedReceive(uint64_t uuid,
+                                             const WeightVersion& version,
+                                             absl::Duration timeout)
+      ABSL_LOCKS_EXCLUDED(receive_state_mu_);
+
+  // Returns the receive session for `uuid` only while ready; else NotFound.
+  absl::StatusOr<std::shared_ptr<TransferSession>> GetSession(
+      uint64_t uuid) const override ABSL_LOCKS_EXCLUDED(receive_state_mu_);
 
  protected:
   // Two-phase construction for Create() and subclasses: the constructors only
@@ -831,6 +903,89 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   std::optional<size_t> pipeline_group_size_override_;
   void UpdateAllocatedOccupancyMetric(size_t delta = 0);
   std::atomic<size_t> allocated_host_dram_bytes_{0};
+
+  // TODO(raiden-eng): Confirm default with production telemetry.
+  static constexpr absl::Duration kReceiveDrainPollInterval =
+      absl::Milliseconds(5);
+  // TODO(raiden-eng): Confirm with production telemetry.
+  static constexpr size_t kMaxFinishedReceives = 1024;
+  enum class ReceivePhase { kPending, kReady, kCommitted, kFailed };
+  struct ReceiveEntry {
+    uint64_t uuid = 0;
+    VersionedReceiveSpec spec;
+    std::shared_ptr<TransferSession> session;
+    ReceivePhase phase = ReceivePhase::kPending;
+    bool registered_with_grpc_delegate = false;
+    absl::Time drain_deadline = absl::InfiniteFuture();
+    absl::Status outcome;
+    bool IsActive() const {
+      return phase == ReceivePhase::kPending || phase == ReceivePhase::kReady;
+    }
+  };
+  struct RetiredSession {
+    uint64_t uuid = 0;
+    std::shared_ptr<TransferSession> session;
+  };
+
+  void DetachIfDoneLocked(ReceiveEntry& e, std::vector<RetiredSession>& retired)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(receive_state_mu_);
+  std::vector<uint64_t> CollectUndrainedSessionsLocked(
+      uint64_t self_uuid, std::vector<RetiredSession>& retired)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(receive_state_mu_);
+  void RetireUnlocked(std::vector<RetiredSession>& retired)
+      ABSL_LOCKS_EXCLUDED(receive_state_mu_);
+  absl::Status FailActiveLocked(
+      uint64_t uuid, const absl::Status& status,
+      std::vector<RetiredSession>* absl_nullable retired)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(receive_state_mu_);
+  void FailActiveAndLogLocked(
+      uint64_t uuid, const absl::Status& status,
+      std::vector<RetiredSession>* absl_nullable retired)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(receive_state_mu_);
+  // Checks the ready receive, like KVCacheManagerWithTransfer::
+  // CompleteReadWithDetails(): fails it if its session failed, commits it once
+  // its session is done (every push has returned) with OK, and times it out
+  // once it is past its deadline. Then detaches finished sessions and forgets
+  // the oldest finished receives past the limit.
+  void CompleteVersionedReceivesLocked(std::vector<RetiredSession>& retired)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(receive_state_mu_);
+  // Commits `e`, the ready receive, whose session the caller checked is done
+  // with OK. On error `e` is still active, with its gRPC registration removed
+  // and a claim that was not ready dropped; the caller must fail it.
+  absl::Status CommitActiveLocked(ReceiveEntry& e,
+                                  std::vector<RetiredSession>& retired)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(receive_state_mu_);
+  absl::Status UnregisterFromGrpcDelegateLocked(ReceiveEntry& e)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(receive_state_mu_);
+  void RecordFinishedLocked(ReceiveEntry& e)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(receive_state_mu_);
+  void TrimFinishedReceivesLocked()
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(receive_state_mu_);
+  static absl::Status RefusalFor(const ReceiveEntry& e);
+
+  StagingBufferGuard staging_guard_;
+  // Only one receive uses the staging buffer at a time. Never hold this mutex
+  // while waiting, calling ForgetPushProgress(), or destroying a session.
+  mutable absl::Mutex receive_state_mu_;
+  WeightGrpcTransportDelegate* absl_nullable grpc_delegate_
+      ABSL_GUARDED_BY(receive_state_mu_) = nullptr;
+  // Committed and failed receives stay in `receives_` so a late prepare for the
+  // same transfer is refused and so AwaitVersionedReceive can report their
+  // result. `finished_receive_uuids_` lists them oldest first. Past
+  // `max_finished_receives_`, the oldest are dropped once their sessions are
+  // gone; an old receive whose session is still running stops the trim until
+  // it is gone (transfer IDs are never reused).
+  absl::flat_hash_map<uint64_t, ReceiveEntry> receives_
+      ABSL_GUARDED_BY(receive_state_mu_);
+  std::deque<uint64_t> finished_receive_uuids_
+      ABSL_GUARDED_BY(receive_state_mu_);
+  size_t max_finished_receives_ ABSL_GUARDED_BY(receive_state_mu_) =
+      kMaxFinishedReceives;
+  absl::flat_hash_set<uint64_t> live_receive_uuids_
+      ABSL_GUARDED_BY(receive_state_mu_);
+  uint64_t active_receive_uuid_ ABSL_GUARDED_BY(receive_state_mu_) = 0;
+  absl::Duration receive_drain_poll_interval_
+      ABSL_GUARDED_BY(receive_state_mu_) = kReceiveDrainPollInterval;
 };
 
 }  // namespace weight_sync

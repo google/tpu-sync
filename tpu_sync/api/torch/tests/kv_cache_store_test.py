@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import concurrent.futures
 import os
 import socket
 import subprocess
@@ -1007,6 +1008,44 @@ class KVCacheStoreHostResidentOnlyLookupTest(absltest.TestCase):
           pin_found=False,
           mode=kv_cache_store.LookupMatchMode.SUBSET,
       )
+
+  def test_lookup_from_background_threads(self):
+    store = self._make_store()
+    hashes = [f"bg_blk_{i}".encode() for i in range(4)]
+    slices = [
+        kv_cache_store.RaidenBlockId(
+            store.raiden_id, i, kv_cache_store.BlockStatus.HOST
+        )
+        for i in range(4)
+    ]
+    self.assertTrue(store.insert(hashes, slices, True))
+    store.release(hashes)
+
+    def _run_lookups(worker_idx: int):
+      for _ in range(25):
+        prefix_res = store.lookup(
+            hashes,
+            enable_global=False,
+            pin_found=False,
+            host_resident_only=True,
+            mode=kv_cache_store.LookupMatchMode.PREFIX,
+        )
+        subset_res = store.lookup(
+            [hashes[0], b"missing_blk", hashes[3]],
+            enable_global=False,
+            pin_found=False,
+            host_resident_only=True,
+            mode=kv_cache_store.LookupMatchMode.SUBSET,
+        )
+        if [h for h, _ in prefix_res] != hashes:
+          raise AssertionError(f"worker {worker_idx} prefix mismatch")
+        if [h for h, _ in subset_res] != [hashes[0], hashes[3]]:
+          raise AssertionError(f"worker {worker_idx} subset mismatch")
+      return True
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+      results = list(executor.map(_run_lookups, range(4)))
+    self.assertEqual(results, [True] * 4)
 
 
 if __name__ == "__main__":

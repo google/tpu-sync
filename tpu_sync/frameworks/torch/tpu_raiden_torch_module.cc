@@ -1092,7 +1092,13 @@ NB_MODULE(_tpu_raiden_torch, m) {
             options.pin_found = pin_found;
             options.host_resident_only = host_resident_only;
             options.match_mode = mode;
-            auto res = self->Lookup(hashes, options);
+            // Released around the C++ call ONLY. ToStdStringVector above and
+            // nb::bytes below touch CPython refcounts, so they must run with
+            // the GIL held.
+            auto res = [&] {
+              nb::gil_scoped_release release;
+              return self->Lookup(hashes, options);
+            }();
             if (!res.ok()) {
               throw std::runtime_error(absl::StrCat(
                   "KVCacheStore lookup failed: ", res.status().message()));

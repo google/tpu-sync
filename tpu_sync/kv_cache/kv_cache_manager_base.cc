@@ -683,6 +683,7 @@ raiden::PjRtCopyFuture JoinAndRecordTelemetry(
     return joined_future;
   }
   MaybeUpdateHostMemoryBreakdownMetrics(manager, absl::ToUnixNanos(start_time));
+  MaybeRecordHostNumaMemoryMetrics(manager);
 
   const size_t num_shards = manager.num_shards();
   const size_t start_shard = single_shard_idx.value_or(0);

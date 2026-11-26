@@ -2573,6 +2573,51 @@ TEST(KVCacheManagerTest, HostNumaMemoryMetricsSkippedOnNonZeroLocalRank) {
   worker1_mgr.UpdateAllocatedOccupancyMetric();
 }
 
+TEST(KVCacheManagerTest, TransferEmitsHostNumaMemoryMetrics) {
+  ScopedUnsetLocalRank unset_local_rank;
+  FakeSysfsNodeDir sysfs("numa_sysfs_transfer");
+  sysfs.AddDir("node0",
+               "Node 0 MemTotal: 4000 kB\n"
+               "Node 0 MemFree:  1500 kB\n"
+               "Node 0 MemUsed:  2500 kB\n");
+  FakeSysfsKVCacheManager manager(/*num_layers=*/1, /*num_shards=*/1,
+                                  /*slice_byte_size=*/128, /*host_blocks=*/2,
+                                  sysfs.path());
+
+  auto mock_backend = std::make_unique<telemetry::MockMetricsBackend>();
+  telemetry::MockMetricsBackend* raw_mock = mock_backend.get();
+  telemetry::ScopedMetricsBackendReset scoped_reset(std::move(mock_backend));
+
+  EXPECT_CALL(
+      *raw_mock,
+      SetGauge(testing::Ne(telemetry::metric_names::kHostNumaMemoryBytes),
+               testing::_, testing::_))
+      .Times(testing::AnyNumber());
+  EXPECT_CALL(*raw_mock, ObserveHistogram(testing::_, testing::_, testing::_))
+      .Times(testing::AnyNumber());
+  EXPECT_CALL(*raw_mock, IncrementCounter(testing::_, testing::_, testing::_))
+      .Times(testing::AnyNumber());
+  for (const auto& [state, kib] :
+       std::vector<std::pair<absl::string_view, double>>{
+           {telemetry::metric_labels::kStateUsed, 2500},
+           {telemetry::metric_labels::kStateFree, 1500},
+           {telemetry::metric_labels::kStateTotal, 4000}}) {
+    EXPECT_CALL(
+        *raw_mock,
+        SetGauge(telemetry::metric_names::kHostNumaMemoryBytes,
+                 NumaStateLabels("0", state), testing::DoubleEq(kib * 1024.0)))
+        .Times(1);
+  }
+
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture d2h_res,
+                       manager.D2h(/*src=*/{0}, /*dst=*/{0}, /*sizes=*/{1}));
+  ABSL_EXPECT_OK(d2h_res.Await());
+  // Immediate subsequent transfer is throttled and emits no extra NUMA samples.
+  TF_ASSERT_OK_AND_ASSIGN(raiden::PjRtCopyFuture h2d_res,
+                       manager.H2d(/*src=*/{0}, /*dst=*/{0}, /*sizes=*/{1}));
+  ABSL_EXPECT_OK(h2d_res.Await());
+}
+
 // ===========================================================================
 // Pipelined Storage Offload & Recall Engine
 // ===========================================================================

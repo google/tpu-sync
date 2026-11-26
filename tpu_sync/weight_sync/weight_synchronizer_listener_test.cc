@@ -63,13 +63,25 @@ namespace tpu_raiden {
 namespace weight_sync {
 
 // Gives the tests access to WeightSynchronizerBase's private endpoint
-// recording.
+// recording and receiver tiling state.
 class WeightSynchronizerBaseTestPeer {
  public:
   static absl::Status RecordPeerControlEndpoints(
       WeightSynchronizerBase& engine, const std::vector<std::string>& peers,
       const tpu_sync::rpc::StartTransferRequest& request) {
     return engine.RecordPeerControlEndpoints(peers, request);
+  }
+  static tpu_sync::rpc::HostTilingMode GetReceiverTiling(
+      WeightSynchronizerBase& engine, uint64_t uuid) {
+    return engine.GetReceiverTiling(uuid);
+  }
+  // True if H2D copies layer `layer_idx` as is, without tiling it, i.e. as
+  // device-layout (PRE_TILED or tiled-on-arrival) host bytes.
+  static bool LayerArmedForRawH2d(WeightSynchronizerBase& engine,
+                                  size_t layer_idx) {
+    absl::MutexLock lock(engine.tile_ready_mu_);
+    return layer_idx < engine.layer_tile_ready_.size() &&
+           engine.layer_tile_ready_[layer_idx] != nullptr;
   }
 };
 
@@ -2058,6 +2070,136 @@ TEST(WeightSynchronizerPspPeerChannelTest,
   grpc::Status status = CallPeregrine(channel, PspTcpRequestWithoutToken());
   EXPECT_EQ(status.error_code(), grpc::StatusCode::INVALID_ARGUMENT);
   EXPECT_THAT(status.error_message(), HasSubstr("psp token must be present"));
+}
+
+TEST(WeightSynchronizerListenerTest,
+     LegacyStartTransferReceiverRejectsUnknownHostTilingMode) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> engine,
+      CreateShardedCpuEngine(/*num_shards=*/1, 2 * kSrcShardBytes));
+
+  ControlRequest req;
+  req.set_command(ControlRequest::COMMAND_START_TRANSFER);
+  StartTransferRequest* start = req.mutable_start_transfer_request();
+  start->set_is_sender(false);
+  start->set_uuid(kPushUuid + 90);
+  start->set_expected_block_count(1);
+  (*start->mutable_expected_layer_chunk_counts())[0] = 1;
+  start->set_host_tiling_mode(static_cast<tpu_sync::rpc::HostTilingMode>(7));
+
+  ControlResponse bad_resp;
+  WeightSynchronizerListener::ExecuteControlRequest(engine.get(), req,
+                                                    &bad_resp);
+  EXPECT_FALSE(bad_resp.success());
+  EXPECT_EQ(bad_resp.message(),
+            absl::StrCat("COMMAND_START_TRANSFER (uuid=", kPushUuid + 90,
+                         ") sets unknown host_tiling_mode=7"));
+  // Unchecked, the receiver stored the unknown mode and armed layer 0 for a
+  // raw H2D, as if its host bytes were PRE_TILED.
+  EXPECT_EQ(WeightSynchronizerBaseTestPeer::GetReceiverTiling(*engine,
+                                                              kPushUuid + 90),
+            tpu_sync::rpc::HOST_TILING_MODE_DEFERRED);
+  EXPECT_FALSE(WeightSynchronizerBaseTestPeer::LayerArmedForRawH2d(*engine, 0));
+
+  // Positive control: a known HostTilingMode registers cleanly.
+  start->set_uuid(kPushUuid + 91);
+  start->set_host_tiling_mode(tpu_sync::rpc::HOST_TILING_MODE_ON_ARRIVAL);
+  ControlResponse ok_resp;
+  WeightSynchronizerListener::ExecuteControlRequest(engine.get(), req,
+                                                    &ok_resp);
+  EXPECT_TRUE(ok_resp.success()) << ok_resp.message();
+  EXPECT_EQ(WeightSynchronizerBaseTestPeer::GetReceiverTiling(*engine,
+                                                              kPushUuid + 91),
+            tpu_sync::rpc::HOST_TILING_MODE_ON_ARRIVAL);
+  EXPECT_TRUE(WeightSynchronizerBaseTestPeer::LayerArmedForRawH2d(*engine, 0));
+}
+
+TEST(WeightSynchronizerListenerTest,
+     PrepareWeightReceiveRejectsUnknownHostTilingMode) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<WeightSynchronizerBase> engine,
+      CreateShardedCpuEngine(/*num_shards=*/1, 2 * kSrcShardBytes));
+  WeightSynchronizerListener listener(engine.get(), /*listener_port=*/0);
+
+  PrepareWeightReceiveRequest unknown = MakePrepareRequest(kPushUuid, 2);
+  unknown.set_host_tiling_mode(static_cast<tpu_sync::rpc::HostTilingMode>(7));
+  EXPECT_THAT(
+      SendPrepare(listener, unknown),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr(absl::StrCat("PrepareWeightReceive (uuid=", kPushUuid,
+                                      ") sets unknown host_tiling_mode=7"))));
+  EXPECT_EQ(
+      WeightSynchronizerBaseTestPeer::GetReceiverTiling(*engine, kPushUuid),
+      tpu_sync::rpc::HOST_TILING_MODE_DEFERRED);
+
+  PrepareWeightReceiveRequest pre_tiled = MakePrepareRequest(kPushUuid + 1, 2);
+  pre_tiled.set_host_tiling_mode(tpu_sync::rpc::HOST_TILING_MODE_PRE_TILED);
+  ABSL_EXPECT_OK(SendPrepare(listener, pre_tiled));
+  EXPECT_EQ(
+      WeightSynchronizerBaseTestPeer::GetReceiverTiling(*engine, kPushUuid + 1),
+      tpu_sync::rpc::HOST_TILING_MODE_PRE_TILED);
+}
+
+TEST(WeightSynchronizerListenerTest,
+     StartWeightPushCoordinatedRejectsUnknownHostTilingMode) {
+  PushCapturingEngine engine;
+  ABSL_ASSERT_OK(engine.Init());
+  WeightSynchronizerListener listener(&engine, /*listener_port=*/0);
+
+  StartWeightPushRequest req = MakeSwapPushRequest(kPushUuid, kPeerA);
+  req.set_host_tiling_mode(static_cast<tpu_sync::rpc::HostTilingMode>(7));
+  EXPECT_THAT(
+      SendStartPush(listener, req),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr(absl::StrCat("StartWeightPush (uuid=", kPushUuid,
+                                      ") sets unknown host_tiling_mode=7"))));
+  EXPECT_EQ(engine.pushed().uuid(), 0);
+
+  // Positive control: a known HostTilingMode is forwarded to the engine.
+  req.set_uuid(kPushUuid + 1);
+  req.set_host_tiling_mode(tpu_sync::rpc::HOST_TILING_MODE_PRE_TILED);
+  ABSL_EXPECT_OK(SendStartPush(listener, req));
+  EXPECT_EQ(engine.pushed().uuid(), kPushUuid + 1);
+  EXPECT_EQ(engine.pushed().host_tiling_mode(),
+            tpu_sync::rpc::HOST_TILING_MODE_PRE_TILED);
+}
+
+TEST(WeightSynchronizerListenerTest,
+     StartWeightPushDirectRejectsUnknownHostTilingModes) {
+  PushCapturingEngine engine;
+  ABSL_ASSERT_OK(engine.Init());
+  WeightSynchronizerListener listener(&engine, /*listener_port=*/0);
+
+  StartWeightPushRequest bad_sender_mode = MakeDirectPushRequest(kPushUuid);
+  bad_sender_mode.set_host_tiling_mode(
+      static_cast<tpu_sync::rpc::HostTilingMode>(7));
+  EXPECT_THAT(
+      SendStartPush(listener, bad_sender_mode),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr(absl::StrCat("StartWeightPush (uuid=", kPushUuid,
+                                      ") sets unknown host_tiling_mode=7"))));
+
+  StartWeightPushRequest bad_receiver_mode = MakeDirectPushRequest(kPushUuid);
+  bad_receiver_mode.mutable_direct()->set_receiver_host_tiling_mode(
+      static_cast<tpu_sync::rpc::HostTilingMode>(9));
+  EXPECT_THAT(
+      SendStartPush(listener, bad_receiver_mode),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr(absl::StrCat(
+                   "StartWeightPush (uuid=", kPushUuid,
+                   ") sets unknown direct.receiver_host_tiling_mode=9"))));
+
+  // Positive control: known sender and receiver tiling modes pass validation
+  // and reach the unimplemented direct-push stub.
+  StartWeightPushRequest valid = MakeDirectPushRequest(kPushUuid);
+  valid.set_host_tiling_mode(tpu_sync::rpc::HOST_TILING_MODE_PRE_TILED);
+  valid.mutable_direct()->set_receiver_host_tiling_mode(
+      tpu_sync::rpc::HOST_TILING_MODE_ON_ARRIVAL);
+  EXPECT_THAT(SendStartPush(listener, valid),
+              StatusIs(absl::StatusCode::kUnimplemented,
+                       HasSubstr("sets mode direct; direct pushes are not "
+                                 "implemented yet")));
+  EXPECT_EQ(engine.pushed().uuid(), 0);
 }
 
 }  // namespace

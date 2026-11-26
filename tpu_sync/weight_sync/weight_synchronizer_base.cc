@@ -74,6 +74,7 @@
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/transport/buffer_push_task.h"
+#include "tpu_sync/weight_sync/host_tiling_validation.h"
 #include "tpu_sync/weight_sync/shard_push_entry.h"
 #include "tpu_sync/weight_sync/tiling_utils.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_listener.h"
@@ -1775,6 +1776,9 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
   VLOG(1) << "Starting PushWeightsResharded for uuid=" << request.uuid()
           << " across " << num_layers_
           << " layers (skip_d2h=" << request.skip_d2h() << ")...";
+  ABSL_RETURN_IF_ERROR(CheckKnownHostTilingMode(
+      absl::StrCat("PushWeightsResharded (uuid=", request.uuid(), ")"),
+      "host_tiling_mode", request.host_tiling_mode()));
   StoreSkipTilingLocal(request.uuid(), request);
   const std::vector<bool> planned_skip_tiling =
       ExtractRequestSkipTiling(num_layers_, request);
@@ -2389,6 +2393,10 @@ absl::Status WeightSynchronizerBase::RegisterExpectedLayerChunks(
 absl::Status WeightSynchronizerBase::RegisterExpectedLayerChunksLocal(
     uint64_t uuid,
     const absl::flat_hash_map<size_t, uint32_t>& expected_layer_chunks) {
+  const tpu_sync::rpc::HostTilingMode tiling = GetReceiverTiling(uuid);
+  ABSL_RETURN_IF_ERROR(CheckKnownHostTilingMode(
+      absl::StrCat("RegisterExpectedLayerChunks (uuid=", uuid, ")"),
+      "host_tiling_mode", tiling));
   for (const auto& [layer_idx, count] : expected_layer_chunks) {
     if (count > 0) ClearExplicitD2hLayer(layer_idx);
   }
@@ -2404,7 +2412,8 @@ absl::Status WeightSynchronizerBase::RegisterExpectedLayerChunksLocal(
   // counts before every pipeline stage, so layers that already have a signal
   // or have been received under `uuid` are left alone.
   const bool signal_layers =
-      GetReceiverTiling(uuid) != tpu_sync::rpc::HOST_TILING_MODE_DEFERRED;
+      tiling == tpu_sync::rpc::HOST_TILING_MODE_ON_ARRIVAL ||
+      tiling == tpu_sync::rpc::HOST_TILING_MODE_PRE_TILED;
   if (auto_h2d_) {
     // Auto-H2D copies each layer as it arrives, so resolve the device buffers
     // once per uuid, before any of its data can arrive. A re-arm of the same
@@ -2451,8 +2460,11 @@ absl::Status WeightSynchronizerBase::RegisterExpectedLayerChunksLocal(
 
 absl::Status WeightSynchronizerBase::OnLayerDataReceived(size_t layer_idx,
                                                          uint64_t uuid) {
-  ClearExplicitD2hLayer(layer_idx);
   const tpu_sync::rpc::HostTilingMode tiling = GetReceiverTiling(uuid);
+  ABSL_RETURN_IF_ERROR(CheckKnownHostTilingMode(
+      absl::StrCat("OnLayerDataReceived (uuid=", uuid, ")"), "host_tiling_mode",
+      tiling));
+  ClearExplicitD2hLayer(layer_idx);
   absl::MutexLock lock(pending_h2d_mu_);
   if (!h2d_pool_) {
     h2d_pool_ =
@@ -2469,7 +2481,8 @@ absl::Status WeightSynchronizerBase::OnLayerDataReceived(size_t layer_idx,
     state.tile_ready.erase(it);
   } else {
     // Not armed via RegisterExpectedLayerChunksLocal().
-    if (tiling != tpu_sync::rpc::HOST_TILING_MODE_DEFERRED) {
+    if (tiling == tpu_sync::rpc::HOST_TILING_MODE_ON_ARRIVAL ||
+        tiling == tpu_sync::rpc::HOST_TILING_MODE_PRE_TILED) {
       ready = std::make_shared<LayerTileReady>();
     }
     SetLayerTileReady(layer_idx, ready);

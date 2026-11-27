@@ -13,10 +13,12 @@
 // limitations under the License.
 
 #include <algorithm>
+#include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <future>
+#include <initializer_list>
 #include <memory>
 #include <optional>
 #include <string>
@@ -31,6 +33,7 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/flags/declare.h"
 #include "absl/flags/flag.h"
+#include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/memory/memory.h"
 #include "absl/status/status.h"
@@ -62,7 +65,11 @@
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
+#include "tpu_sync/transport/transfer_session.h"
+#include "tpu_sync/weight_sync/staging_buffer_guard.h"
+#include "tpu_sync/weight_sync/weight_grpc_transport_delegate.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
+#include "tpu_sync/weight_sync/weight_version.h"
 
 ABSL_DECLARE_FLAG(size_t, raiden_weight_sync_host_buffer_scratchpad_size);
 
@@ -4895,6 +4902,535 @@ TEST_F(WeightSynchronizerTest,
     EXPECT_EQ(dst0[0], v0);
     EXPECT_EQ(dst1[0], v1);
   }
+}
+
+}  // namespace
+
+class WeightSynchronizerBaseTestPeer {
+ public:
+  static void SetDrainPollInterval(WeightSynchronizerBase& ws,
+                                   absl::Duration poll) {
+    absl::MutexLock l(ws.receive_state_mu_);
+    ws.receive_drain_poll_interval_ = poll;
+  }
+  static void SetMaxFinishedReceives(WeightSynchronizerBase& ws, size_t max) {
+    CHECK_GE(max, 1u) << "max_finished_receives must be at least 1";
+    absl::MutexLock l(ws.receive_state_mu_);
+    ws.max_finished_receives_ = max;
+  }
+  static StagingBufferGuard& StagingGuard(WeightSynchronizerBase& ws) {
+    return ws.staging_guard_;
+  }
+  static bool IsActive(const WeightSynchronizerBase& ws, uint64_t id) {
+    absl::MutexLock l(ws.receive_state_mu_);
+    return ws.active_receive_uuid_ == id;
+  }
+  static bool HasLiveSession(const WeightSynchronizerBase& ws, uint64_t id) {
+    absl::MutexLock l(ws.receive_state_mu_);
+    return ws.live_receive_uuids_.contains(id);
+  }
+  static std::shared_ptr<TransferSession> AnySession(
+      const WeightSynchronizerBase& ws, uint64_t id) {
+    absl::MutexLock l(ws.receive_state_mu_);
+    auto it = ws.receives_.find(id);
+    return it != ws.receives_.end() ? it->second.session : nullptr;
+  }
+  static bool HasSkipTiling(const WeightSynchronizerBase& ws, uint64_t id) {
+    absl::MutexLock l(ws.skip_tiling_mu_);
+    return ws.uuid_to_skip_tiling_.contains(id);
+  }
+};
+
+namespace {
+using ::absl::StatusCode;
+using ::absl_testing::IsOkAndHolds;
+using ::absl_testing::StatusIs;
+using ::testing::AllOf;
+using ::testing::HasSubstr;
+using ::testing::Optional;
+using Peer = WeightSynchronizerBaseTestPeer;
+
+template <typename Pred>
+bool WaitUntil(Pred&& pred) {
+  for (absl::Time end = absl::Now() + absl::Seconds(5); !pred();) {
+    if (absl::Now() >= end) return false;
+    absl::SleepFor(absl::Milliseconds(1));
+  }
+  return true;
+}
+
+tpu_sync::rpc::StartTransferRequest MakeRecvReq(
+    int64_t uuid,
+    std::initializer_list<std::pair<int32_t, int64_t>> chunks = {{0, 1}}) {
+  tpu_sync::rpc::StartTransferRequest req;
+  req.set_uuid(uuid);
+  for (auto [l, c] : chunks)
+    (*req.mutable_expected_layer_chunk_counts())[l] = c;
+  return req;
+}
+
+absl::StatusOr<StagingBufferGuard::ReadPin> HoldPin(
+    WeightSynchronizerBase& ws) {
+  Peer::StagingGuard(ws).Claim(999999);
+  return Peer::StagingGuard(ws).CommitAndPin(999999, WeightVersion::Default(),
+                                             {});
+}
+
+constexpr absl::Duration kWait = absl::Seconds(5);
+constexpr absl::Duration kShort = absl::Milliseconds(20);
+
+WeightGrpcTransportDelegate MakeDelegate(WeightSynchronizerBase* ws) {
+  return WeightGrpcTransportDelegate([ws](uint64_t b, uint32_t s) {
+    return ws->GetHostBuffer(static_cast<size_t>(b), static_cast<size_t>(s));
+  });
+}
+
+struct ScopedGrpcDelegate {
+  WeightSynchronizerBase& ws;
+  WeightGrpcTransportDelegate delegate;
+  explicit ScopedGrpcDelegate(WeightSynchronizerBase& w)
+      : ws(w), delegate(MakeDelegate(&w)) {
+    ws.SetGrpcTransportDelegate(&delegate);
+  }
+  ~ScopedGrpcDelegate() { ws.SetGrpcTransportDelegate(nullptr); }
+};
+
+std::future<absl::Status> PrepareAsync(
+    WeightSynchronizerBase& ws, tpu_sync::rpc::StartTransferRequest req) {
+  return std::async(std::launch::async, [&ws, req = std::move(req)] {
+    return ws.PrepareVersionedReceive(req, {.drain_timeout = kWait});
+  });
+}
+
+TEST_F(WeightSynchronizerTest,
+       VersionedReceivePrepareGetSessionAndGrpcDelegate) {
+  TF_ASSERT_OK_AND_ASSIGN(auto ws, LayerNotifyingSynchronizer::CreateCpu(2, 4096));
+  auto delegate = MakeDelegate(ws.get());
+  ws->SetGrpcTransportDelegate(&delegate);
+  TF_ASSERT_OK_AND_ASSIGN(auto pin, HoldPin(*ws));
+  auto prep = PrepareAsync(*ws, MakeRecvReq(101, {{0, 1}, {1, 1}}));
+  ASSERT_TRUE(WaitUntil([&] { return Peer::IsActive(*ws, 101); }));
+  EXPECT_THAT(ws->GetSession(101), StatusIs(StatusCode::kNotFound));
+  EXPECT_THAT(delegate.GetSession(101), StatusIs(StatusCode::kNotFound));
+  Peer::StagingGuard(*ws).ReleaseReadPin(pin.pin_id);
+  ABSL_ASSERT_OK(prep.get());
+  TF_ASSERT_OK_AND_ASSIGN(auto s, ws->GetSession(101));
+  EXPECT_THAT(delegate.GetSession(101), IsOkAndHolds(s));
+  EXPECT_FALSE(s->Done());
+  ws->SetGrpcTransportDelegate(&delegate);  // Same delegate is a no-op.
+  ABSL_ASSERT_OK(delegate.OnPushChunks(101, 0, 0, 0));
+  EXPECT_FALSE(s->Done());
+  ABSL_ASSERT_OK(delegate.OnPushChunks(101, 1, 0, 0));
+  EXPECT_TRUE(s->Done());
+  ABSL_EXPECT_OK(s->GetStatus());
+  ws.reset();  // Teardown unregisters active receive from live delegate.
+  EXPECT_THAT(delegate.GetSession(101), StatusIs(StatusCode::kNotFound));
+}
+
+TEST_F(WeightSynchronizerTest, VersionedReceiveInputValidationAndSpecMatching) {
+  TF_ASSERT_OK_AND_ASSIGN(auto ws, LayerNotifyingSynchronizer::CreateCpu(2, 4096));
+  auto bad_req = [&](const char* name, auto mutate) {
+    auto r = MakeRecvReq(200);
+    VersionedReceiveOptions o;
+    mutate(r, o);
+    EXPECT_THAT(ws->PrepareVersionedReceive(r, o),
+                StatusIs(StatusCode::kInvalidArgument))
+        << name;
+  };
+  auto bad_chunk = [&](const char* n, int l, int c) {
+    bad_req(n, [l, c](auto& r, auto&) {
+      (*r.mutable_expected_layer_chunk_counts())[l] = c;
+    });
+  };
+  using Mode = tpu_sync::rpc::HostTilingMode;
+  bad_req("zero_uuid", [](auto& r, auto&) { r.set_uuid(0); });
+  bad_req("neg_uuid", [](auto& r, auto&) { r.set_uuid(-5); });
+  bad_req("is_sender", [](auto& r, auto&) { r.set_is_sender(true); });
+  bad_req("bad_tiling", [](auto& r, auto&) {
+    r.set_host_tiling_mode(static_cast<Mode>(99));
+  });
+  bad_req("neg_skip",
+          [](auto& r, auto&) { (*r.mutable_skip_tiling())[-1] = 1; });
+  bad_req("oob_skip",
+          [](auto& r, auto&) { (*r.mutable_skip_tiling())[2] = 1; });
+  bad_chunk("neg_layer", -1, 1);
+  bad_chunk("oob_zero", 999, 0);
+  bad_chunk("neg_count", 0, -1);
+  bad_req("neg_drain", [](auto&, auto& o) { o.drain_timeout = -kShort; });
+  bad_req("neg_recv", [](auto&, auto& o) { o.receive_timeout = -kShort; });
+  auto on_arrival = MakeRecvReq(200);
+  on_arrival.set_host_tiling_mode(tpu_sync::rpc::HOST_TILING_MODE_ON_ARRIVAL);
+  EXPECT_THAT(ws->PrepareVersionedReceive(on_arrival, {}),
+              StatusIs(StatusCode::kUnimplemented, HasSubstr("ON_ARRIVAL")));
+
+  TF_ASSERT_OK_AND_ASSIGN(auto v1, WeightVersion::FromBytes("v1", "version"));
+  TF_ASSERT_OK_AND_ASSIGN(auto v2, WeightVersion::FromBytes("v2", "version"));
+  auto base = MakeRecvReq(201, {{0, 2}});
+  base.set_host_tiling_mode(tpu_sync::rpc::HOST_TILING_MODE_UNSPECIFIED);
+  (*base.mutable_skip_tiling())[0] = true;
+  ABSL_ASSERT_OK(ws->PrepareVersionedReceive(base, {.version = v1}));
+  TF_ASSERT_OK_AND_ASSIGN(auto s, ws->GetSession(201));
+  auto eq = base;
+  eq.set_host_tiling_mode(tpu_sync::rpc::HOST_TILING_MODE_DEFERRED);
+  (*eq.mutable_skip_tiling())[1] = false;
+  (*eq.mutable_expected_layer_chunk_counts())[1] = 0;
+  ABSL_EXPECT_OK(ws->PrepareVersionedReceive(eq, {.version = v1}));
+  EXPECT_THAT(ws->GetSession(201), IsOkAndHolds(s));
+
+  auto bad_join = [&](auto mutate, const char* sub) {
+    auto r = base;
+    VersionedReceiveOptions o{.version = v1};
+    mutate(r, o);
+    EXPECT_THAT(ws->PrepareVersionedReceive(r, o),
+                StatusIs(StatusCode::kInvalidArgument, HasSubstr(sub)));
+  };
+  bad_join([&](auto&, auto& o) { o.version = v2; }, "version");
+  bad_join(
+      [](auto& r, auto&) {
+        r.set_host_tiling_mode(tpu_sync::rpc::HOST_TILING_MODE_PRE_TILED);
+      },
+      "host_tiling_mode");
+  bad_join([](auto& r, auto&) { (*r.mutable_skip_tiling())[0] = false; },
+           "skip_tiling");
+  bad_join(
+      [](auto& r, auto&) { (*r.mutable_expected_layer_chunk_counts())[0] = 3; },
+      "expected_layer_chunks");
+  EXPECT_THAT(ws->GetSession(201), IsOkAndHolds(s));
+}
+
+TEST_F(WeightSynchronizerTest, VersionedReceiveConcurrentJoinersAndTimeout) {
+  TF_ASSERT_OK_AND_ASSIGN(auto ws, LayerNotifyingSynchronizer::CreateCpu(1, 4096));
+  ScopedGrpcDelegate grpc(*ws);
+  TF_ASSERT_OK_AND_ASSIGN(auto pin, HoldPin(*ws));
+  auto req = MakeRecvReq(301);
+  auto creator = PrepareAsync(*ws, req);
+  ASSERT_TRUE(WaitUntil([&] { return Peer::IsActive(*ws, 301); }));
+  EXPECT_THAT(ws->PrepareVersionedReceive(req, {.drain_timeout = kShort}),
+              StatusIs(StatusCode::kDeadlineExceeded));
+  EXPECT_TRUE(Peer::IsActive(*ws, 301));
+  auto joiner = PrepareAsync(*ws, req);
+  absl::SleepFor(absl::Milliseconds(15));
+  Peer::StagingGuard(*ws).ReleaseReadPin(pin.pin_id);
+  // RegisterSession rejects duplicates, so both OK proves single registration.
+  ABSL_ASSERT_OK(creator.get());
+  ABSL_ASSERT_OK(joiner.get());
+  TF_ASSERT_OK_AND_ASSIGN(auto s, ws->GetSession(301));
+  EXPECT_THAT(grpc.delegate.GetSession(301), IsOkAndHolds(s));
+}
+
+TEST_F(WeightSynchronizerTest,
+       VersionedReceiveReplaceActiveDrainAndCreatorTimeout) {
+  TF_ASSERT_OK_AND_ASSIGN(auto ws, LayerNotifyingSynchronizer::CreateCpu(1, 4096));
+  Peer::SetDrainPollInterval(*ws, absl::Milliseconds(1));
+  ScopedGrpcDelegate grpc(*ws);
+  ABSL_ASSERT_OK(ws->PrepareVersionedReceive(MakeRecvReq(401), {}));
+  TF_ASSERT_OK_AND_ASSIGN(auto s1, ws->GetSession(401));
+  ASSERT_TRUE(s1->TryBeginOp());
+  auto prep2 = PrepareAsync(*ws, MakeRecvReq(402));
+  ASSERT_TRUE(WaitUntil([&] { return s1->IsDraining(); }));
+  EXPECT_THAT(grpc.delegate.GetSession(401), StatusIs(StatusCode::kNotFound));
+  EXPECT_THAT(ws->GetSession(402), StatusIs(StatusCode::kNotFound));
+  EXPECT_EQ(prep2.wait_for(std::chrono::milliseconds(15)),
+            std::future_status::timeout);
+  s1->EndOp();
+  ABSL_ASSERT_OK(prep2.get());
+  EXPECT_FALSE(Peer::HasLiveSession(*ws, 401));
+  TF_ASSERT_OK_AND_ASSIGN(auto s2, ws->GetSession(402));
+  EXPECT_THAT(grpc.delegate.GetSession(402), IsOkAndHolds(s2));
+  ASSERT_TRUE(s2->TryBeginOp());
+  EXPECT_THAT(
+      ws->PrepareVersionedReceive(MakeRecvReq(403), {.drain_timeout = kShort}),
+      StatusIs(StatusCode::kDeadlineExceeded, HasSubstr("402")));
+  EXPECT_THAT(ws->GetSession(403), StatusIs(StatusCode::kNotFound));
+  EXPECT_THAT(ws->PrepareVersionedReceive(MakeRecvReq(403), {}),
+              StatusIs(StatusCode::kAborted));
+  s2->EndOp();
+}
+
+TEST_F(WeightSynchronizerTest,
+       VersionedReceiveFailRefusalDetachAndReceiveTimeout) {
+  TF_ASSERT_OK_AND_ASSIGN(auto ws, LayerNotifyingSynchronizer::CreateCpu(1, 4096));
+  ScopedGrpcDelegate grpc(*ws);
+  ws->FailVersionedReceive(999, absl::CancelledError("unknown"));  // No-op.
+  auto req501 = MakeRecvReq(501);
+  ABSL_ASSERT_OK(
+      ws->PrepareVersionedReceive(req501, {.receive_timeout = kWait}));
+  TF_ASSERT_OK_AND_ASSIGN(auto s501, ws->GetSession(501));
+  EXPECT_LT(s501->deadline(), std::chrono::steady_clock::time_point::max());
+  ws->StoreSkipTiling(501, req501);
+  ASSERT_TRUE(Peer::HasSkipTiling(*ws, 501));
+  ws->FailVersionedReceive(501, absl::DataLossError("boom"));
+  EXPECT_THAT(grpc.delegate.GetSession(501), StatusIs(StatusCode::kNotFound));
+  EXPECT_THAT(ws->GetSession(501), StatusIs(StatusCode::kNotFound));
+  EXPECT_FALSE(Peer::HasLiveSession(*ws, 501));
+  EXPECT_FALSE(Peer::HasSkipTiling(*ws, 501));
+  ws->FailVersionedReceive(501, absl::InternalError("ignored"));  // No-op.
+  EXPECT_THAT(ws->PrepareVersionedReceive(req501, {}),
+              StatusIs(StatusCode::kAborted, HasSubstr("boom")));
+  // Shorter receive_timeout caps drain_timeout while staging buffer is pinned.
+  TF_ASSERT_OK_AND_ASSIGN(auto pin, HoldPin(*ws));
+  EXPECT_THAT(
+      ws->PrepareVersionedReceive(MakeRecvReq(502), {.receive_timeout = kShort,
+                                                     .drain_timeout = kWait}),
+      StatusIs(StatusCode::kDeadlineExceeded));
+  Peer::StagingGuard(*ws).ReleaseReadPin(pin.pin_id);
+  EXPECT_THAT(ws->PrepareVersionedReceive(MakeRecvReq(502), {}),
+              StatusIs(StatusCode::kAborted));
+}
+
+TEST_F(WeightSynchronizerTest,
+       VersionedReceiveExternalFailureDelegateDetachAndEmptyChunks) {
+  TF_ASSERT_OK_AND_ASSIGN(auto ws, LayerNotifyingSynchronizer::CreateCpu(2, 4096));
+  ScopedGrpcDelegate grpc(*ws);
+  auto req601 = MakeRecvReq(601);
+  ABSL_ASSERT_OK(ws->PrepareVersionedReceive(req601, {}));
+  TF_ASSERT_OK_AND_ASSIGN(auto s601, ws->GetSession(601));
+  s601->Finish(absl::ResourceExhaustedError("peer reset"));
+  EXPECT_THAT(
+      ws->PrepareVersionedReceive(req601, {}),
+      StatusIs(StatusCode::kResourceExhausted, HasSubstr("peer reset")));
+  EXPECT_THAT(ws->GetSession(601), StatusIs(StatusCode::kNotFound));
+  EXPECT_THAT(grpc.delegate.GetSession(601), StatusIs(StatusCode::kNotFound));
+
+  TF_ASSERT_OK_AND_ASSIGN(auto pin, HoldPin(*ws));
+  auto prep602 = PrepareAsync(*ws, MakeRecvReq(602));
+  ASSERT_TRUE(WaitUntil([&] { return Peer::IsActive(*ws, 602); }));
+  auto s602 = Peer::AnySession(*ws, 602);
+  ASSERT_NE(s602, nullptr);
+  s602->Finish(absl::InternalError("transport died"));
+  Peer::StagingGuard(*ws).ReleaseReadPin(pin.pin_id);
+  EXPECT_THAT(prep602.get(),
+              StatusIs(StatusCode::kInternal, HasSubstr("transport died")));
+  EXPECT_THAT(grpc.delegate.GetSession(602), StatusIs(StatusCode::kNotFound));
+
+  ABSL_ASSERT_OK(ws->PrepareVersionedReceive(MakeRecvReq(603), {}));
+  ABSL_EXPECT_OK(grpc.delegate.GetSession(603).status());
+  ws->SetGrpcTransportDelegate(nullptr);
+  EXPECT_THAT(grpc.delegate.GetSession(603), StatusIs(StatusCode::kNotFound));
+  ABSL_EXPECT_OK(ws->GetSession(603).status());
+  ws->FailVersionedReceive(603, absl::CancelledError("done"));
+
+  ws->SetGrpcTransportDelegate(&grpc.delegate);
+  ABSL_ASSERT_OK(ws->PrepareVersionedReceive(MakeRecvReq(604, {}), {}));
+  TF_ASSERT_OK_AND_ASSIGN(auto s604, ws->GetSession(604));
+  EXPECT_THAT(grpc.delegate.GetSession(604), IsOkAndHolds(s604));
+  EXPECT_TRUE(s604->Done());
+  ABSL_EXPECT_OK(s604->GetStatus());
+}
+
+TEST_F(WeightSynchronizerTest, VersionedReceiveCommitsAfterAllDataArrives) {
+  TF_ASSERT_OK_AND_ASSIGN(auto ws, LayerNotifyingSynchronizer::CreateCpu(2, 4096));
+  ScopedGrpcDelegate grpc(*ws);
+  TF_ASSERT_OK_AND_ASSIGN(auto v1, WeightVersion::FromBytes("v1", "version"));
+  auto req = MakeRecvReq(701, {{0, 1}, {1, 2}});
+  ABSL_ASSERT_OK(ws->PrepareVersionedReceive(req, {.version = v1}));
+  ABSL_ASSERT_OK(grpc.delegate.OnPushChunks(701, 0, 0, 0));
+  ABSL_ASSERT_OK(grpc.delegate.OnPushChunks(701, 1, 0, 0));
+  EXPECT_THAT(ws->AwaitVersionedReceive(701, v1, absl::ZeroDuration()),
+              IsOkAndHolds(false));
+  TF_ASSERT_OK_AND_ASSIGN(auto s, ws->GetSession(701));
+  EXPECT_THAT(grpc.delegate.GetSession(701), IsOkAndHolds(s));
+  EXPECT_TRUE(Peer::HasLiveSession(*ws, 701));
+  ABSL_ASSERT_OK(grpc.delegate.OnPushChunks(701, 1, 0, 1));
+  EXPECT_THAT(ws->AwaitVersionedReceive(701, v1, kWait), IsOkAndHolds(true));
+  EXPECT_THAT(Peer::StagingGuard(*ws).staged_version(), Optional(v1));
+  EXPECT_THAT(ws->GetSession(701), StatusIs(StatusCode::kNotFound));
+  EXPECT_THAT(grpc.delegate.GetSession(701), StatusIs(StatusCode::kNotFound));
+  EXPECT_FALSE(Peer::HasLiveSession(*ws, 701));
+  EXPECT_THAT(ws->AwaitVersionedReceive(701, v1, absl::ZeroDuration()),
+              IsOkAndHolds(true));
+  EXPECT_THAT(ws->PrepareVersionedReceive(req, {.version = v1}),
+              StatusIs(StatusCode::kFailedPrecondition,
+                       HasSubstr("already committed")));
+}
+
+TEST_F(WeightSynchronizerTest,
+       VersionedReceiveAwaitReportsRunningReceiveAndBadArguments) {
+  TF_ASSERT_OK_AND_ASSIGN(auto ws, LayerNotifyingSynchronizer::CreateCpu(1, 4096));
+  TF_ASSERT_OK_AND_ASSIGN(auto v1, WeightVersion::FromBytes("v1", "version"));
+  const WeightVersion v0;
+  ABSL_ASSERT_OK(ws->PrepareVersionedReceive(MakeRecvReq(711), {}));
+  EXPECT_THAT(ws->AwaitVersionedReceive(711, v0, kShort), IsOkAndHolds(false));
+  ABSL_EXPECT_OK(ws->GetSession(711).status());
+  EXPECT_THAT(ws->AwaitVersionedReceive(711, v0, absl::ZeroDuration()),
+              IsOkAndHolds(false));
+  EXPECT_THAT(ws->AwaitVersionedReceive(719, v0, kShort),
+              StatusIs(StatusCode::kNotFound, HasSubstr("uuid=719")));
+  EXPECT_THAT(ws->AwaitVersionedReceive(711, v1, kShort),
+              StatusIs(StatusCode::kInvalidArgument, HasSubstr("version")));
+  EXPECT_THAT(
+      ws->AwaitVersionedReceive(711, v0, -kShort),
+      StatusIs(StatusCode::kInvalidArgument, HasSubstr("negative timeout")));
+  ABSL_EXPECT_OK(ws->GetSession(711).status());
+}
+
+TEST_F(WeightSynchronizerTest, VersionedReceiveTimesOutOnlyUnfinishedReceive) {
+  TF_ASSERT_OK_AND_ASSIGN(auto ws, LayerNotifyingSynchronizer::CreateCpu(1, 4096));
+  ScopedGrpcDelegate grpc(*ws);
+  const WeightVersion v0;
+  ABSL_ASSERT_OK(ws->PrepareVersionedReceive(
+      MakeRecvReq(721), {.receive_timeout = absl::Milliseconds(200)}));
+  TF_ASSERT_OK_AND_ASSIGN(auto s721, ws->GetSession(721));
+  ASSERT_TRUE(WaitUntil(
+      [&] { return std::chrono::steady_clock::now() > s721->deadline(); }));
+  EXPECT_THAT(
+      ws->AwaitVersionedReceive(721, v0, absl::ZeroDuration()),
+      StatusIs(
+          StatusCode::kDeadlineExceeded,
+          HasSubstr("uuid=721 timed out; AwaitVersionedReceive(uuid=721)")));
+  EXPECT_EQ(Peer::StagingGuard(*ws).staged_version(), std::nullopt);
+  EXPECT_THAT(ws->GetSession(721), StatusIs(StatusCode::kNotFound));
+  EXPECT_THAT(ws->PrepareVersionedReceive(MakeRecvReq(721), {}),
+              StatusIs(StatusCode::kAborted));
+
+  ABSL_ASSERT_OK(ws->PrepareVersionedReceive(
+      MakeRecvReq(722), {.receive_timeout = absl::Milliseconds(500)}));
+  TF_ASSERT_OK_AND_ASSIGN(auto s, ws->GetSession(722));
+  ABSL_ASSERT_OK(grpc.delegate.OnPushChunks(722, 0, 0, 0));
+  ASSERT_TRUE(WaitUntil(
+      [&] { return std::chrono::steady_clock::now() > s->deadline(); }));
+  EXPECT_THAT(ws->AwaitVersionedReceive(722, v0, absl::ZeroDuration()),
+              IsOkAndHolds(true));
+  EXPECT_THAT(Peer::StagingGuard(*ws).staged_version(), Optional(v0));
+}
+
+TEST_F(WeightSynchronizerTest,
+       VersionedReceiveCommitsOnlyAfterHeldPushReturns) {
+  TF_ASSERT_OK_AND_ASSIGN(auto ws, LayerNotifyingSynchronizer::CreateCpu(1, 4096));
+  ScopedGrpcDelegate grpc(*ws);
+  TF_ASSERT_OK_AND_ASSIGN(auto v1, WeightVersion::FromBytes("v1", "version"));
+  ABSL_ASSERT_OK(ws->PrepareVersionedReceive(
+      MakeRecvReq(731),
+      {.version = v1, .receive_timeout = absl::Milliseconds(500)}));
+  TF_ASSERT_OK_AND_ASSIGN(auto s, ws->GetSession(731));
+  ASSERT_TRUE(s->TryBeginOp());
+  ABSL_ASSERT_OK(grpc.delegate.OnPushChunks(731, 0, 0, 0));
+  EXPECT_TRUE(s->IsDraining());
+  EXPECT_FALSE(s->Done());
+  ASSERT_TRUE(WaitUntil(
+      [&] { return std::chrono::steady_clock::now() > s->deadline(); }));
+  EXPECT_THAT(ws->AwaitVersionedReceive(731, v1, kShort), IsOkAndHolds(false));
+  EXPECT_EQ(Peer::StagingGuard(*ws).staged_version(), std::nullopt);
+  s->EndOp();
+  EXPECT_THAT(ws->AwaitVersionedReceive(731, v1, kWait), IsOkAndHolds(true));
+  EXPECT_THAT(Peer::StagingGuard(*ws).staged_version(), Optional(v1));
+}
+
+TEST_F(WeightSynchronizerTest, VersionedReceiveAwaitReturnsSessionError) {
+  TF_ASSERT_OK_AND_ASSIGN(auto ws, LayerNotifyingSynchronizer::CreateCpu(1, 4096));
+  ScopedGrpcDelegate grpc(*ws);
+  ABSL_ASSERT_OK(ws->PrepareVersionedReceive(MakeRecvReq(741), {}));
+  TF_ASSERT_OK_AND_ASSIGN(auto s, ws->GetSession(741));
+  EXPECT_THAT(grpc.delegate.GetSession(741), IsOkAndHolds(s));
+  s->Finish(absl::DataLossError("bad"));
+  EXPECT_THAT(ws->AwaitVersionedReceive(741, WeightVersion(), kWait),
+              StatusIs(StatusCode::kDataLoss,
+                       HasSubstr("bad; AwaitVersionedReceive(uuid=741)")));
+  EXPECT_EQ(Peer::StagingGuard(*ws).staged_version(), std::nullopt);
+  EXPECT_THAT(grpc.delegate.GetSession(741), StatusIs(StatusCode::kNotFound));
+}
+
+TEST_F(WeightSynchronizerTest, VersionedReceiveAwaitLeavesPendingReceive) {
+  TF_ASSERT_OK_AND_ASSIGN(auto ws, LayerNotifyingSynchronizer::CreateCpu(1, 4096));
+  TF_ASSERT_OK_AND_ASSIGN(auto pin, HoldPin(*ws));
+  auto prep = PrepareAsync(*ws, MakeRecvReq(751, {}));
+  ASSERT_TRUE(WaitUntil([&] { return Peer::IsActive(*ws, 751); }));
+  EXPECT_THAT(ws->AwaitVersionedReceive(751, WeightVersion(), kShort),
+              IsOkAndHolds(false));
+  Peer::StagingGuard(*ws).ReleaseReadPin(pin.pin_id);
+  ABSL_ASSERT_OK(prep.get());
+  EXPECT_THAT(ws->AwaitVersionedReceive(751, WeightVersion(), kWait),
+              IsOkAndHolds(true));
+}
+
+TEST_F(WeightSynchronizerTest,
+       VersionedReceivePrepareAndFailCommitFinishedReceiveFirst) {
+  TF_ASSERT_OK_AND_ASSIGN(auto ws, LayerNotifyingSynchronizer::CreateCpu(1, 4096));
+  ScopedGrpcDelegate grpc(*ws);
+  TF_ASSERT_OK_AND_ASSIGN(auto v1, WeightVersion::FromBytes("v1", "version"));
+  TF_ASSERT_OK_AND_ASSIGN(auto v2, WeightVersion::FromBytes("v2", "version"));
+  ABSL_ASSERT_OK(
+      ws->PrepareVersionedReceive(MakeRecvReq(761), {.version = v1}));
+  ABSL_ASSERT_OK(grpc.delegate.OnPushChunks(761, 0, 0, 0));
+  ABSL_ASSERT_OK(
+      ws->PrepareVersionedReceive(MakeRecvReq(762), {.version = v2}));
+  EXPECT_THAT(ws->AwaitVersionedReceive(761, v1, kWait), IsOkAndHolds(true));
+  // Receive 762's claim dropped the version that 761 staged.
+  EXPECT_EQ(Peer::StagingGuard(*ws).staged_version(), std::nullopt);
+  ABSL_ASSERT_OK(grpc.delegate.OnPushChunks(762, 0, 0, 0));
+  ws->FailVersionedReceive(762, absl::InternalError("too late"));
+  EXPECT_THAT(ws->AwaitVersionedReceive(762, v2, kWait), IsOkAndHolds(true));
+  EXPECT_THAT(Peer::StagingGuard(*ws).staged_version(), Optional(v2));
+}
+
+TEST_F(WeightSynchronizerTest, VersionedReceiveForgetsOldestFinishedReceives) {
+  TF_ASSERT_OK_AND_ASSIGN(auto ws, LayerNotifyingSynchronizer::CreateCpu(1, 4096));
+  const WeightVersion v0;
+  Peer::SetMaxFinishedReceives(*ws, 2);
+  for (int64_t id : {771, 772, 773, 774}) {
+    ABSL_ASSERT_OK(ws->PrepareVersionedReceive(MakeRecvReq(id, {}), {}));
+  }
+  EXPECT_THAT(ws->AwaitVersionedReceive(774, v0, kWait), IsOkAndHolds(true));
+  EXPECT_THAT(ws->AwaitVersionedReceive(771, v0, kWait),
+              StatusIs(StatusCode::kNotFound));
+  EXPECT_THAT(ws->AwaitVersionedReceive(772, v0, kWait),
+              StatusIs(StatusCode::kNotFound));
+  EXPECT_THAT(ws->AwaitVersionedReceive(773, v0, kWait), IsOkAndHolds(true));
+
+  // A finished receive whose push is still held stops the trim.
+  Peer::SetMaxFinishedReceives(*ws, 1);
+  ABSL_ASSERT_OK(ws->PrepareVersionedReceive(MakeRecvReq(775), {}));
+  TF_ASSERT_OK_AND_ASSIGN(auto s, ws->GetSession(775));
+  ASSERT_TRUE(s->TryBeginOp());
+  ws->FailVersionedReceive(775, absl::CancelledError("held"));
+  EXPECT_THAT(
+      ws->PrepareVersionedReceive(MakeRecvReq(776), {.drain_timeout = kShort}),
+      StatusIs(StatusCode::kDeadlineExceeded, HasSubstr("775")));
+  EXPECT_THAT(ws->AwaitVersionedReceive(775, v0, kWait),
+              StatusIs(StatusCode::kCancelled));
+  EXPECT_THAT(ws->AwaitVersionedReceive(776, v0, kWait),
+              StatusIs(StatusCode::kDeadlineExceeded));
+  s->EndOp();
+  EXPECT_THAT(ws->AwaitVersionedReceive(776, v0, kWait),
+              StatusIs(StatusCode::kDeadlineExceeded));
+  EXPECT_THAT(ws->AwaitVersionedReceive(775, v0, kWait),
+              StatusIs(StatusCode::kNotFound));
+}
+
+TEST_F(WeightSynchronizerTest,
+       VersionedReceiveFailsWhenCommitOrUnregisterFails) {
+  TF_ASSERT_OK_AND_ASSIGN(auto ws, LayerNotifyingSynchronizer::CreateCpu(1, 4096));
+  ScopedGrpcDelegate grpc(*ws);
+  TF_ASSERT_OK_AND_ASSIGN(auto v1, WeightVersion::FromBytes("v1", "version"));
+  ABSL_ASSERT_OK(
+      ws->PrepareVersionedReceive(MakeRecvReq(791), {.version = v1}));
+  ABSL_ASSERT_OK(grpc.delegate.OnPushChunks(791, 0, 0, 0));
+  TF_ASSERT_OK_AND_ASSIGN(auto s791, ws->GetSession(791));
+  EXPECT_TRUE(s791->Done());
+  EXPECT_TRUE(Peer::HasLiveSession(*ws, 791));
+  // Another ID claims the buffer, so receive 791 loses its claim.
+  TF_ASSERT_OK_AND_ASSIGN(auto pin, HoldPin(*ws));
+  EXPECT_THAT(ws->AwaitVersionedReceive(791, v1, kWait),
+              StatusIs(StatusCode::kFailedPrecondition,
+                       AllOf(HasSubstr("Commit of uuid=791"),
+                             HasSubstr("AwaitVersionedReceive(uuid=791)"))));
+  EXPECT_THAT(Peer::StagingGuard(*ws).staged_version(),
+              Optional(WeightVersion::Default()));
+  EXPECT_THAT(ws->GetSession(791), StatusIs(StatusCode::kNotFound));
+  EXPECT_FALSE(Peer::HasLiveSession(*ws, 791));
+  Peer::StagingGuard(*ws).ReleaseReadPin(pin.pin_id);
+
+  ABSL_ASSERT_OK(ws->PrepareVersionedReceive(MakeRecvReq(792), {}));
+  ABSL_ASSERT_OK(grpc.delegate.OnPushChunks(792, 0, 0, 0));
+  TF_ASSERT_OK_AND_ASSIGN(auto s792, ws->GetSession(792));
+  EXPECT_TRUE(s792->Done());
+  EXPECT_TRUE(Peer::HasLiveSession(*ws, 792));
+  ABSL_ASSERT_OK(grpc.delegate.UnregisterSession(792));
+  EXPECT_THAT(ws->AwaitVersionedReceive(792, WeightVersion(), kWait),
+              StatusIs(StatusCode::kInternal,
+                       HasSubstr("Failed to unregister receive uuid=792")));
+  EXPECT_EQ(Peer::StagingGuard(*ws).staged_version(), std::nullopt);
+  EXPECT_FALSE(Peer::HasLiveSession(*ws, 792));
 }
 
 }  // namespace

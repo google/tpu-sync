@@ -29,6 +29,7 @@
 #include "absl/functional/any_invocable.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
@@ -284,9 +285,11 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
     return base_remote_id + chunk_k;
   }
 
+  // Plain managers have no sessions; NotFound keeps their raw pushes on the
+  // legacy path.
   absl::StatusOr<std::shared_ptr<TransferSession>> GetSession(
       uint64_t uuid) const override {
-    return absl::UnimplementedError("Transfer sessions are not available");
+    return absl::NotFoundError(absl::StrCat("No session for uuid=", uuid));
   }
 
   absl::Status OnLayerDataReceived(size_t layer_idx,

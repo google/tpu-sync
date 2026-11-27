@@ -79,6 +79,7 @@
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/chunk_serializer.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
+#include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden::transport::lib {
 
@@ -280,6 +281,46 @@ inline void AppendOrMergeIov(std::vector<struct iovec>& iovs, uint8_t* ptr,
     iovs.push_back({.iov_base = ptr, .iov_len = len});
   }
 }
+
+// Returns the session that holds a push's uuid, or nullptr when the push takes
+// the legacy path: uuid 0 (never looked up) or a uuid the delegate does not
+// know (NotFound). Any other lookup error refuses the push.
+absl::StatusOr<std::shared_ptr<TransferSession>> LookupPushSession(
+    const RawBufferTransportDelegate& delegate, uint64_t uuid) {
+  if (uuid == 0) return nullptr;
+  absl::StatusOr<std::shared_ptr<TransferSession>> session =
+      delegate.GetSession(uuid);
+  if (absl::IsNotFound(session.status())) return nullptr;
+  ABSL_RETURN_IF_ERROR(session.status());
+  if (*session == nullptr) {
+    return absl::InternalError(absl::StrCat("GetSession(uuid=", uuid,
+                                            ") returned OK without a session"));
+  }
+  return session;
+}
+
+// Admits one op-7 push into `session`, like KV's BeginIncomingPush().
+absl::Status BeginSessionPush(TransferSession& session, uint64_t uuid) {
+  if (session.TryBeginOp()) return absl::OkStatus();
+  return absl::CancelledError(
+      absl::StrCat("op-7 push of uuid=", uuid,
+                   " refused: the session is not accepting pushes"));
+}
+
+// Ends a push admitted by BeginSessionPush() exactly once, like KV's
+// EndIncomingPush(): a failed push first fails the session. Returns the push's
+// error, or Cancelled when the session itself failed.
+absl::Status EndSessionPush(TransferSession& session, uint64_t uuid,
+                            const absl::Status& status) {
+  if (!status.ok()) session.Finish(status);
+  session.EndOp();
+  ABSL_RETURN_IF_ERROR(status);
+  const absl::Status session_status = session.GetStatus();
+  if (session_status.ok()) return absl::OkStatus();
+  return absl::CancelledError(
+      absl::StrCat("op-7 push of uuid=", uuid,
+                   " ended in a failed session: ", session_status.message()));
+}
 }  // namespace
 
 RawBufferTransport::RawBufferTransport(
@@ -400,6 +441,14 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
     const uint32_t size_bytes = header.count_or_size;
     const uint16_t buf_id = header.buffer_id;
 
+    ABSL_ASSIGN_OR_RETURN(const std::shared_ptr<TransferSession> session,
+                          LookupPushSession(*raw_delegate_, header.uuid));
+    if (session != nullptr) {
+      return absl::FailedPreconditionError(absl::StrCat(
+          "op-5 push of uuid=", header.uuid,
+          " refused: a session holds this uuid; versioned data uses op 7"));
+    }
+
     ABSL_ASSIGN_OR_RETURN(
         const absl::Span<uint8_t> host_buffer,
         raw_delegate_->GetHostBuffer(buf_id, dst_shard_idx),
@@ -518,151 +567,188 @@ absl::Status RawBufferTransport::ProcessPeerRequest(int client_fd) {
           metadata[i], DeserializeChunkMetadata(item_bytes, header.version));
     }
 
-    // Validate every item upfront with overflow-checked uint64_t arithmetic and
-    // zero iovec allocation; payload iovecs are streamed in fixed IOV_MAX
-    // windows below.
-    constexpr uint64_t kMaxTotalBytes =
-        static_cast<uint64_t>(std::numeric_limits<ssize_t>::max());
-    constexpr uint64_t kMaxIovs = static_cast<uint64_t>(IOV_MAX);
-    std::vector<uint8_t*> base_ptrs(batch_size, nullptr);
-    uint64_t total_bytes = 0;
-    uint64_t iov_hint = 0;
-
-    for (uint32_t i = 0; i < batch_size; ++i) {
-      const ChunkMetadata& meta = metadata[i];
-      ABSL_ASSIGN_OR_RETURN(
-          const absl::Span<uint8_t> host_buffer,
-          raw_delegate_->GetHostBuffer(meta.layer_idx, meta.dst_shard_idx),
-          _.SetCode(absl::StatusCode::kInvalidArgument).SetPrepend()
-              << "Destination host pointer is null in batched push: ");
-      base_ptrs[i] = host_buffer.data();
-      const uint64_t host_size = host_buffer.size();
-      const uint64_t count =
-          meta.count > 0 ? static_cast<uint64_t>(meta.count) : uint64_t{1};
-      const uint64_t dst_stride =
-          meta.dst_stride_bytes > 0 ? meta.dst_stride_bytes : meta.size_bytes;
-      const bool is_contiguous = count == 1 || dst_stride == meta.size_bytes;
-
-      uint64_t item_bytes = 0;
-      if (is_contiguous) {
-        if (meta.size_bytes > 0 && count > host_size / meta.size_bytes) {
-          return absl::InvalidArgumentError(absl::StrCat(
-              "Destination out of bounds in batched push: item ", i, " (layer ",
-              meta.layer_idx, ", shard ", meta.dst_shard_idx, ") count ", count,
-              " * size_bytes ", meta.size_bytes, " exceeds host buffer size ",
-              host_size));
-        }
-        item_bytes = count * meta.size_bytes;
-        if (meta.dst_offset_bytes > host_size - item_bytes) {
-          return absl::InvalidArgumentError(absl::StrCat(
-              "Destination out of bounds in batched push: item ", i, " (layer ",
-              meta.layer_idx, ", shard ", meta.dst_shard_idx, ") offset ",
-              meta.dst_offset_bytes, " + bytes ", item_bytes,
-              " exceeds host buffer size ", host_size));
-        }
-      } else {
-        if (dst_stride < meta.size_bytes) {
-          return absl::InvalidArgumentError(absl::StrCat(
-              "Destination stride (", dst_stride,
-              ") cannot be smaller than slice size (", meta.size_bytes,
-              ") in strided push for item ", i, " (layer ", meta.layer_idx,
-              ", shard ", meta.dst_shard_idx, ")"));
-        }
-        if (meta.size_bytes > host_size) {
-          return absl::InvalidArgumentError(absl::StrCat(
-              "Destination out of bounds in strided push: item ", i, " (layer ",
-              meta.layer_idx, ", shard ", meta.dst_shard_idx, ") size_bytes ",
-              meta.size_bytes, " exceeds host buffer size ", host_size));
-        }
-        if (count - 1 > (host_size - meta.size_bytes) / dst_stride) {
-          return absl::InvalidArgumentError(absl::StrCat(
-              "Destination out of bounds in strided push: item ", i, " (layer ",
-              meta.layer_idx, ", shard ", meta.dst_shard_idx, ") count ", count,
-              " with stride ", dst_stride, " and size_bytes ", meta.size_bytes,
-              " exceeds host buffer size ", host_size));
-        }
-        const uint64_t span = (count - 1) * dst_stride + meta.size_bytes;
-        if (meta.dst_offset_bytes > host_size - span) {
-          return absl::InvalidArgumentError(absl::StrCat(
-              "Destination out of bounds in strided push: item ", i, " (layer ",
-              meta.layer_idx, ", shard ", meta.dst_shard_idx, ") offset ",
-              meta.dst_offset_bytes, " + span ", span,
-              " exceeds host buffer size ", host_size));
-        }
-        item_bytes = count * meta.size_bytes;
-      }
-
-      if (item_bytes > kMaxTotalBytes - total_bytes) {
-        return absl::InvalidArgumentError(absl::StrCat(
-            "Total batched push bytes overflow at item ", i, " (layer ",
-            meta.layer_idx, ", shard ", meta.dst_shard_idx, "): total_bytes ",
-            total_bytes, " + item_bytes ", item_bytes, " exceeds limit ",
-            kMaxTotalBytes));
-      }
-      total_bytes += item_bytes;
-      if (meta.size_bytes > 0) {
-        iov_hint +=
-            std::min(is_contiguous ? uint64_t{1} : count, kMaxIovs - iov_hint);
-      }
+    // If a session holds the push's uuid, that session must admit the push
+    // before any payload byte is written, is told about each item once its
+    // bytes are in host memory, and decides the transfer's outcome, as for
+    // KV's block pushes and gRPC pushes. Pushes that no session holds take the
+    // legacy path.
+    ABSL_ASSIGN_OR_RETURN(const std::shared_ptr<TransferSession> session,
+                          LookupPushSession(*raw_delegate_, header.uuid));
+    if (session != nullptr) {
+      ABSL_RETURN_IF_ERROR(BeginSessionPush(*session, header.uuid));
     }
 
-    if (total_bytes > 0) {
-      std::vector<struct iovec> iovs;
-      iovs.reserve(static_cast<size_t>(iov_hint));
-      auto flush_iovs = [&]() -> absl::Status {
-        if (iovs.empty()) return absl::OkStatus();
-        ABSL_RETURN_IF_ERROR(ReadVExact(client_fd, iovs));
-        iovs.clear();
-        return absl::OkStatus();
-      };
-      auto push_iov = [&](uint8_t* ptr, size_t len) -> absl::Status {
-        if (len == 0) return absl::OkStatus();
-        if (!iovs.empty() &&
-            static_cast<uint8_t*>(iovs.back().iov_base) + iovs.back().iov_len ==
-                ptr) {
-          iovs.back().iov_len += len;
-          return absl::OkStatus();
-        }
-        if (iovs.size() == IOV_MAX) {
-          ABSL_RETURN_IF_ERROR(flush_iovs());
-        }
-        iovs.push_back({.iov_base = ptr, .iov_len = len});
-        return absl::OkStatus();
-      };
+    uint64_t total_bytes = 0;
+    const absl::Status op_status = [&]() -> absl::Status {
+      // Validate every item upfront with overflow-checked uint64_t arithmetic
+      // and zero iovec allocation; payload iovecs are streamed in fixed IOV_MAX
+      // windows below.
+      constexpr uint64_t kMaxTotalBytes =
+          static_cast<uint64_t>(std::numeric_limits<ssize_t>::max());
+      constexpr uint64_t kMaxIovs = static_cast<uint64_t>(IOV_MAX);
+      std::vector<uint8_t*> base_ptrs(batch_size, nullptr);
+      uint64_t iov_hint = 0;
 
       for (uint32_t i = 0; i < batch_size; ++i) {
         const ChunkMetadata& meta = metadata[i];
-        if (meta.size_bytes == 0) continue;
-        uint8_t* const base_host_ptr = base_ptrs[i];
+        ABSL_ASSIGN_OR_RETURN(
+            const absl::Span<uint8_t> host_buffer,
+            raw_delegate_->GetHostBuffer(meta.layer_idx, meta.dst_shard_idx),
+            _.SetCode(absl::StatusCode::kInvalidArgument).SetPrepend()
+                << "Destination host pointer is null in batched push: ");
+        base_ptrs[i] = host_buffer.data();
+        const uint64_t host_size = host_buffer.size();
         const uint64_t count =
             meta.count > 0 ? static_cast<uint64_t>(meta.count) : uint64_t{1};
         const uint64_t dst_stride =
             meta.dst_stride_bytes > 0 ? meta.dst_stride_bytes : meta.size_bytes;
-        if (count == 1 || dst_stride == meta.size_bytes) {
-          const size_t task_bytes =
-              static_cast<size_t>(count * meta.size_bytes);
-          ABSL_RETURN_IF_ERROR(
-              push_iov(base_host_ptr + meta.dst_offset_bytes, task_bytes));
-        } else {
-          for (uint64_t c = 0; c < count; ++c) {
-            ABSL_RETURN_IF_ERROR(
-                push_iov(base_host_ptr + meta.dst_offset_bytes + c * dst_stride,
-                         static_cast<size_t>(meta.size_bytes)));
+        const bool is_contiguous = count == 1 || dst_stride == meta.size_bytes;
+
+        uint64_t item_bytes = 0;
+        if (is_contiguous) {
+          if (meta.size_bytes > 0 && count > host_size / meta.size_bytes) {
+            return absl::InvalidArgumentError(absl::StrCat(
+                "Destination out of bounds in batched push: item ", i,
+                " (layer ", meta.layer_idx, ", shard ", meta.dst_shard_idx,
+                ") count ", count, " * size_bytes ", meta.size_bytes,
+                " exceeds host buffer size ", host_size));
           }
+          item_bytes = count * meta.size_bytes;
+          if (meta.dst_offset_bytes > host_size - item_bytes) {
+            return absl::InvalidArgumentError(absl::StrCat(
+                "Destination out of bounds in batched push: item ", i,
+                " (layer ", meta.layer_idx, ", shard ", meta.dst_shard_idx,
+                ") offset ", meta.dst_offset_bytes, " + bytes ", item_bytes,
+                " exceeds host buffer size ", host_size));
+          }
+        } else {
+          if (dst_stride < meta.size_bytes) {
+            return absl::InvalidArgumentError(absl::StrCat(
+                "Destination stride (", dst_stride,
+                ") cannot be smaller than slice size (", meta.size_bytes,
+                ") in strided push for item ", i, " (layer ", meta.layer_idx,
+                ", shard ", meta.dst_shard_idx, ")"));
+          }
+          if (meta.size_bytes > host_size) {
+            return absl::InvalidArgumentError(absl::StrCat(
+                "Destination out of bounds in strided push: item ", i,
+                " (layer ", meta.layer_idx, ", shard ", meta.dst_shard_idx,
+                ") size_bytes ", meta.size_bytes, " exceeds host buffer size ",
+                host_size));
+          }
+          if (count - 1 > (host_size - meta.size_bytes) / dst_stride) {
+            return absl::InvalidArgumentError(absl::StrCat(
+                "Destination out of bounds in strided push: item ", i,
+                " (layer ", meta.layer_idx, ", shard ", meta.dst_shard_idx,
+                ") count ", count, " with stride ", dst_stride,
+                " and size_bytes ", meta.size_bytes,
+                " exceeds host buffer size ", host_size));
+          }
+          const uint64_t span = (count - 1) * dst_stride + meta.size_bytes;
+          if (meta.dst_offset_bytes > host_size - span) {
+            return absl::InvalidArgumentError(absl::StrCat(
+                "Destination out of bounds in strided push: item ", i,
+                " (layer ", meta.layer_idx, ", shard ", meta.dst_shard_idx,
+                ") offset ", meta.dst_offset_bytes, " + span ", span,
+                " exceeds host buffer size ", host_size));
+          }
+          item_bytes = count * meta.size_bytes;
+        }
+
+        if (item_bytes > kMaxTotalBytes - total_bytes) {
+          return absl::InvalidArgumentError(absl::StrCat(
+              "Total batched push bytes overflow at item ", i, " (layer ",
+              meta.layer_idx, ", shard ", meta.dst_shard_idx, "): total_bytes ",
+              total_bytes, " + item_bytes ", item_bytes, " exceeds limit ",
+              kMaxTotalBytes));
+        }
+        total_bytes += item_bytes;
+        if (meta.size_bytes > 0) {
+          iov_hint += std::min(is_contiguous ? uint64_t{1} : count,
+                               kMaxIovs - iov_hint);
         }
       }
-      ABSL_RETURN_IF_ERROR(flush_iovs());
-    }
-    if (total_bytes > 0 && store_ != nullptr) {
-      store_->IncrementCounter(metric_names::kWeightSyncReceivedBytesTotal, {},
-                               total_bytes);
-    }
 
-    TestOnlyRateLimiter* const limiter =
-        test_only_ingress_rate_limiter_raw_.load(std::memory_order_relaxed);
-    if (ABSL_PREDICT_FALSE(limiter != nullptr)) {
-      limiter->Consume(total_bytes);
+      if (total_bytes > 0) {
+        std::vector<struct iovec> iovs;
+        iovs.reserve(static_cast<size_t>(iov_hint));
+        auto flush_iovs = [&]() -> absl::Status {
+          if (iovs.empty()) return absl::OkStatus();
+          ABSL_RETURN_IF_ERROR(ReadVExact(client_fd, iovs));
+          iovs.clear();
+          return absl::OkStatus();
+        };
+        auto push_iov = [&](uint8_t* ptr, size_t len) -> absl::Status {
+          if (len == 0) return absl::OkStatus();
+          if (!iovs.empty() && static_cast<uint8_t*>(iovs.back().iov_base) +
+                                       iovs.back().iov_len ==
+                                   ptr) {
+            iovs.back().iov_len += len;
+            return absl::OkStatus();
+          }
+          if (iovs.size() == IOV_MAX) {
+            ABSL_RETURN_IF_ERROR(flush_iovs());
+          }
+          iovs.push_back({.iov_base = ptr, .iov_len = len});
+          return absl::OkStatus();
+        };
+
+        for (uint32_t i = 0; i < batch_size; ++i) {
+          const ChunkMetadata& meta = metadata[i];
+          if (meta.size_bytes == 0) continue;
+          uint8_t* const base_host_ptr = base_ptrs[i];
+          const uint64_t count =
+              meta.count > 0 ? static_cast<uint64_t>(meta.count) : uint64_t{1};
+          const uint64_t dst_stride = meta.dst_stride_bytes > 0
+                                          ? meta.dst_stride_bytes
+                                          : meta.size_bytes;
+          if (count == 1 || dst_stride == meta.size_bytes) {
+            const size_t task_bytes =
+                static_cast<size_t>(count * meta.size_bytes);
+            ABSL_RETURN_IF_ERROR(
+                push_iov(base_host_ptr + meta.dst_offset_bytes, task_bytes));
+          } else {
+            for (uint64_t c = 0; c < count; ++c) {
+              ABSL_RETURN_IF_ERROR(push_iov(
+                  base_host_ptr + meta.dst_offset_bytes + c * dst_stride,
+                  static_cast<size_t>(meta.size_bytes)));
+            }
+          }
+        }
+        ABSL_RETURN_IF_ERROR(flush_iovs());
+      }
+      if (total_bytes > 0 && store_ != nullptr) {
+        store_->IncrementCounter(metric_names::kWeightSyncReceivedBytesTotal,
+                                 {}, total_bytes);
+      }
+
+      TestOnlyRateLimiter* const limiter =
+          test_only_ingress_rate_limiter_raw_.load(std::memory_order_relaxed);
+      if (ABSL_PREDICT_FALSE(limiter != nullptr)) {
+        limiter->Consume(total_bytes);
+      }
+
+      if (session != nullptr) {
+        // One OnDataReceived() call per item, including items with no bytes:
+        // the receive session counts pushed items per layer, the same unit the
+        // sender's schedule uses.
+        for (const ChunkMetadata& meta : metadata) {
+          const int shard = static_cast<int>(meta.dst_shard_idx);
+          ABSL_RETURN_IF_ERROR(
+              session->OnDataReceived(meta.layer_idx, {}, {shard}));
+        }
+      }
+      return absl::OkStatus();
+    }();
+
+    if (session != nullptr) {
+      ABSL_RETURN_IF_ERROR(EndSessionPush(*session, header.uuid, op_status));
+      // The ACK goes out only after the push ended cleanly. On an error the
+      // connection closes, so the sender sees the push fail.
+      const uint8_t ack = 1;
+      return WriteExact(client_fd, &ack, 1);
     }
+    ABSL_RETURN_IF_ERROR(op_status);
 
     const uint8_t ack = 1;
     ABSL_RETURN_IF_ERROR(WriteExact(client_fd, &ack, 1));

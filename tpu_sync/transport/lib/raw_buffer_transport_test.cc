@@ -23,6 +23,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>  // NOLINT
 #include <cstddef>
 #include <cstdint>
@@ -35,6 +36,7 @@
 #include <random>
 #include <string>
 #include <thread>  // NOLINT
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -66,6 +68,7 @@
 #include "peregrine/src/api/v1/conn_util.h"
 #include "peregrine/src/api/v1/psp/psp.h"
 #include "peregrine/src/api/v1/socket_util.h"
+#include "xla/tsl/concurrency/future.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
 #include "tpu_sync/fault_injection/hooks.h"
 #include "tpu_sync/telemetry/metrics_api.h"
@@ -76,6 +79,7 @@
 #include "tpu_sync/transport/lib/psp/peregrine_control_service.h"
 #include "tpu_sync/transport/lib/psp/psp_syscall_mock.h"  // NOLINT
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
+#include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden::transport::lib {
 namespace {
@@ -132,13 +136,18 @@ void RandomNonZero(absl::Span<uint8_t> data) {
 using ::absl_testing::IsOkAndHolds;
 using ::absl_testing::StatusIs;
 using ::testing::_;
+using ::testing::AllOf;
 using ::testing::Each;
 using ::testing::ElementsAre;
+using ::testing::ElementsAreArray;
 using ::testing::Eq;
+using ::testing::FieldsAre;
 using ::testing::HasSubstr;
+using ::testing::IsEmpty;
 using ::testing::Ne;
 using ::testing::Not;
 using ::testing::Pointwise;
+using ::testing::SizeIs;
 using ::testing::UnorderedElementsAre;
 using ::testing::UnorderedElementsAreArray;
 
@@ -2187,10 +2196,10 @@ std::vector<char> SerializeOp7V2Request(uint64_t uuid,
 
 absl::StatusOr<uint8_t> SendRawOp7V2AndReadAck(
     absl::string_view dst_addr, absl::Span<const ChunkMetadata> items,
-    absl::Span<const uint8_t> payload = {}) {
+    absl::Span<const uint8_t> payload = {}, uint64_t uuid = 0) {
   ABSL_ASSIGN_OR_RETURN(const int fd, ConnectToPeer(dst_addr));
   const absl::Cleanup close_fd = [fd] { close(fd); };
-  const std::vector<char> req = SerializeOp7V2Request(/*uuid=*/0, items);
+  const std::vector<char> req = SerializeOp7V2Request(uuid, items);
   ABSL_RETURN_IF_ERROR(WriteExact(fd, req.data(), req.size()));
   if (!payload.empty()) {
     ABSL_RETURN_IF_ERROR(WriteExact(fd, payload.data(), payload.size()));
@@ -2647,6 +2656,505 @@ TEST(RawBufferTransportBatchedPushBoundsTest,
         << "gap clobbered at segment " << c << " byte 3";
   }
 }
+
+// One TransferSession::OnDataReceived() call: unit, minor dimension indices
+// and shard ids.
+using DataReport = std::tuple<size_t, std::vector<int>, std::vector<int>>;
+
+// Receive session for versioned pushes, modeled on StubTransferSession in
+// weight_sync/lib/grpc_transport_test.cc. Admits pushes while accepting and
+// keeps the first error passed to Finish(). All state is behind `mu_`.
+class FakePushSession final : public TransferSession {
+ public:
+  // What the transport did to this session.
+  struct Record {
+    int begin_calls = 0;  // TryBeginOp() calls, admitted or not.
+    int end_calls = 0;
+    bool unmatched_end = false;  // An EndOp() that no TryBeginOp() admitted.
+    std::vector<DataReport> reports;
+  };
+
+  explicit FakePushSession(bool accepting = true) : accepting_(accepting) {}
+
+  // OnDataReceived() returns `status`, as for excess data.
+  void SetDataError(absl::Status status) {
+    absl::MutexLock lock(mu_);
+    data_error_ = std::move(status);
+  }
+  // OnDataReceived() fails the session itself with `status` and returns OK,
+  // as when a receive fails on its own while a push is in flight.
+  void SetSelfFailure(absl::Status status) {
+    absl::MutexLock lock(mu_);
+    self_failure_ = std::move(status);
+  }
+  Record record() const {
+    absl::MutexLock lock(mu_);
+    return record_;
+  }
+
+  absl::Status Start() override { return absl::OkStatus(); }
+  bool Done() const override {
+    absl::MutexLock lock(mu_);
+    return done_;
+  }
+  void Finish(const absl::Status& status = absl::OkStatus()) override {
+    absl::MutexLock lock(mu_);
+    FinishLocked(status);
+  }
+  bool TryBeginOp() override {
+    absl::MutexLock lock(mu_);
+    ++record_.begin_calls;
+    if (!accepting_ || draining_) return false;
+    ++in_flight_;
+    return true;
+  }
+  void EndOp() override {
+    absl::MutexLock lock(mu_);
+    ++record_.end_calls;
+    if (in_flight_ == 0) {
+      record_.unmatched_end = true;
+      return;
+    }
+    --in_flight_;
+    done_ = draining_ && in_flight_ == 0;
+  }
+  absl::Status GetStatus() const override {
+    absl::MutexLock lock(mu_);
+    return status_;
+  }
+  absl::Status AwaitForDone() override {
+    absl::MutexLock lock(mu_);
+    mu_.Await(absl::Condition(&done_));
+    return status_;
+  }
+  bool IsDraining() const override {
+    absl::MutexLock lock(mu_);
+    return draining_;
+  }
+  absl::StatusOr<size_t> ResolveStagingSlot(size_t unit) override {
+    return absl::NotFoundError(absl::StrCat("unit ", unit, " has no slot"));
+  }
+  absl::Status OnDataReceived(size_t unit, absl::Span<const int> minor,
+                              absl::Span<const int> shards) override {
+    absl::MutexLock lock(mu_);
+    record_.reports.emplace_back(
+        unit, std::vector<int>(minor.begin(), minor.end()),
+        std::vector<int>(shards.begin(), shards.end()));
+    if (!self_failure_.ok()) FinishLocked(self_failure_);
+    return data_error_;
+  }
+  tsl::Future<> GetDataReadyFuture(size_t unit) override {
+    return tsl::Future<>(absl::OkStatus());
+  }
+  std::optional<std::shared_ptr<const TransferPlan>> plan() const override {
+    return std::nullopt;
+  }
+  std::chrono::steady_clock::time_point deadline() const override {
+    return std::chrono::steady_clock::time_point::max();
+  }
+
+ private:
+  void FinishLocked(const absl::Status& status)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_) {
+    status_.Update(status);
+    draining_ = true;
+    done_ = in_flight_ == 0;
+  }
+
+  mutable absl::Mutex mu_;
+  const bool accepting_;
+  Record record_ ABSL_GUARDED_BY(mu_);
+  int in_flight_ ABSL_GUARDED_BY(mu_) = 0;
+  bool draining_ ABSL_GUARDED_BY(mu_) = false;
+  bool done_ ABSL_GUARDED_BY(mu_) = false;
+  absl::Status status_ ABSL_GUARDED_BY(mu_);
+  absl::Status data_error_ ABSL_GUARDED_BY(mu_);
+  absl::Status self_failure_ ABSL_GUARDED_BY(mu_);
+};
+
+// Layers SessionDelegate serves; GetHostBuffer() of any other is OutOfRange.
+constexpr size_t kSessionDelegateLayers = 2;
+
+// RawMockDelegate whose GetSession() returns the session added for a uuid,
+// else `lookup_result` (NotFound unless set).
+class SessionDelegate : public RawMockDelegate {
+ public:
+  using RawMockDelegate::GetHostBuffer;
+  using RawMockDelegate::RawMockDelegate;
+
+  void AddSession(uint64_t uuid, std::shared_ptr<TransferSession> session) {
+    absl::MutexLock lock(hooks_mu_);
+    sessions_[uuid] = std::move(session);
+  }
+  void SetLookupResult(
+      absl::StatusOr<std::shared_ptr<TransferSession>> result) {
+    absl::MutexLock lock(hooks_mu_);
+    lookup_result_ = std::move(result);
+  }
+  int get_session_calls() const {
+    absl::MutexLock lock(hooks_mu_);
+    return get_session_calls_;
+  }
+
+  absl::StatusOr<absl::Span<const uint8_t>> GetHostBuffer(
+      size_t buffer_id, size_t shard_idx) const override {
+    if (buffer_id >= kSessionDelegateLayers) {
+      return absl::OutOfRangeError(
+          absl::StrCat("layer ", buffer_id, " is out of range"));
+    }
+    return RawMockDelegate::GetHostBuffer(buffer_id, shard_idx);
+  }
+  absl::StatusOr<std::shared_ptr<TransferSession>> GetSession(
+      uint64_t uuid) const override {
+    absl::MutexLock lock(hooks_mu_);
+    ++get_session_calls_;
+    const auto it = sessions_.find(uuid);
+    if (it != sessions_.end()) return it->second;
+    return lookup_result_;
+  }
+
+ private:
+  mutable absl::Mutex hooks_mu_;
+  absl::flat_hash_map<uint64_t, std::shared_ptr<TransferSession>> sessions_
+      ABSL_GUARDED_BY(hooks_mu_);
+  absl::StatusOr<std::shared_ptr<TransferSession>> lookup_result_
+      ABSL_GUARDED_BY(hooks_mu_) = absl::NotFoundError("no session");
+  mutable int get_session_calls_ ABSL_GUARDED_BY(hooks_mu_) = 0;
+};
+
+// Payload of the one-item pushes below; it fills a SessionDelegate buffer.
+constexpr size_t kPushBytes = 16;
+// A uuid that a test gives a session, and one that it does not.
+constexpr uint64_t kSessionUuid = 81;
+constexpr uint64_t kOtherUuid = 82;
+
+std::vector<uint8_t> RandomNonZeroBytes(size_t size) {
+  std::vector<uint8_t> bytes(size);
+  RandomNonZero(absl::MakeSpan(bytes));
+  return bytes;
+}
+
+// Serializes the header of an op-5 (kOpBufferPush) request that writes
+// `size_bytes` to offset 0 of layer 0, shard 0, without payload.
+std::vector<char> SerializeOp5Request(uint64_t uuid, uint32_t size_bytes) {
+  ChunkHeader header = {};
+  header.version = 1;
+  header.op = kOpBufferPush;
+  header.count_or_size = size_bytes;
+  header.uuid = uuid;
+  const auto s_header = SerializeChunkHeader(header);
+  return std::vector<char>(s_header.begin(), s_header.end());
+}
+
+// Pushes `payload` to offset 0 of layer 0, shard 0 as op 5 or as a one-item
+// op-7 batch and returns the ACK. With `partial`, sends only the first half of
+// the payload and then shuts down the write side, so the receiver's payload
+// read fails at EOF instead of waiting for the rest.
+absl::StatusOr<uint8_t> SendRawPush(uint8_t op, absl::string_view dst_addr,
+                                    uint64_t uuid,
+                                    absl::Span<const uint8_t> payload,
+                                    bool partial = false) {
+  const uint32_t size = static_cast<uint32_t>(payload.size());
+  const std::vector<char> req =
+      op == kOpBufferPush
+          ? SerializeOp5Request(uuid, size)
+          : SerializeOp7V2Request(uuid, {ChunkMetadata{.size_bytes = size}});
+  ABSL_ASSIGN_OR_RETURN(const int fd, ConnectToPeer(dst_addr));
+  const absl::Cleanup close_fd = [fd] { close(fd); };
+  ABSL_RETURN_IF_ERROR(WriteExact(fd, req.data(), req.size()));
+  ABSL_RETURN_IF_ERROR(WriteExact(
+      fd, payload.data(), partial ? payload.size() / 2 : payload.size()));
+  if (partial && shutdown(fd, SHUT_WR) != 0) {
+    return absl::InternalError(
+        absl::StrCat("shutdown: ", std::strerror(errno)));
+  }
+  uint8_t ack = 0;
+  ABSL_RETURN_IF_ERROR(ReadExact(fd, &ack, 1, /*timeout_ms=*/5000));
+  return ack;
+}
+
+TEST(RawBufferTransportSessionPushTest,
+     VersionedPushReportsEachItemOnceAndSkipsLegacyProgress) {
+  SessionDelegate dst(kPushBytes);
+  auto session = std::make_shared<FakePushSession>();
+  dst.AddSession(kSessionUuid, session);
+  auto dst_transport = std::make_unique<RawBufferTransport>(&dst, kLocalPort);
+  const std::string dst_addr = GetIpPort(*dst_transport);
+  const std::vector<uint8_t> payload = RandomNonZeroBytes(8);
+
+  // Items for layers {0, 0, 1}; the last one carries no bytes.
+  EXPECT_THAT(
+      SendRawOp7V2AndReadAck(
+          dst_addr,
+          {ChunkMetadata{.dst_shard_idx = 0, .size_bytes = 4},
+           ChunkMetadata{
+               .dst_shard_idx = 1, .dst_offset_bytes = 4, .size_bytes = 4},
+           ChunkMetadata{.layer_idx = 1, .dst_shard_idx = 2}},
+          payload, kSessionUuid),
+      IsOkAndHolds(1));
+  // The push ended before its ACK went out.
+  EXPECT_EQ(session->record().end_calls, 1);
+  EXPECT_THAT(session->record().reports,
+              ElementsAre(FieldsAre(0, IsEmpty(), ElementsAre(0)),
+                          FieldsAre(0, IsEmpty(), ElementsAre(1)),
+                          FieldsAre(1, IsEmpty(), ElementsAre(2))));
+  EXPECT_THAT(dst.DataSpan(0, payload.size()), ElementsAreArray(payload));
+
+  // Legacy progress did not count the versioned items, so registering what
+  // arrived fires nothing, while a legacy push to another uuid still counts.
+  ABSL_ASSERT_OK(dst_transport->RegisterExpectedLayerChunks(kSessionUuid,
+                                                            {{0, 2}, {1, 1}}));
+  ABSL_ASSERT_OK(dst_transport->RegisterExpectedChunks(kSessionUuid, 3));
+  ABSL_ASSERT_OK(
+      dst_transport->RegisterExpectedLayerChunks(kOtherUuid, {{1, 1}}));
+  EXPECT_THAT(SendRawOp7V2AndReadAck(dst_addr, {ChunkMetadata{.layer_idx = 1}},
+                                     {}, kOtherUuid),
+              IsOkAndHolds(1));
+  ASSERT_TRUE(dst.WaitForLayerTriggers(1, kNotificationTimeout));
+
+  // The destructor joins the connection workers: nothing ran after the ACKs.
+  dst_transport.reset();
+  EXPECT_THAT(dst.layer_triggers(), ElementsAre(1));
+  EXPECT_FALSE(dst.on_data_received());
+  const FakePushSession::Record record = session->record();
+  EXPECT_EQ(record.begin_calls, 1);
+  EXPECT_EQ(record.end_calls, 1);
+  EXPECT_FALSE(record.unmatched_end);
+  EXPECT_THAT(record.reports, SizeIs(3));
+  ABSL_EXPECT_OK(session->GetStatus());
+}
+
+TEST(RawBufferTransportSessionPushTest, Op5PushForSessionUuidIsRefused) {
+  absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);
+  EXPECT_CALL(
+      log,
+      Log(absl::LogSeverity::kError, _,
+          HasSubstr(absl::StrCat("FAILED_PRECONDITION: op-5 push of uuid=",
+                                 kSessionUuid, " refused: a session holds"))));
+  log.StartCapturingLogs();
+  SessionDelegate dst(kPushBytes);
+  auto session = std::make_shared<FakePushSession>();
+  dst.AddSession(kSessionUuid, session);
+  auto dst_transport = std::make_unique<RawBufferTransport>(&dst, kLocalPort);
+  const std::vector<uint8_t> payload = RandomNonZeroBytes(kPushBytes);
+
+  EXPECT_THAT(SendRawPush(kOpBufferPush, GetIpPort(*dst_transport),
+                          kSessionUuid, payload),
+              PeerClosed());
+  EXPECT_THAT(dst.DataSpan(), Each(Eq(0)));
+  EXPECT_EQ(session->record().begin_calls, 0);
+  // Op 7 carries the same push into the session.
+  EXPECT_THAT(SendRawPush(kOpBufferPushBatched, GetIpPort(*dst_transport),
+                          kSessionUuid, payload),
+              IsOkAndHolds(1));
+  EXPECT_THAT(dst.DataSpan(), ElementsAreArray(payload));
+
+  dst_transport.reset();
+  EXPECT_EQ(session->record().begin_calls, 1);
+  EXPECT_EQ(session->record().end_calls, 1);
+  EXPECT_FALSE(session->record().unmatched_end);
+}
+
+TEST(RawBufferTransportSessionPushTest, PushThatSessionRefusesGetsNoEndOp) {
+  SessionDelegate dst(kPushBytes);
+  auto session = std::make_shared<FakePushSession>(/*accepting=*/false);
+  dst.AddSession(kSessionUuid, session);
+  auto dst_transport = std::make_unique<RawBufferTransport>(&dst, kLocalPort);
+
+  EXPECT_THAT(SendRawPush(kOpBufferPushBatched, GetIpPort(*dst_transport),
+                          kSessionUuid, RandomNonZeroBytes(kPushBytes)),
+              PeerClosed());
+
+  dst_transport.reset();
+  EXPECT_THAT(dst.DataSpan(), Each(Eq(0)));
+  const FakePushSession::Record record = session->record();
+  EXPECT_EQ(record.begin_calls, 1);
+  EXPECT_EQ(record.end_calls, 0);
+  EXPECT_FALSE(record.unmatched_end);
+  EXPECT_THAT(record.reports, IsEmpty());
+}
+
+TEST(RawBufferTransportSessionPushTest,
+     FailedPayloadReadFailsSessionWithReadError) {
+  SessionDelegate dst(kPushBytes);
+  auto session = std::make_shared<FakePushSession>();
+  dst.AddSession(kSessionUuid, session);
+  auto dst_transport = std::make_unique<RawBufferTransport>(&dst, kLocalPort);
+
+  EXPECT_THAT(SendRawPush(kOpBufferPushBatched, GetIpPort(*dst_transport),
+                          kSessionUuid, RandomNonZeroBytes(kPushBytes),
+                          /*partial=*/true),
+              PeerClosed());
+
+  dst_transport.reset();
+  EXPECT_THAT(session->GetStatus(), PeerEof());
+  const FakePushSession::Record record = session->record();
+  EXPECT_EQ(record.begin_calls, 1);
+  EXPECT_EQ(record.end_calls, 1);
+  EXPECT_FALSE(record.unmatched_end);
+  EXPECT_THAT(record.reports, IsEmpty());
+}
+
+TEST(RawBufferTransportSessionPushTest,
+     FailedItemCheckFailsSessionWithThatCheckError) {
+  SessionDelegate dst(kPushBytes);
+  auto out_of_bounds = std::make_shared<FakePushSession>();
+  auto unknown_layer = std::make_shared<FakePushSession>();
+  dst.AddSession(kSessionUuid, out_of_bounds);
+  dst.AddSession(kOtherUuid, unknown_layer);
+  auto dst_transport = std::make_unique<RawBufferTransport>(&dst, kLocalPort);
+  const std::string dst_addr = GetIpPort(*dst_transport);
+  const std::vector<uint8_t> payload = RandomNonZeroBytes(kPushBytes);
+
+  EXPECT_THAT(SendRawOp7V2AndReadAck(dst_addr,
+                                     {ChunkMetadata{.dst_offset_bytes = 1,
+                                                    .size_bytes = kPushBytes}},
+                                     payload, kSessionUuid),
+              PeerClosed());
+  EXPECT_THAT(
+      SendRawOp7V2AndReadAck(dst_addr,
+                             {ChunkMetadata{.layer_idx = kSessionDelegateLayers,
+                                            .size_bytes = kPushBytes}},
+                             payload, kOtherUuid),
+      PeerClosed());
+
+  dst_transport.reset();
+  EXPECT_THAT(dst.DataSpan(), Each(Eq(0)));
+  EXPECT_THAT(out_of_bounds->GetStatus(),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("Destination out of bounds in batched push: "
+                                 "item 0 (layer 0, shard 0) offset 1")));
+  EXPECT_THAT(
+      unknown_layer->GetStatus(),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               AllOf(HasSubstr("Destination host pointer is null in batched "
+                               "push:"),
+                     HasSubstr("layer 2 is out of range"))));
+  for (const auto& session : {out_of_bounds, unknown_layer}) {
+    EXPECT_EQ(session->record().begin_calls, 1);
+    EXPECT_EQ(session->record().end_calls, 1);
+    EXPECT_FALSE(session->record().unmatched_end);
+  }
+}
+
+TEST(RawBufferTransportSessionPushTest, ReportErrorFailsSessionWithoutAck) {
+  SessionDelegate dst(kPushBytes);
+  auto session = std::make_shared<FakePushSession>();
+  session->SetDataError(
+      absl::FailedPreconditionError("Excess data for layer_idx=0"));
+  dst.AddSession(kSessionUuid, session);
+  auto dst_transport = std::make_unique<RawBufferTransport>(&dst, kLocalPort);
+
+  EXPECT_THAT(
+      SendRawOp7V2AndReadAck(GetIpPort(*dst_transport),
+                             {ChunkMetadata{}, ChunkMetadata{.layer_idx = 1}},
+                             /*payload=*/{}, kSessionUuid),
+      PeerClosed());
+
+  dst_transport.reset();
+  EXPECT_THAT(session->GetStatus(),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       "Excess data for layer_idx=0"));
+  const FakePushSession::Record record = session->record();
+  // Reporting stopped at the first error.
+  EXPECT_THAT(record.reports, SizeIs(1));
+  EXPECT_EQ(record.begin_calls, 1);
+  EXPECT_EQ(record.end_calls, 1);
+  EXPECT_FALSE(record.unmatched_end);
+}
+
+TEST(RawBufferTransportSessionPushTest, SessionFailedDuringPushGetsNoAck) {
+  absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);
+  EXPECT_CALL(log, Log(absl::LogSeverity::kError, _,
+                       HasSubstr(absl::StrCat(
+                           "CANCELLED: op-7 push of uuid=", kSessionUuid,
+                           " ended in a failed session: receive replaced"))));
+  log.StartCapturingLogs();
+  SessionDelegate dst(kPushBytes);
+  auto session = std::make_shared<FakePushSession>();
+  session->SetSelfFailure(absl::AbortedError("receive replaced"));
+  dst.AddSession(kSessionUuid, session);
+  auto dst_transport = std::make_unique<RawBufferTransport>(&dst, kLocalPort);
+
+  EXPECT_THAT(
+      SendRawOp7V2AndReadAck(GetIpPort(*dst_transport), {ChunkMetadata{}},
+                             /*payload=*/{}, kSessionUuid),
+      PeerClosed());
+
+  dst_transport.reset();
+  EXPECT_THAT(session->GetStatus(),
+              StatusIs(absl::StatusCode::kAborted, "receive replaced"));
+  EXPECT_EQ(session->record().begin_calls, 1);
+  EXPECT_EQ(session->record().end_calls, 1);
+  EXPECT_FALSE(session->record().unmatched_end);
+}
+
+// Lookup refusals and legacy pushes, run as op 5 and as op 7.
+class RawBufferTransportSessionLookupTest
+    : public ::testing::TestWithParam<uint8_t> {
+ protected:
+  absl::StatusOr<uint8_t> Push(uint64_t uuid, bool partial = false) {
+    return SendRawPush(GetParam(), dst_addr_, uuid, payload_, partial);
+  }
+
+  const std::vector<uint8_t> payload_ = RandomNonZeroBytes(kPushBytes);
+  SessionDelegate dst_{kPushBytes};
+  std::unique_ptr<RawBufferTransport> dst_transport_ =
+      std::make_unique<RawBufferTransport>(&dst_, kLocalPort);
+  const std::string dst_addr_ = GetIpPort(*dst_transport_);
+};
+
+TEST_P(RawBufferTransportSessionLookupTest, LookupErrorRefusesPush) {
+  dst_.SetLookupResult(absl::FailedPreconditionError("receive not ready"));
+
+  EXPECT_THAT(Push(kOtherUuid), PeerClosed());
+
+  dst_transport_.reset();
+  EXPECT_THAT(dst_.DataSpan(), Each(Eq(0)));
+  EXPECT_EQ(dst_.get_session_calls(), 1);
+}
+
+TEST_P(RawBufferTransportSessionLookupTest,
+       OkWithoutSessionRefusesWithInternal) {
+  absl::ScopedMockLog log(absl::MockLogDefault::kIgnoreUnexpected);
+  EXPECT_CALL(
+      log, Log(absl::LogSeverity::kError, _,
+               HasSubstr(absl::StrCat("INTERNAL: GetSession(uuid=", kOtherUuid,
+                                      ") returned OK without a session"))));
+  log.StartCapturingLogs();
+  dst_.SetLookupResult(std::shared_ptr<TransferSession>());
+
+  EXPECT_THAT(Push(kOtherUuid), PeerClosed());
+
+  dst_transport_.reset();
+  EXPECT_THAT(dst_.DataSpan(), Each(Eq(0)));
+}
+
+TEST_P(RawBufferTransportSessionLookupTest, UnknownUuidTakesLegacyPath) {
+  ABSL_ASSERT_OK(dst_transport_->RegisterExpectedChunks(kOtherUuid, 1));
+
+  EXPECT_THAT(Push(kOtherUuid), IsOkAndHolds(1));
+  ASSERT_TRUE(dst_.WaitForDataReceived(kNotificationTimeout));
+
+  dst_transport_.reset();
+  EXPECT_EQ(dst_.get_session_calls(), 1);
+  EXPECT_THAT(dst_.DataSpan(), ElementsAreArray(payload_));
+}
+
+TEST_P(RawBufferTransportSessionLookupTest, UntaggedPushSkipsSessionLookup) {
+  EXPECT_THAT(Push(/*uuid=*/0), IsOkAndHolds(1));
+
+  dst_transport_.reset();
+  EXPECT_EQ(dst_.get_session_calls(), 0);
+  EXPECT_THAT(dst_.DataSpan(), ElementsAreArray(payload_));
+}
+
+INSTANTIATE_TEST_SUITE_P(Ops, RawBufferTransportSessionLookupTest,
+                         ::testing::Values(kOpBufferPush, kOpBufferPushBatched),
+                         [](const ::testing::TestParamInfo<uint8_t>& info) {
+                           return absl::StrCat("Op",
+                                               static_cast<int>(info.param));
+                         });
 
 }  // namespace
 }  // namespace tpu_raiden::transport::lib

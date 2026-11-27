@@ -17,18 +17,21 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <future>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "absl/base/nullability.h"
 #include "absl/base/optimization.h"
 #include "absl/base/thread_annotations.h"
 #include "absl/cleanup/cleanup.h"
@@ -36,6 +39,7 @@
 #include "absl/container/flat_hash_set.h"
 #include "absl/flags/flag.h"
 #include "absl/functional/any_invocable.h"
+#include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/log/vlog_is_on.h"
 #include "absl/memory/memory.h"
@@ -74,8 +78,11 @@
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/transport/buffer_push_task.h"
+#include "tpu_sync/transport/transfer_session.h"
 #include "tpu_sync/weight_sync/shard_push_entry.h"
 #include "tpu_sync/weight_sync/tiling_utils.h"
+#include "tpu_sync/weight_sync/weight_grpc_transport_delegate.h"
+#include "tpu_sync/weight_sync/weight_receive_session.h"
 #include "tpu_sync/weight_sync/weight_synchronizer_listener.h"
 
 ABSL_FLAG(size_t, raiden_weight_sync_host_buffer_scratchpad_size, 256 * 1024,
@@ -500,7 +507,26 @@ WeightSynchronizerBase::~WeightSynchronizerBase() {
   // waits for in-flight handlers without a time limit; see
   // weight_synchronizer_listener.h.
   listener_.reset();
+  {
+    absl::MutexLock lock(receive_state_mu_);
+    if (active_receive_uuid_ != 0) {
+      FailActiveAndLogLocked(
+          active_receive_uuid_,
+          absl::CancelledError("WeightSynchronizerBase shutting down"),
+          /*retired=*/nullptr);
+    }
+  }
   StopTransportServer();
+  {
+    // Destroy sessions after releasing receive_state_mu_.
+    absl::flat_hash_map<uint64_t, ReceiveEntry> dropped_receives;
+    absl::MutexLock lock(receive_state_mu_);
+    dropped_receives = std::exchange(receives_, {});
+    live_receive_uuids_.clear();
+    finished_receive_uuids_.clear();
+    active_receive_uuid_ = 0;
+    grpc_delegate_ = nullptr;
+  }
   {
     absl::MutexLock op_lock(d2h_op_mu_);
     WaitForInFlightD2h();
@@ -2917,6 +2943,498 @@ void WeightSynchronizerBase::SetTestOnlyRateLimiters(
     std::shared_ptr<peregrine::v1::TestOnlyRateLimiter> ingress) {
   RaidenManagerBase::SetTestOnlyRateLimiters(std::move(egress),
                                              std::move(ingress));
+}
+
+namespace {
+using SteadyTimePoint = std::chrono::steady_clock::time_point;
+
+SteadyTimePoint AddSteadySaturating(SteadyTimePoint base, absl::Duration d) {
+  if (d <= absl::ZeroDuration()) return base;
+  if (d == absl::InfiniteDuration() ||
+      d >= absl::FromChrono(SteadyTimePoint::max() - base)) {
+    return SteadyTimePoint::max();
+  }
+  return base + std::chrono::duration_cast<SteadyTimePoint::duration>(
+                    absl::ToChronoNanoseconds(d));
+}
+
+absl::Status AnnotateReceiveStatus(const absl::Status& s,
+                                   absl::string_view operation, uint64_t uuid) {
+  // OSS Abseil status_macros.h lacks StatusBuilder; annotate directly.
+  return absl::Status(s.code(), absl::StrCat(s.message(), "; ", operation,
+                                             "(uuid=", uuid, ")"));
+}
+
+absl::StatusOr<VersionedReceiveSpec> BuildReceiveSpec(
+    const tpu_sync::rpc::StartTransferRequest& req,
+    const VersionedReceiveOptions& opts, size_t num_layers) {
+  auto bad = [&](auto&&... parts) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "PrepareVersionedReceive(uuid=", req.uuid(), "): ", parts...));
+  };
+  auto check_layer = [&](int32_t layer, absl::string_view field) {
+    return (layer < 0 || static_cast<size_t>(layer) >= num_layers)
+               ? bad(field, " layer=", layer, " out of [0, ", num_layers, ")")
+               : absl::OkStatus();
+  };
+  if (req.uuid() <= 0) return bad("requires positive uuid");
+  if (req.is_sender()) return bad("requires is_sender=false");
+  if (!tpu_sync::rpc::HostTilingMode_IsValid(req.host_tiling_mode())) {
+    return bad("invalid host_tiling_mode=",
+               static_cast<int>(req.host_tiling_mode()));
+  }
+  // Commit means the staged bytes are final, which needs on-arrival tiling to
+  // finish first; that comes with H2D.
+  if (req.host_tiling_mode() == tpu_sync::rpc::HOST_TILING_MODE_ON_ARRIVAL) {
+    return absl::UnimplementedError(
+        absl::StrCat("PrepareVersionedReceive(uuid=", req.uuid(),
+                     "): HOST_TILING_MODE_ON_ARRIVAL is not supported yet"));
+  }
+  if (opts.drain_timeout < absl::ZeroDuration()) {
+    return bad("negative drain_timeout=",
+               absl::FormatDuration(opts.drain_timeout));
+  }
+  if (opts.receive_timeout < absl::ZeroDuration()) {
+    return bad("negative receive_timeout=",
+               absl::FormatDuration(opts.receive_timeout));
+  }
+  VersionedReceiveSpec spec{
+      .version = opts.version,
+      .host_tiling_mode =
+          req.host_tiling_mode() == tpu_sync::rpc::HOST_TILING_MODE_UNSPECIFIED
+              ? tpu_sync::rpc::HOST_TILING_MODE_DEFERRED
+              : req.host_tiling_mode(),
+      .skip_tiling = std::vector<bool>(num_layers, false),
+      .expected_layer_chunks = std::vector<size_t>(num_layers, 0),
+  };
+  for (const auto& [layer, skip] : req.skip_tiling()) {
+    ABSL_RETURN_IF_ERROR(check_layer(layer, "skip_tiling"));
+    spec.skip_tiling[static_cast<size_t>(layer)] = skip;
+  }
+  for (const auto& [layer, count] : req.expected_layer_chunk_counts()) {
+    ABSL_RETURN_IF_ERROR(check_layer(layer, "expected_layer_chunk_counts"));
+    if (count < 0 ||
+        static_cast<uint64_t>(count) > std::numeric_limits<size_t>::max()) {
+      return bad("invalid chunk count=", count, " for layer=", layer);
+    }
+    spec.expected_layer_chunks[static_cast<size_t>(layer)] =
+        static_cast<size_t>(count);
+  }
+  return spec;
+}
+
+absl::Status DescribeSpecMismatch(uint64_t uuid, const VersionedReceiveSpec& a,
+                                  const VersionedReceiveSpec& b) {
+  std::vector<std::string> d;
+  if (a.version != b.version) {
+    d.push_back(absl::StrCat("version (", a.version, " vs ", b.version, ")"));
+  }
+  if (a.host_tiling_mode != b.host_tiling_mode) {
+    d.push_back(absl::StrCat(
+        "host_tiling_mode (",
+        tpu_sync::rpc::HostTilingMode_Name(a.host_tiling_mode), " vs ",
+        tpu_sync::rpc::HostTilingMode_Name(b.host_tiling_mode), ")"));
+  }
+  if (a.skip_tiling != b.skip_tiling) d.push_back("skip_tiling");
+  if (a.expected_layer_chunks != b.expected_layer_chunks) {
+    d.push_back("expected_layer_chunks");
+  }
+  return absl::InvalidArgumentError(
+      absl::StrCat("PrepareVersionedReceive(uuid=", uuid,
+                   ") settings mismatch: ", absl::StrJoin(d, ", ")));
+}
+}  // namespace
+
+void WeightSynchronizerBase::SetGrpcTransportDelegate(
+    WeightGrpcTransportDelegate* absl_nullable delegate) {
+  absl::MutexLock lock(receive_state_mu_);
+  if (delegate == grpc_delegate_) return;
+  if (delegate != nullptr) {
+    CHECK_EQ(active_receive_uuid_, uint64_t{0})
+        << "SetGrpcTransportDelegate requires no active versioned receive";
+  }
+  if (grpc_delegate_ != nullptr && active_receive_uuid_ != 0) {
+    ReceiveEntry& e = receives_.at(active_receive_uuid_);
+    if (e.registered_with_grpc_delegate) {
+      e.registered_with_grpc_delegate = false;
+      if (absl::Status s =
+              grpc_delegate_->UnregisterSession(active_receive_uuid_);
+          !s.ok()) {
+        LOG(ERROR) << "UnregisterSession(" << active_receive_uuid_
+                   << ") failed while detaching delegate: " << s;
+      }
+    }
+  }
+  grpc_delegate_ = delegate;
+}
+
+void WeightSynchronizerBase::DetachIfDoneLocked(
+    ReceiveEntry& e, std::vector<RetiredSession>& retired) {
+  if (e.IsActive() || e.session == nullptr || !e.session->Done()) return;
+  CHECK_EQ(live_receive_uuids_.erase(e.uuid), 1u);
+  retired.push_back({e.uuid, std::exchange(e.session, nullptr)});
+}
+
+std::vector<uint64_t> WeightSynchronizerBase::CollectUndrainedSessionsLocked(
+    uint64_t self_uuid, std::vector<RetiredSession>& retired) {
+  std::vector<uint64_t> done, undrained;
+  for (uint64_t id : live_receive_uuids_) {
+    if (id == self_uuid) continue;
+    const ReceiveEntry& other = receives_.at(id);
+    if (!other.IsActive() && other.session->Done()) {
+      done.push_back(id);
+    } else if (!other.session->Done()) {
+      undrained.push_back(id);
+    }
+  }
+  for (uint64_t id : done) DetachIfDoneLocked(receives_.at(id), retired);
+  std::sort(undrained.begin(), undrained.end());
+  return undrained;
+}
+
+void WeightSynchronizerBase::RetireUnlocked(
+    std::vector<RetiredSession>& retired) {
+  for (const RetiredSession& r : retired) ForgetPushProgress(r.uuid);
+  retired.clear();
+}
+
+absl::Status WeightSynchronizerBase::UnregisterFromGrpcDelegateLocked(
+    ReceiveEntry& e) {
+  if (!e.registered_with_grpc_delegate) return absl::OkStatus();
+  CHECK(grpc_delegate_ != nullptr);
+  e.registered_with_grpc_delegate = false;
+  if (absl::Status s = grpc_delegate_->UnregisterSession(e.uuid); !s.ok()) {
+    return absl::InternalError(absl::StrCat(
+        "Failed to unregister receive uuid=", e.uuid, ": ", s.message()));
+  }
+  return absl::OkStatus();
+}
+
+void WeightSynchronizerBase::RecordFinishedLocked(ReceiveEntry& e) {
+  finished_receive_uuids_.push_back(e.uuid);
+  // Only active receives compare expected_layer_chunks; clear() would keep the
+  // memory.
+  std::vector<size_t>().swap(e.spec.expected_layer_chunks);
+}
+
+absl::Status WeightSynchronizerBase::FailActiveLocked(
+    uint64_t uuid, const absl::Status& status,
+    std::vector<RetiredSession>* absl_nullable retired) {
+  CHECK(!status.ok());
+  ReceiveEntry& e = receives_.at(uuid);
+  CHECK(e.IsActive() && active_receive_uuid_ == uuid);
+  const absl::Status unreg = UnregisterFromGrpcDelegateLocked(e);
+  e.session->Finish(status);
+  const absl::Status session_status = e.session->GetStatus();
+  e.outcome = !session_status.ok() ? session_status : status;
+  e.phase = ReceivePhase::kFailed;
+  active_receive_uuid_ = 0;
+  staging_guard_.AbortClaim(uuid);
+  RecordFinishedLocked(e);
+  if (retired != nullptr) DetachIfDoneLocked(e, *retired);
+  return unreg;
+}
+
+void WeightSynchronizerBase::FailActiveAndLogLocked(
+    uint64_t uuid, const absl::Status& status,
+    std::vector<RetiredSession>* absl_nullable retired) {
+  if (absl::Status u = FailActiveLocked(uuid, status, retired); !u.ok()) {
+    LOG(ERROR) << u;
+  }
+}
+
+absl::Status WeightSynchronizerBase::CommitActiveLocked(
+    ReceiveEntry& e, std::vector<RetiredSession>& retired) {
+  ABSL_RETURN_IF_ERROR(UnregisterFromGrpcDelegateLocked(e));
+  // Empty extents are a placeholder, not "no shards".
+  // TODO(raiden-eng): Fill extents before any reader uses them.
+  ABSL_ASSIGN_OR_RETURN(
+      const StagingBufferGuard::ReadPin pin,
+      staging_guard_.CommitAndPin(e.uuid, e.spec.version, /*extents=*/{}));
+  // Nothing reads the staged version yet, so release the pin right away. The
+  // version stays staged until the next receive claims the buffer.
+  staging_guard_.ReleaseReadPin(pin.pin_id);
+  e.phase = ReceivePhase::kCommitted;
+  e.outcome = absl::OkStatus();
+  active_receive_uuid_ = 0;
+  RecordFinishedLocked(e);
+  DetachIfDoneLocked(e, retired);
+  LOG(INFO) << "Committed receive uuid=" << e.uuid << " of " << e.spec.version;
+  return absl::OkStatus();
+}
+
+void WeightSynchronizerBase::TrimFinishedReceivesLocked() {
+  while (finished_receive_uuids_.size() > max_finished_receives_) {
+    const uint64_t oldest = finished_receive_uuids_.front();
+    if (live_receive_uuids_.contains(oldest)) break;
+    CHECK_EQ(receives_.erase(oldest), 1u);
+    finished_receive_uuids_.pop_front();
+  }
+}
+
+void WeightSynchronizerBase::CompleteVersionedReceivesLocked(
+    std::vector<RetiredSession>& retired) {
+  if (active_receive_uuid_ != 0) {
+    ReceiveEntry& e = receives_.at(active_receive_uuid_);
+    if (e.phase == ReceivePhase::kReady) {
+      // Pushes call Finish() only while they are still in progress, so once a
+      // session is done only this class can change its status, and only under
+      // receive_state_mu_. Read Done() first for that reason.
+      const bool done = e.session->Done();
+      const absl::Status status = e.session->GetStatus();
+      if (!status.ok()) {
+        LOG(WARNING) << "Receive uuid=" << e.uuid << " failed: " << status;
+        FailActiveAndLogLocked(e.uuid, status, &retired);
+      } else if (done && status.ok()) {
+        if (absl::Status s = CommitActiveLocked(e, retired); !s.ok()) {
+          LOG(WARNING) << "Commit of receive uuid=" << e.uuid
+                       << " failed: " << s;
+          FailActiveAndLogLocked(e.uuid, s, &retired);
+        }
+      } else if (!e.session->IsDraining() &&
+                 e.session->deadline() <= std::chrono::steady_clock::now()) {
+        // A session checks its deadline only when data arrives, so a receive
+        // whose sender stopped is timed out here. A session that finished is
+        // already draining, so it is not timed out. A push that finishes the
+        // session right after the IsDraining() check still loses to the
+        // timeout, as in KV.
+        const absl::Status timed_out = absl::DeadlineExceededError(
+            absl::StrCat("Receive uuid=", e.uuid, " timed out"));
+        LOG(WARNING) << timed_out;
+        FailActiveAndLogLocked(e.uuid, timed_out, &retired);
+      }
+    }
+  }
+  (void)CollectUndrainedSessionsLocked(/*self_uuid=*/0, retired);
+  TrimFinishedReceivesLocked();
+}
+
+absl::Status WeightSynchronizerBase::RefusalFor(const ReceiveEntry& e) {
+  CHECK(!e.IsActive()) << "RefusalFor on active receive uuid=" << e.uuid;
+  if (e.phase == ReceivePhase::kCommitted) {
+    return absl::FailedPreconditionError(
+        absl::StrCat("Prepare refused: receive uuid=", e.uuid,
+                     " already committed version ", e.spec.version));
+  }
+  return absl::AbortedError(
+      absl::StrCat("Prepare refused: receive uuid=", e.uuid,
+                   " already failed: ", e.outcome.ToString()));
+}
+
+absl::Status WeightSynchronizerBase::PrepareVersionedReceive(
+    const tpu_sync::rpc::StartTransferRequest& request,
+    const VersionedReceiveOptions& options) {
+  ABSL_ASSIGN_OR_RETURN(VersionedReceiveSpec spec,
+                        BuildReceiveSpec(request, options, num_layers_));
+  const uint64_t uuid = static_cast<uint64_t>(request.uuid());
+  const absl::Duration drain_wait =
+      (options.receive_timeout > absl::ZeroDuration() &&
+       options.receive_timeout < options.drain_timeout)
+          ? options.receive_timeout
+          : options.drain_timeout;
+  const absl::Time caller_deadline = absl::Now() + drain_wait;
+  const SteadyTimePoint session_deadline =
+      (options.receive_timeout > absl::ZeroDuration() &&
+       options.receive_timeout != absl::InfiniteDuration())
+          ? AddSteadySaturating(std::chrono::steady_clock::now(),
+                                options.receive_timeout)
+          : SteadyTimePoint::max();
+  ABSL_ASSIGN_OR_RETURN(
+      std::shared_ptr<TransferSession> candidate_session,
+      WeightReceiveSession::CreatePushReceiveSession(
+          request, WeightReceiveSessionOptions{.deadline = session_deadline}));
+  ABSL_RETURN_IF_ERROR(candidate_session->Start());
+
+  absl::Time wait_deadline = absl::InfinitePast();
+  {
+    std::vector<RetiredSession> retired;
+    std::optional<absl::Status> done;
+    {
+      absl::MutexLock lock(receive_state_mu_);
+      auto it = receives_.find(uuid);
+      if (it != receives_.end() && it->second.IsActive()) {
+        ReceiveEntry& e = it->second;
+        if (e.spec != spec) {
+          done = DescribeSpecMismatch(uuid, e.spec, spec);
+        } else if (absl::Status s = e.session->GetStatus(); !s.ok()) {
+          FailActiveAndLogLocked(uuid, s, &retired);
+          done = AnnotateReceiveStatus(s, "PrepareVersionedReceive", uuid);
+        } else if (e.phase == ReceivePhase::kReady) {
+          done = absl::OkStatus();
+        } else {
+          wait_deadline = std::min(caller_deadline, e.drain_deadline);
+        }
+      } else if (it != receives_.end()) {
+        done = RefusalFor(it->second);
+      } else {
+        CompleteVersionedReceivesLocked(retired);
+        staging_guard_.Claim(uuid);
+        if (active_receive_uuid_ != 0) {
+          absl::Status unreg =
+              FailActiveLocked(active_receive_uuid_,
+                               absl::AbortedError(absl::StrCat(
+                                   "Replaced by newer receive uuid=", uuid)),
+                               &retired);
+          if (!unreg.ok()) {
+            staging_guard_.AbortClaim(uuid);
+            done = unreg;
+          }
+        }
+        if (!done.has_value()) {
+          (void)CollectUndrainedSessionsLocked(/*self_uuid=*/0, retired);
+          wait_deadline = caller_deadline;
+          receives_.emplace(
+              uuid, ReceiveEntry{.uuid = uuid,
+                                 .spec = std::move(spec),
+                                 .session = std::move(candidate_session),
+                                 .phase = ReceivePhase::kPending,
+                                 .drain_deadline = caller_deadline});
+          CHECK(live_receive_uuids_.insert(uuid).second);
+          active_receive_uuid_ = uuid;
+        }
+      }
+    }
+    RetireUnlocked(retired);
+    if (done.has_value()) return *done;
+  }
+
+  const absl::Status guard = staging_guard_.AwaitReady(uuid, wait_deadline);
+  while (true) {
+    std::vector<RetiredSession> retired;
+    std::optional<absl::Status> result;
+    absl::Duration poll_interval = kReceiveDrainPollInterval;
+    {
+      absl::MutexLock lock(receive_state_mu_);
+      poll_interval = receive_drain_poll_interval_;
+      auto it = receives_.find(uuid);
+      if (it == receives_.end()) {
+        result = absl::AbortedError(
+            absl::StrCat("Prepare refused: receive uuid=", uuid, " ended"));
+      } else if (ReceiveEntry& e = it->second; !e.IsActive()) {
+        result = RefusalFor(e);
+      } else if (absl::Status s = e.session->GetStatus(); !s.ok()) {
+        FailActiveAndLogLocked(uuid, s, &retired);
+        result = AnnotateReceiveStatus(s, "PrepareVersionedReceive", uuid);
+      } else if (e.phase == ReceivePhase::kReady) {
+        result = absl::OkStatus();
+      } else if (!guard.ok() && !absl::IsDeadlineExceeded(guard)) {
+        FailActiveAndLogLocked(uuid, guard, &retired);
+        result = e.outcome;
+      } else {
+        std::vector<uint64_t> undrained =
+            CollectUndrainedSessionsLocked(uuid, retired);
+        const absl::Time now_wall = absl::Now();
+        if (!guard.ok() || (!undrained.empty() && now_wall >= wait_deadline)) {
+          std::string msg = guard.ok()
+                                ? absl::StrCat("Prepare of uuid=", uuid,
+                                               " timed out waiting for drain")
+                                : std::string(guard.message());
+          if (!undrained.empty()) {
+            absl::StrAppend(&msg, "; earlier sessions still running: [",
+                            absl::StrJoin(undrained, ", "), "]");
+          }
+          absl::Status err = absl::DeadlineExceededError(msg);
+          if (wait_deadline >= e.drain_deadline ||
+              now_wall >= e.drain_deadline) {
+            FailActiveAndLogLocked(uuid, err, &retired);
+            result = e.outcome;
+          } else {
+            result = std::move(err);
+          }
+        } else if (undrained.empty()) {
+          absl::Status reg =
+              grpc_delegate_ != nullptr
+                  ? grpc_delegate_->RegisterSession(uuid, e.session)
+                  : absl::OkStatus();
+          if (!reg.ok()) {
+            FailActiveAndLogLocked(uuid, reg, &retired);
+            result = e.outcome;
+          } else {
+            e.registered_with_grpc_delegate = (grpc_delegate_ != nullptr);
+            e.phase = ReceivePhase::kReady;
+            result = absl::OkStatus();
+          }
+        }
+      }
+    }
+    RetireUnlocked(retired);
+    if (result.has_value()) return *result;
+    if (absl::Duration rem = wait_deadline - absl::Now();
+        rem > absl::ZeroDuration()) {
+      absl::SleepFor(std::min(poll_interval, rem));
+    }
+  }
+}
+
+void WeightSynchronizerBase::FailVersionedReceive(uint64_t uuid,
+                                                  absl::Status status) {
+  CHECK(!status.ok()) << "FailVersionedReceive requires a non-OK status";
+  std::vector<RetiredSession> retired;
+  {
+    absl::MutexLock lock(receive_state_mu_);
+    CompleteVersionedReceivesLocked(retired);
+    auto it = receives_.find(uuid);
+    if (it != receives_.end() && it->second.IsActive()) {
+      FailActiveAndLogLocked(uuid, status, &retired);
+    }
+  }
+  RetireUnlocked(retired);
+}
+
+absl::StatusOr<bool> WeightSynchronizerBase::AwaitVersionedReceive(
+    uint64_t uuid, const WeightVersion& version, absl::Duration timeout) {
+  if (timeout < absl::ZeroDuration()) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("AwaitVersionedReceive(uuid=", uuid,
+                     "): negative timeout=", absl::FormatDuration(timeout)));
+  }
+  const absl::Time wait_deadline = absl::Now() + timeout;
+  while (true) {
+    std::vector<RetiredSession> retired;
+    std::optional<absl::StatusOr<bool>> result;
+    absl::Duration poll_interval = kReceiveDrainPollInterval;
+    {
+      absl::MutexLock lock(receive_state_mu_);
+      poll_interval = receive_drain_poll_interval_;
+      CompleteVersionedReceivesLocked(retired);
+      auto it = receives_.find(uuid);
+      if (it == receives_.end()) {
+        result = absl::NotFoundError(
+            absl::StrCat("AwaitVersionedReceive(uuid=", uuid,
+                         "): unknown or forgotten transfer"));
+      } else if (const ReceiveEntry& e = it->second;
+                 e.spec.version != version) {
+        result = absl::InvalidArgumentError(absl::StrCat(
+            "AwaitVersionedReceive(uuid=", uuid, "): receive is for version ",
+            e.spec.version, ", not ", version));
+      } else if (e.phase == ReceivePhase::kCommitted) {
+        result = true;
+      } else if (e.phase == ReceivePhase::kFailed) {
+        result =
+            AnnotateReceiveStatus(e.outcome, "AwaitVersionedReceive", uuid);
+      } else if (absl::Now() >= wait_deadline) {
+        result = false;
+      }
+    }
+    RetireUnlocked(retired);
+    if (result.has_value()) return *std::move(result);
+    if (absl::Duration rem = wait_deadline - absl::Now();
+        rem > absl::ZeroDuration()) {
+      absl::SleepFor(std::min(poll_interval, rem));
+    }
+  }
+}
+
+absl::StatusOr<std::shared_ptr<TransferSession>>
+WeightSynchronizerBase::GetSession(uint64_t uuid) const {
+  absl::MutexLock lock(receive_state_mu_);
+  auto it = receives_.find(uuid);
+  if (it == receives_.end() || it->second.phase != ReceivePhase::kReady ||
+      it->second.session == nullptr) {
+    return absl::NotFoundError(
+        absl::StrCat("No ready receive session for uuid=", uuid));
+  }
+  return it->second.session;
 }
 
 }  // namespace weight_sync

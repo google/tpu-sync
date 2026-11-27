@@ -23,9 +23,11 @@
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "grpcpp/channel.h"
+#include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden::transport::lib {
 
@@ -65,6 +67,20 @@ class RawBufferTransportDelegate {
   // transfer.
   virtual absl::Status OnDataReceived(uint64_t uuid = 0) {
     return absl::OkStatus();
+  }
+
+  // Returns the session that admits pushes tagged `uuid` (non-zero). Returns
+  // NotFound only when the delegate knows nothing about `uuid`; such pushes
+  // take the legacy path. A delegate that knows `uuid` but is not ready for
+  // its pushes (for example a receive that is still being set up or has
+  // already finished) must return another error, which refuses the push
+  // before any payload byte is written. Unlike the block transport, which
+  // refuses on NotFound, this transport keeps legacy pushes working. Never
+  // returns OK(nullptr); the transport refuses that with Internal. Runs on
+  // connection threads concurrently with no transport lock held.
+  virtual absl::StatusOr<std::shared_ptr<::tpu_raiden::TransferSession>>
+  GetSession(uint64_t uuid) const {
+    return absl::NotFoundError(absl::StrCat("No session for uuid=", uuid));
   }
 
   // Returns the gRPC channel for PeregrineControlService for the given peer.

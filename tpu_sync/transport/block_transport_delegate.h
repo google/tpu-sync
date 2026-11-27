@@ -222,9 +222,10 @@ class BlockTransportDelegate : public lib::RawBufferTransportDelegate {
   virtual int GetRemoteReadBlockId(int base_remote_id, int chunk_k) = 0;
 
   // Returns the active transfer session registered under |uuid|, or kNotFound
-  // when no session holds it.
-  virtual absl::StatusOr<std::shared_ptr<TransferSession>> GetSession(
-      uint64_t uuid) const = 0;
+  // when no session holds it. Block pushes refuse on any error; raw pushes
+  // take the legacy path on kNotFound (see RawBufferTransportDelegate).
+  absl::StatusOr<std::shared_ptr<TransferSession>> GetSession(
+      uint64_t uuid) const override = 0;
 
   virtual size_t num_layers() const = 0;
   virtual size_t num_shards() const = 0;
